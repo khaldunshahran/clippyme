@@ -105,16 +105,31 @@ def _atomic_json(path: str, payload: dict[str, Any]) -> None:
             json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
-        tmp = ""
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        if os.name != "nt":
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        for attempt in range(10):
+            try:
+                if os.name == "nt" and os.path.exists(path):
+                    try:
+                        import stat
+                        os.chmod(path, stat.S_IWRITE)
+                    except OSError:
+                        pass
+                os.replace(tmp, path)
+                tmp = ""
+                break
+            except (PermissionError, OSError):
+                if attempt == 9:
+                    raise
+                time.sleep(0.05 * (1.5 ** attempt))
+        if tmp == "" and os.name != "nt":
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
     finally:
         if tmp:
             try:
@@ -353,12 +368,10 @@ def collect_runtime_metrics(pid: int | None, output_dir: str) -> dict[str, Any]:
                 pass
     except Exception:
         try:
-            usage = os.statvfs(output_dir or ".")
-            metrics["disk_free_gb"] = round(
-                (usage.f_bavail * usage.f_frsize) / (1024 ** 3),
-                2,
-            )
-        except OSError:
+            import shutil
+            disk = shutil.disk_usage(output_dir or ".")
+            metrics["disk_free_gb"] = round(float(disk.free) / (1024 ** 3), 2)
+        except Exception:
             pass
     return metrics
 

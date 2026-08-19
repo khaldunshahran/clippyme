@@ -149,6 +149,8 @@ services:
     volumes:
       - ./dashboard:/app
       - /app/node_modules
+    environment:
+      - BACKEND_URL=http://backend:8000
     networks:
       - clippyme-net
     restart: unless-stopped

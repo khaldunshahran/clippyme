@@ -52,12 +52,31 @@ def _atomic_json(path: str, payload: dict[str, Any]) -> None:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
-        tmp = ""
+        if os.name != "nt":
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        for attempt in range(10):
+            try:
+                if os.name == "nt" and os.path.exists(path):
+                    try:
+                        import stat
+                        os.chmod(path, stat.S_IWRITE)
+                    except OSError:
+                        pass
+                os.replace(tmp, path)
+                tmp = ""
+                break
+            except (PermissionError, OSError):
+                if attempt == 9:
+                    raise
+                time.sleep(0.05 * (1.5 ** attempt))
+        if tmp == "" and os.name != "nt":
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
     finally:
         if tmp:
             try:
@@ -157,6 +176,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--aspect", choices=["9:16", "1:1", "16:9"], default="9:16")
     parser.add_argument("--monitor", action="store_true")
     parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--min-duration", type=float, default=None)
+    parser.add_argument("--max-duration", type=float, default=None)
+    parser.add_argument("--min-clips", type=int, default=None)
+    parser.add_argument("--max-clips", type=int, default=None)
+    parser.add_argument("--clip-type", type=str, default=None)
     return parser.parse_args(argv)
 
 
@@ -392,6 +416,11 @@ def _load_or_analyze(
             transcript,
             duration,
             instructions=args.instructions,
+            min_duration=args.min_duration,
+            max_duration=args.max_duration,
+            min_clips=args.min_clips,
+            max_clips=args.max_clips,
+            clip_type=args.clip_type,
         )
         if not clips_data or "shorts" not in clips_data:
             if should_use_fallback(args.monitor):

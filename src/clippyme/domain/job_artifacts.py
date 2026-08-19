@@ -32,7 +32,7 @@ def load_job_metadata(job_id: str, output_dir: str) -> Tuple[str, dict]:
     metadata file does not exist.
     """
     metadata_path = find_job_metadata_path(job_id, output_dir)
-    with open(metadata_path, "r") as f:
+    with open(metadata_path, "r", encoding="utf-8") as f:
         return metadata_path, json.load(f)
 
 

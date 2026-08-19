@@ -239,6 +239,79 @@ from clippyme.pipeline.diarization import (  # noqa: E402
 )
 
 
+def _transcribe_whisper_chunked(model, audio_path: str, language: str | None, chunk_duration: float = 600.0) -> tuple[list, str]:
+    """Transcribe long audio files in chunks to avoid NumPy FFT memory allocation errors on large inputs."""
+    import subprocess
+    import tempfile
+
+    # Get total audio duration via ffprobe
+    probe_cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", audio_path
+    ]
+    try:
+        res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        total_duration = float(res.stdout.strip())
+    except Exception:
+        total_duration = 0.0
+
+    detected_lang = language or "en"
+
+    if total_duration > 0 and total_duration <= chunk_duration:
+        segs, info = model.transcribe(audio_path, word_timestamps=True, language=language)
+        return list(segs), getattr(info, "language", detected_lang)
+
+    if total_duration <= 0:
+        segs, info = model.transcribe(audio_path, word_timestamps=True, language=language)
+        return list(segs), getattr(info, "language", detected_lang)
+
+    all_segments = []
+    num_chunks = int((total_duration + chunk_duration - 1) // chunk_duration)
+    print(f"📦 Audio is {total_duration:.1f}s — transcribing in {num_chunks} chunks of {chunk_duration:.0f}s to conserve RAM...")
+
+    for i in range(num_chunks):
+        offset = i * chunk_duration
+        current_chunk_duration = min(chunk_duration, total_duration - offset)
+        if current_chunk_duration <= 0.1:
+            break
+        print(f"   ▶️ Transcribing chunk {i+1}/{num_chunks} ({offset:.0f}s - {offset + current_chunk_duration:.0f}s)...")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_chunk:
+            chunk_file = tmp_chunk.name
+        try:
+            cmd = [
+                "ffmpeg", "-y", "-ss", str(offset), "-t", str(current_chunk_duration),
+                "-i", audio_path, "-ac", "1", "-ar", "16000", chunk_file
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            chunk_segs, info = model.transcribe(
+                chunk_file,
+                word_timestamps=True,
+                language=language,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                condition_on_previous_text=False,
+                temperature=0.0,
+                beam_size=5,
+            )
+            if i == 0 and info and getattr(info, "language", None):
+                detected_lang = info.language
+            for seg in chunk_segs:
+                seg.start += offset
+                seg.end += offset
+                if getattr(seg, "words", None):
+                    for w in seg.words:
+                        w.start += offset
+                        w.end += offset
+                all_segments.append(seg)
+        finally:
+            if os.path.exists(chunk_file):
+                try:
+                    os.remove(chunk_file)
+                except Exception:
+                    pass
+    return all_segments, detected_lang
+
+
 def transcribe_video(video_path):
     """Dispatch to the configured transcription provider.
 
@@ -256,7 +329,7 @@ def transcribe_video(video_path):
     downstream Gemini prompt + subtitle writer see the same ``speaker``
     field as the Deepgram path.
     """
-    provider = (os.getenv("TRANSCRIPTION_PROVIDER") or "deepgram").strip().lower()
+    provider = (os.getenv("TRANSCRIPTION_PROVIDER") or "whisper").strip().lower()
 
     # Strip to an audio-only track once so neither backend ingests the full
     # video (see diarization.extract_audio_for_asr). Massively shrinks the
@@ -315,12 +388,15 @@ def transcribe_video(video_path):
         _whisper_lang = _lang_override if _lang_override and _lang_override != "multi" else None
         if _whisper_lang:
             print(f"   🌐 Whisper language override: {_whisper_lang}")
-        segments, info = model.transcribe(
-            asr_input, word_timestamps=True, language=_whisper_lang
-        )
-        segments = list(segments)
 
-        print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
+        try:
+            segments, detected_lang = _transcribe_whisper_chunked(model, asr_input, _whisper_lang, chunk_duration=600.0)
+        except Exception as exc:
+            if os.getenv("DEEPGRAM_API_KEY"):
+                print(f"⚠️ Faster-Whisper transcription failed ({exc}) — falling back to Deepgram...")
+                from clippyme.pipeline.deepgram_transcribe import transcribe_with_deepgram
+                return transcribe_with_deepgram(asr_input)
+            raise
 
         # Convert to openai-whisper compatible format
         transcript_segments = []
@@ -393,7 +469,7 @@ def transcribe_video(video_path):
         return {
             'text': full_text.strip(),
             'segments': transcript_segments,
-            'language': info.language
+            'language': detected_lang
         }
     finally:
         for _tmp in (_audio_tmp, _iso_tmp):
@@ -403,7 +479,16 @@ def transcribe_video(video_path):
                 except OSError:
                     pass
 
-def get_viral_clips(transcript_result, video_duration, instructions=None):
+def get_viral_clips(
+    transcript_result,
+    video_duration,
+    instructions=None,
+    min_duration=None,
+    max_duration=None,
+    min_clips=None,
+    max_clips=None,
+    clip_type=None,
+):
     print("🤖  Analyzing with Gemini...")
     get_viral_clips._last_gemini_exhausted = False
 
@@ -427,8 +512,15 @@ def get_viral_clips(transcript_result, video_duration, instructions=None):
     # template fill) is pure — it lives in gemini_request, host-tested.
     # The live monitor knows whose stream this is; manual jobs don't (unset).
     prompt, words = build_viral_prompt(
-        transcript_result, video_duration, instructions,
+        transcript_result,
+        video_duration,
+        instructions,
         creator=os.getenv("CLIPPYME_CREATOR_NAME"),
+        min_duration=min_duration,
+        max_duration=max_duration,
+        min_clips=min_clips,
+        max_clips=max_clips,
+        clip_type=clip_type,
     )
 
     if not words:
@@ -647,6 +739,11 @@ if __name__ == '__main__':
                         help="Override the Gemini model for viral detection on THIS job (e.g. "
                              "'gemini-2.5-pro', 'gemini-3.1-pro-preview'). When unset, the pipeline uses "
                              "GEMINI_MODEL from env / Settings (default gemini-3.5-flash).")
+    parser.add_argument('--min-duration', type=float, default=None, help="Minimum clip duration in seconds.")
+    parser.add_argument('--max-duration', type=float, default=None, help="Maximum clip duration in seconds.")
+    parser.add_argument('--min-clips', type=int, default=None, help="Minimum number of clips to extract.")
+    parser.add_argument('--max-clips', type=int, default=None, help="Maximum number of clips to extract.")
+    parser.add_argument('--clip-type', type=str, default=None, help="Content focus (viral, educational, humor, storytelling, all).")
 
     args = parser.parse_args()
 
@@ -799,7 +896,16 @@ if __name__ == '__main__':
             duration = 0.0
 
         # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration, instructions=args.instructions)
+        clips_data = get_viral_clips(
+            transcript,
+            duration,
+            instructions=args.instructions,
+            min_duration=args.min_duration,
+            max_duration=args.max_duration,
+            min_clips=args.min_clips,
+            max_clips=args.max_clips,
+            clip_type=args.clip_type,
+        )
 
         # Smarter no-AI fallback: when Gemini is unavailable (no key) or its
         # output is unusable, segment the transcript into topic-coherent clips

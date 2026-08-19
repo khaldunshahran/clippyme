@@ -28,6 +28,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Hea
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 from clippyme.domain.job_results import build_main_cmd, canonical_reframe_mode
@@ -47,6 +48,7 @@ from clippyme.api.schemas import (
     BatchRequest,
     ComposeRequest,
     EditAIRequest,
+    GenerateMetadataRequest,
     LiveMonitorPublishingRequest,
     LiveMonitorStartRequest,
     LiveMonitorStopRequest,
@@ -221,6 +223,13 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    from fastapi.encoders import jsonable_encoder
+    logger.warning("Validation error on %s %s: %s", request.method, request.url.path, exc.errors())
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+
+
 @app.exception_handler(ClippyMeError)
 async def _clippyme_error_handler(request: Request, exc: ClippyMeError):
     """Map domain exceptions to HTTP responses so domain modules don't need
@@ -335,6 +344,11 @@ async def process_endpoint(
         no_zoom = bool(validated.no_zoom)
         skip_analysis = bool(validated.skip_analysis)
         model = validated.model
+        min_duration = validated.min_duration
+        max_duration = validated.max_duration
+        min_clips = validated.min_clips
+        max_clips = validated.max_clips
+        clip_type = validated.clip_type
 
     # For multipart/form-data uploads, extract reframe_mode + language from form fields
     if "multipart/form-data" in content_type:
@@ -350,6 +364,11 @@ async def process_endpoint(
         no_zoom = str(form.get("no_zoom", "")).lower() in {"1", "true", "yes"} or no_zoom
         skip_analysis = str(form.get("skip_analysis", "")).lower() in {"1", "true", "yes"} or skip_analysis
         model = form.get("model", model) or None
+        min_duration = float(form["min_duration"]) if form.get("min_duration") else min_duration
+        max_duration = float(form["max_duration"]) if form.get("max_duration") else max_duration
+        min_clips = int(form["min_clips"]) if form.get("min_clips") else min_clips
+        max_clips = int(form["max_clips"]) if form.get("max_clips") else max_clips
+        clip_type = form.get("clip_type", clip_type) or None
         # Validate the multipart values through the same schema for
         # consistency — we drop the url requirement since we're using
         # an uploaded file path.
@@ -364,6 +383,11 @@ async def process_endpoint(
                 "no_zoom": no_zoom,
                 "skip_analysis": skip_analysis,
                 "model": model or None,
+                "min_duration": min_duration,
+                "max_duration": max_duration,
+                "min_clips": min_clips,
+                "max_clips": max_clips,
+                "clip_type": clip_type,
             })
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=exc.errors())
@@ -427,6 +451,11 @@ async def process_endpoint(
             no_zoom=no_zoom,
             skip_analysis=skip_analysis,
             model=model,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            min_clips=min_clips,
+            max_clips=max_clips,
+            clip_type=clip_type,
         )
     except ValueError as exc:
         await asyncio.to_thread(shutil.rmtree, job_output_dir, True)
@@ -481,6 +510,11 @@ async def batch_process(req: BatchRequest, request: Request):
                 no_zoom=bool(getattr(req, "no_zoom", False)),
                 skip_analysis=bool(getattr(req, "skip_analysis", False)),
                 model=getattr(req, "model", None),
+                min_duration=getattr(req, "min_duration", None),
+                max_duration=getattr(req, "max_duration", None),
+                min_clips=getattr(req, "min_clips", None),
+                max_clips=getattr(req, "max_clips", None),
+                clip_type=getattr(req, "clip_type", None),
             )
         except ValueError as exc:
             # This item's output dir was already created above but it never
@@ -508,6 +542,26 @@ async def batch_process(req: BatchRequest, request: Request):
         raise HTTPException(status_code=400, detail="No valid URLs provided or queue is full.")
 
     return {"jobs": batch_jobs, "total": len(batch_jobs)}
+
+
+@app.get("/api/jobs/active")
+async def get_active_jobs():
+    active = []
+    for j_id, j in jobs.items():
+        if j.get("status") in ("queued", "processing", "paused"):
+            cmd = j.get("cmd") or []
+            source = j.get("input_path")
+            if not source and "-u" in cmd:
+                try:
+                    source = cmd[cmd.index("-u") + 1]
+                except (ValueError, IndexError):
+                    source = None
+            active.append({
+                "jobId": j_id,
+                "status": j["status"],
+                "source": source,
+            })
+    return {"jobs": active}
 
 
 @app.get("/api/status/{job_id}")
@@ -706,6 +760,53 @@ async def edit_clip_ai(
         clip_duration=duration,
     )
     return {"drop_ranges": result["drops"], "explanation": result["explanation"]}
+
+
+@app.post("/api/generate-metadata/{job_id}/{clip_index}")
+async def generate_clip_metadata_endpoint(
+    job_id: str,
+    clip_index: int,
+    req: GenerateMetadataRequest,
+    request: Request,
+    api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+):
+    """AI speaker identification, trending hashtags, title, and viral caption generation."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+
+    resolved = await asyncio.to_thread(
+        resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
+    clip = resolved.clip_info
+    start, end = clip.get("start", 0), clip.get("end", 0)
+
+    transcript = resolved.metadata.get("transcript") or {}
+    from clippyme.domain.smartcut import clip_transcript_segments
+    segments = clip_transcript_segments(transcript, start, end)
+    clip_transcript_text = " ".join(s.get("text", "") for s in segments if s.get("text"))
+
+    video_title = resolved.metadata.get("title") or clip.get("video_title_for_youtube_short") or ""
+    uploader = resolved.metadata.get("uploader") or ""
+
+    cfg = load_persistent_config() or {}
+    key = api_key or os.environ.get("GEMINI_API_KEY") or cfg.get("GEMINI_API_KEY")
+    model = req.model or cfg.get("GEMINI_MODEL") or "gemini-2.5-flash"
+    if not key:
+        raise HTTPException(status_code=400, detail="Gemini API key not configured")
+
+    from clippyme.domain.metadata_generator import generate_clip_metadata
+    result = await asyncio.to_thread(
+        generate_clip_metadata,
+        api_key=key,
+        model=model,
+        clip_transcript=clip_transcript_text,
+        start=start,
+        end=end,
+        video_title=video_title,
+        uploader=uploader,
+        instructions=req.instruction or "",
+    )
+    return result
 
 
 @app.post("/api/reframe/{job_id}/{clip_index}")

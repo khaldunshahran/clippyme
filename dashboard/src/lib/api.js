@@ -40,6 +40,11 @@ export async function submitProcessJob(data, apiKey, { signal } = {}) {
   const letterboxZoom = Number(data.preselections?.letterbox_zoom) || 0;
   const skipAnalysis = data.preselections?.skip_analysis === true;
   const model = (data.preselections?.model || '').trim();
+  const minDuration = Number(data.preselections?.min_duration) || null;
+  const maxDuration = Number(data.preselections?.max_duration) || null;
+  const minClips = Number(data.preselections?.min_clips) || null;
+  const maxClips = Number(data.preselections?.max_clips) || null;
+  const clipType = (data.preselections?.clip_type || '').trim() || null;
 
   if (data.type === 'url') {
     headers['Content-Type'] = 'application/json';
@@ -52,6 +57,11 @@ export async function submitProcessJob(data, apiKey, { signal } = {}) {
     if (noZoom) jsonBody.no_zoom = true;
     if (skipAnalysis) jsonBody.skip_analysis = true;
     if (model) jsonBody.model = model;
+    if (minDuration) jsonBody.min_duration = minDuration;
+    if (maxDuration) jsonBody.max_duration = maxDuration;
+    if (minClips) jsonBody.min_clips = minClips;
+    if (maxClips) jsonBody.max_clips = maxClips;
+    if (clipType) jsonBody.clip_type = clipType;
     body = JSON.stringify(jsonBody);
   } else {
     if (data.payload?.size > 16 * 1024 * 1024 * 1024) throw new Error('File too large. Maximum size is 16 GB.');
@@ -65,6 +75,11 @@ export async function submitProcessJob(data, apiKey, { signal } = {}) {
     if (noZoom) formData.append('no_zoom', 'true');
     if (skipAnalysis) formData.append('skip_analysis', 'true');
     if (model) formData.append('model', model);
+    if (minDuration) formData.append('min_duration', String(minDuration));
+    if (maxDuration) formData.append('max_duration', String(maxDuration));
+    if (minClips) formData.append('min_clips', String(minClips));
+    if (maxClips) formData.append('max_clips', String(maxClips));
+    if (clipType) formData.append('clip_type', clipType);
     body = formData;
   }
 
@@ -83,6 +98,11 @@ export async function submitBatchJob(data, apiKey, { signal } = {}) {
   if (data.preselections?.no_zoom === true) batchBody.no_zoom = true;
   if (data.preselections?.skip_analysis === true) batchBody.skip_analysis = true;
   if ((data.preselections?.model || '').trim()) batchBody.model = data.preselections.model.trim();
+  if (Number(data.preselections?.min_duration)) batchBody.min_duration = Number(data.preselections.min_duration);
+  if (Number(data.preselections?.max_duration)) batchBody.max_duration = Number(data.preselections.max_duration);
+  if (Number(data.preselections?.min_clips)) batchBody.min_clips = Number(data.preselections.min_clips);
+  if (Number(data.preselections?.max_clips)) batchBody.max_clips = Number(data.preselections.max_clips);
+  if ((data.preselections?.clip_type || '').trim()) batchBody.clip_type = data.preselections.clip_type.trim();
   const res = await apiFetch(getApiUrl('/api/batch'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Gemini-Key': apiKey },

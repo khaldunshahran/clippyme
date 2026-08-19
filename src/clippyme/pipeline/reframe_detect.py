@@ -21,8 +21,9 @@ def _get_yolo_model():
         _yolo_model.to(DEVICE)
     return _yolo_model
 
-mp_face_detection = mp.solutions.face_detection
-mp_face_mesh = mp.solutions.face_mesh
+_has_solutions = hasattr(mp, "solutions")
+mp_face_detection = getattr(mp.solutions, "face_detection", None) if _has_solutions else None
+mp_face_mesh = getattr(mp.solutions, "face_mesh", None) if _has_solutions else None
 
 _face_detection = None
 _face_mesh = None
@@ -32,7 +33,7 @@ def _get_face_detection():
     """Lazy-init MediaPipe FaceDetection on first use (avoids ~300ms TFLite
     load at import time on every subprocess, incl. --reframe-only switches)."""
     global _face_detection
-    if _face_detection is None:
+    if _face_detection is None and mp_face_detection is not None:
         _face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
     return _face_detection
 
@@ -40,7 +41,7 @@ def _get_face_detection():
 def _get_face_mesh():
     """Lazy-init MediaPipe FaceMesh on first use (see _get_face_detection)."""
     global _face_mesh
-    if _face_mesh is None:
+    if _face_mesh is None and mp_face_mesh is not None:
         _face_mesh = mp_face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
@@ -81,11 +82,14 @@ def compute_mouth_aspect_ratio(frame_bgr, face_box) -> float | None:
     y2 = min(H, int(y + h + pad))
     if x2 - x1 < 30 or y2 - y1 < 30:
         return None
+    face_mesh = _get_face_mesh()
+    if face_mesh is None:
+        return None
     roi = frame_bgr[y1:y2, x1:x2]
     rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
     rgb.flags.writeable = False
-    res = _get_face_mesh().process(rgb)
-    if not res.multi_face_landmarks:
+    res = face_mesh.process(rgb)
+    if not res or not getattr(res, "multi_face_landmarks", None):
         return None
     lm = res.multi_face_landmarks[0].landmark
     rh, rw = roi.shape[:2]
@@ -99,31 +103,46 @@ def compute_mouth_aspect_ratio(frame_bgr, face_box) -> float | None:
         return None
     return mouth_h / mouth_w
 
+
 def detect_face_candidates(frame):
     """
     Returns list of all detected faces using lightweight FaceDetection.
+    Falls back to YOLO upper-body detection when FaceDetection is unavailable.
     """
-    height, width, _ = frame.shape
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = _get_face_detection().process(rgb_frame)
-    
+    face_det = _get_face_detection()
+    if face_det is not None:
+        height, width, _ = frame.shape
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_det.process(rgb_frame)
+        candidates = []
+        if not results or not getattr(results, "detections", None):
+            return []
+        for detection in results.detections:
+            bboxC = detection.location_data.relative_bounding_box
+            x = int(bboxC.xmin * width)
+            y = int(bboxC.ymin * height)
+            w = int(bboxC.width * width)
+            h = int(bboxC.height * height)
+            candidates.append({
+                'box': [x, y, w, h],
+                'score': w * h  # Area as score
+            })
+        return candidates
+
+    # Fallback: Detect person upper bodies using YOLO
+    results = _get_yolo_model()(frame, verbose=False, classes=[0])
     candidates = []
-    
-    if not results.detections:
-        return []
-        
-    for detection in results.detections:
-        bboxC = detection.location_data.relative_bounding_box
-        x = int(bboxC.xmin * width)
-        y = int(bboxC.ymin * height)
-        w = int(bboxC.width * width)
-        h = int(bboxC.height * height)
-        
-        candidates.append({
-            'box': [x, y, w, h],
-            'score': w * h # Area as score
-        })
-            
+    if results:
+        for result in results:
+            for box in getattr(result, "boxes", []):
+                x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+                w = x2 - x1
+                h = y2 - y1
+                head_h = max(20, int(h * 0.35))
+                candidates.append({
+                    'box': [x1, y1, w, head_h],
+                    'score': w * head_h
+                })
     return candidates
 
 def detect_person_yolo(frame):

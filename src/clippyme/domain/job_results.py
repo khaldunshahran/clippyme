@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 
 from clippyme.domain.clip_resolve import clip_filename_for
 from clippyme.pipeline.reframe_ops import normalize_letterbox_zoom
@@ -55,6 +56,11 @@ def build_main_cmd(
     aspect: str | None = None,
     model: str | None = None,
     monitor: bool = False,
+    min_duration: float | None = None,
+    max_duration: float | None = None,
+    min_clips: int | None = None,
+    max_clips: int | None = None,
+    clip_type: str | None = None,
 ) -> list[str]:
     """Build argv for the checkpointed backend pipeline.
 
@@ -92,7 +98,7 @@ def build_main_cmd(
     if input_path and input_path.lstrip().startswith("-"):
         raise ValueError("input_path must not start with '-'")
 
-    cmd = ["python", "-u", "-m", "clippyme.pipeline.orchestrator"]
+    cmd = [sys.executable, "-u", "-m", "clippyme.pipeline.orchestrator"]
     if url:
         cmd.extend(["-u", url])
         if cookies_path and os.path.exists(cookies_path):
@@ -121,6 +127,16 @@ def build_main_cmd(
         cmd.extend(["--model", model.strip()])
     if monitor:
         cmd.append("--monitor")
+    if min_duration is not None and min_duration > 0:
+        cmd.extend(["--min-duration", f"{min_duration:.1f}"])
+    if max_duration is not None and max_duration > 0:
+        cmd.extend(["--max-duration", f"{max_duration:.1f}"])
+    if min_clips is not None and min_clips > 0:
+        cmd.extend(["--min-clips", str(int(min_clips))])
+    if max_clips is not None and max_clips > 0:
+        cmd.extend(["--max-clips", str(int(max_clips))])
+    if clip_type and clip_type.strip():
+        cmd.extend(["--clip-type", clip_type.strip()])
     return cmd
 
 

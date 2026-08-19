@@ -86,6 +86,10 @@ class ViralClip(BaseModel):
     # trim during normalization anyway.
     video_title_for_youtube_short: str = Field("", max_length=110)
     viral_hook_text: str = Field("", max_length=160)
+    speaker_name: str = ""
+    hashtags: list[str] = Field(default_factory=list)
+    video_description: str = ""
+    clip_type: str = ""
 
     @field_validator(
         "viral_reason",
@@ -93,6 +97,9 @@ class ViralClip(BaseModel):
         "video_description_for_instagram",
         "video_title_for_youtube_short",
         "viral_hook_text",
+        "speaker_name",
+        "video_description",
+        "clip_type",
     )
     @classmethod
     def _normalize_whitespace(cls, v: str) -> str:
@@ -114,13 +121,13 @@ class ViralClip(BaseModel):
         if v <= start:
             raise ValueError(f"end ({v}) must be strictly greater than start ({start})")
         duration = v - start
-        if duration < 10 or duration > 75:
+        if duration < 5 or duration > 900:
             raise ValueError(
-                f"clip duration {duration:.2f}s outside allowed range [10, 75]"
+                f"clip duration {duration:.2f}s outside allowed range [5, 900]"
             )
         return v
 
 
 class ViralClipsResponse(BaseModel):
     """Top-level response shape from the Gemini viral-moment prompt."""
-    shorts: list[ViralClip] = Field(..., min_length=0, max_length=20)
+    shorts: list[ViralClip] = Field(..., min_length=0, max_length=50)

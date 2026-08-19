@@ -5,8 +5,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Icon, Social, Btn, Switch, PlatPill, PLATFORMS } from './primitives';
 import { LazyVideo } from './LazyVideo';
-import { clipVideoSrc } from './realApi';
-import { publishClip, getZernio } from './realApi';
+import { clipVideoSrc, publishClip, getZernio, generateClipMetadata } from './realApi';
 import { seedToggles, seedHookParams, seedSubtitleParams, seedLogoParams, seedBannerParams } from '../lib/seedClipParams';
 import { localDatePlus } from '../lib/scheduleDates';
 import { useModalA11y } from './useModalA11y';
@@ -58,14 +57,36 @@ function PubRow({ clip, idx, st, plats }) {
 
 export function PublishModal({ clips, jobId, clipStates = {}, preselections, onClose, onPublished, pushToast }) {
   const all = clips.length > 1;
+  const firstClip = clips[0] || {};
   const [zernio, setZernio] = useState(null);
-  const [plats, setPlats] = useState({ tiktok: true, ig: true, yt: false });
+  const [plats, setPlats] = useState({ tiktok: false, ig: false, yt: false });
   const [schedule, setSchedule] = useState(true);
-  const [caption, setCaption] = useState(clips[0]?.tiktok_caption || clips[0]?.video_title_for_youtube_short || '');
+  const [titleText, setTitleText] = useState(firstClip.video_title_for_youtube_short || '');
+  const [caption, setCaption] = useState(
+    firstClip.video_description || firstClip.video_description_for_tiktok || firstClip.tiktok_caption || firstClip.video_title_for_youtube_short || ''
+  );
+  const [speakerName, setSpeakerName] = useState(firstClip.speaker_name || '');
+  const [hashtags, setHashtags] = useState(
+    firstClip.hashtags?.length ? firstClip.hashtags : ['#shorts', '#trending', '#viral']
+  );
+  const [generatingAi, setGeneratingAi] = useState(false);
   const [stage, setStage] = useState('setup'); // setup | uploading | done
   const [progress, setProgress] = useState({});
 
-  useEffect(() => { getZernio().then(setZernio).catch(() => setZernio({ configured: false })); }, []);
+  useEffect(() => {
+    getZernio()
+      .then((z) => {
+        setZernio(z);
+        if (z?.accounts) {
+          setPlats({
+            tiktok: !!z.accounts.tiktok,
+            ig: !!z.accounts.instagram,
+            yt: !!z.accounts.youtube,
+          });
+        }
+      })
+      .catch(() => setZernio({ configured: false }));
+  }, []);
 
   // Accessibility: focus trap + Escape-to-close + focus restore.
   const panelRef = useModalA11y(onClose);
@@ -81,7 +102,35 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
     .filter((k) => plats[k] && accounts[PLAT[k].acct])
     .map((k) => ({ platform: PLAT[k].platform, accountId: accounts[PLAT[k].acct] }));
   const targets = platTargets();
-  const ready = zernio?.configured && targets.length > 0;
+  const handleGenerateAi = async () => {
+    if (generatingAi) return;
+    if (!jobId) {
+      pushToast?.('warn', 'No active job ID found for metadata generation');
+      return;
+    }
+    setGeneratingAi(true);
+    const apiIdx = Number.isInteger(firstClip.original_index) ? firstClip.original_index : (firstClip._apiIdx ?? firstClip._idx ?? 0);
+    try {
+      const res = await generateClipMetadata(jobId, apiIdx);
+      if (res.title) setTitleText(res.title);
+      if (res.speaker_name) setSpeakerName(res.speaker_name);
+      if (res.hashtags?.length) setHashtags(res.hashtags);
+      if (res.caption) setCaption(res.caption);
+      pushToast?.('success', 'AI Caption, Tags & Speaker generated!');
+    } catch (err) {
+      pushToast?.('warn', `AI Generation failed: ${err?.message || err}`);
+    } finally {
+      setGeneratingAi(false);
+    }
+  };
+
+  const toggleTag = (tag) => {
+    if (caption.includes(tag)) {
+      setCaption((c) => c.replace(new RegExp(`\\s*${tag}`, 'g'), '').trim());
+    } else {
+      setCaption((c) => (c ? `${c} ${tag}` : tag));
+    }
+  };
 
   // `batchPos` is the clip's position within this batch (0-based). When
   // scheduling, each clip gets its own day (start_date = today + batchPos) so
@@ -96,10 +145,23 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
     const logoParams = cs.logoParams ?? seedLogoParams(preselections);
     const gradeParams = cs.gradeParams ?? { preset: preselections?.grade?.preset || 'none' };
     const bannerParams = cs.bannerParams ?? seedBannerParams(preselections);
-    const title = (clip.video_title_for_youtube_short || `Clip ${idx + 1}`).slice(0, 100);
+    const resolvedTitle = (titleText && !all ? titleText : (clip.video_title_for_youtube_short || `Clip ${idx + 1}`)).slice(0, 100);
+    let resolvedCaption = (caption && caption.trim()) || resolvedTitle;
+    if (all) {
+      if (clip.video_description) {
+        resolvedCaption = clip.video_description;
+      } else {
+        let desc = clip.video_description_for_tiktok || clip.video_title_for_youtube_short || `Clip ${idx + 1}`;
+        if (clip.speaker_name) {
+          desc = `Featuring ${clip.speaker_name} — ${desc}`;
+        }
+        const tags = clip.hashtags?.length ? clip.hashtags : hashtags;
+        resolvedCaption = `${desc}\n\n${tags.join(' ')}`;
+      }
+    }
     return {
-      title,
-      caption: (caption && caption.trim()) || title,
+      title: resolvedTitle,
+      caption: resolvedCaption,
       platforms: targets,
       schedule_mode: schedule ? 'auto' : 'now',
       ...(schedule ? { start_date: localDatePlus(batchPos) } : {}),
@@ -124,7 +186,16 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
       // clipStates/progress, which are unaffected by a manual-publish gap.
       const apiIdx = clip._apiIdx ?? idx;
       try {
-        await publishClip(jobId, apiIdx, buildBody(clip, idx, batchPos));
+        let body = buildBody(clip, idx, batchPos);
+        // In batch publish, generate fresh unique AI metadata for clips that don't have rich descriptions
+        if (all && !clip.video_description) {
+          try {
+            const ai = await generateClipMetadata(jobId, apiIdx);
+            if (ai?.caption) body.caption = ai.caption;
+            if (ai?.title) body.title = ai.title;
+          } catch (_) {}
+        }
+        await publishClip(jobId, apiIdx, body);
         setProgress((p) => ({ ...p, [idx]: { state: 'done' } }));
         onPublished?.(idx);
         return true;
@@ -145,7 +216,7 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
   };
 
   const title = stage === 'done' ? (schedule ? 'Scheduled' : 'Published')
-    : all ? `Publish ${clips.length} clips` : `Publish · ${clips[0]?.video_title_for_youtube_short || ''}`;
+    : all ? `Publish ${clips.length} clips` : `Publish · ${titleText || firstClip?.video_title_for_youtube_short || ''}`;
 
   return (
     // Backdrop click is a mouse-only convenience; keyboard users close via
@@ -173,7 +244,19 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
               ) : (
                 <>
                   <div className="field">
-                    <span className="field-label">Platforms</span>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                      <span className="field-label" style={{ margin: 0 }}>Social Platforms</span>
+                      <button
+                        type="button"
+                        className="btn ghost-btn"
+                        style={{ padding: '4px 10px', fontSize: '12px', height: '28px', color: 'var(--brand-teal)', display: 'inline-flex', alignItems: 'center', gap: '6px', border: '1px solid var(--brand-teal-dim, rgba(2,197,191,0.2))', borderRadius: '6px', cursor: 'pointer', background: 'transparent' }}
+                        onClick={handleGenerateAi}
+                        disabled={generatingAi}
+                      >
+                        <Icon n={generatingAi ? "loader" : "sparkles"} style={{ width: 14, height: 14 }} />
+                        {generatingAi ? "AI Generating…" : "✨ AI Caption & Tags"}
+                      </button>
+                    </div>
                     <div className="plats">
                       {PLATFORMS.map((p) => {
                         const has = !!accounts[PLAT[p.id].acct];
@@ -182,11 +265,76 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
                       })}
                     </div>
                   </div>
+
+                  {!all && (
+                    <div className="field">
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                        <span className="field-label" style={{ margin: 0 }}>Video Title</span>
+                        {speakerName && (
+                          <span style={{ fontSize: '11.5px', color: 'var(--brand-teal)', background: 'rgba(2,197,191,0.1)', padding: '2px 8px', borderRadius: '12px', fontWeight: 600 }}>
+                            🗣️ {speakerName}
+                          </span>
+                        )}
+                      </div>
+                      <input
+                        className="key-input"
+                        style={{ width: '100%', fontFamily: 'var(--font-sans)', fontSize: '13.5px', padding: '8px 12px' }}
+                        value={titleText}
+                        maxLength={100}
+                        onChange={(e) => setTitleText(e.target.value)}
+                        placeholder="Viral video title for YouTube Shorts..."
+                      />
+                    </div>
+                  )}
+
                   <div className="field">
-                    <span className="field-label">Caption</span>
-                    <textarea className="ta" rows="3" value={caption} onChange={(e) => setCaption(e.target.value)}></textarea>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <span className="field-label" style={{ margin: 0 }}>Caption & Description</span>
+                      <span style={{ fontSize: '11px', color: 'var(--fg-3)' }}>{caption.length}/2200 chars</span>
+                    </div>
+                    <textarea
+                      className="ta"
+                      rows={4}
+                      value={caption}
+                      onChange={(e) => setCaption(e.target.value)}
+                      placeholder="Write or generate an engaging description with trending tags..."
+                    />
                   </div>
-                  <div className="opt" style={{ borderBottom: 0 }}>
+
+                  {hashtags.length > 0 && (
+                    <div className="field" style={{ marginTop: -4 }}>
+                      <span className="field-label" style={{ fontSize: '11.5px', color: 'var(--fg-3)', marginBottom: 6, display: 'block' }}>
+                        🔥 Trending & Topic Tags (click to toggle in caption):
+                      </span>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                        {hashtags.map((tag) => {
+                          const active = caption.includes(tag);
+                          return (
+                            <button
+                              key={tag}
+                              type="button"
+                              onClick={() => toggleTag(tag)}
+                              style={{
+                                border: '1px solid ' + (active ? 'var(--brand-teal)' : 'var(--border)'),
+                                background: active ? 'rgba(2,197,191,0.15)' : 'var(--bg-card)',
+                                color: active ? 'var(--brand-teal)' : 'var(--fg-2)',
+                                padding: '3px 8px',
+                                borderRadius: '12px',
+                                fontSize: '11.5px',
+                                fontWeight: active ? 600 : 400,
+                                cursor: 'pointer',
+                                transition: 'all 0.2s',
+                              }}
+                            >
+                              {active ? '✓ ' : '+ '}{tag}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="opt" style={{ borderBottom: 0, marginTop: 4 }}>
                     <div className="oico"><Icon n="calendar-clock" /></div>
                     <div className="otxt"><div className="ot">Schedule for prime time</div><div className="od">SmartScheduler picks the slot · off = publish now</div></div>
                     <div className="r"><Switch on={schedule} onChange={setSchedule} /></div>

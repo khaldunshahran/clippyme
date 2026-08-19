@@ -21,7 +21,8 @@ MODEL_PRICING = {
 }
 
 GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor specialized in TikTok, IG Reels and YouTube Shorts virality. Read the ENTIRE transcript + word-level timestamps and select the 3–15 MOST VIRAL 15–60s moments.
+You are a senior video editor specialized in social media virality across YouTube Shorts, TikTok, IG Reels, and YouTube Highlights. Read the ENTIRE transcript + word-level timestamps and select {target_moments_instruction} MOST COMPELLING {duration_descriptor} moments.
+{clip_type_focus_block}
 
 ## IS THIS MOMENT EVEN WORTH CUTTING? (gate — apply BEFORE scoring)
 A clip must hit at least ONE of these HARD. A moment that is merely pleasant,
@@ -79,7 +80,7 @@ Absence of these markers means the provider didn't tag audio events; score
 normally on the words alone.
 
 ## HARD CONSTRAINTS (violating = clip REJECTED)
-- 15s ≤ duration ≤ 60s
+- {duration_constraint}
 - start on a complete sentence boundary; end on a natural beat
 - no cold-open ambiguity ("...and then she said" with no setup)
 - 0 ≤ start < end ≤ VIDEO_DURATION_SECONDS
@@ -258,10 +259,13 @@ Output schema:
       "end": 37.900,
       "viral_score": 87,
       "viral_reason": "<>=20 chars, cite specific hook/payoff/quote, same language as transcript>",
-      "video_description_for_tiktok": "<TikTok description, ends with a genuine question or a debatable opinion — never mechanical engagement bait>",
-      "video_description_for_instagram": "<Instagram description, ends with a genuine question or a debatable opinion — never mechanical engagement bait>",
+      "video_description_for_tiktok": "<TikTok description with relevant hashtags, ends with a genuine question or debatable opinion>",
+      "video_description_for_instagram": "<Instagram description with relevant hashtags, ends with a genuine question or debatable opinion>",
       "video_title_for_youtube_short": "<max 100 chars, engagement-first bait per TITLE & CAPTION COPY — stakes/speculation/comment trigger, grounded in the clip, never a flat summary>",
-      "viral_hook_text": "<REQUIRED, 3-8 words, scroll-stopping overlay copy — NOT a transcript quote. Use curiosity gap, POV, counter-claim, question, number, or warning pattern. Same language as transcript.>"
+      "viral_hook_text": "<REQUIRED, 3-8 words, scroll-stopping overlay copy — NOT a transcript quote. Use curiosity gap, POV, counter-claim, question, number, or warning pattern. Same language as transcript.>",
+      "speaker_name": "<Identified speaker name or prominent subject in this moment if detectable from dialogue or context (e.g. 'John Kiriakou', 'Judge Napolitano', or empty if unknown)>",
+      "hashtags": ["#shorts", "#topicTag1", "#topicTag2", "#topicTag3", "#trending"],
+      "video_description": "<Rich complete YouTube Shorts description with hook, speaker attribution, key takeaway, and hashtags>"
     }}
   ]
 }}
@@ -322,7 +326,17 @@ def encode_words_toon(words):
     return "\n".join(lines)
 
 
-def build_viral_prompt(transcript_result, video_duration, instructions=None, creator=None):
+def build_viral_prompt(
+    transcript_result,
+    video_duration,
+    instructions=None,
+    creator=None,
+    min_duration=None,
+    max_duration=None,
+    min_clips=None,
+    max_clips=None,
+    clip_type=None,
+):
     """Return ``(prompt, words)`` for the primary Gemini call.
 
     ``words`` is also what ``gemini_parser.backfill_hook_text`` needs later,
@@ -361,8 +375,70 @@ def build_viral_prompt(transcript_result, video_duration, instructions=None, cre
             "clip: guests and co-streamers exist (see SPEAKER ATTRIBUTION RULE)."
         )
 
+    # Resolve duration bounds
+    min_dur = float(min_duration) if min_duration is not None and min_duration > 0 else 15.0
+    max_dur = float(max_duration) if max_duration is not None and max_duration > 0 else 60.0
+    if max_dur < min_dur:
+        max_dur = max(min_dur + 15.0, 60.0)
+
+    duration_descriptor = f"{min_dur:.0f}–{max_dur:.0f}s"
+    duration_constraint = f"{min_dur:.0f}s ≤ duration ≤ {max_dur:.0f}s"
+
+    # Resolve target clip count
+    if min_clips is not None and max_clips is not None and min_clips > 0 and max_clips >= min_clips:
+        target_moments_instruction = f"the {min_clips}–{max_clips}"
+    elif max_clips is not None and max_clips > 0:
+        target_moments_instruction = f"up to {max_clips}"
+    else:
+        duration_min = float(video_duration or 0) / 60.0
+        if duration_min <= 15:
+            target_moments_instruction = "the 3–8"
+        elif duration_min <= 60:
+            target_moments_instruction = "the 5–15"
+        elif duration_min <= 120:
+            target_moments_instruction = "the 10–20"
+        else:
+            target_moments_instruction = "the 15–30"
+
+    # Resolve clip focus block
+    clip_type_focus_block = ""
+    ctype = (clip_type or "").strip().lower()
+    if ctype == "educational":
+        clip_type_focus_block = (
+            "\n## CONTENT FOCUS: EDUCATIONAL & KEY INSIGHTS\n"
+            "Prioritize actionable frameworks, deep explanations, mental models, counter-intuitive facts, "
+            "tutorials, and high-value insights that viewers will save and share."
+        )
+    elif ctype == "humor":
+        clip_type_focus_block = (
+            "\n## CONTENT FOCUS: HUMOR & ENTERTAINING MOMENTS\n"
+            "Prioritize funny banter, comedic timing, jokes, awkward reactions, bloopers, "
+            "and moments that evoke genuine laughter."
+        )
+    elif ctype == "storytelling":
+        clip_type_focus_block = (
+            "\n## CONTENT FOCUS: STORYTELLING & DEEP DIVES\n"
+            "Prioritize complete beginning-middle-end narrative arcs, personal stories, dramatic revelations, "
+            "and engaging anecdotes that keep viewers hooked all the way through."
+        )
+    elif ctype == "viral":
+        clip_type_focus_block = (
+            "\n## CONTENT FOCUS: VIRAL HOOKS & HOT TAKES\n"
+            "Prioritize fast-paced pattern interrupts, controversial opinions, instant shocking hooks, "
+            "and debates that divide the audience and drive intense comment sections."
+        )
+    elif ctype == "all":
+        clip_type_focus_block = (
+            "\n## CONTENT FOCUS: BALANCED MIX\n"
+            "Curate a diverse selection covering viral hot takes, educational insights, funny moments, and deep stories."
+        )
+
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
+        target_moments_instruction=target_moments_instruction,
+        duration_descriptor=duration_descriptor,
+        duration_constraint=duration_constraint,
+        clip_type_focus_block=clip_type_focus_block,
         transcript_text=json.dumps(transcript_result.get('text', '')),
         words_toon=encode_words_toon(words),
         user_instructions_block=user_instructions_block,

@@ -57,16 +57,31 @@ def save_journal(path: str, records: dict) -> None:
                 json.dump(records, file)
                 file.flush()
                 os.fsync(file.fileno())
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp_path, path)
-            tmp_path = None
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
+            if os.name != "nt":
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except OSError:
+                    pass
+            for attempt in range(10):
+                try:
+                    if os.name == "nt" and os.path.exists(path):
+                        try:
+                            import stat
+                            os.chmod(path, stat.S_IWRITE)
+                        except OSError:
+                            pass
+                    os.replace(tmp_path, path)
+                    tmp_path = None
+                    break
+                except (PermissionError, OSError):
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.05 * (1.5 ** attempt))
+            if tmp_path is None and os.name != "nt":
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
             try:
                 directory_fd = os.open(directory, os.O_RDONLY)
             except OSError:

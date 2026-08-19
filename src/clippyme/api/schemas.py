@@ -74,8 +74,10 @@ def _validate_timezone(value: Optional[str]) -> Optional[str]:
 
         try:
             ZoneInfo(normalized)
-        except ZoneInfoNotFoundError as exc:
-            raise ValueError(f"unknown timezone: {normalized!r}") from exc
+        except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+            import re
+            if not re.match(r"^[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*$", normalized):
+                raise ValueError(f"unknown timezone: {normalized!r}") from exc
     except ImportError:  # pragma: no cover - Python 3.11 always has zoneinfo
         pass
     return normalized
@@ -95,6 +97,11 @@ class ProcessRequest(BaseModel):
     model: Optional[str] = Field(
         None, max_length=72, pattern=r"^gemini-[A-Za-z0-9.\-]{1,64}$"
     )
+    min_duration: Optional[float] = Field(None, ge=5, le=900)
+    max_duration: Optional[float] = Field(None, ge=5, le=900)
+    min_clips: Optional[int] = Field(None, ge=1, le=50)
+    max_clips: Optional[int] = Field(None, ge=1, le=50)
+    clip_type: Optional[str] = Field(None, max_length=64)
 
     @field_validator("url")
     @classmethod
@@ -123,6 +130,11 @@ class BatchRequest(BaseModel):
     model: Optional[str] = Field(
         None, max_length=72, pattern=r"^gemini-[A-Za-z0-9.\-]{1,64}$"
     )
+    min_duration: Optional[float] = Field(None, ge=5, le=900)
+    max_duration: Optional[float] = Field(None, ge=5, le=900)
+    min_clips: Optional[int] = Field(None, ge=1, le=50)
+    max_clips: Optional[int] = Field(None, ge=1, le=50)
+    clip_type: Optional[str] = Field(None, max_length=64)
 
     @field_validator("urls")
     @classmethod
@@ -293,6 +305,13 @@ class ComposeRequest(BaseModel):
 
 class EditAIRequest(BaseModel):
     instruction: str = Field(..., min_length=1, max_length=1000)
+    model: Optional[str] = Field(
+        None, max_length=64, pattern=r"^gemini-[A-Za-z0-9.\-]{1,64}$"
+    )
+
+
+class GenerateMetadataRequest(BaseModel):
+    instruction: Optional[str] = Field(None, max_length=1000)
     model: Optional[str] = Field(
         None, max_length=64, pattern=r"^gemini-[A-Za-z0-9.\-]{1,64}$"
     )

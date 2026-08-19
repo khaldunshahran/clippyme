@@ -172,11 +172,32 @@ export async function publishClip(jobId, index, body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    const e = new Error((err.detail || `HTTP ${res.status}`).toString());
+    let msg = err.detail || `HTTP ${res.status}`;
+    if (Array.isArray(msg)) {
+      msg = msg.map((m) => (m.msg ? `${m.loc ? m.loc.slice(1).join('.') + ': ' : ''}${m.msg}` : JSON.stringify(m))).join(', ');
+    } else if (typeof msg === 'object' && msg !== null) {
+      msg = JSON.stringify(msg);
+    }
+    const e = new Error(String(msg));
     e.status = res.status;
     throw e;
   }
   return res.json().catch(() => ({}));
+}
+
+export async function generateClipMetadata(jobId, index, instruction = '') {
+  const res = await apiFetch(getApiUrl(`/api/generate-metadata/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ instruction }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json(); // { speaker_name, title, hashtags, caption }
 }
 
 export async function restoreJob(jobId) {
@@ -191,12 +212,19 @@ export async function restoreJob(jobId) {
 // Cross-checking against this set lets the UI flag entries that can no longer
 // be opened instead of failing silently on click. Returns a Set of jobIds;
 // empty Set on any error (treated as "unknown" → don't disable anything).
-export async function listBackendJobIds() {
+export async function listBackendJobs() {
   try {
     const res = await apiFetch(getApiUrl('/api/history'));
-    if (!res.ok) return null;
+    if (!res.ok) return [];
     const data = await res.json();
-    return new Set((data.jobs || []).map((j) => j.jobId).filter(Boolean));
+    return Array.isArray(data.jobs) ? data.jobs : [];
+  } catch { return []; }
+}
+
+export async function listBackendJobIds() {
+  try {
+    const jobs = await listBackendJobs();
+    return new Set(jobs.map((j) => j.jobId).filter(Boolean));
   } catch { return null; }
 }
 
@@ -394,9 +422,12 @@ export function optsToPreselections(opts) {
     no_zoom: !opts.zoom,
     skip_analysis: !opts.detect,
     smartcut: opts.smartcut,
-    // Per-job Gemini model override (quick-picker). Omitted when blank →
-    // lib/api.js skips the field and the backend uses the Settings default.
     model: (opts.model || '').trim() || undefined,
+    min_duration: opts.durationMode === 'custom' ? (Number(opts.minDuration) || null) : (opts.durationMode === 'shorts' ? 15 : opts.durationMode === 'mid' ? 60 : opts.durationMode === 'long' ? 180 : null),
+    max_duration: opts.durationMode === 'custom' ? (Number(opts.maxDuration) || null) : (opts.durationMode === 'shorts' ? 60 : opts.durationMode === 'mid' ? 180 : opts.durationMode === 'long' ? 600 : null),
+    min_clips: opts.clipsAuto ? null : (Number(opts.minClips) || (Number(opts.clips) ? Math.max(1, Number(opts.clips) - 2) : null)),
+    max_clips: opts.clipsAuto ? null : (Number(opts.maxClips) || Number(opts.clips) || null),
+    clip_type: (opts.clipType || 'viral').trim(),
     subtitles: opts.subtitles
       ? {
           mode: opts.subMode, preset: opts.subPreset, position: opts.subPosition || 'bottom',

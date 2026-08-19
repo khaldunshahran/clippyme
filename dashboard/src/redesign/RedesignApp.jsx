@@ -14,11 +14,12 @@ import { PublishModal } from './publish';
 import { HistoryView, SettingsView, ApiKeyModal } from './views';
 import { LiveMonitorView } from './live';
 import { EditClipModal } from './captions';
-import { optsToPreselections, restoreJob, listBackendJobIds, cancelJob, pauseJob, resumeJob, stopJob, reframeClip, composeClip } from './realApi';
+import { optsToPreselections, restoreJob, listBackendJobIds, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, reframeClip, composeClip } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
 import { clipStateToParams, buildBulkPlan } from '../lib/bulkApply';
 import { runApplyEdit } from '../lib/applyEdit';
+import { pollJob } from '../lib/api';
 
 import { useJobSubmission } from '../hooks/useJobSubmission';
 import { useJobPolling } from '../hooks/useJobPolling';
@@ -30,7 +31,8 @@ import { useSessionPersistence, loadPersistedSession, clearPersistedSession } fr
 
 const DEFAULT_OPTS = {
   mode: 'single', source: 'url', url: '', file: null, fileName: '', batch: '', batchFiles: [], instructions: '',
-  clipsAuto: true, clips: 7, aspect: '9:16',
+  clipType: 'viral', durationMode: 'shorts', minDuration: 15, maxDuration: 60,
+  clipsAuto: true, clips: 7, minClips: 5, maxClips: 15, aspect: '9:16',
   detect: true, reframeMode: 'auto', letterboxZoom: 0, smartcut: true, zoom: true, model: '',
   subtitles: true, subMode: 'karaoke', subPreset: 'hormozi_bold',
   // Bottom-left is the default reading position: low enough to stay out of the
@@ -114,9 +116,9 @@ export default function RedesignApp() {
   useEffect(() => () => { toastTimerIds.current.forEach(clearTimeout); }, []);
   const [publishClips, setPublishClips] = useState(null);
   const [editClip, setEditClip] = useState(null);
-  // Multi-select bulk editor: { targets: [{ i, c }] }.
   const [bulkEdit, setBulkEdit] = useState(null);
   const [viewingHistory, setViewingHistory] = useState(false);
+  const [historyJob, setHistoryJob] = useState(null);
   // jobIds that still exist on disk (null = not yet known / backend offline →
   // don't disable anything). Reconciles the localStorage history list against
   // reality so jobs wiped by a rebuild are flagged instead of dead-clicking.
@@ -125,6 +127,7 @@ export default function RedesignApp() {
   const { history, saveToHistory, deleteFromHistory, clearHistory } = useHistory();
   const { cookiesConfigured, setCookiesConfigured } = useBackendStatus();
   const { states: clipStates, updateClip: updateClipState } = useClipStates(jobId);
+  const { states: histClipStates, updateClip: updateHistClipState } = useClipStates(historyJob?.jobId);
 
   // Cross-job taste memory (#8): record a kept/discarded signal as the user
   // publishes or removes clips, then wrap updateClipState so every call site
@@ -142,12 +145,29 @@ export default function RedesignApp() {
   };
 
   useEffect(() => { if (apiKey) localStorage.setItem('gemini_key', apiKey); }, [apiKey]);
-  // Refresh the on-disk job set whenever the History tab opens, so a job whose
-  // files were removed (rebuild/cleanup) shows as unavailable rather than
-  // failing silently when clicked.
+  // Refresh and reconcile the on-disk backend job set whenever the History tab opens or on load,
+  // so any job completed on disk (even via CLI, API or across refreshes) appears in History.
   useEffect(() => {
-    if (tab === 'history' && !viewingHistory) listBackendJobIds().then(setAvailableJobIds);
-  }, [tab, viewingHistory]);
+    listBackendJobs().then((backendJobs) => {
+      if (backendJobs && backendJobs.length > 0) {
+        setAvailableJobIds(new Set(backendJobs.map((j) => j.jobId).filter(Boolean)));
+        backendJobs.forEach((bJob) => {
+          if (bJob.clipCount > 0 || bJob.status === 'complete') {
+            saveToHistory({
+              jobId: bJob.jobId,
+              status: bJob.status || 'complete',
+              timestamp: bJob.timestamp || Date.now(),
+              source: bJob.source || bJob.title || bJob.jobId,
+              sourceType: bJob.sourceType || 'url',
+              clipCount: bJob.clipCount || 0,
+              cost: bJob.cost || null,
+            });
+          }
+        });
+      }
+    });
+  }, [tab, viewingHistory, saveToHistory]);
+
   useSessionPersistence({ status, jobId, results, processingMedia, activeTab: tab, preselections });
 
   const dismissToast = useCallback((id) => setToasts((items) => items.filter((item) => item.id !== id)), []);
@@ -280,6 +300,23 @@ export default function RedesignApp() {
     }
   };
 
+  const retryJob = () => {
+    const pre = optsToPreselections(opts);
+    let instructions = opts.instructions || '';
+    if (!opts.clipsAuto) {
+      instructions = `${instructions} Aim for roughly ${opts.clips} clips.`.trim();
+    }
+    if (processingMedia?.type === 'url' && typeof processingMedia.payload === 'string' && processingMedia.payload.trim()) {
+      handleProcess({ type: 'url', payload: processingMedia.payload.trim(), instructions, preselections: pre });
+      return;
+    }
+    if (processingMedia?.type === 'file' && processingMedia.payload instanceof File) {
+      handleProcess({ type: 'file', payload: processingMedia.payload, instructions, preselections: pre });
+      return;
+    }
+    startJob();
+  };
+
   const resetToCreate = () => {
     // If a job is still running, actually cancel it on the backend instead of
     // just dropping our local handle (which would leave it churning).
@@ -315,20 +352,24 @@ export default function RedesignApp() {
       setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setProcessingMedia(null); setCurrentStep(null);
     }
     setViewingHistory(false);
+    setHistoryJob(null);
     setTab(next);
   };
 
   const openHistoryJob = async (h) => {
     try {
       const data = await restoreJob(h.jobId);
-      setJobId(h.jobId);
-      setResults(data.result);
-      setStatus('complete');
-      setProcessingMedia({ type: h.sourceType || 'url', payload: h.source });
+      let saved = null;
       try {
-        const saved = localStorage.getItem(`clippyme_preselections_job_${h.jobId}`);
-        setPreselectionsRaw(saved ? JSON.parse(saved) : null);
-      } catch { setPreselectionsRaw(null); }
+        const raw = localStorage.getItem(`clippyme_preselections_job_${h.jobId}`);
+        saved = raw ? JSON.parse(raw) : null;
+      } catch { /* */ }
+      setHistoryJob({
+        jobId: h.jobId,
+        results: data.result,
+        media: { type: h.sourceType || 'url', payload: h.source },
+        preselections: saved,
+      });
       setViewingHistory(true);
     } catch (err) {
       // The clip files are gone from disk (typically a docker rebuild/cleanup
@@ -402,6 +443,31 @@ export default function RedesignApp() {
       <TopNav tab={tab} setTab={goTab} busy={status === 'processing'} />
       {confetti && <Confetti />}
 
+      {status === 'processing' && tab !== 'create' && (
+        <div
+          role="button"
+          tabIndex={0}
+          style={{
+            background: 'linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%)',
+            color: '#ffffff',
+            padding: '10px 24px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            fontSize: '13px',
+            fontWeight: '600',
+            cursor: 'pointer',
+          }}
+          onClick={() => { setViewingHistory(false); setHistoryJob(null); setTab('create'); }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#4ade80', boxShadow: '0 0 8px #4ade80' }} />
+            <span>⚡ Active Job Running in Background: {processingMedia?.type === 'url' ? processingMedia.payload : (processingMedia?.payload?.name || 'Processing video…')}</span>
+          </div>
+          <span style={{ textDecoration: 'underline', opacity: 0.9 }}>Return to Live Progress →</span>
+        </div>
+      )}
+
       {tab === 'create' && status === 'idle' && (
         <CreateView opts={opts} set={set} onPickPreset={pickPreset} onCreate={startJob}
           presets={presetList} defaultId={defaultPresetId}
@@ -409,7 +475,7 @@ export default function RedesignApp() {
       )}
       {tab === 'create' && (status === 'processing' || status === 'error') && (
         <ProcessingView media={processingMedia} status={status} logs={logs} step={currentStep}
-          clips={clips} opts={opts} onCancel={resetToCreate} onRetry={startJob}
+          clips={clips} opts={opts} onCancel={resetToCreate} onRetry={retryJob}
           paused={paused} onPause={pauseCurrent} onResume={resumeCurrent} onStop={stopCurrent} />
       )}
       {tab === 'create' && status === 'complete' && (
@@ -428,15 +494,25 @@ export default function RedesignApp() {
           onDelete={(id) => { deleteFromHistory(id); pushToast('info', 'Job deleted'); }}
           onClear={() => { clearHistory(); pushToast('info', 'History cleared'); }} />
       )}
-      {tab === 'history' && viewingHistory && (
+      {tab === 'history' && viewingHistory && historyJob && (
         <div className="fade-in">
           <div className="container" style={{ paddingTop: 24, paddingBottom: 0 }}>
-            <Btn variant="secondary" size="sm" icon="arrow-left" onClick={() => setViewingHistory(false)}>Back to history</Btn>
+            <Btn variant="secondary" size="sm" icon="arrow-left" onClick={() => { setViewingHistory(false); setHistoryJob(null); }}>Back to history</Btn>
           </div>
-          <ResultsView clips={clips} jobId={jobId} preselections={preselections} embedded
-            clipStates={clipStates} onUpdateClipState={updateClipStateT}
+          <ResultsView clips={historyJob.results?.clips || []} jobId={historyJob.jobId} preselections={historyJob.preselections} embedded
+            clipStates={histClipStates} onUpdateClipState={updateHistClipState}
             onPublish={openPublish} onPublishAll={openPublish} onEdit={(c, i) => setEditClip({ clip: c, idx: i })}
-            onApplyToAll={applyClipToAll} onEditSelected={(targets) => setBulkEdit({ targets })}
+            onApplyToAll={(srcIdx) => {
+              const histClips = historyJob.results?.clips || [];
+              const src = histClips[srcIdx];
+              if (!src) return;
+              const srcParams = clipStateToParams(histClipStates[srcIdx], historyJob.preselections, src);
+              const plan = buildBulkPlan(srcParams, histClips.map((c, i) => ({ i, c })).filter(({ i }) => !histClipStates[i]?.deleted), histClipStates, srcIdx);
+              if (!plan.length) { pushToast('info', 'No other clips to apply to'); return; }
+              pushToast('info', `Applying settings to ${plan.length} clip${plan.length === 1 ? '' : 's'}…`);
+              runBulk(plan);
+            }}
+            onEditSelected={(targets) => setBulkEdit({ targets })}
             pushToast={pushToast} />
         </div>
       )}
@@ -444,27 +520,76 @@ export default function RedesignApp() {
       {tab === 'settings' && <SettingsView apiKey={apiKey} onApiKey={setApiKey} cookiesConfigured={cookiesConfigured} onCookiesChange={setCookiesConfigured} pushToast={pushToast} />}
 
       {publishClips && (
-        <PublishModal clips={publishClips} jobId={jobId} clipStates={clipStates} preselections={preselections}
+        <PublishModal clips={publishClips} jobId={viewingHistory && historyJob ? historyJob.jobId : jobId}
+          clipStates={viewingHistory && historyJob ? histClipStates : clipStates}
+          preselections={viewingHistory && historyJob ? historyJob.preselections : preselections}
           onClose={() => setPublishClips(null)}
-          onPublished={(idx) => updateClipStateT(idx, { publishedAt: Date.now() })}
+          onPublished={(idx) => {
+            const updater = viewingHistory && historyJob ? updateHistClipState : updateClipStateT;
+            updater(idx, { publishedAt: Date.now() });
+          }}
           pushToast={pushToast} />
       )}
       {editClip && (
-        <EditClipModal clip={editClip.clip} idx={editClip.idx} jobId={jobId}
-          initial={clipStates[editClip.idx]}
-          appliedMode={clipStates[editClip.idx]?.reframeMode || editClip.clip.reframe_mode || 'auto'}
-          preselections={preselections} sourceBanner={results?.source_info?.banner}
+        <EditClipModal clip={editClip.clip} idx={editClip.idx} jobId={viewingHistory && historyJob ? historyJob.jobId : jobId}
+          initial={(viewingHistory && historyJob ? histClipStates : clipStates)[editClip.idx]}
+          appliedMode={(viewingHistory && historyJob ? histClipStates : clipStates)[editClip.idx]?.reframeMode || editClip.clip.reframe_mode || 'auto'}
+          preselections={viewingHistory && historyJob ? historyJob.preselections : preselections}
+          sourceBanner={(viewingHistory && historyJob ? historyJob.results : results)?.source_info?.banner}
           onClose={() => setEditClip(null)}
-          onApply={(params) => { reprocessClip(editClip.idx, editClip.clip, params); setEditClip(null); }} />
+          onApply={(params) => {
+            if (viewingHistory && historyJob) {
+              runApplyEdit({
+                jobId: historyJob.jobId, idx: editClip.idx, apiIdx: editClip.clip?.original_index ?? editClip.idx, params,
+                api: { reframeClip, composeClip },
+                updateClipState: updateHistClipState, pushToast,
+              });
+            } else {
+              reprocessClip(editClip.idx, editClip.clip, params);
+            }
+            setEditClip(null);
+          }} />
       )}
       {bulkEdit && bulkEdit.targets.length > 0 && (
-        <EditClipModal clip={bulkEdit.targets[0].c} idx={bulkEdit.targets[0].i} jobId={jobId}
+        <EditClipModal clip={bulkEdit.targets[0].c} idx={bulkEdit.targets[0].i} jobId={viewingHistory && historyJob ? historyJob.jobId : jobId}
           bulk targetCount={bulkEdit.targets.length}
-          initial={clipStates[bulkEdit.targets[0].i]}
-          appliedMode={clipStates[bulkEdit.targets[0].i]?.reframeMode || bulkEdit.targets[0].c.reframe_mode || 'auto'}
-          preselections={preselections} sourceBanner={results?.source_info?.banner}
+          initial={(viewingHistory && historyJob ? histClipStates : clipStates)[bulkEdit.targets[0].i]}
+          appliedMode={(viewingHistory && historyJob ? histClipStates : clipStates)[bulkEdit.targets[0].i]?.reframeMode || bulkEdit.targets[0].c.reframe_mode || 'auto'}
+          preselections={viewingHistory && historyJob ? historyJob.preselections : preselections}
+          sourceBanner={(viewingHistory && historyJob ? historyJob.results : results)?.source_info?.banner}
           onClose={() => setBulkEdit(null)}
-          onApply={(params) => { applyBulkEdit(params, bulkEdit.targets); setBulkEdit(null); }} />
+          onApply={(params) => {
+            if (viewingHistory && historyJob) {
+              const srcParams = {
+                reframeMode: params.reframeMode,
+                toggles: params.toggles,
+                subtitleParams: params.subtitleParams,
+                hookParams: params.hookParams,
+                logoParams: params.logoParams,
+                gradeParams: params.gradeParams,
+                bannerParams: params.bannerParams,
+              };
+              const plan = buildBulkPlan(srcParams, bulkEdit.targets, histClipStates);
+              if (plan.length) {
+                pushToast('info', `Reprocessing ${plan.length} clip${plan.length === 1 ? '' : 's'}…`);
+                let next = 0;
+                const worker = async () => {
+                  while (next < plan.length) {
+                    const { idx, clip, params: p } = plan[next++];
+                    await runApplyEdit({
+                      jobId: historyJob.jobId, idx, apiIdx: clip?.original_index ?? idx, params: p,
+                      api: { reframeClip, composeClip },
+                      updateClipState: updateHistClipState, pushToast,
+                    });
+                  }
+                };
+                Promise.all(Array.from({ length: Math.min(2, plan.length) }, worker));
+              }
+            } else {
+              applyBulkEdit(params, bulkEdit.targets);
+            }
+            setBulkEdit(null);
+          }} />
       )}
       {showKeyModal && <ApiKeyModal onClose={() => setShowKeyModal(false)} onGoToSettings={() => { setShowKeyModal(false); setTab('settings'); }} />}
 

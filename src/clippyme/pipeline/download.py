@@ -139,8 +139,8 @@ _FORMAT_LADDER = (
     'best[ext=mp4]/bestvideo*+bestaudio/best'
 )
 
-# Player-client fallback chain (mid-2026 verified bot-resistance order).
-_DEFAULT_PLAYER_CLIENTS = ("default", "tv+tv_embedded", "web_safari")
+# Player-client fallback chain (bot-resistant mobile/VR clients first).
+_DEFAULT_PLAYER_CLIENTS = ("android_vr", "android", "ios", "web_safari", "default")
 
 
 def _player_client_chain():
@@ -165,9 +165,6 @@ def classify_download_error(msg: str) -> str:
     """Classify a yt-dlp error as ``retry`` or ``fatal``."""
     m = (msg or "").lower()
     fatal_signals = (
-        "sign in to confirm you're not a bot",
-        "sign in to confirm youre not a bot",
-        "confirm your age",
         "private video",
         "this video is private",
         "video has been removed",
@@ -195,10 +192,18 @@ def classify_download_error(msg: str) -> str:
         "no formats found",
         "no video formats",
         "empty formats",
+        "page needs to be reloaded",
+        "the page needs to be reloaded",
+        "cookies are no longer valid",
+        "only images are available",
+        "skipping client",
+        "sign in to confirm you're not a bot",
+        "sign in to confirm youre not a bot",
+        "confirm your age",
     )
     if any(s in m for s in retry_signals):
         return "retry"
-    return "fatal"
+    return "retry"
 
 
 SOURCE_INFO_FILENAME = "source_info.json"
@@ -247,17 +252,33 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
     else:
         print("⚠️ No cookies file found.")
 
-    # Verbose mode can leak paths, request URLs and headers into job logs, so it
-    # stays opt-in. TLS verification stays on unless explicitly overridden.
+    # Build matrix of attempts:
+    # Android client without cookies is the fastest and most reliable on YouTube (bypasses bot blocks and PO token requirements).
+    attempts = [
+        ("android", False),
+        ("android_vr", False),
+        ("ios", False),
+        ("mweb", False),
+    ]
+    if cookies_path:
+        attempts.extend([
+            ("web_safari", True),
+            ("default", True),
+        ])
+    attempts.extend([
+        ("web_safari", False),
+        ("default", False),
+    ])
+
     ydl_verbose = os.environ.get('YTDLP_VERBOSE') == '1'
-    common_ydl_opts = {
+    base_ydl_opts = {
         'quiet': not ydl_verbose,
         'verbose': ydl_verbose,
         'no_warnings': False,
-        'cookiefile': cookies_path if cookies_path else None,
         'socket_timeout': 30,
         'retries': 10,
         'fragment_retries': 10,
+        'http_chunk_size': 10485760,
         'nocheckcertificate': os.environ.get('YTDLP_NOCHECKCERT') == '1',
         'throttledratelimit': int(
             (os.environ.get('YTDLP_THROTTLED_RATE') or '').strip() or 100 * 1024
@@ -273,14 +294,19 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
         },
     }
 
-    chain = _player_client_chain()
     last_error = RuntimeError("download attempt chain was empty")
-    for i, attempt in enumerate(chain, 1):
-        extractor_args = _extractor_args_for(attempt)
-        attempt_opts = {**common_ydl_opts}
+    for i, (client_name, use_cookies) in enumerate(attempts, 1):
+        extractor_args = _extractor_args_for(client_name)
+        active_cookiefile = cookies_path if (use_cookies and cookies_path) else None
+        attempt_opts = {
+            **base_ydl_opts,
+            'cookiefile': active_cookiefile,
+        }
         if extractor_args:
             attempt_opts['extractor_args'] = extractor_args
-        print(f"🔁 Download attempt {i}/{len(chain)} (player_client: {attempt})")
+
+        cookie_label = "with cookies" if active_cookiefile else "without cookies"
+        print(f"🔁 Download attempt {i}/{len(attempts)} (player_client: {client_name}, {cookie_label})")
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -322,12 +348,12 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
         except Exception as exc:
             last_error = exc
             kind = classify_download_error(str(exc))
-            if kind == "retry" and i < len(chain):
+            if kind == "retry" and i < len(attempts):
                 print(
-                    f"⚠️ Attempt {i} failed (retryable: {exc}); "
-                    "trying next player_client in 5s..."
+                    f"⚠️ Attempt {i} failed ({exc}); "
+                    "trying next configuration in 3s..."
                 )
-                time.sleep(5)
+                time.sleep(3)
                 continue
             break
 

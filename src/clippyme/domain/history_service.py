@@ -52,7 +52,7 @@ def scan_history(output_dir: str) -> List[dict]:
             # consistent with job_results._pick_latest_metadata.
             meta_files.sort(key=os.path.getmtime, reverse=True)
             try:
-                with open(meta_files[0], "r") as f:
+                with open(meta_files[0], "r", encoding="utf-8") as f:
                     data = json.load(f)
                 clips = data.get("shorts", [])
                 clip_files = []

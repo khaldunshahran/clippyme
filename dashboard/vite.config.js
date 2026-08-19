@@ -70,19 +70,19 @@ export default defineConfig({
     ],
     proxy: {
       '/api': {
-        target: 'http://backend:8000',
+        target: process.env.VITE_BACKEND_URL || process.env.BACKEND_URL || 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
       '/videos': {
-        target: 'http://backend:8000',
+        target: process.env.VITE_BACKEND_URL || process.env.BACKEND_URL || 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
       '/thumbnails': {
-        target: 'http://backend:8000',
+        target: process.env.VITE_BACKEND_URL || process.env.BACKEND_URL || 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
       '/fonts': {
-        target: 'http://backend:8000',
+        target: process.env.VITE_BACKEND_URL || process.env.BACKEND_URL || 'http://127.0.0.1:8000',
         changeOrigin: true,
       }
     }

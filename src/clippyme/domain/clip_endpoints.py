@@ -73,7 +73,7 @@ def restore_job_from_disk(job_id: str, output_dir: str, job_dir: str) -> dict:
     # Newest-by-mtime, consistent with job_results._pick_latest_metadata.
     meta_files.sort(key=os.path.getmtime, reverse=True)
 
-    with open(meta_files[0], "r") as f:
+    with open(meta_files[0], "r", encoding="utf-8") as f:
         data = json.load(f)
     clips = data.get("shorts", [])
     present = []

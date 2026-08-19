@@ -269,28 +269,90 @@ function OptionsPanel({ opts, set }) {
   const [bannerCfg, setBannerCfg] = useState(false);
   return (
     <Panel title="Recipe" sub="What ClippyMe makes from each video" icon="sliders-horizontal">
-      <div className="label" style={{ marginBottom: 4 }}>Output</div>
+      <div className="label" style={{ marginBottom: 4 }}>Clip Strategy &amp; Duration</div>
+      <div className="opt">
+        <div className="oico"><Icon n="sparkles" /></div>
+        <div className="otxt">
+          <div className="ot">Content focus</div>
+          <div className="od">
+            {opts.clipType === 'educational' && 'Key insights, takeaways, tutorials & frameworks'}
+            {opts.clipType === 'humor' && 'Funny banter, comedic timing, bloopers & reactions'}
+            {opts.clipType === 'storytelling' && 'Complete narrative arcs, personal stories & drama'}
+            {opts.clipType === 'all' && 'Diverse curation across all categories'}
+            {(!opts.clipType || opts.clipType === 'viral') && 'High energy, pattern breaks, hot takes & hooks'}
+          </div>
+        </div>
+        <div className="r" style={{ flex: '0 0 210px' }}>
+          <select className="sel" value={opts.clipType || 'viral'} onChange={(e) => set({ clipType: e.target.value })}>
+            <option value="viral">🔥 Viral Hooks &amp; Hot Takes</option>
+            <option value="educational">💡 Educational &amp; Insights</option>
+            <option value="humor">😂 Humor &amp; Banter</option>
+            <option value="storytelling">🎙️ Storytelling &amp; Deep Dives</option>
+            <option value="all">🌐 Balanced Mix</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="opt">
+        <div className="oico"><Icon n="clock" /></div>
+        <div className="otxt">
+          <div className="ot">Clip length &amp; format</div>
+          <div className="od">
+            {opts.durationMode === 'shorts' && '15s – 60s · Shorts, TikTok & Reels'}
+            {opts.durationMode === 'mid' && '60s – 3 min · Extended social reels & X videos'}
+            {opts.durationMode === 'long' && '3 min – 10 min · Deep-dive YouTube highlights & stories'}
+            {opts.durationMode === 'custom' && `${opts.minDuration || 15}s – ${opts.maxDuration || 60}s · Custom duration bounds`}
+          </div>
+        </div>
+        <div className="r">
+          <Segmented value={opts.durationMode || 'shorts'} onChange={(id) => set({ durationMode: id })}
+            options={[
+              { id: 'shorts', label: 'Shorts (15-60s)' },
+              { id: 'mid', label: 'Mid (1-3m)' },
+              { id: 'long', label: 'Long (3-10m)' },
+              { id: 'custom', label: 'Custom' },
+            ]} />
+        </div>
+      </div>
+      {opts.durationMode === 'custom' && (
+        <div className="cfg-drawer fade-in" style={{ display: 'flex', gap: 16, alignItems: 'center', justifyContent: 'flex-start', padding: '10px 14px', background: 'var(--bg-2)', borderRadius: 8, marginBottom: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className="label">Min sec</span>
+            <input type="number" min={5} max={900} className="mono" style={{ width: 80, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--line-1)', background: 'var(--bg-1)', color: 'inherit' }}
+              value={opts.minDuration || 15} onChange={(e) => set({ minDuration: Number(e.target.value) })} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 16 }}>
+            <span className="label">Max sec</span>
+            <input type="number" min={10} max={900} className="mono" style={{ width: 80, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--line-1)', background: 'var(--bg-1)', color: 'inherit' }}
+              value={opts.maxDuration || 60} onChange={(e) => set({ maxDuration: Number(e.target.value) })} />
+          </div>
+        </div>
+      )}
+
       <div className="opt">
         <div className="oico"><Icon n="scissors" /></div>
         <div className="otxt">
-          <div className="ot">Clips per video</div>
-          <div className="od">{opts.clipsAuto ? 'Auto · ClippyMe picks the best number for the video' : 'Aim for a rough target (a hint, not a hard cap)'}</div>
+          <div className="ot">Clips to extract</div>
+          <div className="od">{opts.clipsAuto ? 'Auto · Scales dynamically with video duration (up to 30)' : `Target range: ${opts.minClips || 5} to ${opts.maxClips || 15} clips`}</div>
         </div>
         <div className="r" style={{ gap: 9 }}>
-          {/* No ceiling: the number is a hint in the Gemini prompt, not a cap the
-              pipeline enforces, so the stepper's default max=12 was arbitrary. */}
           {!opts.clipsAuto && (
-            <Stepper value={opts.clips} set={(v) => set({ clips: v })}
-              max={Infinity} label="Clip count" />
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span className="label">Min</span>
+              <Stepper value={opts.minClips || 5} set={(v) => set({ minClips: Math.max(1, v) })} max={opts.maxClips || 50} label="Min clips" />
+              <span className="label">Max</span>
+              <Stepper value={opts.maxClips || 15} set={(v) => set({ maxClips: Math.max(opts.minClips || 1, v) })} max={50} label="Max clips" />
+            </div>
           )}
           <Segmented value={opts.clipsAuto ? 'auto' : 'custom'}
             onChange={(id) => set({ clipsAuto: id === 'auto' })}
-            options={[{ id: 'auto', label: 'Auto' }, { id: 'custom', label: 'Set' }]} />
+            options={[{ id: 'auto', label: 'Auto' }, { id: 'custom', label: 'Min/Max' }]} />
         </div>
       </div>
+
       <div className="opt">
         <div className="oico"><Icon n="crop" /></div>
-        <div className="otxt"><div className="ot">Aspect ratio</div><div className="od">9:16 vertical · 1:1 square · 16:9 horizontal</div></div>
+        <div className="otxt"><div className="ot">Aspect ratio</div><div className="od">9:16 vertical (Shorts/Reels) · 1:1 square · 16:9 horizontal (YouTube)</div></div>
         <div className="r"><Segmented value={opts.aspect} onChange={(id) => set({ aspect: id })}
           options={[{ id: '9:16', label: '9:16' }, { id: '1:1', label: '1:1' }, { id: '16:9', label: '16:9' }]} /></div>
       </div>
@@ -365,10 +427,16 @@ function OptionsPanel({ opts, set }) {
 }
 
 function SummaryBar({ opts, ready, count, onCreate, error }) {
+  const durationLabel = opts.durationMode === 'mid' ? '1–3m mid' : opts.durationMode === 'long' ? '3–10m long' : opts.durationMode === 'custom' ? `${opts.minDuration || 15}–${opts.maxDuration || 60}s` : '15–60s shorts';
+  const focusLabel = opts.clipType === 'educational' ? '💡 educational' : opts.clipType === 'humor' ? '😂 humor' : opts.clipType === 'storytelling' ? '🎙️ stories' : opts.clipType === 'all' ? '🌐 mix' : '🔥 viral';
+  const clipsLabel = opts.clipsAuto ? 'auto clips' : `${opts.minClips || 5}–${opts.maxClips || 15} clips`;
+
   const chips = [
     opts.aspect || '9:16',
-    opts.clipsAuto ? 'auto clips' : `~${opts.clips} clips`,
-    opts.detect ? 'viral detect' : 'whole video',
+    focusLabel,
+    durationLabel,
+    clipsLabel,
+    opts.detect ? 'AI analyze' : 'whole video',
     (() => { const m = opts.reframeMode || (opts.reframe === false ? 'disabled' : 'auto'); return (m === 'subject' || m === 'object') ? 'subject crop' : m === 'disabled' ? 'letterbox' : 'reframe'; })(),
     opts.smartcut && 'smart-cut',
     opts.subtitles && (opts.subMode + ' subs'),
@@ -377,7 +445,7 @@ function SummaryBar({ opts, ready, count, onCreate, error }) {
   return (
     <div className="summary">
       <div>
-        <div className="s-main">{ready ? (opts.clipsAuto ? 'ClippyMe will pick the best clips' : `Aiming for about ${count} clip${count === 1 ? '' : 's'}`) : 'Add a source to get started'}</div>
+        <div className="s-main">{ready ? (opts.clipsAuto ? 'ClippyMe will extract the best moments' : `Extracting ${opts.minClips || 5} to ${opts.maxClips || 15} clips`) : 'Add a source to get started'}</div>
         <div className="s-sub">
           {chips.map((c) => <span key={c} className="chip">{c}</span>)}
         </div>
