@@ -25,6 +25,9 @@ vi.mock('./realApi', () => ({
   logoStatus: vi.fn(async () => ({ configured: false })),
   uploadLogo: vi.fn(),
   deleteLogo: vi.fn(),
+  getWatchdog: vi.fn(async () => ({ enabled: true, ai_diagnosis: true, provider: 'ntfy' })),
+  saveWatchdog: vi.fn(async (p) => ({ enabled: true, ...p })),
+  testWatchdogAlert: vi.fn(async () => ({ status: 'ok' })),
 }));
 
 const EMPTY_CONFIG = { GEMINI_API_KEY: '', HF_TOKEN: '', DEEPGRAM_API_KEY: '', ELEVENLABS_API_KEY: '' };

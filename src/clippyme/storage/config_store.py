@@ -22,6 +22,7 @@ VALID_CONFIG_KEYS = (
     "TWITCH_CLIENT_SECRET",
 )
 ZERNIO_CONFIG_NAMESPACE = "zernio"
+WATCHDOG_CONFIG_NAMESPACE = "watchdog"
 _CONFIG_LOCK = threading.RLock()
 
 
@@ -142,6 +143,79 @@ def zernio_config_status() -> dict:
         "api_key_masked": masked,
         "accounts": cfg.get("accounts", {}),
         "timezone": cfg.get("timezone", "Europe/Rome"),
+    }
+
+
+def load_watchdog_config() -> dict:
+    """Load watchdog and alert notification configuration."""
+    raw = _read_raw_config()
+    wd = raw.get(WATCHDOG_CONFIG_NAMESPACE) or {}
+    if not isinstance(wd, dict):
+        wd = {}
+    return {
+        "enabled": wd.get("enabled", True),
+        "ai_diagnosis": wd.get("ai_diagnosis", True),
+        "notify_on_failure": wd.get("notify_on_failure", True),
+        "notify_on_success": wd.get("notify_on_success", False),
+        "provider": wd.get("provider", "ntfy"),
+        "ntfy_topic": wd.get("ntfy_topic", ""),
+        "ntfy_server": wd.get("ntfy_server", "https://ntfy.sh"),
+        "telegram_bot_token": wd.get("telegram_bot_token", ""),
+        "telegram_chat_id": wd.get("telegram_chat_id", ""),
+        "discord_webhook_url": wd.get("discord_webhook_url", ""),
+        "webhook_url": wd.get("webhook_url", ""),
+    }
+
+
+def save_watchdog_config(updates: dict) -> bool:
+    """Merge-update Watchdog alert settings."""
+    with _CONFIG_LOCK:
+        raw = _read_raw_config()
+        current = raw.get(WATCHDOG_CONFIG_NAMESPACE) or {}
+        if not isinstance(current, dict):
+            current = {}
+        for key in (
+            "enabled", "ai_diagnosis", "notify_on_failure", "notify_on_success",
+            "provider", "ntfy_topic", "ntfy_server", "telegram_bot_token",
+            "telegram_chat_id", "discord_webhook_url", "webhook_url",
+        ):
+            if key in updates:
+                val = updates[key]
+                if val in (None, "") and key not in ("enabled", "ai_diagnosis", "notify_on_failure", "notify_on_success"):
+                    current.pop(key, None)
+                else:
+                    current[key] = val
+        raw[WATCHDOG_CONFIG_NAMESPACE] = current
+        return _write_raw_config(raw)
+
+
+def watchdog_config_status() -> dict:
+    """Status dictionary with secrets safely masked for UI consumption."""
+    cfg = load_watchdog_config()
+    tg_token = cfg.get("telegram_bot_token", "")
+    disc_url = cfg.get("discord_webhook_url", "")
+    wh_url = cfg.get("webhook_url", "")
+
+    def _mask_url(u: str) -> str:
+        if not u or len(u) < 15:
+            return ""
+        return f"{u[:10]}...{u[-6:]}"
+
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "ai_diagnosis": bool(cfg.get("ai_diagnosis", True)),
+        "notify_on_failure": bool(cfg.get("notify_on_failure", True)),
+        "notify_on_success": bool(cfg.get("notify_on_success", False)),
+        "provider": cfg.get("provider", "ntfy"),
+        "ntfy_topic": cfg.get("ntfy_topic", ""),
+        "ntfy_server": cfg.get("ntfy_server", "https://ntfy.sh"),
+        "telegram_bot_token_masked": f"{tg_token[:6]}...{tg_token[-4:]}" if tg_token and len(tg_token) > 10 else "",
+        "telegram_chat_id": cfg.get("telegram_chat_id", ""),
+        "discord_webhook_masked": _mask_url(disc_url),
+        "webhook_url_masked": _mask_url(wh_url),
+        "has_telegram_token": bool(tg_token),
+        "has_discord_webhook": bool(disc_url),
+        "has_webhook_url": bool(wh_url),
     }
 
 

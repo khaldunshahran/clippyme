@@ -72,3 +72,7 @@ fonts/NotoColorEmoji.ttf
 
 # Local Codex CLI settings
 .codex/
+
+# Local reference and test outputs
+openshorts_repo/
+output_test/

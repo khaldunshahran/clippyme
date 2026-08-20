@@ -64,10 +64,7 @@ export default defineConfig({
     // Dev-server Host allow-list. Only local names — the unrelated upstream
     // 'openshorts.app' was removed (DNS-rebinding hardening). Add your own
     // hostname here if you proxy the dev server through a custom domain.
-    allowedHosts: [
-      'localhost',
-      '127.0.0.1',
-    ],
+    allowedHosts: true,
     proxy: {
       '/api': {
         target: process.env.VITE_BACKEND_URL || process.env.BACKEND_URL || 'http://127.0.0.1:8000',

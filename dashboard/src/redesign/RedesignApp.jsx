@@ -14,7 +14,7 @@ import { PublishModal } from './publish';
 import { HistoryView, SettingsView, ApiKeyModal } from './views';
 import { LiveMonitorView } from './live';
 import { EditClipModal } from './captions';
-import { optsToPreselections, restoreJob, listBackendJobIds, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, reframeClip, composeClip } from './realApi';
+import { optsToPreselections, restoreJob, listBackendJobIds, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, reframeClip, composeClip, getConfig } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
 import { clipStateToParams, buildBulkPlan } from '../lib/bulkApply';
@@ -267,8 +267,15 @@ export default function RedesignApp() {
     onProgress: (lg, step) => { setLogs(lg); if (step) setCurrentStep(step); },
   });
 
+  const [serverHasKey, setServerHasKey] = useState(false);
+  useEffect(() => {
+    getConfig().then((cfg) => {
+      if (cfg?.server_has_gemini || cfg?.GEMINI_API_KEY) setServerHasKey(true);
+    }).catch(() => {});
+  }, []);
+
   const { handleProcess, handleBatchProcess } = useJobSubmission({
-    apiKey, setShowKeyModal, setStatus, setLogs, setResults, setProcessingMedia,
+    apiKey, serverHasKey, setShowKeyModal, setStatus, setLogs, setResults, setProcessingMedia,
     setPreselections, setJobId,
     onBatchFinished: ({ succeeded, failed, total }) => {
       setTab('history');

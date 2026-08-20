@@ -7,6 +7,7 @@ import { Hero } from './chrome';
 import {
   getConfig, saveConfig, getModels, cookiesStatus, uploadCookies, deleteCookies,
   getZernio, saveZernio, discoverZernioAccounts,
+  getWatchdog, saveWatchdog, testWatchdogAlert,
   listFonts, uploadFont, deleteFont, logoStatus, uploadLogo, deleteLogo,
 } from './realApi';
 import { SUB_FONTS } from './data';
@@ -139,6 +140,17 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
   const [models, setModels] = useState(FALLBACK_MODELS);
   const [loadingModels, setLoadingModels] = useState(false);
 
+  const [watchdog, setWatchdogState] = useState(null);
+  const [wdEnabled, setWdEnabled] = useState(true);
+  const [wdAi, setWdAi] = useState(true);
+  const [wdProvider, setWdProvider] = useState('ntfy');
+  const [wdTopic, setWdTopic] = useState('');
+  const [wdTgToken, setWdTgToken] = useState('');
+  const [wdTgChat, setWdTgChat] = useState('');
+  const [wdDiscUrl, setWdDiscUrl] = useState('');
+  const [wdWhUrl, setWdWhUrl] = useState('');
+  const [testingWd, setTestingWd] = useState(false);
+
   // Pull the live model list from the backend (uses the saved key if the
   // header is empty). Merges discovery with the curated fallback + the
   // currently-selected model so the dropdown is never empty and never drops
@@ -173,13 +185,68 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
 
   useEffect(() => {
     refreshConfig().then(loadModels);
-    getZernio().then((z) => { setZernioState(z); if (z.accounts) setAccts({ tiktok: '', instagram: '', youtube: '', ...z.accounts }); }).catch(() => {});
+    getZernio().then((z) => { setZernioState(z); if (z.accounts) setAccts({ tiktok: '', instagram: '', youtube: '', facebook: '', ...z.accounts }); }).catch(() => {});
+    getWatchdog().then((w) => {
+      if (w) {
+        setWatchdogState(w);
+        setWdEnabled(w.enabled !== false);
+        setWdAi(w.ai_diagnosis !== false);
+        if (w.provider) setWdProvider(w.provider);
+        if (w.ntfy_topic) setWdTopic(w.ntfy_topic);
+        if (w.telegram_chat_id) setWdTgChat(w.telegram_chat_id);
+      }
+    }).catch(() => {});
     cookiesStatus().then((s) => setCookies(!!s.configured)).catch(() => {});
     logoStatus().then((s) => setLogoOn(!!s.configured)).catch(() => {});
     listFonts().then(({ fonts: f }) => setFonts(Array.isArray(f) ? f : [])).catch(() => {});
     // Mount-once bootstrap; loadModels reads the latest key via closure on call.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const saveWatchdogCfg = async (overrides = {}) => {
+    try {
+      const payload = {
+        enabled: overrides.enabled ?? wdEnabled,
+        ai_diagnosis: overrides.ai_diagnosis ?? wdAi,
+        provider: wdProvider,
+        ntfy_topic: wdTopic.trim(),
+        telegram_chat_id: wdTgChat.trim(),
+      };
+      if (wdTgToken.trim()) payload.telegram_bot_token = wdTgToken.trim();
+      if (wdDiscUrl.trim()) payload.discord_webhook_url = wdDiscUrl.trim();
+      if (wdWhUrl.trim()) payload.webhook_url = wdWhUrl.trim();
+      const updated = await saveWatchdog(payload);
+      setWatchdogState(updated);
+      setWdTgToken('');
+      setWdDiscUrl('');
+      setWdWhUrl('');
+      pushToast?.('success', 'Watchdog settings saved');
+    } catch (err) {
+      pushToast?.('error', err.message || 'Failed to save Watchdog settings');
+    }
+  };
+
+  const sendTestAlert = async () => {
+    setTestingWd(true);
+    try {
+      const payload = {
+        enabled: wdEnabled,
+        ai_diagnosis: wdAi,
+        provider: wdProvider,
+        ntfy_topic: wdTopic.trim(),
+        telegram_chat_id: wdTgChat.trim(),
+      };
+      if (wdTgToken.trim()) payload.telegram_bot_token = wdTgToken.trim();
+      if (wdDiscUrl.trim()) payload.discord_webhook_url = wdDiscUrl.trim();
+      if (wdWhUrl.trim()) payload.webhook_url = wdWhUrl.trim();
+      await testWatchdogAlert(payload);
+      pushToast?.('success', 'Test alert sent! Check your phone.');
+    } catch (err) {
+      pushToast?.('error', err.message || 'Test alert failed. Check settings.');
+    } finally {
+      setTestingWd(false);
+    }
+  };
 
   const saveKeys = async (patch) => {
     try { await saveConfig(patch); pushToast?.('success', 'Saved'); await refreshConfig(); }
@@ -209,6 +276,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
         if (p.includes('tiktok')) next.tiktok = id;
         else if (p.includes('insta')) next.instagram = id;
         else if (p.includes('you')) next.youtube = id;
+        else if (p.includes('face') || p.includes('fb')) next.facebook = id;
       });
       setAccts(next);
       pushToast?.('success', `Discovered ${(accounts || []).length} accounts`);
@@ -319,8 +387,8 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
           <input className="key-input" style={{ width: '100%' }} type="password" value={zKey}
             aria-label="Zernio API key"
             placeholder={zernio?.configured ? 'Replace API key (optional)' : 'Zernio API key (sk_…)'} onChange={(e) => setZKey(e.target.value)} />
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
-            {['tiktok', 'instagram', 'youtube'].map((p) => (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 8 }}>
+            {['tiktok', 'instagram', 'youtube', 'facebook'].map((p) => (
               <input key={p} className="key-input" style={{ width: '100%', fontFamily: 'var(--font-sans)' }}
                 aria-label={`${p} account id`}
                 value={accts[p] || ''} placeholder={`${p} account id`} onChange={(e) => setAccts((a) => ({ ...a, [p]: e.target.value }))} />
@@ -329,6 +397,102 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
           <div style={{ display: 'flex', gap: 10 }}>
             <Btn variant="secondary" size="sm" icon="rss" onClick={discover}>Discover from Zernio</Btn>
             <Btn variant="primary" size="sm" icon="check" onClick={saveZernioCfg}>Save</Btn>
+          </div>
+        </div>
+      </Panel>
+
+      <Panel title="AI Watchdog & Alerts" sub="Autonomous error diagnosis + push notifications to your phone" icon="activity" style={{ marginBottom: 18 }}>
+        <div className="zernio-card" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div className="zico"><Icon n="bell" /></div>
+              <div>
+                <div className="kt">Mobile Push Alerts</div>
+                <div className="kd">Send instant alerts to your phone if a task fails or needs action</div>
+              </div>
+            </div>
+            <Switch checked={wdEnabled} onChange={(v) => { setWdEnabled(v); saveWatchdogCfg({ enabled: v }); }} />
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderTop: '1px solid var(--border-subtle, rgba(255,255,255,0.08))', paddingTop: 10 }}>
+            <div>
+              <div className="ot" style={{ fontSize: 13 }}>AI Error Diagnosis (Doctor)</div>
+              <div className="od">Use Gemini to diagnose root causes & propose fixes automatically</div>
+            </div>
+            <Switch checked={wdAi} onChange={(v) => { setWdAi(v); saveWatchdogCfg({ ai_diagnosis: v }); }} />
+          </div>
+
+          <div style={{ borderTop: '1px solid var(--border-subtle, rgba(255,255,255,0.08))', paddingTop: 10 }}>
+            <div className="od" style={{ marginBottom: 8, fontWeight: 600 }}>Alert Channel / Provider</div>
+            <Segmented
+              value={wdProvider}
+              onChange={(p) => { setWdProvider(p); saveWatchdogCfg({ provider: p }); }}
+              options={[
+                { id: 'ntfy', label: 'ntfy.sh (App)' },
+                { id: 'telegram', label: 'Telegram' },
+                { id: 'discord', label: 'Discord' },
+                { id: 'webhook', label: 'Webhook' },
+              ]}
+            />
+          </div>
+
+          {wdProvider === 'ntfy' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div className="od">Install the free <b>ntfy</b> app on your phone, pick any private topic name, and subscribe:</div>
+              <input
+                className="key-input"
+                style={{ width: '100%' }}
+                placeholder="Topic name (e.g. clippyme-alerts-khaldun)"
+                value={wdTopic}
+                onChange={(e) => setWdTopic(e.target.value)}
+              />
+            </div>
+          )}
+
+          {wdProvider === 'telegram' && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <input
+                className="key-input"
+                type="password"
+                placeholder={watchdog?.has_telegram_token ? 'Replace Bot Token' : 'Telegram Bot Token'}
+                value={wdTgToken}
+                onChange={(e) => setWdTgToken(e.target.value)}
+              />
+              <input
+                className="key-input"
+                placeholder="Telegram Chat ID"
+                value={wdTgChat}
+                onChange={(e) => setWdTgChat(e.target.value)}
+              />
+            </div>
+          )}
+
+          {wdProvider === 'discord' && (
+            <input
+              className="key-input"
+              style={{ width: '100%' }}
+              type="password"
+              placeholder={watchdog?.has_discord_webhook ? 'Replace Discord Webhook URL' : 'https://discord.com/api/webhooks/...'}
+              value={wdDiscUrl}
+              onChange={(e) => setWdDiscUrl(e.target.value)}
+            />
+          )}
+
+          {wdProvider === 'webhook' && (
+            <input
+              className="key-input"
+              style={{ width: '100%' }}
+              placeholder={watchdog?.has_webhook_url ? 'Replace Webhook URL' : 'https://example.com/webhook'}
+              value={wdWhUrl}
+              onChange={(e) => setWdWhUrl(e.target.value)}
+            />
+          )}
+
+          <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
+            <Btn variant="primary" size="sm" icon="check" onClick={() => saveWatchdogCfg()}>Save Settings</Btn>
+            <Btn variant="secondary" size="sm" icon="send" disabled={testingWd} onClick={sendTestAlert}>
+              {testingWd ? 'Sending…' : 'Send Test Alert'}
+            </Btn>
           </div>
         </div>
       </Panel>

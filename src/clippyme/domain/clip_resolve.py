@@ -51,9 +51,9 @@ def clip_filename_for(metadata_path: str, clip_info: dict, clip_index: int) -> s
 def composed_clip_basename(clip_info: dict, clip_index: int) -> str:
     """Filename for a clip's final composed (hook/subtitles/banner/…) output.
 
-    Title-based and Windows-safe, disambiguated with a positional ``_clip_{N}``
-    suffix so different clips within a job (or clips with long identical/truncated
-    titles) NEVER collide and overwrite each other.
+    Title-based and Windows-safe, prefixed with ``composed_`` and disambiguated
+    with a positional ``_clip_{N}`` suffix so it NEVER collides with the base
+    clip filename or wipes the base clip before/during composition.
     """
     from clippyme.pipeline.run_ops import sanitize_windows_basename
 
@@ -64,7 +64,7 @@ def composed_clip_basename(clip_info: dict, clip_index: int) -> str:
         if not base.endswith(suffix):
             max_len = 80 - len(suffix)
             base = f"{base[:max_len]}{suffix}"
-        return f"{base}.mp4"
+        return f"composed_{base}.mp4"
     return f"composed_clip_{clip_index + 1}.mp4"
 
 
@@ -96,6 +96,29 @@ def resolve_clip(job_id: str, clip_index: int, output_root: str,
 
     clip_filename = clip_filename_for(metadata_path, clip_info, clip_index)
     clip_path = os.path.join(job_dir, clip_filename)
+
+    # If the exact clip_filename doesn't exist on disk, look for on-disk fallback variants
+    if not os.path.exists(clip_path):
+        candidates = [
+            os.path.join(job_dir, composed_clip_basename(clip_info, clip_index)),
+            os.path.join(job_dir, f"composed_{clip_filename}"),
+            os.path.join(job_dir, f"source_{clip_filename}"),
+            os.path.join(job_dir, f"reframe_{clip_filename}"),
+        ]
+        for cand in candidates:
+            if os.path.isfile(cand):
+                clip_path = cand
+                break
+        else:
+            if os.path.isdir(job_dir):
+                suffix = f"_clip_{clip_index + 1}.mp4"
+                for entry in sorted(os.listdir(job_dir)):
+                    if entry.endswith(suffix):
+                        cand = os.path.join(job_dir, entry)
+                        if os.path.isfile(cand):
+                            clip_path = cand
+                            break
+
     if require_file and not os.path.exists(clip_path):
         raise NotFoundError(f"Clip file not found: {clip_filename}")
 

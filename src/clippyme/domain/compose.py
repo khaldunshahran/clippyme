@@ -473,8 +473,8 @@ async def _compose_layers_impl(
     composed_path = os.path.join(job_dir, composed_filename)
     # Always wipe a stale composed file from a previous compose pass so
     # we never accidentally upload yesterday's version when the user has
-    # changed toggles in the meantime.
-    if os.path.exists(composed_path):
+    # changed toggles in the meantime. Never remove if it points to current_input / base_clip.
+    if os.path.exists(composed_path) and os.path.abspath(composed_path) not in (os.path.abspath(current_input), os.path.abspath(base_clip)):
         try:
             os.remove(composed_path)
         except OSError:

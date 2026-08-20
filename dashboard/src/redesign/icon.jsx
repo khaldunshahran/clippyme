@@ -43,7 +43,7 @@ export function Icon({ n, cls, style }) {
 // Brand/social marks via Simple Icons CDN (lucide dropped these).
 // `n` is constrained to a known allow-list so a caller can never inject an
 // arbitrary slug (or scheme) into the CDN URL — only these three marks exist.
-const SOCIAL_SLUGS = new Set(['tiktok', 'instagram', 'youtube']);
+const SOCIAL_SLUGS = new Set(['tiktok', 'instagram', 'youtube', 'facebook']);
 const SAFE_COLOR_RE = /^[a-zA-Z0-9]+$/;
 
 export function Social({ n, color = 'white', size = 15, style }) {

@@ -19,6 +19,7 @@ function withTaste(data) {
  */
 export function useJobSubmission({
   apiKey,
+  serverHasKey,
   setShowKeyModal,
   setStatus,
   setLogs,
@@ -43,7 +44,7 @@ export function useJobSubmission({
   );
 
   const handleProcess = async (data) => {
-    if (!apiKey) {
+    if (!apiKey && !serverHasKey) {
       setShowKeyModal(true);
       return;
     }
@@ -63,7 +64,7 @@ export function useJobSubmission({
   };
 
   const handleBatchProcess = async (data) => {
-    if (!apiKey) {
+    if (!apiKey && !serverHasKey) {
       setShowKeyModal(true);
       return;
     }

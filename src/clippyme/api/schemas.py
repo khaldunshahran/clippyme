@@ -258,7 +258,7 @@ def _validate_toggles(value):
 
 def validate_publish_platforms(value: List[dict]) -> List[dict]:
     """Validate the small, flat Zernio target objects forwarded downstream."""
-    allowed = {"tiktok", "instagram", "youtube"}
+    allowed = {"tiktok", "instagram", "youtube", "facebook"}
     for item in value:
         if not isinstance(item, dict):
             raise ValueError("each platform must be an object")
@@ -479,7 +479,7 @@ class ZernioConfigRequest(BaseModel):
             raise ValueError("accounts must be an object")
         if len(value) > 16:
             raise ValueError("too many account entries")
-        allowed = {"tiktok", "instagram", "youtube"}
+        allowed = {"tiktok", "instagram", "youtube", "facebook"}
         for platform, account_id in value.items():
             if platform not in allowed:
                 raise ValueError(f"unknown account platform: {platform!r}")
@@ -490,3 +490,27 @@ class ZernioConfigRequest(BaseModel):
                     f"account id for {platform!r} must be a string <= 256 chars"
                 )
         return value
+
+
+class WatchdogConfigRequest(BaseModel):
+    enabled: Optional[bool] = None
+    ai_diagnosis: Optional[bool] = None
+    notify_on_failure: Optional[bool] = None
+    notify_on_success: Optional[bool] = None
+    provider: Optional[str] = Field(None, max_length=32)
+    ntfy_topic: Optional[str] = Field(None, max_length=128)
+    ntfy_server: Optional[str] = Field(None, max_length=256)
+    telegram_bot_token: Optional[str] = Field(None, max_length=256)
+    telegram_chat_id: Optional[str] = Field(None, max_length=64)
+    discord_webhook_url: Optional[str] = Field(None, max_length=512)
+    webhook_url: Optional[str] = Field(None, max_length=512)
+
+    @field_validator("provider")
+    @classmethod
+    def _validate_provider(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        val_clean = value.strip().lower()
+        if val_clean not in ("ntfy", "telegram", "discord", "webhook"):
+            raise ValueError(f"unsupported watchdog provider: {value!r}")
+        return val_clean

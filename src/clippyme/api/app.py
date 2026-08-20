@@ -154,6 +154,19 @@ async def lifespan(app: FastAPI):
     # Failures are non-fatal — smartcut has an FFmpeg fallback path.
     from clippyme.integrations.auto_editor_updater import background_updater_loop
     ae_updater_task = asyncio.create_task(background_updater_loop())
+
+    # Start Telegram AI Assistant & Remote Control listener
+    from clippyme.domain.telegram_bot import TelegramBotListener
+    telegram_listener = TelegramBotListener(
+        jobs=jobs,
+        job_queue=job_queue,
+        output_dir=OUTPUT_DIR,
+        upload_dir=UPLOAD_DIR,
+        data_dir=DATA_DIR,
+        run_job_fn=run_job,
+    )
+    telegram_task = asyncio.create_task(telegram_listener.start())
+
     # Bring back every monitor that was still marked resume_on_start when the
     # process last went down (durable auto-resume). Never fatal to startup —
     # a per-monitor failure stays visible via its status() instead.
@@ -162,6 +175,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("live monitor auto-resume failed")
     yield
+    telegram_listener.stop()
     # Stop the live monitor first so its in-flight capture/publish tasks unwind
     # cleanly before we tear down the worker loops they depend on. shutdown()
     # (not stop()) so resume_on_start survives for the next auto-resume.
@@ -172,7 +186,7 @@ async def lifespan(app: FastAPI):
     # Cancel ALL background tasks on shutdown — not just the updater. Leaving
     # the worker/cleanup loops pending blocks uvicorn's graceful exit and logs
     # "Task was destroyed but it is pending!" tracebacks.
-    _bg_tasks = (worker_task, cleanup_task, ae_updater_task)
+    _bg_tasks = (worker_task, cleanup_task, ae_updater_task, telegram_task)
     for _t in _bg_tasks:
         _t.cancel()
     for _t in _bg_tasks:
@@ -249,6 +263,7 @@ async def _unhandled_error_handler(request: Request, exc: Exception):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https?://.*\.trycloudflare\.com",
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "Authorization", "X-Gemini-Key", "X-API-Token"],
@@ -309,7 +324,10 @@ async def process_endpoint(
     require_trusted_config_request(request)
     # ~20 single-job submissions/min per client; compute-heavy, so throttle.
     enforce_rate_limit(request, "process", capacity=20, refill_per_sec=20 / 60)
-    api_key = request.headers.get("X-Gemini-Key")
+    api_key = request.headers.get("X-Gemini-Key") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        persisted = await asyncio.to_thread(load_persistent_config)
+        api_key = persisted.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
@@ -482,7 +500,10 @@ async def batch_process(req: BatchRequest, request: Request):
     require_trusted_config_request(request)
     # Each batch can enqueue up to 20 jobs, so limit batch calls more tightly.
     enforce_rate_limit(request, "batch", capacity=10, refill_per_sec=10 / 60)
-    api_key = request.headers.get("X-Gemini-Key")
+    api_key = request.headers.get("X-Gemini-Key") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        persisted = await asyncio.to_thread(load_persistent_config)
+        api_key = persisted.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 

@@ -81,6 +81,7 @@ export const PLATFORMS = [
   { id: 'tiktok', icon: 'tiktok', label: 'TikTok' },
   { id: 'ig', icon: 'instagram', label: 'Reels' },
   { id: 'yt', icon: 'youtube', label: 'Shorts' },
+  { id: 'fb', icon: 'facebook', label: 'Facebook' },
 ];
 
 export function PlatPill({ id, icon, label, on, onClick }) {

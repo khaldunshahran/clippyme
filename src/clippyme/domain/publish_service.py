@@ -109,8 +109,13 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
             detail_msg,
             status_code=502 if e.status_code is None else e.status_code,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("publish: unexpected error")
+        try:
+            from clippyme.domain.watchdog import on_api_error
+            asyncio.create_task(on_api_error(f"/api/publish/{job_id}/{clip_index}", str(exc), 500, context={"job_id": job_id, "clip_index": clip_index}))
+        except Exception:
+            pass
         raise ClippyMeError("Publish failed", status_code=500)
 
     # Best-effort: the publish already succeeded, so a metadata-write hiccup

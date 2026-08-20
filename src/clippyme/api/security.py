@@ -78,10 +78,28 @@ def client_ip(request: Request) -> str:
     return peer
 
 
+TAILSCALE_IPV4_NET = ipaddress.ip_network("100.64.0.0/10")
+TAILSCALE_IPV6_NET = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
 def is_trusted_origin(origin: Optional[str]) -> bool:
     if not origin:
         return False
-    return origin.rstrip("/") in ALLOWED_ORIGINS
+    norm = origin.rstrip("/").lower()
+    if norm in ALLOWED_ORIGINS:
+        return True
+    if norm.endswith(".trycloudflare.com") or ".trycloudflare.com" in norm:
+        return True
+    if norm.endswith(".ts.net") or ".ts.net:" in norm:
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(norm).hostname
+        if host and is_trusted_client_host(host):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def is_trusted_client_host(client_host: Optional[str]) -> bool:
@@ -91,13 +109,20 @@ def is_trusted_client_host(client_host: Optional[str]) -> bool:
     normalized_host = client_host.strip().lower()
     if normalized_host in {"127.0.0.1", "::1", "localhost"}:
         return True
+    if normalized_host.endswith(".ts.net"):
+        return True
 
     try:
         address = ipaddress.ip_address(normalized_host)
     except ValueError:
         return False
 
-    return address.is_loopback or address.is_private
+    return (
+        address.is_loopback
+        or address.is_private
+        or (isinstance(address, ipaddress.IPv4Address) and address in TAILSCALE_IPV4_NET)
+        or (isinstance(address, ipaddress.IPv6Address) and address in TAILSCALE_IPV6_NET)
+    )
 
 
 def require_trusted_config_request(request: Request) -> None:
@@ -118,12 +143,22 @@ def require_trusted_config_request(request: Request) -> None:
     sec_fetch_site = request.headers.get("sec-fetch-site")
     if sec_fetch_site in ("cross-site", "same-site"):
         raise HTTPException(status_code=403, detail="Cross-site requests are not allowed.")
+    if sec_fetch_site == "same-origin":
+        return
 
     origin = request.headers.get("origin")
     if origin:
         if is_trusted_origin(origin):
             return
         raise HTTPException(status_code=403, detail="Origin not allowed for config access.")
+
+    referer = request.headers.get("referer")
+    if referer and is_trusted_origin(referer):
+        return
+
+    host = request.headers.get("host")
+    if host and is_trusted_origin(f"http://{host}"):
+        return
 
     client_host = client_ip(request)
     if is_trusted_client_host(client_host):

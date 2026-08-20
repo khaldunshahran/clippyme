@@ -20,14 +20,17 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Header, HTTPException, Request, UploadFile
 
-from clippyme.api.schemas import ConfigUpdateRequest, ZernioConfigRequest
+from clippyme.api.schemas import ConfigUpdateRequest, WatchdogConfigRequest, ZernioConfigRequest
 from clippyme.api.security import require_trusted_config_request
 from clippyme.pipeline.gemini_service import list_available_models
 from clippyme.storage.config_store import (
     load_persistent_config,
+    load_watchdog_config,
     load_zernio_config,
     save_persistent_config,
+    save_watchdog_config,
     save_zernio_config,
+    watchdog_config_status,
     zernio_config_status,
 )
 
@@ -102,16 +105,27 @@ async def get_config(request: Request):
     """Return current active configuration (keys are partially masked for safety)."""
     require_trusted_config_request(request)
     config = await asyncio.to_thread(load_persistent_config)
-    # Secret keys are never returned verbatim — even short values are masked so
-    # a brief key can't leak. Non-secret flags (model/provider) pass through.
+    env_gemini = os.environ.get("GEMINI_API_KEY", "").strip()
+    active_gemini = env_gemini or config.get("GEMINI_API_KEY", "")
+    active_config = {
+        "GEMINI_API_KEY": active_gemini,
+        "HF_TOKEN": os.environ.get("HF_TOKEN") or config.get("HF_TOKEN", ""),
+        "DEEPGRAM_API_KEY": os.environ.get("DEEPGRAM_API_KEY") or config.get("DEEPGRAM_API_KEY", ""),
+        "ELEVENLABS_API_KEY": os.environ.get("ELEVENLABS_API_KEY") or config.get("ELEVENLABS_API_KEY", ""),
+        "TRANSCRIPTION_PROVIDER": os.environ.get("TRANSCRIPTION_PROVIDER") or config.get("TRANSCRIPTION_PROVIDER", "whisper"),
+        "GEMINI_MODEL": os.environ.get("GEMINI_MODEL") or config.get("GEMINI_MODEL", ""),
+        "TWITCH_CLIENT_ID": os.environ.get("TWITCH_CLIENT_ID") or config.get("TWITCH_CLIENT_ID", ""),
+        "TWITCH_CLIENT_SECRET": os.environ.get("TWITCH_CLIENT_SECRET") or config.get("TWITCH_CLIENT_SECRET", ""),
+    }
     secret_keys = {"GEMINI_API_KEY", "HF_TOKEN", "DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY",
                    "YOUTUBE_COOKIES", "TWITCH_CLIENT_SECRET"}
     masked = {}
-    for k, v in config.items():
+    for k, v in active_config.items():
         if k in secret_keys and v:
             masked[k] = f"{v[:4]}...{v[-4:]}" if len(v) > 8 else "********"
         else:
             masked[k] = v
+    masked["server_has_gemini"] = bool(active_gemini)
     return masked
 
 
@@ -368,3 +382,36 @@ async def list_zernio_accounts(request: Request):
     except ZernioError as e:
         raise HTTPException(status_code=502, detail=f"Zernio API error: {e}")
     return {"accounts": accounts}
+
+
+@router.get("/api/config/watchdog")
+async def get_watchdog_config_endpoint(request: Request):
+    """Return persisted Watchdog alert settings (tokens/URLs masked)."""
+    require_trusted_config_request(request)
+    return await asyncio.to_thread(watchdog_config_status)
+
+
+@router.post("/api/config/watchdog")
+async def update_watchdog_config_endpoint(req: WatchdogConfigRequest, request: Request):
+    """Update Watchdog notification provider and alert settings."""
+    require_trusted_config_request(request)
+    updates = req.model_dump(exclude_unset=True)
+    ok = await asyncio.to_thread(save_watchdog_config, updates)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save Watchdog config")
+    return await asyncio.to_thread(watchdog_config_status)
+
+
+@router.post("/api/config/watchdog/test")
+async def test_watchdog_alert_endpoint(request: Request, req: Optional[WatchdogConfigRequest] = None):
+    """Send an immediate test alert to verify the configured notification channel."""
+    require_trusted_config_request(request)
+    from clippyme.domain.watchdog import send_test_alert
+    override = req.model_dump(exclude_unset=True) if req else None
+    success = await send_test_alert(cfg_override=override)
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to send test alert. Please check your notification provider settings and credentials.",
+        )
+    return {"status": "ok", "message": "Test notification sent successfully!"}

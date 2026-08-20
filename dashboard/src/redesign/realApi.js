@@ -338,6 +338,40 @@ export async function discoverZernioAccounts() {
   return res.json();
 }
 
+// --- Watchdog & Mobile Alerts ----------------------------------------------
+
+export async function getWatchdog() {
+  const res = await apiFetch(getApiUrl('/api/config/watchdog'));
+  if (!res.ok) return { enabled: false };
+  return res.json();
+}
+
+export async function saveWatchdog(payload) {
+  const res = await apiFetch(getApiUrl('/api/config/watchdog'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to save Watchdog settings');
+  }
+  return res.json().catch(() => ({}));
+}
+
+export async function testWatchdogAlert(payload) {
+  const res = await apiFetch(getApiUrl('/api/config/watchdog/test'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Test alert failed');
+  }
+  return res.json().catch(() => ({}));
+}
+
 // --- Kick live-channel monitor ---------------------------------------------
 
 export async function startLiveMonitor(config) {

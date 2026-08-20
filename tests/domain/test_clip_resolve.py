@@ -19,12 +19,12 @@ from clippyme.domain.errors import NotFoundError
 def test_composed_clip_basename_title_based():
     assert composed_clip_basename(
         {"video_title_for_youtube_short": "Litigio shock! in villa"}, 0
-    ) == "Litigio shock! in villa_clip_1.mp4"
+    ) == "composed_Litigio shock! in villa_clip_1.mp4"
     # falls back to positional when no usable title
     assert composed_clip_basename({"start": 0}, 2) == "composed_clip_3.mp4"
     assert composed_clip_basename({"video_title_for_youtube_short": "***"}, 1) == "composed_clip_2.mp4"
     # honours legacy "title" key
-    assert composed_clip_basename({"title": "Ciao mondo"}, 0) == "Ciao mondo_clip_1.mp4"
+    assert composed_clip_basename({"title": "Ciao mondo"}, 0) == "composed_Ciao mondo_clip_1.mp4"
 
 JOB_ID = "33333333-3333-4333-8333-333333333333"
 
@@ -129,6 +129,24 @@ def test_resolve_clip_end_to_end_with_new_format_metadata(tmp_path, job_dir):
     r = resolve_clip(JOB_ID, 0, str(tmp_path))
     assert r.clip_filename == "Best Moment Ever_clip_1.mp4"
     assert r.clip_path == str(job_dir / "Best Moment Ever_clip_1.mp4")
+
+
+def test_resolve_clip_fallback_to_source_file(tmp_path, job_dir):
+    _write_meta(job_dir, "vid_metadata.json",
+                [{"clip_filename": "Best Moment Ever_clip_1.mp4"}])
+    (job_dir / "source_Best Moment Ever_clip_1.mp4").write_bytes(b"\x00")
+    r = resolve_clip(JOB_ID, 0, str(tmp_path))
+    assert r.clip_filename == "Best Moment Ever_clip_1.mp4"
+    assert r.clip_path == str(job_dir / "source_Best Moment Ever_clip_1.mp4")
+
+
+def test_resolve_clip_fallback_to_composed_file(tmp_path, job_dir):
+    _write_meta(job_dir, "vid_metadata.json",
+                [{"clip_filename": "Best Moment Ever_clip_1.mp4"}])
+    (job_dir / "composed_Best Moment Ever_clip_1.mp4").write_bytes(b"\x00")
+    r = resolve_clip(JOB_ID, 0, str(tmp_path))
+    assert r.clip_filename == "Best Moment Ever_clip_1.mp4"
+    assert r.clip_path == str(job_dir / "composed_Best Moment Ever_clip_1.mp4")
 
 
 def test_latest_metadata_by_mtime_wins(tmp_path, job_dir):

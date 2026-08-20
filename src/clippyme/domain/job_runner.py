@@ -272,9 +272,13 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
                     if returncode == 2
                     else "retry limit reached"
                 )
-                jobs[job_id]["logs"].append(
-                    f"Process failed with exit code {returncode} ({reason})."
-                )
+                fail_msg = f"Process failed with exit code {returncode} ({reason})."
+                jobs[job_id]["logs"].append(fail_msg)
+                try:
+                    from clippyme.domain.watchdog import on_job_failed
+                    asyncio.create_task(on_job_failed(job_id, jobs[job_id], fail_msg))
+                except Exception:
+                    pass
                 break
 
         except asyncio.CancelledError:
@@ -288,7 +292,13 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
             job = jobs.get(job_id)
             if job is not None:
                 job["status"] = "failed"
-                job["logs"].append(f"Execution error: {exc}")
+                fail_msg = f"Execution error: {exc}"
+                job["logs"].append(fail_msg)
+                try:
+                    from clippyme.domain.watchdog import on_job_failed
+                    asyncio.create_task(on_job_failed(job_id, job, fail_msg))
+                except Exception:
+                    pass
             logger.exception("run_job failed for job_id=%s", job_id)
             await _stop_process_tree(job_id, process or (job or {}).get("process"))
         finally:
