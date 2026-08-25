@@ -414,8 +414,10 @@ def publish_clip(
     tiktok_settings: Optional[dict] = None,
     scheduler: Optional[SmartScheduler] = None,
     start_date: Optional[str] = None,
+    thumbnail_path: Optional[str] = None,
+    thumbnail_url: Optional[str] = None,
 ) -> dict:
-    """Publish a single clip via Zernio.
+    """Publish a single clip via Zernio with optional AI thumbnail/cover attachment.
 
     Args:
         api_key: Zernio API key (sk_...). Never logged.
@@ -428,6 +430,9 @@ def publish_clip(
         timezone: IANA tz string passed to Zernio
         tiktok_settings: optional root-level TikTok settings (consent, privacy)
         scheduler: optional injected SmartScheduler (testing)
+        start_date: optional starting date for auto schedule
+        thumbnail_path: optional local path to thumbnail image (.png/.jpg)
+        thumbnail_url: optional public URL of thumbnail image
 
     Returns:
         {
@@ -436,6 +441,7 @@ def publish_clip(
             "scheduled_for": str | None,
             "schedule_mode": str,
             "platforms": [...],
+            "thumbnail_url": str | None,
         }
 
     Raises:
@@ -466,9 +472,10 @@ def publish_clip(
     # the separate `title` field at the Zernio root, so it's unaffected.
     effective_content = (caption or "").strip() or (title or "").strip()
     logger.info(
-        "publish_clip: platforms=%s content_len=%d title_len=%d mode=%s",
+        "publish_clip: platforms=%s content_len=%d title_len=%d mode=%s has_thumb=%s",
         [p.get("platform") for p in platform_targets],
         len(effective_content), len(title or ""), schedule_mode,
+        bool(thumbnail_path or thumbnail_url),
     )
 
     client = ZernioClient(api_key)
@@ -549,7 +556,27 @@ def publish_clip(
     elif schedule_mode == "manual":
         final_scheduled_for = scheduled_for
 
-    # 2. Presign + upload
+    # 2. Upload thumbnail if provided
+    final_thumb_url: Optional[str] = thumbnail_url
+    if thumbnail_path and os.path.isfile(thumbnail_path):
+        thumb_filename = os.path.basename(thumbnail_path)
+        thumb_content_type = "image/png" if thumb_filename.lower().endswith(".png") else "image/jpeg"
+        try:
+            thumb_size = os.path.getsize(thumbnail_path)
+        except OSError:
+            thumb_size = None
+        try:
+            thumb_presign = client.presign_upload(
+                thumb_filename, content_type=thumb_content_type, size_bytes=thumb_size
+            )
+            thumb_upload_url = thumb_presign["uploadUrl"]
+            final_thumb_url = thumb_presign["publicUrl"]
+            client.upload_to_presigned(thumb_upload_url, thumbnail_path, content_type=thumb_content_type)
+            logger.info("publish_clip: thumbnail uploaded successfully -> %s", final_thumb_url)
+        except Exception as e:
+            logger.warning("publish_clip: thumbnail presign/upload failed (continuing without cover): %s", e)
+
+    # 3. Presign + upload video clip
     filename = os.path.basename(clip_path)
     try:
         size_bytes = os.path.getsize(clip_path)
@@ -566,20 +593,40 @@ def publish_clip(
         raise ZernioError(f"malformed presign response (missing {exc})") from exc
     client.upload_to_presigned(upload_url, clip_path, content_type="video/mp4")
 
-    # 3. Create post
+    # 4. Attach thumbnail to platform targets if available
+    effective_platform_targets = []
+    for pt in platform_targets:
+        pt_copy = dict(pt)
+        plat = (pt_copy.get("platform") or "").lower()
+        if final_thumb_url:
+            psd = dict(pt_copy.get("platformSpecificData") or {})
+            if plat in ("instagram", "ig"):
+                psd.setdefault("instagramThumbnail", final_thumb_url)
+                psd.setdefault("reelCover", final_thumb_url)
+            elif plat in ("youtube", "yt"):
+                psd.setdefault("thumbnailUrl", final_thumb_url)
+            elif plat in ("facebook", "fb"):
+                psd.setdefault("thumbnailUrl", final_thumb_url)
+            pt_copy["platformSpecificData"] = psd
+        effective_platform_targets.append(pt_copy)
+
+    # 5. Create post
     media_items = [{"type": "video", "url": public_url}]
+    if final_thumb_url:
+        media_items[0]["thumbnailUrl"] = final_thumb_url
+
     response = client.create_post(
         content=effective_content,
         title=title,
         media_items=media_items,
-        platforms=platform_targets,
+        platforms=effective_platform_targets,
         scheduled_for=final_scheduled_for,
         timezone=timezone,
         publish_now=publish_now,
         tiktok_settings=tiktok_settings,
     )
 
-    # 4. Extract post id (response shape varies)
+    # 6. Extract post id (response shape varies)
     post_obj = response.get("post") if isinstance(response, dict) else None
     if isinstance(post_obj, dict):
         post_id = post_obj.get("_id") or post_obj.get("id")
@@ -596,4 +643,5 @@ def publish_clip(
         "scheduled_for": final_scheduled_for,
         "schedule_mode": schedule_mode,
         "platforms": platforms_resp,
+        "thumbnail_url": final_thumb_url,
     }

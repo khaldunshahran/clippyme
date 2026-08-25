@@ -125,7 +125,7 @@ def test_resolve_cookies_none_when_nothing_available(tmp_path, monkeypatch):
 
 def test_player_client_chain_default(monkeypatch):
     monkeypatch.delenv("YTDLP_PLAYER_CLIENTS", raising=False)
-    assert dl._player_client_chain() == ["default", "tv+tv_embedded", "web_safari"]
+    assert dl._player_client_chain() == ["android_vr", "android", "ios", "web_safari", "default"]
 
 
 def test_player_client_chain_env_override(monkeypatch):
@@ -135,7 +135,7 @@ def test_player_client_chain_env_override(monkeypatch):
 
 def test_player_client_chain_blank_env_falls_back(monkeypatch):
     monkeypatch.setenv("YTDLP_PLAYER_CLIENTS", "   ")
-    assert dl._player_client_chain() == ["default", "tv+tv_embedded", "web_safari"]
+    assert dl._player_client_chain() == ["android_vr", "android", "ios", "web_safari", "default"]
 
 
 def test_extractor_args_default_is_none():
@@ -164,13 +164,13 @@ def test_extractor_args_joined_clients():
     "No video formats found!; please report this issue",
     "empty formats returned by extractor",
     "403 Forbidden",
+    "ERROR: Sign in to confirm you're not a bot. Use --cookies",
 ])
 def test_classify_retry(msg):
     assert dl.classify_download_error(msg) == "retry"
 
 
 @pytest.mark.parametrize("msg", [
-    "ERROR: Sign in to confirm you're not a bot. Use --cookies",
     "ERROR: Private video. Sign in if you've been granted access",
     "This video is private",
     "Video unavailable. This video has been removed by the user",
@@ -187,4 +187,4 @@ def test_classify_fatal(msg):
 
 def test_classify_bot_wall_beats_any_incidental_403():
     msg = "Sign in to confirm you're not a bot (HTTP Error 403)"
-    assert dl.classify_download_error(msg) == "fatal"
+    assert dl.classify_download_error(msg) == "retry"

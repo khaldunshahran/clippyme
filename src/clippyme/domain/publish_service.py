@@ -76,6 +76,44 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
     if not os.path.exists(upload_path):
         raise NotFoundError(f"Clip file not found: {upload_path}")
 
+    # Resolve / generate thumbnail if requested
+    thumbnail_path = req.get("thumbnail_path")
+    if req.get("generate_ai_thumbnail") and not thumbnail_path:
+        from clippyme.storage.config_store import load_persistent_config
+        cfg = load_persistent_config() or {}
+        gemini_key = os.environ.get("GEMINI_API_KEY") or cfg.get("GEMINI_API_KEY")
+        if gemini_key:
+            start = resolved.clip_info.get("start", 0)
+            end = resolved.clip_info.get("end", 0)
+            transcript = resolved.metadata.get("transcript") or {}
+            from clippyme.domain.smartcut import clip_transcript_segments
+            segments = clip_transcript_segments(transcript, start, end)
+            clip_transcript_text = " ".join(s.get("text", "") for s in segments if s.get("text"))
+
+            cover_candidate = os.path.splitext(base_clip)[0] + "_cover.jpg"
+            face_img = cover_candidate if os.path.exists(cover_candidate) else None
+
+            from clippyme.studio.youtube_studio import generate_youtube_thumbnail
+            out_thumb_dir = os.path.join(job_dir, "thumbnails")
+            resolved_title = req.get("title") or resolved.clip_info.get("title", "") or f"Clip {clip_index + 1}"
+            try:
+                thumbnail_path = await asyncio.to_thread(
+                    generate_youtube_thumbnail,
+                    title=resolved_title,
+                    output_dir=out_thumb_dir,
+                    api_key=gemini_key,
+                    face_image_path=face_img,
+                    bg_image_path=None,
+                    extra_prompt=req.get("thumbnail_prompt") or "",
+                    video_context=clip_transcript_text[:1500],
+                    aspect_ratio=req.get("thumbnail_aspect_ratio", "9:16"),
+                    model=req.get("thumbnail_model"),
+                )
+                logger.info("publish_clip_flow: generated AI thumbnail -> %s", thumbnail_path)
+            except Exception as exc:
+                logger.warning("publish: AI thumbnail generation failed: %s", exc)
+                thumbnail_path = None
+
     # Run the publish in a worker thread (presign + PUT + create are blocking)
     from clippyme.integrations.social_publisher import publish_clip, ZernioError
     try:
@@ -91,6 +129,7 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
             timezone=req.get("timezone") or zernio_cfg.get("timezone") or "Europe/Rome",
             tiktok_settings=req.get("tiktok_settings"),
             start_date=req.get("start_date"),
+            thumbnail_path=thumbnail_path,
         )
     except ValueError as e:
         raise ValidationError(str(e))
@@ -135,5 +174,30 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
         )
     except Exception as e:
         logger.warning("publish: failed to persist publish record for %s/%d: %s", job_id, clip_index, e)
+
+    try:
+        from clippyme.storage.config_store import load_persistent_config
+        cfg = await asyncio.to_thread(load_persistent_config) or {}
+        auto_cleanup = bool(cfg.get("AUTO_CLEANUP_PUBLISHED", True))
+        if req.get("delete_after_publish") or auto_cleanup:
+            from clippyme.domain.job_artifacts import delete_clip_artifacts, cleanup_published_job
+            output_root = os.path.dirname(job_dir)
+            await asyncio.to_thread(
+                delete_clip_artifacts,
+                job_id,
+                resolved.clip_info,
+                base_clip,
+                upload_path,
+                output_root
+            )
+            await asyncio.to_thread(
+                cleanup_published_job,
+                job_id,
+                output_root,
+                clip_index
+            )
+            logger.info("publish: successfully deleted post-publish artifacts for %s/%d", job_id, clip_index)
+    except Exception as e:
+        logger.warning("publish: failed to run post-publish artifact cleanup for %s/%d: %s", job_id, clip_index, e)
 
     return {"success": True, **result}

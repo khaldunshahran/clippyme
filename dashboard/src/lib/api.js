@@ -31,28 +31,31 @@ function pickLanguage(pre) {
 }
 
 export async function submitProcessJob(data, apiKey, { signal } = {}) {
-  const headers = { 'X-Gemini-Key': apiKey };
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = key ? { 'X-Gemini-Key': key } : {};
   let body;
   const language = pickLanguage(data.preselections);
-  const reframeMode = data.preselections?.reframe_mode;
-  const aspect = data.preselections?.aspect;
-  const noZoom = data.preselections?.no_zoom === true;
-  const letterboxZoom = Number(data.preselections?.letterbox_zoom) || 0;
-  const skipAnalysis = data.preselections?.skip_analysis === true;
-  const model = (data.preselections?.model || '').trim();
-  const minDuration = Number(data.preselections?.min_duration) || null;
-  const maxDuration = Number(data.preselections?.max_duration) || null;
-  const minClips = Number(data.preselections?.min_clips) || null;
-  const maxClips = Number(data.preselections?.max_clips) || null;
-  const clipType = (data.preselections?.clip_type || '').trim() || null;
+  const reframeMode = data.reframe_mode || data.preselections?.reframe_mode;
+  const aspect = data.aspect || data.preselections?.aspect;
+  const noZoom = data.no_zoom === true || data.preselections?.no_zoom === true;
+  const letterboxZoom = Number(data.letterbox_zoom ?? data.preselections?.letterbox_zoom) || 0;
+  const skipAnalysis = data.skip_analysis === true || data.preselections?.skip_analysis === true;
+  const model = (data.model || data.preselections?.model || '').trim();
+  const minDuration = Number(data.min_duration ?? data.preselections?.min_duration) || null;
+  const maxDuration = Number(data.max_duration ?? data.preselections?.max_duration) || null;
+  const minClips = Number(data.min_clips ?? data.preselections?.min_clips) || null;
+  const maxClips = Number(data.max_clips ?? data.preselections?.max_clips) || null;
+  const clipType = (data.clip_type || data.preselections?.clip_type || '').trim() || null;
+  const highlights = data.highlights === true || data.preselections?.highlights === true;
 
   if (data.type === 'url') {
     headers['Content-Type'] = 'application/json';
     const jsonBody = { url: data.payload };
     if (data.instructions) jsonBody.instructions = data.instructions;
+    if (highlights) jsonBody.highlights = true;
     if (reframeMode) jsonBody.reframe_mode = reframeMode;
     if (letterboxZoom) jsonBody.letterbox_zoom = letterboxZoom;
-    if (aspect && aspect !== '9:16') jsonBody.aspect = aspect;
+    if (aspect) jsonBody.aspect = aspect;
     if (language) jsonBody.language = language;
     if (noZoom) jsonBody.no_zoom = true;
     if (skipAnalysis) jsonBody.skip_analysis = true;
@@ -68,9 +71,10 @@ export async function submitProcessJob(data, apiKey, { signal } = {}) {
     const formData = new FormData();
     formData.append('file', data.payload);
     if (data.instructions) formData.append('instructions', data.instructions);
+    if (highlights) formData.append('highlights', 'true');
     if (reframeMode) formData.append('reframe_mode', reframeMode);
     if (letterboxZoom) formData.append('letterbox_zoom', String(letterboxZoom));
-    if (aspect && aspect !== '9:16') formData.append('aspect', aspect);
+    if (aspect) formData.append('aspect', aspect);
     if (language) formData.append('language', language);
     if (noZoom) formData.append('no_zoom', 'true');
     if (skipAnalysis) formData.append('skip_analysis', 'true');
@@ -109,6 +113,12 @@ export async function submitBatchJob(data, apiKey, { signal } = {}) {
     body: JSON.stringify(batchBody),
     signal,
   });
+  if (!res.ok) await throwFromResponse(res);
+  return res.json();
+}
+
+export async function triggerStorageCleanup({ signal } = {}) {
+  const res = await apiFetch(getApiUrl('/api/storage/cleanup'), { method: 'POST', signal });
   if (!res.ok) await throwFromResponse(res);
   return res.json();
 }

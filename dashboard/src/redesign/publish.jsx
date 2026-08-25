@@ -70,6 +70,8 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
   const [hashtags, setHashtags] = useState(
     firstClip.hashtags?.length ? firstClip.hashtags : ['#shorts', '#trending', '#viral']
   );
+  const [aiThumbnail, setAiThumbnail] = useState(false);
+  const [aspectRatio, setAspectRatio] = useState('9:16');
   const [generatingAi, setGeneratingAi] = useState(false);
   const [stage, setStage] = useState('setup'); // setup | uploading | done
   const [progress, setProgress] = useState({});
@@ -170,6 +172,8 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
       schedule_mode: schedule ? 'auto' : 'now',
       ...(schedule ? { start_date: localDatePlus(batchPos) } : {}),
       timezone: zernio?.timezone || 'Europe/Rome',
+      generate_ai_thumbnail: aiThumbnail,
+      thumbnail_aspect_ratio: aspectRatio,
       tiktok_settings: plats.tiktok && accounts.tiktok ? {
         privacy_level: 'PUBLIC_TO_EVERYONE', allow_comment: true, allow_duet: true,
         allow_stitch: true, content_preview_confirmed: true, express_consent_given: true,
@@ -334,6 +338,49 @@ export function PublishModal({ clips, jobId, clipStates = {}, preselections, onC
                             </button>
                           );
                         })}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="opt" style={{ borderBottom: 0, marginTop: 4 }}>
+                    <div className="oico"><Icon n="sparkles" /></div>
+                    <div className="otxt">
+                      <div className="ot">AI Thumbnail / Cover (Nano Banana)</div>
+                      <div className="od">Auto-generate and attach high-CTR cover to post</div>
+                    </div>
+                    <div className="r"><Switch on={aiThumbnail} onChange={setAiThumbnail} /></div>
+                  </div>
+
+                  {aiThumbnail && (
+                    <div className="field" style={{ marginTop: 6, marginBottom: 8, padding: '8px 12px', background: 'rgba(255,255,255,0.03)', borderRadius: 8, border: '1px solid var(--border)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span className="field-label" style={{ margin: 0, fontSize: '12px' }}>Cover Aspect Ratio:</span>
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          {[
+                            { id: '9:16', label: '9:16 (Shorts/Reels)' },
+                            { id: '1:1', label: '1:1 (Square/Feed)' },
+                            { id: '16:9', label: '16:9 (YouTube)' },
+                          ].map((r) => (
+                            <button
+                              key={r.id}
+                              type="button"
+                              onClick={() => setAspectRatio(r.id)}
+                              style={{
+                                border: '1px solid ' + (aspectRatio === r.id ? 'var(--brand-teal)' : 'var(--border)'),
+                                background: aspectRatio === r.id ? 'rgba(2,197,191,0.15)' : 'transparent',
+                                color: aspectRatio === r.id ? 'var(--brand-teal)' : 'var(--fg-2)',
+                                padding: '3px 8px',
+                                borderRadius: '6px',
+                                fontSize: '11px',
+                                fontWeight: aspectRatio === r.id ? 600 : 400,
+                                cursor: 'pointer',
+                                transition: 'all 0.2s',
+                              }}
+                            >
+                              {r.label}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     </div>
                   )}

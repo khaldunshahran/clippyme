@@ -94,7 +94,7 @@ def test_no_active_toggles_returns_base_unmodified(tmp_path, monkeypatch):
     assert result == "clip_0.mp4"
     assert order == []
     # No composed_clip_*.mp4 should be produced when nothing is active.
-    assert not os.path.exists(tmp_path / "composed_clip_0.mp4")
+    assert not os.path.exists(tmp_path / "composed_clip_1.mp4")
 
 
 # --- ordering --------------------------------------------------------------
@@ -104,8 +104,8 @@ def test_all_layers_run_in_subtitles_smartcut_hook_order(tmp_path, monkeypatch):
     _install_recording_stubs(monkeypatch, order)
     result = _run_compose(tmp_path, {"smartcut": True, "hook": True, "subtitles": True})
     assert order == ["subtitles", "smartcut", "hook"]
-    assert result == "composed_clip_0.mp4"
-    assert os.path.exists(tmp_path / "composed_clip_0.mp4")
+    assert result == "composed_clip_1.mp4"
+    assert os.path.exists(tmp_path / "composed_clip_1.mp4")
 
 
 def test_subtitles_run_before_smartcut_when_hook_off(tmp_path, monkeypatch):
@@ -128,8 +128,8 @@ def test_hook_toggle_on_but_empty_text_is_skipped(tmp_path, monkeypatch):
     # Hook layer skipped → no layer ran, but composed file is still emitted
     # (a copy of the base clip) so the caller gets a consistent path back.
     assert order == []
-    assert result == "composed_clip_0.mp4"
-    assert os.path.exists(tmp_path / "composed_clip_0.mp4")
+    assert result == "composed_clip_1.mp4"
+    assert os.path.exists(tmp_path / "composed_clip_1.mp4")
 
 
 # --- failure path cleanup --------------------------------------------------
@@ -149,10 +149,10 @@ def test_failure_cleans_intermediates_and_reraises(tmp_path, monkeypatch):
         _run_compose(tmp_path, {"smartcut": True, "hook": False, "subtitles": True})
 
     # Subtitles ran first and created composed_sub_0.mp4; the failure path
-    # must remove it and must not leave a half-written composed_clip_0.mp4.
+    # must remove it and must not leave a half-written composed_clip_1.mp4.
     assert order == ["subtitles", "smartcut"]
     assert not os.path.exists(tmp_path / "composed_sub_0.mp4")
-    assert not os.path.exists(tmp_path / "composed_clip_0.mp4")
+    assert not os.path.exists(tmp_path / "composed_clip_1.mp4")
 
 
 # --- _cleanup_intermediates ------------------------------------------------
@@ -227,7 +227,7 @@ def test_banner_runs_last_after_hook(tmp_path, monkeypatch):
     )
     steps = [o for o in order if isinstance(o, str)]
     assert steps == ["hook", "banner"]  # banner is topmost, after hook
-    assert result == "composed_clip_0.mp4"
+    assert result == "composed_clip_1.mp4"
 
 
 def test_banner_enabled_via_params_only_no_toggle(tmp_path, monkeypatch):
@@ -243,7 +243,7 @@ def test_banner_enabled_via_params_only_no_toggle(tmp_path, monkeypatch):
         banner_params={"enabled": True, "platform": "youtube", "handle": "chan"},
     )
     assert "banner" in order
-    assert result == "composed_clip_0.mp4"
+    assert result == "composed_clip_1.mp4"
 
 
 def test_banner_skipped_when_handle_unresolvable(tmp_path, monkeypatch):
@@ -259,4 +259,4 @@ def test_banner_skipped_when_handle_unresolvable(tmp_path, monkeypatch):
     # active, so a composed copy of the base is still emitted for a consistent
     # return path.
     assert "banner" not in order
-    assert result == "composed_clip_0.mp4"
+    assert result == "composed_clip_1.mp4"

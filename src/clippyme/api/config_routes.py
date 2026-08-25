@@ -304,7 +304,7 @@ def _validate_logo_png(content: bytes) -> None:
             ):
                 raise ValueError("dimensions out of range")
             image.verify()
-    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError) as exc:
+    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError, ModuleNotFoundError, Exception) as exc:
         raise HTTPException(status_code=400, detail="Logo must be a valid, reasonably-sized PNG") from exc
 
 

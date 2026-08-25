@@ -154,7 +154,7 @@ async def _apply_smartcut(
         transcript,
         clip_info.get("start", 0),
         clip_info.get("end", 0),
-        transcript.get("language"),
+        transcript.get("language") if isinstance(transcript, dict) else None,
         drop_ranges,
     )
     # Track the smart-cut artefact so _cleanup_intermediates can remove
@@ -314,9 +314,6 @@ async def _apply_subtitles(
                 preset=subtitle_params.get("preset", "classic_white"),
                 mode=subtitle_params.get("display_mode", "word_group"),
                 words_per_group=subtitle_params.get("words_per_group", 3),
-                # Default None → honour the preset's own casing (mrbeast_box /
-                # minimal_clean are lower-case presets). Only an explicit
-                # frontend value overrides it.
                 uppercase=subtitle_params.get("uppercase"),
                 font_color=subtitle_params.get("font_color"),
                 highlight_color=subtitle_params.get("highlight_color"),
@@ -331,7 +328,42 @@ async def _apply_subtitles(
             ),
         )
         if not success:
-            raise ValidationError("No words found for this clip range.")
+            logger.info("compose: no words in job transcript for clip %d [%.1f-%.1f]; transcribing clip on-the-fly...",
+                        clip_index, clip_start, clip_end)
+            try:
+                from clippyme.pipeline.main import transcribe_video
+                clip_transcript = await asyncio.to_thread(transcribe_video, current_input)
+                if clip_transcript:
+                    clip_dur = float(clip_end - clip_start if clip_end > clip_start else 3600.0)
+                    success = await asyncio.to_thread(
+                        lambda: generate_ass_karaoke(
+                            clip_transcript,
+                            0.0,
+                            clip_dur,
+                            ass_path,
+                            preset=subtitle_params.get("preset", "classic_white"),
+                            mode=subtitle_params.get("display_mode", "word_group"),
+                            words_per_group=subtitle_params.get("words_per_group", 3),
+                            uppercase=subtitle_params.get("uppercase"),
+                            font_color=subtitle_params.get("font_color"),
+                            highlight_color=subtitle_params.get("highlight_color"),
+                            outline_width=subtitle_params.get("outline_width"),
+                            font_name=subtitle_params.get("font"),
+                            font_size=subtitle_params.get("font_size"),
+                            position=subtitle_params.get("position", "bottom"),
+                            offset_y=sub_offset_y,
+                            outline_color=subtitle_params.get("outline_color"),
+                            align=subtitle_params.get("align", "center"),
+                            band_top=band_top,
+                        ),
+                    )
+            except Exception as _ot_exc:
+                logger.warning("compose: on-the-fly transcription failed for clip %d: %s", clip_index, _ot_exc)
+
+        if not success:
+            logger.warning("compose: no speech detected for clip %d; skipping subtitle burn.", clip_index)
+            return current_input
+
         await asyncio.to_thread(
             lambda: burn_subtitles(
                 current_input,
@@ -356,7 +388,23 @@ async def _apply_subtitles(
             generate_srt, transcript, clip_start, clip_end, srt_path
         )
         if not success:
-            raise ValidationError("No words found for this clip range.")
+            logger.info("compose: no words in job transcript for clip %d [%.1f-%.1f]; transcribing clip on-the-fly...",
+                        clip_index, clip_start, clip_end)
+            try:
+                from clippyme.pipeline.main import transcribe_video
+                clip_transcript = await asyncio.to_thread(transcribe_video, current_input)
+                if clip_transcript:
+                    clip_dur = float(clip_end - clip_start if clip_end > clip_start else 3600.0)
+                    success = await asyncio.to_thread(
+                        generate_srt, clip_transcript, 0.0, clip_dur, srt_path
+                    )
+            except Exception as _ot_exc:
+                logger.warning("compose: on-the-fly transcription failed for clip %d: %s", clip_index, _ot_exc)
+
+        if not success:
+            logger.warning("compose: no speech detected for clip %d; skipping subtitle burn.", clip_index)
+            return current_input
+
         await asyncio.to_thread(
             lambda: burn_subtitles(
                 current_input,
@@ -471,14 +519,12 @@ async def _compose_layers_impl(
     from clippyme.domain.clip_resolve import composed_clip_basename
     composed_filename = composed_clip_basename(clip_info, clip_index)
     composed_path = os.path.join(job_dir, composed_filename)
-    # Always wipe a stale composed file from a previous compose pass so
-    # we never accidentally upload yesterday's version when the user has
-    # changed toggles in the meantime. Never remove if it points to current_input / base_clip.
-    if os.path.exists(composed_path) and os.path.abspath(composed_path) not in (os.path.abspath(current_input), os.path.abspath(base_clip)):
-        try:
-            os.remove(composed_path)
-        except OSError:
-            pass
+    # NOTE: We do NOT delete a stale composed file upfront. Instead we write
+    # atomically via a .tmp sibling → os.replace at the very end, so the
+    # previous composed output is never absent during the pipeline. If every
+    # step succeeds the old file is atomically replaced; if anything fails
+    # mid-pipeline the old file remains intact (the except block below removes
+    # only the .tmp and any intermediates).
 
     layers_applied: list[str] = []
 
@@ -624,8 +670,35 @@ async def _compose_layers_impl(
             layers_applied.append("banner")
             logger.info("compose_layers: ✓ banner → %s", os.path.basename(current_input))
 
+        # Atomic final write: copy to a .tmp sibling first, then os.replace into
+        # place. This guarantees the composed file is never absent between the
+        # "start writing" and "done writing" moments — the old version (if any)
+        # remains readable until the very instant the new one is ready.
         if os.path.abspath(current_input) != os.path.abspath(composed_path):
-            shutil.copy2(current_input, composed_path)
+            _tmp_composed = composed_path + ".tmp"
+            try:
+                shutil.copy2(current_input, _tmp_composed)
+                # Windows retry: os.replace can fail with WinError 5
+                # (Access is denied) or WinError 32 (file in use) when
+                # the target is momentarily locked by antivirus, a video
+                # preview, or another concurrent compose in a batch
+                # "Publish all" run. A short backoff absorbs the lock.
+                for _attempt in range(6):
+                    try:
+                        os.replace(_tmp_composed, composed_path)
+                        break
+                    except (PermissionError, OSError) as _replace_exc:
+                        if _attempt == 5:
+                            raise
+                        import time as _t
+                        _t.sleep(0.1 * (2 ** _attempt))
+            except Exception:
+                # Tidy up the .tmp on copy failure so it doesn't linger.
+                try:
+                    os.remove(_tmp_composed)
+                except OSError:
+                    pass
+                raise
 
         logger.info(
             "compose_layers: ✅ final = %s (applied=%s)",
@@ -643,9 +716,13 @@ async def _compose_layers_impl(
         # intermediate we created. Then re-raise the original exception
         # so the endpoint layer can map it to an HTTP error.
         _cleanup_intermediates(intermediate_files, "")
-        if os.path.exists(composed_path):
+        # Remove any stale .tmp from a partial atomic write.
+        _tmp_composed = composed_path + ".tmp"
+        if os.path.exists(_tmp_composed):
             try:
-                os.remove(composed_path)
+                os.remove(_tmp_composed)
             except OSError:
                 pass
+        # Leave the original composed file intact if it exists — the pipeline
+        # failed so the user still has the previous version to download.
         raise

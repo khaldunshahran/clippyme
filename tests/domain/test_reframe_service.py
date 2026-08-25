@@ -16,15 +16,10 @@ import os
 from clippyme.domain import reframe_service
 
 
-class _FakeProc:
-    returncode = 0
+import subprocess
+from unittest.mock import MagicMock
 
-    async def communicate(self):
-        return (b"", None)
-
-
-async def _fake_exec(*cmd, **kwargs):
-    return _FakeProc()
+from clippyme.domain import reframe_service
 
 
 def _run(**kwargs):
@@ -32,7 +27,7 @@ def _run(**kwargs):
 
 
 def test_run_reframe_resolves_title_based_clip_filename(tmp_path, monkeypatch):
-    monkeypatch.setattr(reframe_service.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""))
     job_id = "55555555-5555-4555-8555-555555555555"
     output_root = str(tmp_path)
     job_dir = os.path.join(output_root, job_id)
@@ -58,7 +53,7 @@ def test_run_reframe_resolves_title_based_clip_filename(tmp_path, monkeypatch):
 
 
 def test_run_reframe_legacy_positional_fallback_unchanged(tmp_path, monkeypatch):
-    monkeypatch.setattr(reframe_service.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""))
     job_id = "66666666-6666-4666-8666-666666666666"
     output_root = str(tmp_path)
     job_dir = os.path.join(output_root, job_id)

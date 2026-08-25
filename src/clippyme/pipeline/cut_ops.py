@@ -57,7 +57,8 @@ def flatten_words(transcript: dict | None) -> list[dict]:
     if not transcript:
         return []
     words: list[dict] = []
-    for seg in transcript.get("segments", []) or []:
+    segments = transcript if isinstance(transcript, list) else (transcript.get("segments", []) if isinstance(transcript, dict) else [])
+    for seg in (segments or []):
         for w in seg.get("words", []) or []:
             s = w.get("start")
             e = w.get("end")

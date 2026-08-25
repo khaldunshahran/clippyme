@@ -23,7 +23,7 @@ import { useModalA11y } from './useModalA11y';
 import { clipPreviewSrc } from './realApi';
 import { useManualTrim } from '../hooks/useManualTrim';
 import {
-  ReframeTab, SmartCutTab, TrimTab, CaptionsTab, HookTab, LogoTab, GradeTab, BannerTab,
+  ReframeTab, SmartCutTab, TrimTab, CaptionsTab, HookTab, LogoTab, GradeTab, BannerTab, DubbingTab,
 } from './editTabs';
 import {
   seedSubtitleParams, seedHookParams, seedLogoParams, seedGradeParams, seedBannerParams,
@@ -42,7 +42,7 @@ function pickHookStyle(src) {
 const canonReframe = (m) => (m === 'object' ? 'subject' : (m || 'auto'));
 
 export function EditClipModal({ clip, idx, jobId, initial, appliedMode, preselections, sourceBanner,
-                                bulk = false, targetCount = 0, onClose, onApply }) {
+                                bulk = false, targetCount = 0, onClose, onApply, pushToast }) {
   const t0 = initial?.toggles || {};
   const sp = initial?.subtitleParams || {};
   const pre = preselections || {};
@@ -131,6 +131,7 @@ export function EditClipModal({ clip, idx, jobId, initial, appliedMode, preselec
     { id: 'logo', label: 'Logo', icon: 'stamp' },
     { id: 'grade', label: 'Grade', icon: 'palette' },
     { id: 'banner', label: 'Banner', icon: 'rss' },
+    !bulk && { id: 'dubbing', label: 'Dubbing', icon: 'globe' },
   ].filter(Boolean);
 
   const gradeOn = gradePreset && gradePreset !== 'none';
@@ -221,6 +222,10 @@ export function EditClipModal({ clip, idx, jobId, initial, appliedMode, preselec
             {tab === 'banner' && (
               <BannerTab on={bannerOn} onToggle={setBannerOn} banner={banner}
                 onChange={(partial) => setBanner((b) => ({ ...b, ...partial }))} />
+            )}
+            {tab === 'dubbing' && !bulk && (
+              <DubbingTab jobId={jobId} clipIndex={clip.original_index ?? idx}
+                onDubSuccess={(res) => pushToast?.('success', `Dubbing complete: ${res.dubbed_filename}`)} />
             )}
           </div>
         </div>

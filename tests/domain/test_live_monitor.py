@@ -1179,9 +1179,9 @@ def test_successful_publish_deletes_clip_files_and_empty_dir(tmp_path, monkeypat
     (job_dir / "c_cover.jpg").write_bytes(b"x")
     # Job-dir composed file is now title-based (composed_clip_basename): the
     # clip's title "T" → "T.mp4", not the legacy composed_clip_0.mp4.
-    (job_dir / "T.mp4").write_bytes(b"x")
+    (job_dir / "composed_T_clip_1.mp4").write_bytes(b"x")
     (job_dir / "run_metadata.json").write_text(
-        '{"shorts": [{"video_url": "/videos/job1/c.mp4"}]}')
+        '{"status": "completed", "shorts": [{"video_url": "/videos/job1/c.mp4"}]}')
     monitor_dir = tmp_path / "monitor_kick_chan"
     monitor_dir.mkdir()
     composed = monitor_dir / "Title.mp4"

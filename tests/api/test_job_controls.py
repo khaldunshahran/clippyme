@@ -38,12 +38,11 @@ class FakeProc:
         return 0
 
 
+import clippyme.domain.job_control as domain_job_control
+
 @pytest.fixture
 def client(monkeypatch):
     # Neutralise the psutil tree calls — return a fixed count, touch nothing.
-    monkeypatch.setattr(app_module.job_control, "suspend_tree", lambda pid: 1)
-    monkeypatch.setattr(app_module.job_control, "resume_tree", lambda pid: 1)
-
     def terminate_tree(pid, timeout=5):
         for job in app_module.jobs.values():
             proc = job.get("process")
@@ -53,7 +52,12 @@ def client(monkeypatch):
                 return 1
         return 0
 
+    monkeypatch.setattr(domain_job_control, "suspend_tree", lambda pid: 1)
+    monkeypatch.setattr(domain_job_control, "resume_tree", lambda pid: 1)
+    monkeypatch.setattr(domain_job_control, "terminate_tree", terminate_tree)
     monkeypatch.setattr(app_module.job_control, "terminate_tree", terminate_tree)
+    monkeypatch.setattr(job_runner_module.job_control, "terminate_tree", terminate_tree)
+    monkeypatch.setattr("clippyme.domain.watchdog.on_job_failed", lambda *a, **k: asyncio.sleep(0))
     app_module.jobs.pop(JOB_ID, None)
     yield TestClient(app_module.app, headers=ORIGIN)
     app_module.jobs.pop(JOB_ID, None)
@@ -146,7 +150,7 @@ def test_cancel_queued_job_still_allowed(client):
     assert app_module.jobs[JOB_ID]["status"] == "cancelled"
 
 
-def test_run_job_kills_orphan_on_unexpected_error(monkeypatch):
+def test_run_job_kills_orphan_on_unexpected_error(client, monkeypatch):
     """A crash inside run_job's loop must not leave the subprocess running.
 
     load_partial_result raising a non-(OSError/JSONDecodeError/ValueError)
@@ -168,6 +172,7 @@ def test_run_job_kills_orphan_on_unexpected_error(monkeypatch):
     monkeypatch.setattr(job_runner_module.subprocess, "Popen", lambda *a, **k: proc)
     monkeypatch.setattr(job_runner_module, "load_partial_result", boom)
     monkeypatch.setattr(job_runner_module.asyncio, "sleep", instant_sleep)
+    monkeypatch.setattr(job_runner_module, "enqueue_output", lambda *a, **k: None)
 
     app_module.jobs[JOB_ID] = {
         "status": "queued", "logs": [],
@@ -226,3 +231,58 @@ def test_delete_history_terminal_job_removes_output_and_upload(client, monkeypat
     assert not job_dir.exists()
     assert not upload.exists()
     assert JOB_ID not in app_module.jobs
+
+
+def test_retry_failed_job_resumes(client, monkeypatch, tmp_path):
+    output_root = tmp_path / "output"
+    job_dir = output_root / JOB_ID
+    job_dir.mkdir(parents=True)
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", str(output_root))
+    monkeypatch.setattr(app_module, "persist_jobs", lambda: None)
+
+    app_module.jobs[JOB_ID] = {
+        "status": "failed",
+        "logs": ["Error: network dropped"],
+        "cmd": ["python", "-m", "clippyme.pipeline.orchestrator", "-u", "https://youtu.be/xyz", "-o", str(job_dir)],
+        "env": {"GEMINI_API_KEY": "fake_key"},
+        "output_dir": str(job_dir),
+    }
+
+    res = client.post(f"/api/retry/{JOB_ID}")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["success"] is True
+    assert data["status"] == "queued"
+    assert app_module.jobs[JOB_ID]["status"] == "queued"
+    assert any("Retry requested" in log for log in app_module.jobs[JOB_ID]["logs"])
+
+
+def test_retry_reconstructs_from_disk(client, monkeypatch, tmp_path):
+    import json
+    output_root = tmp_path / "output"
+    job_dir = output_root / JOB_ID
+    job_dir.mkdir(parents=True)
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", str(output_root))
+    monkeypatch.setattr(app_module, "persist_jobs", lambda: None)
+
+    # Empty in-memory state
+    app_module.jobs.pop(JOB_ID, None)
+
+    # Disk runtime checkpoint
+    runtime_file = job_dir / ".clippyme_runtime.json"
+    runtime_file.write_text(json.dumps({
+        "job_id": JOB_ID,
+        "artifacts": {
+            "source_url": "https://youtu.be/disk_test",
+        }
+    }), encoding="utf-8")
+
+    res = client.post(f"/api/retry/{JOB_ID}", headers={"X-Gemini-Key": "test_key", **ORIGIN})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["success"] is True
+    assert data["status"] == "queued"
+    assert JOB_ID in app_module.jobs
+    assert app_module.jobs[JOB_ID]["status"] == "queued"
+    assert "-u" in app_module.jobs[JOB_ID]["cmd"]
+

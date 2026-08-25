@@ -218,7 +218,8 @@ def clip_transcript_segments(transcript, clip_start, clip_end):
     Falls back to the segment-level text/timing when per-word timing is absent.
     """
     out = []
-    for seg in transcript.get("segments", []):
+    segments = transcript if isinstance(transcript, list) else (transcript.get("segments", []) if isinstance(transcript, dict) else [])
+    for seg in segments:
         words = seg.get("words") or []
         in_words = [w for w in words
                     if w.get("end", 0) > clip_start and w.get("start", 0) < clip_end]
@@ -292,8 +293,9 @@ def analyze_silences(transcript, clip_start, clip_end, language=None, drop_range
     fillers, max_ngram = _build_filler_index(lang)
 
     words = []
-    for segment in transcript.get('segments', []):
-        for word_info in segment.get('words', []):
+    segments = transcript if isinstance(transcript, list) else (transcript.get("segments", []) if isinstance(transcript, dict) else [])
+    for segment in segments:
+        for word_info in (segment.get('words') or []):
             if word_info['end'] > clip_start and word_info['start'] < clip_end:
                 words.append({
                     'word': word_info['word'].strip(),
@@ -322,7 +324,7 @@ def analyze_silences(transcript, clip_start, clip_end, language=None, drop_range
                 "manual_drops": len(drops),
                 "segments": len(kept),
             }
-        if not any('words' in s for s in transcript.get('segments', [])):
+        if not any('words' in s for s in segments):
             logger.info("smartcut: transcript has no word-level timestamps; nothing to cut")
         return [], {"error": "No words found in clip range"}
 

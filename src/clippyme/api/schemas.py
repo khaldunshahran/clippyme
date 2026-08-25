@@ -75,9 +75,7 @@ def _validate_timezone(value: Optional[str]) -> Optional[str]:
         try:
             ZoneInfo(normalized)
         except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
-            import re
-            if not re.match(r"^[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*$", normalized):
-                raise ValueError(f"unknown timezone: {normalized!r}") from exc
+            raise ValueError(f"unknown timezone: {normalized!r}") from exc
     except ImportError:  # pragma: no cover - Python 3.11 always has zoneinfo
         pass
     return normalized
@@ -86,7 +84,7 @@ def _validate_timezone(value: Optional[str]) -> Optional[str]:
 class ProcessRequest(BaseModel):
     url: str = Field(..., max_length=2048)
     instructions: Optional[str] = Field(None, max_length=MAX_INSTRUCTIONS_LEN)
-    reframe_mode: Optional[str] = Field(None, pattern=r"^(auto|disabled|subject|object)$")
+    reframe_mode: Optional[str] = Field(None, pattern=r"^(auto|disabled|subject|object|split|screencast)$")
     # Fixed zoom for the letterbox render. 0 (default) = whole frame between
     # the bars; the dashboard sends a percentage (5-15), normalized downstream.
     letterbox_zoom: Optional[float] = Field(None, ge=0, le=15)
@@ -102,6 +100,7 @@ class ProcessRequest(BaseModel):
     min_clips: Optional[int] = Field(None, ge=1, le=50)
     max_clips: Optional[int] = Field(None, ge=1, le=50)
     clip_type: Optional[str] = Field(None, max_length=64)
+    highlights: Optional[bool] = False
 
     @field_validator("url")
     @classmethod
@@ -119,7 +118,7 @@ class ProcessRequest(BaseModel):
 class BatchRequest(BaseModel):
     urls: List[str] = Field(..., min_length=1, max_length=20)
     instructions: Optional[str] = Field(None, max_length=MAX_INSTRUCTIONS_LEN)
-    reframe_mode: Optional[str] = Field(None, pattern=r"^(auto|disabled|subject|object)$")
+    reframe_mode: Optional[str] = Field(None, pattern=r"^(auto|disabled|subject|object|split|screencast)$")
     # Fixed zoom for the letterbox render. 0 (default) = whole frame between
     # the bars; the dashboard sends a percentage (5-15), normalized downstream.
     letterbox_zoom: Optional[float] = Field(None, ge=0, le=15)
@@ -179,7 +178,7 @@ class ConfigUpdateRequest(BaseModel):
 
 
 class ReframeRequest(BaseModel):
-    reframe_mode: Optional[str] = Field(None, pattern=r"^(auto|disabled|subject|object)$")
+    reframe_mode: Optional[str] = Field(None, pattern=r"^(auto|disabled|subject|object|split|screencast)$")
     # Fixed zoom for the letterbox render. 0 (default) = whole frame between
     # the bars; the dashboard sends a percentage (5-15), normalized downstream.
     letterbox_zoom: Optional[float] = Field(None, ge=0, le=15)
@@ -334,6 +333,12 @@ class PublishRequest(BaseModel):
     grade_params: Optional[dict] = None
     banner_params: Optional[dict] = None
     drop_ranges: Optional[list] = None
+    generate_ai_thumbnail: bool = False
+    thumbnail_path: Optional[str] = Field(None, max_length=500)
+    thumbnail_aspect_ratio: str = Field("9:16", pattern=r"^(16:9|9:16|1:1|4:3|3:4)$")
+    thumbnail_prompt: Optional[str] = Field(None, max_length=1000)
+    thumbnail_model: Optional[str] = Field(None, max_length=64)
+    delete_after_publish: Optional[bool] = False
 
     @field_validator("timezone")
     @classmethod

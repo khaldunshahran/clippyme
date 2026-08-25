@@ -20,6 +20,29 @@ def _strip_ass_braces(text: str) -> str:
     return (text or "").replace('{', '').replace('}', '')
 
 
+def extract_segments(transcript):
+    """Extract flat list of segment dicts from transcript, handling any nesting or shape."""
+    if not transcript:
+        return []
+    if isinstance(transcript, dict):
+        if "segments" in transcript and isinstance(transcript["segments"], list):
+            return extract_segments(transcript["segments"])
+        if "transcript" in transcript:
+            return extract_segments(transcript["transcript"])
+        return [transcript]
+    if isinstance(transcript, list):
+        out = []
+        for item in transcript:
+            if isinstance(item, dict) and ("segments" in item or "transcript" in item):
+                out.extend(extract_segments(item))
+            elif isinstance(item, dict):
+                out.append(item)
+            elif isinstance(item, list):
+                out.extend(extract_segments(item))
+        return out
+    return []
+
+
 _cuda_works = None  # cached after first check
 
 def _check_cuda():
@@ -139,11 +162,26 @@ def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, ma
     
     words = []
     # 1. Extract and flatten words within range
-    for segment in transcript.get('segments', []):
-        for word_info in segment.get('words', []):
+    for segment in extract_segments(transcript):
+        for word_info in (segment.get('words') or []):
+            if not isinstance(word_info, dict):
+                continue
+            w_start = word_info.get('start')
+            w_end = word_info.get('end')
+            if w_start is None or w_end is None:
+                continue
+            try:
+                w_start = float(w_start)
+                w_end = float(w_end)
+            except (TypeError, ValueError):
+                continue
             # Check overlap
-            if word_info['end'] > clip_start and word_info['start'] < clip_end:
-                words.append(word_info)
+            if w_end > clip_start and w_start < clip_end:
+                words.append({
+                    'word': str(word_info.get('word', '')),
+                    'start': w_start,
+                    'end': w_end,
+                })
     
     if not words:
         return False
@@ -533,10 +571,25 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
 
     # Extract words in range
     words = []
-    for segment in transcript.get('segments', []):
-        for word_info in segment.get('words', []):
-            if word_info['end'] > clip_start and word_info['start'] < clip_end:
-                words.append(word_info)
+    for segment in extract_segments(transcript):
+        for word_info in (segment.get('words') or []):
+            if not isinstance(word_info, dict):
+                continue
+            w_start = word_info.get('start')
+            w_end = word_info.get('end')
+            if w_start is None or w_end is None:
+                continue
+            try:
+                w_start = float(w_start)
+                w_end = float(w_end)
+            except (TypeError, ValueError):
+                continue
+            if w_end > clip_start and w_start < clip_end:
+                words.append({
+                    'word': str(word_info.get('word', '')),
+                    'start': w_start,
+                    'end': w_end,
+                })
 
     if not words:
         return False
@@ -748,11 +801,11 @@ _HEX_RE = re.compile(r'^#[0-9A-Fa-f]{6}$')
 _FONT_NAME_RE = re.compile(r'^[A-Za-z0-9 _\-]{1,40}$')
 
 
-def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
+def burn_subtitles(video_path, srt_path=None, output_path=None, alignment=2, fontsize=16,
                    font_name="Verdana", font_color="#FFFFFF",
                    border_color="#000000", border_width=2,
                    bg_color="#000000", bg_opacity=0.0, offset_y=0,
-                   h_align="center", pre_vf=None):
+                   h_align="center", pre_vf=None, sub_path=None):
     """
     Burns subtitles into the video using FFmpeg.
     Supports .srt (with force_style) and .ass (native ASS rendering with fontsdir).
@@ -764,6 +817,12 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
     separate grade encode followed by a subtitle encode, one generation cheaper.
     Internal callers only; not user input.
     """
+    srt_path = srt_path or sub_path
+    if not srt_path:
+        raise ValueError("srt_path or sub_path must be provided to burn_subtitles")
+    if not output_path:
+        raise ValueError("output_path must be provided to burn_subtitles")
+
     if not _FONT_NAME_RE.match(font_name):
         raise ValueError(f"invalid font_name: {font_name!r}")
     for label, color in (("font_color", font_color), ("border_color", border_color), ("bg_color", bg_color)):

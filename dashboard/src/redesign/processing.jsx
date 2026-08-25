@@ -30,12 +30,26 @@ function Metric({ label, value, hint }) {
 
 function Operations({ runtime, preflight }) {
   if (!runtime && !preflight) return null;
+  const isAcquiring = runtime?.stage === 'acquiring' || runtime?.stage === 'downloading';
+  const dlPercent = runtime?.download_percent;
+  const dlSpeed = runtime?.download_speed ? String(runtime.download_speed).replace(/_/g, ' ') : null;
+  const dlEta = runtime?.download_eta ? String(runtime.download_eta).replace(/_/g, ' ') : null;
+  const dlBytes = runtime?.download_bytes ? String(runtime.download_bytes).replace(/_/g, ' ') : null;
+
   return <section className="operations" aria-labelledby="operations-title">
     <div className="stream-head"><h3 id="operations-title" aria-level="2">Operations</h3>{runtime?.stage && <Badge tone="out">{runtime.stage}</Badge>}</div>
     <div className="operation-grid">
       <Metric label="attempt" value={runtime?.attempt || '—'} hint="bounded retry" />
       <Metric label="verified clips" value={runtime?.clips || '0/0'} hint="QA passed" />
-      <Metric label="ETA" value={formatEta(runtime?.eta_s)} hint="live estimate" />
+      {isAcquiring && dlPercent !== undefined && dlPercent !== null ? (
+        <Metric
+          label="download"
+          value={`${dlPercent}%`}
+          hint={dlSpeed ? `${dlSpeed}${dlEta ? ` · ETA ${dlEta}` : ''}` : (dlBytes || 'fetching source')}
+        />
+      ) : (
+        <Metric label="ETA" value={formatEta(runtime?.eta_s)} hint="live estimate" />
+      )}
       <Metric label="CPU" value={formatMetric(runtime?.cpu, '%')} />
       <Metric label="job RAM" value={formatMetric(runtime?.rss_mb, ' MB')} />
       <Metric label="disk free" value={formatMetric(runtime?.disk_free_gb, ' GB')} />
@@ -64,11 +78,25 @@ export function ProcessingView({ media, status, logs = [], step, clips = [], onC
   const effectiveStep = runtime?.stage || step;
   const info = STEP_INFO[effectiveStep] || STEP_INFO.queued;
   const reportedProgress = Number(runtime?.progress);
-  const pct = failed ? 100 : Number.isFinite(reportedProgress) ? Math.min(100, Math.max(0, reportedProgress)) : Math.min(96, info.pct + Math.min(18, clips.length * 3));
+  const dlPct = Number(runtime?.download_percent);
+  const isAcquiring = (effectiveStep === 'acquiring' || effectiveStep === 'downloading');
+  const pct = failed
+    ? 100
+    : isAcquiring && Number.isFinite(dlPct) && dlPct > 0
+    ? Math.min(18, Math.max(2, Math.round(dlPct * 0.18)))
+    : Number.isFinite(reportedProgress)
+    ? Math.min(100, Math.max(0, reportedProgress))
+    : Math.min(96, info.pct + Math.min(18, clips.length * 3));
   const activeIdx = clips.length > 0 ? Math.max(info.idx, 4) : info.idx;
   const sourceLabel = media?.type === 'url' ? media.payload : (media?.payload?.name || media?.payload || 'your video');
   const words = { queued: 'queued', acquiring: 'fetching', downloading: 'fetching', preflight: 'checking capacity', transcribing: 'transcribing', analyzing: 'scoring', cutting: 'cutting', reframing: 'rendering', quality: 'verifying', finalizing: 'finalizing', processing: 'rendering', completed: 'complete' };
-  const phase = failed ? 'failed' : paused ? 'paused' : (words[effectiveStep] || (clips.length > 0 ? 'rendering' : 'working'));
+  const phase = failed
+    ? 'failed'
+    : paused
+    ? 'paused'
+    : isAcquiring && Number.isFinite(dlPct) && dlPct > 0
+    ? `downloading ${dlPct}%`
+    : (words[effectiveStep] || (clips.length > 0 ? 'rendering' : 'working'));
   const metaOverride = pipelineStepMeta(logs, { ...opts, mediaType: media?.type });
 
   return <main className="container fade-in">

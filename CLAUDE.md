@@ -10,6 +10,19 @@ ClippyMe is a self-hosted AI video platform that turns long-form videos
 Backend: FastAPI + a subprocess video pipeline. Frontend: React 18 + Vite 6 +
 Tailwind v4.
 
+## Strict Port Allocation & Project Boundary Policy
+
+⚠️ **MANDATORY RULES FOR ALL AGENTS WORKING IN THIS REPOSITORY**:
+1. **Never touch or interfere with other repositories/processes** (e.g. `D:\reddit\` or port `8002`). This repository is strictly confined to `D:\clippyme\clippyme\`.
+2. **Dedicated Locked Project Ports**:
+   - **Frontend UI (Vite)**: Strictly locked to port **`5175`** (`http://localhost:5175`, `strictPort: true`). Never switch ports or use 5173/5174/5176.
+   - **Backend API Service (FastAPI)**: Strictly locked to port **`8000`** (`http://127.0.0.1:8000`).
+   - **Downloader Microservice (yt-dlp)**: Strictly locked to port **`8001`** (`http://127.0.0.1:8001`).
+3. **Execution Commands**:
+   - Frontend: `npm run dev` in `dashboard/` (binds strictly to port `5175`).
+   - Backend API: `.\.venv\Scripts\python.exe -m uvicorn clippyme.api.app:app --host 127.0.0.1 --port 8000`
+   - Downloader: `.\.venv\Scripts\python.exe -m uvicorn clippyme.services.downloader_api:app --host 127.0.0.1 --port 8001`
+
 ## Repo layout
 
 Python backend is src-layout under `src/clippyme/` (`pip install -e .`):

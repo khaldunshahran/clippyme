@@ -11,6 +11,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    encoding="utf-8",
 )
 logger = logging.getLogger("clippyme")
 
@@ -71,6 +72,10 @@ from clippyme.storage.config_store import (
 from clippyme.domain.job_worker import make_workers
 from clippyme.domain.history_service import scan_history, is_valid_job_id
 from clippyme.api.config_routes import router as config_router
+from clippyme.api.dubbing_routes import router as dubbing_router
+from clippyme.api.studio_routes import router as studio_router
+from clippyme.api.ugc_routes import router as ugc_router
+from clippyme.api.highlight_routes import router as highlight_router
 
 load_dotenv()
 
@@ -303,6 +308,10 @@ app.mount("/fonts", StaticFiles(directory="fonts"), name="fonts")
 # router — they touch none of the job runtime state, so keeping them out of
 # app.py lets this module stay focused on the job lifecycle.
 app.include_router(config_router)
+app.include_router(dubbing_router)
+app.include_router(studio_router)
+app.include_router(ugc_router)
+app.include_router(highlight_router)
 
 
 @app.get("/")
@@ -324,10 +333,12 @@ async def process_endpoint(
     require_trusted_config_request(request)
     # ~20 single-job submissions/min per client; compute-heavy, so throttle.
     enforce_rate_limit(request, "process", capacity=20, refill_per_sec=20 / 60)
-    api_key = request.headers.get("X-Gemini-Key") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        persisted = await asyncio.to_thread(load_persistent_config)
-        api_key = persisted.get("GEMINI_API_KEY")
+    persisted = await asyncio.to_thread(load_persistent_config)
+    api_key = (
+        request.headers.get("X-Gemini-Key")
+        or (persisted.get("GEMINI_API_KEY") if persisted else None)
+        or os.environ.get("GEMINI_API_KEY")
+    )
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
@@ -344,6 +355,12 @@ async def process_endpoint(
     no_zoom = False
     skip_analysis = False
     model = None
+    min_duration = None
+    max_duration = None
+    min_clips = None
+    max_clips = None
+    clip_type = None
+    highlights = False
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         try:
@@ -367,6 +384,7 @@ async def process_endpoint(
         min_clips = validated.min_clips
         max_clips = validated.max_clips
         clip_type = validated.clip_type
+        highlights = bool(validated.highlights)
 
     # For multipart/form-data uploads, extract reframe_mode + language from form fields
     if "multipart/form-data" in content_type:
@@ -387,6 +405,7 @@ async def process_endpoint(
         min_clips = int(form["min_clips"]) if form.get("min_clips") else min_clips
         max_clips = int(form["max_clips"]) if form.get("max_clips") else max_clips
         clip_type = form.get("clip_type", clip_type) or None
+        highlights = str(form.get("highlights", "")).lower() in {"1", "true", "yes"} or highlights
         # Validate the multipart values through the same schema for
         # consistency — we drop the url requirement since we're using
         # an uploaded file path.
@@ -406,6 +425,7 @@ async def process_endpoint(
                 "min_clips": min_clips,
                 "max_clips": max_clips,
                 "clip_type": clip_type,
+                "highlights": highlights,
             })
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=exc.errors())
@@ -454,6 +474,10 @@ async def process_endpoint(
             except FileNotFoundError:
                 pass
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        # Keep uploaded file available for highlights extraction
+        if highlights:
+            dest_input = os.path.join(job_output_dir, f"source_{job_id}{raw_ext}")
+            shutil.copyfile(input_path, dest_input)
 
     try:
         cmd = build_main_cmd(
@@ -474,6 +498,7 @@ async def process_endpoint(
             min_clips=min_clips,
             max_clips=max_clips,
             clip_type=clip_type,
+            highlights=highlights,
         )
     except ValueError as exc:
         await asyncio.to_thread(shutil.rmtree, job_output_dir, True)
@@ -500,10 +525,12 @@ async def batch_process(req: BatchRequest, request: Request):
     require_trusted_config_request(request)
     # Each batch can enqueue up to 20 jobs, so limit batch calls more tightly.
     enforce_rate_limit(request, "batch", capacity=10, refill_per_sec=10 / 60)
-    api_key = request.headers.get("X-Gemini-Key") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        persisted = await asyncio.to_thread(load_persistent_config)
-        api_key = persisted.get("GEMINI_API_KEY")
+    persisted = await asyncio.to_thread(load_persistent_config)
+    api_key = (
+        request.headers.get("X-Gemini-Key")
+        or (persisted.get("GEMINI_API_KEY") if persisted else None)
+        or os.environ.get("GEMINI_API_KEY")
+    )
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
@@ -590,6 +617,34 @@ async def get_status(job_id: str):
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
     if job_id not in jobs:
+        # Resilient fallback: look up state from output directory on disk
+        job_dir = os.path.join(OUTPUT_DIR, job_id)
+        if os.path.isdir(job_dir):
+            runtime_path = os.path.join(job_dir, ".clippyme_runtime.json")
+            if os.path.isfile(runtime_path):
+                try:
+                    with open(runtime_path, "r", encoding="utf-8") as f:
+                        rt_data = json.load(f)
+                    status = "complete" if rt_data.get("completed_at") else (
+                        "failed" if rt_data.get("failed_at") else "processing"
+                    )
+                    return {
+                        "status": status,
+                        "logs": rt_data.get("logs", []),
+                        "result": rt_data.get("artifacts"),
+                    }
+                except Exception:
+                    pass
+            try:
+                files = os.listdir(job_dir)
+                if files:
+                    return {
+                        "status": "complete",
+                        "logs": ["Job loaded from storage"],
+                        "result": {},
+                    }
+            except Exception:
+                pass
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
@@ -682,6 +737,36 @@ async def stop_job(job_id: str, request: Request):
     finally:
         persist_jobs()
 
+
+@app.post("/api/retry/{job_id}")
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job_endpoint(job_id: str, request: Request):
+    """Resume and retry a failed or interrupted job directly from its latest checkpoints."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+
+    persisted = await asyncio.to_thread(load_persistent_config)
+    api_key = (
+        request.headers.get("X-Gemini-Key")
+        or (persisted.get("GEMINI_API_KEY") if persisted else None)
+        or os.environ.get("GEMINI_API_KEY")
+    )
+
+    from clippyme.domain.job_submission import retry_job_action
+    try:
+        return await retry_job_action(
+            jobs=jobs,
+            job_queue=job_queue,
+            job_id=job_id,
+            output_root=OUTPUT_DIR,
+            api_key=api_key,
+            on_change=persist_jobs,
+        )
+    except (NotFoundError, ValidationError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
 @app.post("/api/smartcut/{job_id}/{clip_index}")
 async def smart_cut_clip(job_id: str, clip_index: int, request: Request):
     """Generate a smart-cut version of a clip (silences + filler words removed)."""
@@ -737,7 +822,7 @@ async def clip_transcript(job_id: str, clip_index: int, request: Request):
     return {
         "segments": segments,
         "duration": round(max(0.0, end - start), 3),
-        "language": transcript.get("language", "en"),
+        "language": transcript.get("language", "en") if isinstance(transcript, dict) else "en",
     }
 
 
@@ -811,7 +896,7 @@ async def generate_clip_metadata_endpoint(
 
     cfg = load_persistent_config() or {}
     key = api_key or os.environ.get("GEMINI_API_KEY") or cfg.get("GEMINI_API_KEY")
-    model = req.model or cfg.get("GEMINI_MODEL") or "gemini-2.5-flash"
+    model = req.model or cfg.get("GEMINI_LITE_MODEL") or "gemini-2.5-flash-lite"
     if not key:
         raise HTTPException(status_code=400, detail="Gemini API key not configured")
 
@@ -845,8 +930,8 @@ async def reframe_clip(job_id: str, clip_index: int, req: ReframeRequest, reques
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job_id")
     mode = (req.reframe_mode or "auto").strip().lower()
-    if mode not in ("auto", "disabled", "subject", "object"):
-        raise HTTPException(status_code=400, detail="reframe_mode must be 'auto', 'subject', or 'disabled'")
+    if mode not in ("auto", "disabled", "subject", "object", "split", "screencast"):
+        raise HTTPException(status_code=400, detail="reframe_mode must be 'auto', 'subject', 'disabled', 'split', or 'screencast'")
     # 'object' is the legacy name for 'subject' — normalize so the subprocess
     # argv + metadata are written with the canonical value.
     mode = canonical_reframe_mode(mode)
@@ -866,6 +951,14 @@ async def list_history(request: Request):
     """Scan output/ for past jobs with metadata files."""
     require_trusted_config_request(request)
     return {"jobs": await asyncio.to_thread(scan_history, OUTPUT_DIR)}
+
+@app.post("/api/storage/cleanup")
+async def trigger_storage_cleanup(request: Request):
+    """Run manual storage cleanup pass: purges partial downloads, failed job assets, and published clip videos."""
+    require_trusted_config_request(request)
+    from clippyme.domain.job_artifacts import run_storage_cleanup
+    res = await asyncio.to_thread(run_storage_cleanup, OUTPUT_DIR)
+    return res
 
 @app.delete("/api/history/{job_id}")
 async def delete_history(job_id: str, request: Request):

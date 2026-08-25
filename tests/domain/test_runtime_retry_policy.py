@@ -43,6 +43,7 @@ def _patch_runner_dependencies(monkeypatch, module):
     # the shared module also replaces the implementation used by
     # asyncio.to_thread's executor, which deadlocks before the worker starts.
     monkeypatch.setattr(module, "enqueue_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr("clippyme.domain.watchdog.on_job_failed", lambda *args, **kwargs: asyncio.sleep(0))
 
 
 def test_transient_failure_retries_to_limit(monkeypatch, tmp_path):
@@ -77,7 +78,11 @@ def test_exit_two_never_retries(monkeypatch, tmp_path):
         calls.append(kwargs["env"]["CLIPPYME_ATTEMPT"])
         return _FinishedProcess(2)
 
+    async def no_sleep(_seconds):
+        return None
+
     monkeypatch.setattr(job_runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(job_runner.asyncio, "sleep", no_sleep)
     jobs = {"j": {
         "status": "queued", "logs": [], "cmd": ["python", "-m", "x"],
         "env": {}, "output_dir": str(tmp_path), "max_attempts": 5,

@@ -7,6 +7,12 @@ phase checkpoints, per-clip resume, preflight, QA and operational progress.
 """
 from __future__ import annotations
 
+import sys
+if sys.stdout is not None:
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr is not None:
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import argparse
 import hashlib
 import json
@@ -181,6 +187,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-clips", type=int, default=None)
     parser.add_argument("--max-clips", type=int, default=None)
     parser.add_argument("--clip-type", type=str, default=None)
+    parser.add_argument("--highlights", action="store_true", help="Generate full-video multi-tier highlight reels")
     return parser.parse_args(argv)
 
 
@@ -267,6 +274,17 @@ def _prepare_input(args: argparse.Namespace, output_dir: str, state: RuntimeStat
     else:
         prior = _safe_output_artifact(state.artifact("input_video"), output_dir)
         same_url = state.artifact("source_url") == args.url
+        if not _valid_file(prior, 10_000):
+            for candidate in os.listdir(output_dir):
+                full_c = os.path.join(output_dir, candidate)
+                if (
+                    candidate.endswith(".mp4")
+                    and not candidate.startswith("clip_")
+                    and not candidate.startswith("source_clip_")
+                    and _valid_file(full_c, 10_000)
+                ):
+                    prior = full_c
+                    break
         if state.completed("acquiring") and same_url and _valid_file(prior, 10_000):
             input_video = prior
             video_title = str(state.artifact("video_title") or Path(prior).stem)
@@ -553,6 +571,20 @@ def _render_one_clip(
         progress=62 + int(index / max(1, total) * 8),
     )
     if not _valid_file(clip_source, 10_000):
+        if not _valid_file(input_video, 10_000):
+            for candidate in os.listdir(output_dir):
+                full_c = os.path.join(output_dir, candidate)
+                if (
+                    candidate.endswith(".mp4")
+                    and not candidate.startswith("clip_")
+                    and not candidate.startswith("source_clip_")
+                    and _valid_file(full_c, 10_000)
+                ):
+                    input_video = full_c
+                    print(f"♻️ Re-linked source video: {os.path.basename(input_video)}", flush=True)
+                    break
+        if not _valid_file(input_video, 10_000):
+            raise FileNotFoundError(f"Input source video file not found on disk: {input_video}")
         command = build_cut_command(input_video, start, end, clip_source)
         print(f"✂️ Clip {index + 1}/{total}: {start:.2f}s → {end:.2f}s", flush=True)
         process = subprocess.run(
@@ -695,6 +727,25 @@ def run(argv: list[str] | None = None) -> int:
         input_video, video_title = _prepare_input(args, output_dir, state, legacy)
         _preflight, duration = _run_preflight(args, input_video, output_dir, state, legacy)
         transcript = _load_or_transcribe(args, input_video, state, legacy)
+        if getattr(args, "highlights", False):
+            state.start("analyzing", "AI scoring viral moments across full video", progress=55)
+            from clippyme.domain.highlight_service import generate_multi_tier_highlights_sync
+            output_root = os.path.dirname(output_dir) or "output"
+            job_id = os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir)
+            print("✨ Synthesizing full-video multi-tier highlight reels...", flush=True)
+            res = generate_multi_tier_highlights_sync(
+                job_id=job_id,
+                aspect=args.aspect,
+                reframe_mode=args.reframe_mode,
+                output_root=output_root,
+                model_name=args.model,
+            )
+            hl_list = res.get("highlights", [])
+            state.start("finalizing", f"completed {len(hl_list)} highlight reels", progress=98)
+            state.finish(f"completed: {len(hl_list)} highlight reels ready")
+            print(f"🎉 Generated {len(hl_list)} multi-tier highlight reels for full video in {time.time() - started:.2f}s", flush=True)
+            return 0
+
         clips_data, metadata_file = _load_or_analyze(
             args,
             input_video,
@@ -778,6 +829,12 @@ def run(argv: list[str] | None = None) -> int:
         state.fail(str(exc), resumable=True)
         logger.exception("checkpointed pipeline failed")
         print(f"❌ Pipeline failed: {exc}", flush=True)
+        try:
+            from clippyme.domain.job_artifacts import cleanup_failed_job_artifacts
+            j_id = state.data.get("job_id") or os.path.basename(output_dir)
+            cleanup_failed_job_artifacts(j_id, os.path.dirname(output_dir))
+        except Exception:
+            pass
         return 1
 
 

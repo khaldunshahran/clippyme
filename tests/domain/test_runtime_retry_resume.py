@@ -32,6 +32,7 @@ def _patch(monkeypatch, attempts, returncode=1):
     # module internally. Mock only the log-consumer target so the runner's
     # daemon thread exits immediately without touching the executor.
     monkeypatch.setattr(job_runner, "enqueue_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr("clippyme.domain.watchdog.on_job_failed", lambda *args, **kwargs: asyncio.sleep(0))
     monkeypatch.setattr(
         job_runner.subprocess,
         "Popen",

@@ -618,7 +618,7 @@ def _reframe_comfort_enabled() -> bool:
 def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracker,
                           detection_smoother, scene_boundaries, scene_strategies,
                           output_width, output_height, original_width, original_height,
-                          total_frames, fps):
+                          total_frames, fps, split_metadata=None, screen_metadata=None):
     """Two-stage track-then-render reframe (opt-in via REFRAME_GLOBAL_SMOOTH).
 
     Pass 1 decodes the clip and records the raw per-frame camera target
@@ -664,7 +664,7 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                         speaker_tracker.reset(frame_number)
                         detection_smoother.reset()
                 strat = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
-                needs_pixels = strat not in ('DISABLED', 'GENERAL') and frame_number % 2 == 0
+                needs_pixels = strat not in ('DISABLED', 'GENERAL', 'SPLIT', 'SCREENCAST') and frame_number % 2 == 0
                 if needs_pixels:
                     ret, frame = cap.read()
                 else:
@@ -673,7 +673,7 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                     break
                 strategies.append(strat)
                 scene_ids.append(current_scene_index)
-                if strat in ('DISABLED', 'GENERAL'):
+                if strat in ('DISABLED', 'GENERAL', 'SPLIT', 'SCREENCAST'):
                     targets.append(None)
                 else:
                     if needs_pixels:
@@ -760,10 +760,25 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                     break
                 try:
                     strat = strategies[frame_number] if frame_number < len(strategies) else 'TRACK'
+                    current_scene_idx = scene_ids[frame_number] if frame_number < len(scene_ids) else 0
                     if strat == 'DISABLED':
                         output_frame = create_disabled_reframe(frame, output_width, output_height)
                     elif strat == 'GENERAL':
                         output_frame = create_general_frame(frame, output_width, output_height)
+                    elif strat == 'SPLIT':
+                        from clippyme.pipeline.layouts.split_layout import create_split_frame
+                        left_c, right_c = (split_metadata or {}).get(
+                            current_scene_idx,
+                            ((original_width / 2, original_height / 2), (original_width / 2, original_height / 2))
+                        )
+                        output_frame = create_split_frame(frame, output_width, output_height, left_c, right_c)
+                    elif strat == 'SCREENCAST':
+                        from clippyme.pipeline.layouts.screencast_layout import create_screencast_frame
+                        face_c = (screen_metadata or {}).get(
+                            current_scene_idx,
+                            (original_width / 2, original_height / 2)
+                        )
+                        output_frame = create_screencast_frame(frame, output_width, output_height, face_c)
                     else:
                         tgt = smoothed[frame_number] if frame_number < len(smoothed) else None
                         if tgt is None:
@@ -925,15 +940,45 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
                                   aspect_ratio=aspect_ratio)
     
     # --- New Strategy: Per-Scene Analysis ---
+    split_metadata = {}
+    screen_metadata = {}
     if reframe_mode == 'disabled':
         print("\n   🤖 Step 3: Skipping scene analysis (reframe disabled).")
         scene_strategies = ['DISABLED'] * len(scenes)
     elif reframe_mode == 'subject':
         print("\n   🤖 Step 3: Skipping scene analysis (subject mode — every scene is FrameShift face-first cropped).")
         scene_strategies = ['OBJECT'] * len(scenes)
+    elif reframe_mode == 'split':
+        print("\n   🤖 Step 3: Detecting split scenes...")
+        from clippyme.pipeline.layouts.split_layout import detect_split_scenes
+        split_metadata = detect_split_scenes(input_video, scenes)
+        scene_strategies = ['SPLIT'] * len(scenes)
+    elif reframe_mode == 'screencast':
+        print("\n   🤖 Step 3: Detecting screencast scenes...")
+        from clippyme.pipeline.layouts.screencast_layout import detect_screencast_scenes
+        screen_metadata = detect_screencast_scenes(input_video, scenes)
+        scene_strategies = ['SCREENCAST'] * len(scenes)
     else:
-        print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
+        print("\n   🔍 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
         scene_strategies = analyze_scenes_strategy(input_video, scenes)
+
+        print("\n   🔍 Step 3.1: Checking for SPLIT upgrades in WIDE scenes...")
+        from clippyme.pipeline.layouts.split_layout import detect_split_scenes
+        # detect_split_scenes uses the strategies list to only analyze WIDE scenes
+        split_metadata_detected = detect_split_scenes(input_video, scenes, strategies=scene_strategies)
+        for idx in split_metadata_detected:
+            scene_strategies[idx] = 'SPLIT'
+            split_metadata[idx] = split_metadata_detected[idx]
+            print(f"      -> Upgraded scene {idx} to SPLIT")
+            
+        print("\n   🔍 Step 3.2: Checking for SCREENCAST upgrades in GENERAL scenes...")
+        from clippyme.pipeline.layouts.screencast_layout import detect_screencast_scenes
+        screen_metadata_detected = detect_screencast_scenes(input_video, scenes)
+        for idx in screen_metadata_detected:
+            if scene_strategies[idx] == 'GENERAL':
+                scene_strategies[idx] = 'SCREENCAST'
+                screen_metadata[idx] = screen_metadata_detected[idx]
+                print(f"      -> Upgraded scene {idx} to SCREENCAST")
 
     print("\n   ✂️ Step 4: Processing video frames...")
 
@@ -1021,6 +1066,8 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
                 scene_boundaries, scene_strategies,
                 OUTPUT_WIDTH, OUTPUT_HEIGHT,
                 original_width, original_height, total_frames, fps,
+                split_metadata=split_metadata,
+                screen_metadata=screen_metadata,
             )
 
         with tqdm(total=total_frames, desc="   Processing", file=sys.stdout) as pbar:
@@ -1065,6 +1112,15 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
                             frame, OUTPUT_WIDTH, OUTPUT_HEIGHT,
                             smoother=frameshift_smoother,
                         )
+
+                    elif current_strategy == 'SPLIT':
+                        from clippyme.pipeline.layouts.split_layout import create_split_frame
+                        left_c, right_c = split_metadata.get(current_scene_index, ((original_width/2, original_height/2), (original_width/2, original_height/2)))
+                        output_frame = create_split_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT, left_c, right_c)
+                    elif current_strategy == 'SCREENCAST':
+                        from clippyme.pipeline.layouts.screencast_layout import create_screencast_frame
+                        face_c = screen_metadata.get(current_scene_index, (original_width/2, original_height/2))
+                        output_frame = create_screencast_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT, face_c)
 
                     elif current_strategy == 'GENERAL':
                         # No faces detected anywhere in scene → letterbox fallback

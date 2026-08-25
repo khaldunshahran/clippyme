@@ -314,3 +314,63 @@ def test_presigned_upload_dns_failure_is_fail_closed(monkeypatch):
 def test_zernio_client_rejects_non_official_base_url():
     with pytest.raises(ValueError, match="official"):
         sp.ZernioClient("sk_test", base_url="https://attacker.example/api")
+
+
+def test_publish_clip_with_thumbnail_attachment(tmp_path, monkeypatch):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake_video")
+    thumb = tmp_path / "cover.png"
+    thumb.write_bytes(b"fake_cover_png")
+
+    captured_presigns = []
+    captured_uploads = []
+    captured_post = {}
+
+    class FakeClient:
+        def __init__(self, api_key):
+            pass
+
+        def presign_upload(self, filename, content_type="video/mp4", size_bytes=None):
+            captured_presigns.append({"filename": filename, "content_type": content_type})
+            if content_type == "image/png":
+                return {"uploadUrl": "https://upload.example/thumb", "publicUrl": "https://cdn.example/thumb.png"}
+            return {"uploadUrl": "https://upload.example/video", "publicUrl": "https://cdn.example/video.mp4"}
+
+        def upload_to_presigned(self, url, file_path, content_type="video/mp4"):
+            captured_uploads.append({"url": url, "path": file_path, "type": content_type})
+
+        def create_post(self, **kwargs):
+            captured_post.update(kwargs)
+            return {"post": {"id": "post_123", "status": "scheduled", "platforms": ["instagram", "youtube"]}}
+
+    monkeypatch.setattr(sp, "ZernioClient", FakeClient)
+
+    result = sp.publish_clip(
+        api_key="sk_test_key",
+        clip_path=str(clip),
+        title="Epic Video",
+        caption="Check this out!",
+        platform_targets=[
+            {"platform": "instagram", "accountId": "ig_123"},
+            {"platform": "youtube", "accountId": "yt_123"},
+        ],
+        schedule_mode="now",
+        thumbnail_path=str(thumb),
+    )
+
+    assert result["post_id"] == "post_123"
+    assert result["thumbnail_url"] == "https://cdn.example/thumb.png"
+    assert len(captured_presigns) == 2
+    assert captured_presigns[0]["content_type"] == "image/png"
+    assert captured_presigns[1]["content_type"] == "video/mp4"
+    assert len(captured_uploads) == 2
+
+    # Check that platform targets got platformSpecificData with thumbnail URLs
+    platforms = captured_post["platforms"]
+    ig_target = next(p for p in platforms if p["platform"] == "instagram")
+    yt_target = next(p for p in platforms if p["platform"] == "youtube")
+    assert ig_target["platformSpecificData"]["instagramThumbnail"] == "https://cdn.example/thumb.png"
+    assert ig_target["platformSpecificData"]["reelCover"] == "https://cdn.example/thumb.png"
+    assert yt_target["platformSpecificData"]["thumbnailUrl"] == "https://cdn.example/thumb.png"
+    assert captured_post["media_items"][0]["thumbnailUrl"] == "https://cdn.example/thumb.png"
+

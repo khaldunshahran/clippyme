@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from typing import Any, Callable, Dict, Optional
 
 import httpx
@@ -143,6 +144,10 @@ class TelegramBotListener:
                 await self._handle_diagnose(token, chat_id)
                 return
 
+            if lower == "/restart":
+                await self._handle_restart(token, chat_id)
+                return
+
             # Check if user sent a video URL to clip
             url_match = YOUTUBE_TWITCH_REGEX.search(text)
             if url_match:
@@ -170,7 +175,8 @@ class TelegramBotListener:
             "• `/status` — View running jobs and queue status\n"
             "• `/history` — List recent videos and clips\n"
             "• `/retry` — Re-run the last failed job\n"
-            "• `/diagnose` — Ask AI to diagnose the latest error\n\n"
+            "• `/diagnose` — Ask AI to diagnose the latest error\n"
+            "• `/restart` — Restart the frontend and backend services\n\n"
             "💬 *AI Chat*\n"
             "Ask me anything about your clips, errors, caption settings, or video editing tips!"
         )
@@ -264,6 +270,21 @@ class TelegramBotListener:
         await self.job_queue.put(jid)
         await send_telegram(token, chat_id, text=f"🔄 *Job `{jid[:8]}` re-queued successfully!*")
 
+    async def _handle_restart(self, token: str, chat_id: str) -> None:
+        """Restarts the clippyme-frontend and clippyme-backend docker containers."""
+        await send_telegram(token, chat_id, text="🔄 *Restarting frontend and backend...* I will be back online shortly.")
+        
+        # Fire and forget frontend restart
+        subprocess.Popen(
+            ["curl", "-s", "--unix-socket", "/var/run/docker.sock", "-X", "POST", "http://localhost/containers/clippyme-frontend/restart"]
+        )
+        # Yield to event loop to ensure the message is sent
+        await asyncio.sleep(1)
+        # Fire and forget backend restart (which will terminate this bot instance)
+        subprocess.Popen(
+            ["curl", "-s", "--unix-socket", "/var/run/docker.sock", "-X", "POST", "http://localhost/containers/clippyme-backend/restart"]
+        )
+
     async def _handle_video_url(self, token: str, chat_id: str, url: str) -> None:
         import uuid
         from clippyme.domain.job_results import build_main_cmd
@@ -335,10 +356,11 @@ class TelegramBotListener:
             try:
                 from google import genai
                 from google.genai import types
+                from clippyme.pipeline.gemini_service import get_auxiliary_gemini_model
 
                 client = genai.Client(api_key=api_key)
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model=get_auxiliary_gemini_model(),
                     contents=f"{system_instruction}\n\nUser Question:\n{prompt}",
                     config=types.GenerateContentConfig(
                         temperature=0.7,

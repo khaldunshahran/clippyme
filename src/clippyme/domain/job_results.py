@@ -61,6 +61,7 @@ def build_main_cmd(
     min_clips: int | None = None,
     max_clips: int | None = None,
     clip_type: str | None = None,
+    highlights: bool = False,
 ) -> list[str]:
     """Build argv for the checkpointed backend pipeline.
 
@@ -137,6 +138,8 @@ def build_main_cmd(
         cmd.extend(["--max-clips", str(int(max_clips))])
     if clip_type and clip_type.strip():
         cmd.extend(["--clip-type", clip_type.strip()])
+    if highlights:
+        cmd.append("--highlights")
     return cmd
 
 
@@ -148,7 +151,8 @@ def _build_clips(data: dict, base_name: str, job_id: str, output_dir: str, only_
 
         transcript = data.get("transcript") or {}
         words = []
-        for segment in transcript.get("segments", []) or []:
+        segments = transcript if isinstance(transcript, list) else (transcript.get("segments", []) if isinstance(transcript, dict) else [])
+        for segment in (segments or []):
             for word in segment.get("words", []) or []:
                 words.append({
                     "w": word.get("word", ""),
@@ -170,16 +174,21 @@ def _build_clips(data: dict, base_name: str, job_id: str, output_dir: str, only_
         if only_ready and not exists:
             continue
         clip["video_url"] = f"/videos/{job_id}/{clip_filename}"
+        composed_filename = f"composed_{clip_filename}"
+        composed_path = os.path.join(output_dir, composed_filename)
+        if os.path.exists(composed_path) and os.path.getsize(composed_path) > 0:
+            clip["composed_video_url"] = f"/videos/{job_id}/{composed_filename}"
         clip["original_index"] = index
         result.append(clip)
     return result
 
 
 def _pick_latest_metadata(output_dir: str) -> str | None:
-    """Return the most-recently-modified ``*_metadata.json`` path."""
+    """Return the most-recently-modified ``*_metadata.json`` path, falling back to ``metadata.json``."""
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
-        return None
+        fallback = os.path.join(output_dir, "metadata.json")
+        return fallback if os.path.isfile(fallback) else None
     try:
         json_files.sort(key=lambda path: os.path.getmtime(path), reverse=True)
     except OSError:
@@ -190,6 +199,7 @@ def _pick_latest_metadata(output_dir: str) -> str | None:
 def _result_payload(data: dict, clips: list, output_dir: str) -> dict:
     payload = {
         "clips": clips,
+        "highlights": data.get("highlights", []),
         "cost_analysis": data.get("cost_analysis"),
         "source_info": data.get("source_info"),
     }

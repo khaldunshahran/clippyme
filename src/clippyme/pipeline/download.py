@@ -97,12 +97,28 @@ def _reject_rebound_internal(url: str) -> None:
         return
 
 
-def sanitize_filename(filename):
-    """Remove invalid characters from filename."""
-    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-    filename = filename.replace(' ', '_')
-    filename = filename.lstrip('-.')
-    return filename[:100] or 'video'
+def sanitize_filename(filename: str) -> str:
+    """Remove invalid and problematic unicode/Windows characters from filename."""
+    if not filename:
+        return "video"
+    mapped = (
+        filename.replace("｜", "")
+        .replace("：", "")
+        .replace("／", "")
+        .replace("＼", "")
+        .replace("？", "")
+        .replace("＊", "")
+        .replace("＜", "")
+        .replace("＞", "")
+        .replace("“", "")
+        .replace("”", "")
+        .replace("‘", "")
+        .replace("’", "")
+        .replace("'", "")
+    )
+    cleaned = re.sub(r'[<>:"/\\|?*#%\x00-\x1f]', "", mapped)
+    cleaned = re.sub(r"\s+", "_", cleaned).lstrip("-.")
+    return cleaned[:100] or "video"
 
 
 def _resolve_cookies_path(explicit: str | None) -> str | None:
@@ -134,9 +150,10 @@ def _resolve_cookies_path(explicit: str | None) -> str | None:
 # never have to transcode VP9/AV1; the generic tail stops AV1/VP9-only serves
 # from hard-failing when no avc1 rendition exists.
 _FORMAT_LADDER = (
-    'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/'
-    'bestvideo[vcodec^=avc1]+bestaudio/'
-    'best[ext=mp4]/bestvideo*+bestaudio/best'
+    'bestvideo[vcodec^=avc1][height>=720][height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+    'bestvideo[height>=720][height<=1080]+bestaudio/'
+    'bestvideo[height<=1080]+bestaudio/'
+    'best'
 )
 
 # Player-client fallback chain (bot-resistant mobile/VR clients first).
@@ -203,7 +220,7 @@ def classify_download_error(msg: str) -> str:
     )
     if any(s in m for s in retry_signals):
         return "retry"
-    return "retry"
+    return "fatal"
 
 
 SOURCE_INFO_FILENAME = "source_info.json"
@@ -235,146 +252,52 @@ def _write_source_info(output_dir, info):
 
 
 def download_youtube_video(url, output_dir=".", cookies_file_path=None):
-    """Download a supported remote source with yt-dlp.
+    """Download a supported remote source by calling the downloader microservice."""
+    import httpx
 
-    Returns the downloaded path and sanitized title. Both metadata extraction
-    and the actual download use the same player-client attempt.
-    """
     url = validate_supported_source_url(url)
     _reject_rebound_internal(url)
-    print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
-    print("📥 Downloading remote video...")
+    print("📥 Calling Downloader Microservice...")
     step_start_time = time.time()
 
-    cookies_path = _resolve_cookies_path(cookies_file_path)
-    if cookies_path:
-        print(f"🍪 Using cookies file: {cookies_path}")
-    else:
-        print("⚠️ No cookies file found.")
+    # We pass absolute path for output_dir because the microservice shares the filesystem
+    abs_output_dir = os.path.abspath(output_dir)
+    abs_cookies_file_path = os.path.abspath(cookies_file_path) if cookies_file_path else None
 
-    # Build matrix of attempts:
-    # Android client without cookies is the fastest and most reliable on YouTube (bypasses bot blocks and PO token requirements).
-    attempts = [
-        ("android", False),
-        ("android_vr", False),
-        ("ios", False),
-        ("mweb", False),
-    ]
-    if cookies_path:
-        attempts.extend([
-            ("web_safari", True),
-            ("default", True),
-        ])
-    attempts.extend([
-        ("web_safari", False),
-        ("default", False),
-    ])
-
-    ydl_verbose = os.environ.get('YTDLP_VERBOSE') == '1'
-    base_ydl_opts = {
-        'quiet': not ydl_verbose,
-        'verbose': ydl_verbose,
-        'no_warnings': False,
-        'socket_timeout': 30,
-        'retries': 10,
-        'fragment_retries': 10,
-        'http_chunk_size': 10485760,
-        'nocheckcertificate': os.environ.get('YTDLP_NOCHECKCERT') == '1',
-        'throttledratelimit': int(
-            (os.environ.get('YTDLP_THROTTLED_RATE') or '').strip() or 100 * 1024
-        ),
-        'cachedir': False,
-        'remote_components': ['ejs:github'],
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            ),
-        },
+    payload = {
+        "url": url,
+        "output_dir": abs_output_dir,
+        "cookies_file_path": abs_cookies_file_path,
     }
 
-    last_error = RuntimeError("download attempt chain was empty")
-    for i, (client_name, use_cookies) in enumerate(attempts, 1):
-        extractor_args = _extractor_args_for(client_name)
-        active_cookiefile = cookies_path if (use_cookies and cookies_path) else None
-        attempt_opts = {
-            **base_ydl_opts,
-            'cookiefile': active_cookiefile,
-        }
-        if extractor_args:
-            attempt_opts['extractor_args'] = extractor_args
+    try:
+        with httpx.Client(timeout=3600.0) as client:
+            response = client.post("http://127.0.0.1:8001/download", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            downloaded_file = data["downloaded_file"]
+            sanitized_title = data["sanitized_title"]
 
-        cookie_label = "with cookies" if active_cookiefile else "without cookies"
-        print(f"🔁 Download attempt {i}/{len(attempts)} (player_client: {client_name}, {cookie_label})")
-        try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                video_title = info.get('title', 'remote_video')
-                sanitized_title = sanitize_filename(video_title)
-                _write_source_info(output_dir, info)
+        step_end_time = time.time()
+        print(f"✅ Video downloaded in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
+        return downloaded_file, sanitized_title
+    except httpx.HTTPError as e:
+        print(f"❌ Downloader Microservice failed: {e}")
+        if hasattr(e, "response") and e.response is not None:
+            print(f"Response: {e.response.text}")
 
-            output_template = os.path.join(output_dir, f'{sanitized_title}.%(ext)s')
-            expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
-            if os.path.exists(expected_file):
-                os.remove(expected_file)
-                print("🗑️  Removed existing file to re-download with H.264 codec")
-
-            ydl_opts = {
-                **attempt_opts,
-                'format': _FORMAT_LADDER,
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'overwrites': True,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-
-            downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
-            if not os.path.exists(downloaded_file):
-                for filename in os.listdir(output_dir):
-                    if filename.startswith(sanitized_title) and filename.endswith('.mp4'):
-                        downloaded_file = os.path.join(output_dir, filename)
-                        break
-            if not os.path.isfile(downloaded_file):
-                raise FileNotFoundError("yt-dlp completed without producing an MP4 file")
-
-            step_end_time = time.time()
-            print(
-                f"✅ Video downloaded in {step_end_time - step_start_time:.2f}s: "
-                f"{downloaded_file}"
-            )
-            return downloaded_file, sanitized_title
-        except Exception as exc:
-            last_error = exc
-            kind = classify_download_error(str(exc))
-            if kind == "retry" and i < len(attempts):
-                print(
-                    f"⚠️ Attempt {i} failed ({exc}); "
-                    "trying next configuration in 3s..."
-                )
-                time.sleep(3)
-                continue
-            break
-
-    print("🚨 SOURCE DOWNLOAD ERROR 🚨", file=sys.stderr)
-    error_msg = f"""
-
+        print("🚨 SOURCE DOWNLOAD ERROR 🚨", file=sys.stderr)
+        error_msg = f"""
 ❌ ================================================================= ❌
 ❌ FATAL ERROR: SOURCE DOWNLOAD FAILED
 ❌ ================================================================= ❌
 
 The remote platform refused or could not complete the download.
+Technical Details: {e}
+        """
+        print(error_msg, file=sys.stdout)
+        print(error_msg, file=sys.stderr)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise RuntimeError(f"Downloader microservice failed: {e}")
 
-Suggested workaround:
-1. Download the video manually to your computer.
-2. Use the 'Upload Video' tab in this app to process it.
-
-Technical Details: {last_error}
-    """
-    print(error_msg, file=sys.stdout)
-    print(error_msg, file=sys.stderr)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    time.sleep(0.5)
-    raise last_error

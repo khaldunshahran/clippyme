@@ -13,6 +13,7 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 VALID_CONFIG_KEYS = (
     "GEMINI_API_KEY",
     "GEMINI_MODEL",
+    "GEMINI_LITE_MODEL",
     "YOUTUBE_COOKIES",
     "HF_TOKEN",
     "DEEPGRAM_API_KEY",
@@ -20,6 +21,8 @@ VALID_CONFIG_KEYS = (
     "TRANSCRIPTION_PROVIDER",
     "TWITCH_CLIENT_ID",
     "TWITCH_CLIENT_SECRET",
+    "AUTO_CLEANUP_PUBLISHED",
+    "AUTO_CLEANUP_FAILED",
 )
 ZERNIO_CONFIG_NAMESPACE = "zernio"
 WATCHDOG_CONFIG_NAMESPACE = "watchdog"
@@ -234,6 +237,7 @@ def load_persistent_config() -> dict:
     config = {
         "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY", ""),
         "GEMINI_MODEL": os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
+        "GEMINI_LITE_MODEL": os.environ.get("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite"),
         "YOUTUBE_COOKIES": os.environ.get("YOUTUBE_COOKIES", ""),
         "HF_TOKEN": os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or "",
         "DEEPGRAM_API_KEY": os.environ.get("DEEPGRAM_API_KEY", ""),

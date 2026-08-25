@@ -40,7 +40,7 @@ async def run_smart_cut(
             transcript,
             clip_data["start"],
             clip_data["end"],
-            transcript.get("language", "en"),
+            transcript.get("language", "en") if isinstance(transcript, dict) else "en",
             drop_ranges,
         )
         if result_path is None:

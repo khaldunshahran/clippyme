@@ -4,11 +4,11 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port 5175 --strictPort",
     "build": "vite build",
     "test": "vitest run",
     "lint": "eslint . --config eslint.a11y.config.js --report-unused-disable-directives --max-warnings 0",
-    "preview": "vite preview"
+    "preview": "vite preview --port 5175 --strictPort"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.2",

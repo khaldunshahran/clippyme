@@ -25,8 +25,14 @@ import { seedToggles, seedHookParams, seedSubtitleParams, seedLogoParams, seedBa
  * @param {object} clip
  */
 export function clipStateToParams(state, preselections, clip) {
+  // baseMode is the clip's CURRENT on-disk reframe mode (identical to reframeMode
+  // here because this function describes current state, not a pending edit).
+  // runApplyEdit uses baseMode to compute reframeChanged — without it, every
+  // "Apply to all" would trigger a spurious reframe subprocess.
+  const currentMode = state?.reframeMode || clip?.reframe_mode || 'auto';
   return {
-    reframeMode: state?.reframeMode || clip?.reframe_mode || 'auto',
+    reframeMode: currentMode,
+    baseMode: currentMode,
     toggles: state?.toggles || seedToggles(preselections),
     subtitleParams: state?.subtitleParams || seedSubtitleParams(preselections),
     hookParams: state?.hookParams || seedHookParams(clip, preselections),

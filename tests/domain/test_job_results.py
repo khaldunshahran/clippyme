@@ -12,8 +12,9 @@ from clippyme.domain.job_results import (
 
 
 def test_url_job_builds_expected_argv():
+    import sys
     cmd = build_main_cmd(url="https://youtu.be/abc", output_dir="output")
-    assert cmd[:4] == ["python", "-u", "-m", "clippyme.pipeline.orchestrator"]
+    assert cmd[:4] == [sys.executable, "-u", "-m", "clippyme.pipeline.orchestrator"]
     assert "-u" in cmd and "https://youtu.be/abc" in cmd
     assert cmd[cmd.index("-o") + 1] == "output"
 

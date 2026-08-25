@@ -42,12 +42,17 @@ export function clipPreviewSrc(clip, state) {
     const b = state.previewBust;
     return b ? `${full}${full.includes('?') ? '&' : '?'}v=${b}` : full;
   }
+  if (clip?.composed_video_url) {
+    const full = safeResolveUrl(clip.composed_video_url);
+    const b = state?.reframeBust;
+    return b ? `${full}${full.includes('?') ? '&' : '?'}v=${b}` : full;
+  }
   return clipVideoSrc(clip, state?.reframeBust);
 }
 
 export function downloadClip(clip, index) {
   const a = document.createElement('a');
-  a.href = safeResolveUrl(clip.video_url || '');
+  a.href = safeResolveUrl(clip.composed_video_url || clip.video_url || '');
   a.download = clipDownloadName(clip, index);
   a.style.display = 'none';
   document.body.appendChild(a);
@@ -515,3 +520,208 @@ export function fmtDuration(start, end) {
   const m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 }
+
+// --- AI Dubbing API ---
+export async function fetchDubbingLanguages() {
+  const res = await apiFetch(getApiUrl('/api/dubbing/languages'));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function dubClip(jobId, clipIndex, targetLanguage, sourceLanguage = null) {
+  const res = await apiFetch(getApiUrl(`/api/dubbing/${jobId}/${clipIndex}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_language: targetLanguage, source_language: sourceLanguage }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// --- YouTube Studio API ---
+export async function fetchViralTitles(transcriptText, language = 'en') {
+  const res = await apiFetch(getApiUrl('/api/studio/titles'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcript_text: transcriptText, language }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function refineViralTitles(context, userInstruction, history = []) {
+  const res = await apiFetch(getApiUrl('/api/studio/titles/refine'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ context, user_instruction: userInstruction, history }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function fetchChapters(segments) {
+  const res = await apiFetch(getApiUrl('/api/studio/chapters'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ segments }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function generateThumbnail(title, videoContext = '', extraPrompt = '', aspectRatio = '16:9', model = null) {
+  const res = await apiFetch(getApiUrl('/api/studio/thumbnail'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title,
+      video_context: videoContext,
+      extra_prompt: extraPrompt,
+      aspect_ratio: aspectRatio,
+      model,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// --- AI Shorts / UGC API ---
+export async function researchProduct(urlOrDescription) {
+  const res = await apiFetch(getApiUrl('/api/ugc/research'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url_or_description: urlOrDescription }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function generateUgcScripts(researchData, targetLanguage = 'en') {
+  const res = await apiFetch(getApiUrl('/api/ugc/scripts'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ research_data: researchData, target_language: targetLanguage }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// --- AI Highlights & Supercut API ---
+export async function planHighlights(jobId, targetDuration = 60, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/plan`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ target_duration: targetDuration }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function generateAllHighlights(jobId, params = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/generate-all`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function applyEditHighlight(jobId, highlightId, params = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/${highlightId}/apply-edit`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function renderHighlightReel(jobId, params = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/render`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getHighlights(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}`));
+  if (!res.ok) {
+    return { highlights: [] };
+  }
+  return res.json();
+}
+
+export async function deleteHighlight(jobId, filename) {
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/${filename}`), {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function retryJobApi(jobId, apiKey = '') {
+  const headers = {};
+  if (apiKey) headers['X-Gemini-Key'] = apiKey;
+  const res = await apiFetch(getApiUrl(`/api/retry/${jobId}`), {
+    method: 'POST',
+    headers,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json();
+}
+
+
+

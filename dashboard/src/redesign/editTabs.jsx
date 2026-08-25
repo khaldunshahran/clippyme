@@ -2,24 +2,28 @@
 // State stays lifted in EditClipModal (tabs are conditionally rendered, so a
 // tab owning state would lose it on every switch; apply() needs it all);
 // these render it and report edits up. Markup moved verbatim from the modal.
+import { useState } from 'react';
 import { Icon, Btn, Segmented, Switch } from './primitives';
 import { HookStyleControls, HookPreview } from './hookStyle';
 import { SubtitleControls } from './subtitleControls';
 import { LogoControls, GradeControls } from './layerControls';
 import { BannerControls } from './bannerControls';
+import { dubClip } from './realApi';
 
 export const REFRAME_OPTS = [
   { id: 'auto', label: 'Auto' },
   { id: 'subject', label: 'Subject' },
+  { id: 'split', label: 'Split' },
+  { id: 'screencast', label: 'Screen' },
   { id: 'disabled', label: 'Off' },
 ];
 
 export function ReframeTab({ mode, onChange }) {
   return (
     <div className="field" style={{ marginTop: 4 }}>
-      <span className="field-label">Reframe</span>
+      <span className="field-label">Reframe Layout</span>
       <Segmented full value={mode} onChange={onChange} options={REFRAME_OPTS} />
-      <div className="eo-d" style={{ marginTop: 6 }}>Auto face-track · Subject FrameShift crop · Off letterbox bands</div>
+      <div className="eo-d" style={{ marginTop: 6 }}>Auto face-track · Subject FrameShift · Split 2-speaker · Screen slides · Off letterbox</div>
     </div>
   );
 }
@@ -187,5 +191,68 @@ export function GradeTab({ preset, onChange }) {
         </div>
       )}
     </>
+  );
+}
+
+export function DubbingTab({ jobId, clipIndex, onDubSuccess }) {
+  const [lang, setLang] = useState('es');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [dubbedUrl, setDubbedUrl] = useState(null);
+
+  const handleDub = async () => {
+    setBusy(true);
+    setMsg('Dubbing clip in background via ElevenLabs...');
+    try {
+      const res = await dubClip(jobId, clipIndex, lang);
+      setDubbedUrl(res.dubbed_url);
+      setMsg(`✅ Dubbing complete! Dubbed video created: ${res.dubbed_filename}`);
+      if (onDubSuccess) onDubSuccess(res);
+    } catch (err) {
+      setMsg(`❌ Dubbing error: ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="cf-row" style={{ marginBottom: 0 }}>
+      <span className="field-label" style={{ marginBottom: 9, display: 'flex' }}>AI Voice Dubbing (ElevenLabs)</span>
+      <div className="eo-d" style={{ marginBottom: 12 }}>
+        Translate and re-voice this clip in 30+ languages while preserving voice characteristics.
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
+        <select
+          className="input-field"
+          style={{ flex: 1 }}
+          value={lang}
+          onChange={(e) => setLang(e.target.value)}
+          disabled={busy}
+        >
+          <option value="es">Spanish (Español)</option>
+          <option value="fr">French (Français)</option>
+          <option value="de">German (Deutsch)</option>
+          <option value="it">Italian (Italiano)</option>
+          <option value="pt">Portuguese (Português)</option>
+          <option value="hi">Hindi (हिन्दी)</option>
+          <option value="ja">Japanese (日本語)</option>
+          <option value="ko">Korean (한국어)</option>
+          <option value="zh">Chinese (中文)</option>
+          <option value="ar">Arabic (العربية)</option>
+          <option value="ru">Russian (Русский)</option>
+        </select>
+        <Btn primary disabled={busy} onClick={handleDub}>
+          {busy ? 'Dubbing…' : 'Start Dubbing'}
+        </Btn>
+      </div>
+      {msg && <div className="eo-d" style={{ color: msg.startsWith('❌') ? '#ef4444' : '#10b981', marginTop: 8 }}>{msg}</div>}
+      {dubbedUrl && (
+        <div style={{ marginTop: 12 }}>
+          <a href={dubbedUrl} download className="btn sm" target="_blank" rel="noreferrer">
+            Download Dubbed Video
+          </a>
+        </div>
+      )}
+    </div>
   );
 }

@@ -60,3 +60,28 @@ def list_available_models(api_key: Optional[str]) -> dict:
         return {"models": models}
     except Exception as e:
         return {"models": [], "error": _redact_key(str(e))}
+
+
+DEFAULT_PRIMARY_MODEL = "gemini-3.5-flash"
+DEFAULT_AUXILIARY_MODEL = "gemini-3.5-flash-lite"
+
+
+def get_primary_gemini_model(override: Optional[str] = None) -> str:
+    """Return the model for core viral detection, scoring, and editing."""
+    if override and override.strip():
+        return override.strip()
+    import os
+    from clippyme.storage.config_store import load_persistent_config
+    cfg = load_persistent_config()
+    return os.environ.get("GEMINI_MODEL") or cfg.get("GEMINI_MODEL") or DEFAULT_PRIMARY_MODEL
+
+
+def get_auxiliary_gemini_model(override: Optional[str] = None) -> str:
+    """Return the lightweight model for diagnostics, chat bots, layout detection, and metadata."""
+    if override and override.strip():
+        return override.strip()
+    import os
+    from clippyme.storage.config_store import load_persistent_config
+    cfg = load_persistent_config()
+    return os.environ.get("GEMINI_LITE_MODEL") or cfg.get("GEMINI_LITE_MODEL") or DEFAULT_AUXILIARY_MODEL
+

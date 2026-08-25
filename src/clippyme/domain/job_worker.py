@@ -140,6 +140,13 @@ def make_workers(
                         except Exception as exc:
                             logger.warning("Cleanup skipped cache %s: %s", filename, exc)
 
+                # Storage sweep: purge partial downloads, failed task leftovers, and published video assets
+                try:
+                    from clippyme.domain.job_artifacts import run_storage_cleanup
+                    await asyncio.to_thread(run_storage_cleanup, output_dir)
+                except Exception as exc:
+                    logger.warning("Periodic storage cleanup failed: %s", exc)
+
             except Exception as e:
                 logger.warning("Cleanup error: %s", e)
 

@@ -336,6 +336,10 @@ def runtime_result_fields(output_dir: str) -> dict[str, Any]:
             "preflight",
             "qa",
             "last_error",
+            "download_percent",
+            "download_speed",
+            "download_eta",
+            "download_bytes",
         )
     }
     return {"operations": public}
@@ -399,6 +403,14 @@ def format_runtime_log(state: dict[str, Any], metrics: dict[str, Any] | None = N
         f"attempt={int(state.get('attempt') or 0)}/{int(state.get('max_attempts') or 1)}",
         f"clips={int(clips.get('ready') or 0)}/{int(clips.get('total') or 0)}",
     ]
+    if state.get("download_percent") is not None:
+        fields.append(f"download_percent={int(state['download_percent'])}")
+    if state.get("download_speed"):
+        fields.append(f"download_speed={str(state['download_speed']).replace(' ', '_')}")
+    if state.get("download_eta"):
+        fields.append(f"download_eta={str(state['download_eta']).replace(' ', '_')}")
+    if state.get("download_bytes"):
+        fields.append(f"download_bytes={str(state['download_bytes']).replace(' ', '_')}")
     if eta is not None:
         fields.append(f"eta_s={eta}")
     for key in ("cpu", "rss_mb", "memory_percent", "disk_free_gb", "processes"):

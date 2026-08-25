@@ -70,3 +70,25 @@ def test_publish_rejects_oversized_scheduled_for():
             platforms=[{"platform": "tiktok", "accountId": "a"}],
             scheduled_for="9" * 65,
         )
+
+
+def test_publish_accepts_thumbnail_options():
+    for ratio in ["16:9", "9:16", "1:1", "4:3", "3:4"]:
+        req = PublishRequest(
+            platforms=[{"platform": "youtube", "accountId": "a"}],
+            generate_ai_thumbnail=True,
+            thumbnail_aspect_ratio=ratio,
+            thumbnail_prompt="punchy and vibrant",
+            thumbnail_path="/output/thumbnails/thumb.png",
+        )
+        assert req.generate_ai_thumbnail is True
+        assert req.thumbnail_aspect_ratio == ratio
+
+
+def test_publish_rejects_invalid_thumbnail_aspect_ratio():
+    with pytest.raises(ValidationError):
+        PublishRequest(
+            platforms=[{"platform": "youtube", "accountId": "a"}],
+            thumbnail_aspect_ratio="21:9",
+        )
+

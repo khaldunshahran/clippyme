@@ -62,6 +62,15 @@ def _bounded_max_attempts(job_data: dict, env: dict) -> int:
     return min(10, max(1, value))
 
 
+def _upsert_download_log(logs: list[str], line: str) -> None:
+    """Keep exactly one live download progress row in job logs."""
+    for index in range(len(logs) - 1, -1, -1):
+        if str(logs[index]).startswith("📥 Downloading source:"):
+            logs[index] = line
+            return
+    logs.append(line)
+
+
 def make_run_job(*, jobs: dict, output_root: str, on_change=None):
     """Build the ``run_job`` coroutine bound to shared application state."""
 
@@ -112,6 +121,21 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
         _merge_runtime_result(job, output_dir, metrics)
         if state:
             upsert_runtime_log(job["logs"], format_runtime_log(state, metrics))
+            dl_percent = state.get("download_percent")
+            if dl_percent is not None and state.get("stage") == "acquiring":
+                speed = state.get("download_speed") or ""
+                eta = state.get("download_eta") or ""
+                bytes_info = state.get("download_bytes") or ""
+                details = []
+                if bytes_info:
+                    details.append(bytes_info)
+                if speed:
+                    details.append(speed)
+                if eta:
+                    details.append(f"ETA {eta}")
+                extra = f" ({', '.join(details)})" if details else ""
+                line = f"📥 Downloading source: {dl_percent}%{extra}"
+                _upsert_download_log(job["logs"], line)
 
     async def run_job(job_id, job_data):
         """Execute a checkpointed subprocess, retrying transient failures."""
@@ -170,6 +194,8 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
                 child_env["CLIPPYME_JOB_ID"] = job_id
                 child_env["CLIPPYME_ATTEMPT"] = str(attempt)
                 child_env["CLIPPYME_JOB_MAX_ATTEMPTS"] = str(max_attempts)
+                child_env["PYTHONIOENCODING"] = "utf-8"
+                child_env["PYTHONUTF8"] = "1"
                 jobs[job_id]["logs"].append(
                     f"Pipeline attempt {attempt}/{max_attempts} started."
                 )

@@ -75,10 +75,11 @@ Respond with ONLY a valid JSON object matching this schema:
         try:
             from google import genai
             from google.genai import types
+            from clippyme.pipeline.gemini_service import get_auxiliary_gemini_model
 
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=get_auxiliary_gemini_model(),
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",

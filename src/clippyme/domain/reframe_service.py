@@ -107,23 +107,28 @@ async def run_reframe(*, job_id: str, clip_index: int, mode: str,
     # same lock also serialises against compose_layers, which reads the clip
     # file this subprocess overwrites.
     async with clip_lock(output_dir, clip_index):
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+        def _exec_reframe():
+            import subprocess
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 env=reframe_env,
+                encoding="utf-8",
+                errors="replace",
             )
-            stdout_data, _ = await proc.communicate()
+
+        try:
+            res = await asyncio.to_thread(_exec_reframe)
         except Exception as e:
             logger.error("Reframe subprocess launch failed: %s", e)
             raise ClippyMeError(f"Failed to launch reframe: {e}", status_code=500)
 
-        output_text = (stdout_data or b"").decode(errors="replace")
-        if proc.returncode != 0:
+        output_text = res.stdout or ""
+        if res.returncode != 0:
             # Full subprocess output is logged server-side only — never returned to
             # the client, which would leak filesystem paths / tracebacks / env.
-            logger.error("Reframe failed (code %s):\n%s", proc.returncode, output_text[-2000:])
+            logger.error("Reframe failed (code %s):\n%s", res.returncode, output_text[-2000:])
             raise ClippyMeError(
                 "Reframe failed. Check server logs for details.", status_code=500)
 
@@ -155,16 +160,21 @@ async def run_reframe(*, job_id: str, clip_index: int, mode: str,
             logger.error("Failed to persist metadata.json after reframe: %s", e)
             save_failed = e
 
-        if (
-            job_id in jobs
-            and "result" in jobs[job_id]
-            and "clips" in jobs[job_id]["result"]
-            and clip_index < len(jobs[job_id]["result"]["clips"])
-        ):
-            # In-memory state also gets the clean URL — the frontend applies
-            # its own cache-bust via `new_video_url` below on the <video> tag.
-            jobs[job_id]["result"]["clips"][clip_index]["video_url"] = clean_video_url
-            jobs[job_id]["result"]["clips"][clip_index]["reframe_mode"] = mode
+        # Update in-memory job state so the live dashboard poll reflects the
+        # new reframe mode immediately, without waiting for a page reload.
+        #
+        # IMPORTANT: jobs[job_id]["result"]["clips"] is the FILTERED list built
+        # by _build_clips / restore_job_from_disk — it skips deleted_after_publish
+        # entries, so its positional indices diverge from the absolute shorts[]
+        # indices once any clip has been deleted. We match by `original_index`
+        # (set to the shorts[] position by both _build_clips and restore_job_from_disk)
+        # to avoid writing to the wrong clip slot after a gap.
+        if job_id in jobs and "result" in jobs[job_id]:
+            for c in (jobs[job_id]["result"].get("clips") or []):
+                if c.get("original_index") == clip_index:
+                    c["video_url"] = clean_video_url
+                    c["reframe_mode"] = mode
+                    break
 
         if save_failed is not None:
             raise ClippyMeError(

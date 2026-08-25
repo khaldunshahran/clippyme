@@ -45,6 +45,27 @@ class TestTelegramBotListener(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ClippyMe System Status", mock_send.call_args.kwargs["text"])
             self.assertIn("*Running*: 1", mock_send.call_args.kwargs["text"])
 
+    async def test_handle_user_message_restart(self):
+        listener = TelegramBotListener(
+            jobs={},
+            job_queue=asyncio.Queue(),
+            output_dir="/tmp",
+            upload_dir="/tmp",
+            data_dir="/tmp",
+        )
+        with patch("clippyme.domain.telegram_bot.send_telegram", new_callable=AsyncMock) as mock_send, \
+             patch("clippyme.domain.telegram_bot.subprocess.Popen") as mock_popen, \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            await listener._handle_user_message("mock_token", "12345", "/restart")
+            mock_send.assert_called_once()
+            self.assertIn("Restarting frontend and backend", mock_send.call_args.kwargs["text"])
+            self.assertEqual(mock_popen.call_count, 2)
+            frontend_call = mock_popen.call_args_list[0][0][0]
+            backend_call = mock_popen.call_args_list[1][0][0]
+            self.assertIn("clippyme-frontend", frontend_call[-1])
+            self.assertIn("clippyme-backend", backend_call[-1])
+
+
 
 if __name__ == "__main__":
     unittest.main()

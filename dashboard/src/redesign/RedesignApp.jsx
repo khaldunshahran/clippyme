@@ -12,9 +12,10 @@ import { ProcessingView } from './processing';
 import { ResultsView } from './results';
 import { PublishModal } from './publish';
 import { HistoryView, SettingsView, ApiKeyModal } from './views';
+import { HighlightsStudioView } from './highlightsStudio';
 import { LiveMonitorView } from './live';
 import { EditClipModal } from './captions';
-import { optsToPreselections, restoreJob, listBackendJobIds, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, reframeClip, composeClip, getConfig } from './realApi';
+import { optsToPreselections, restoreJob, listBackendJobIds, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
 import { clipStateToParams, buildBulkPlan } from '../lib/bulkApply';
@@ -90,7 +91,10 @@ export default function RedesignApp() {
   // server-issued token or sessionStorage.
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
   const [showKeyModal, setShowKeyModal] = useState(false);
-  const [tab, setTab] = useState(restoredSession?.activeTab || 'create');
+  const [tab, setTab] = useState(() => {
+    const t = restoredSession?.activeTab;
+    return (t === 'ai-shorts' || t === 'studio') ? 'create' : (t || 'create');
+  });
   const [jobId, setJobId] = useState(restoredSession?.jobId || null);
   const [status, setStatus] = useState(restoredSession?.status || 'idle'); // idle | processing | complete | error
   const [results, setResults] = useState(restoredSession?.results || null);
@@ -307,7 +311,18 @@ export default function RedesignApp() {
     }
   };
 
-  const retryJob = () => {
+  const retryJob = async () => {
+    if (jobId) {
+      try {
+        setStatus('processing');
+        setLogs((prev) => [...prev, '♻️ Resuming pipeline from latest checkpoint...']);
+        pushToast('info', 'Resuming job from checkpoint...');
+        await retryJobApi(jobId, apiKey);
+        return;
+      } catch (err) {
+        pushToast('warn', 'Checkpoint resume failed, starting fresh: ' + (err.message || err));
+      }
+    }
     const pre = optsToPreselections(opts);
     let instructions = opts.instructions || '';
     if (!opts.clipsAuto) {
@@ -404,12 +419,22 @@ export default function RedesignApp() {
   // N at once and thrash/OOM the box. Cap at 2 (matches AE_MAX_PARALLEL); this
   // is the same reason results.jsx:exportMany runs sequentially. reprocessClip
   // swallows its own errors, so a failed clip never breaks the pool.
-  const runBulk = async (plan, limit = 2) => {
+  const runBulk = async (plan, targetJobId, targetUpdateState, limit = 2) => {
+    const effectiveJobId = targetJobId ?? (viewingHistory && historyJob ? historyJob.jobId : jobId);
+    const effectiveUpdateState = targetUpdateState ?? (viewingHistory && historyJob ? updateHistClipState : updateClipState);
     let next = 0;
     const worker = async () => {
       while (next < plan.length) {
         const { idx, clip, params } = plan[next++];
-        await reprocessClip(idx, clip, params);
+        await runApplyEdit({
+          jobId: effectiveJobId,
+          idx,
+          apiIdx: clip?.original_index ?? idx,
+          params,
+          api: { reframeClip, composeClip },
+          updateClipState: effectiveUpdateState,
+          pushToast,
+        });
       }
     };
     await Promise.all(Array.from({ length: Math.min(limit, plan.length) }, worker));
@@ -419,17 +444,30 @@ export default function RedesignApp() {
   // was never edited) and reprocess every OTHER visible clip with them. Manual
   // trim + per-clip hook text are intentionally not propagated (see bulkApply).
   const applyClipToAll = (srcIdx) => {
-    const src = clips[srcIdx];
+    const isHist = viewingHistory && historyJob;
+    const activeClips = isHist ? (historyJob.results?.clips || []) : clips;
+    const activeStates = isHist ? histClipStates : clipStates;
+    const activePre = isHist ? historyJob.preselections : preselections;
+    const activeJobId = isHist ? historyJob.jobId : jobId;
+    const activeUpdateState = isHist ? updateHistClipState : updateClipState;
+
+    const src = activeClips[srcIdx];
     if (!src) return;
-    const srcParams = clipStateToParams(clipStates[srcIdx], preselections, src);
-    const plan = buildBulkPlan(srcParams, visibleClips(), clipStates, srcIdx);
+    const srcParams = clipStateToParams(activeStates[srcIdx], activePre, src);
+    const targets = activeClips.map((c, i) => ({ i, c })).filter(({ i }) => !activeStates[i]?.deleted);
+    const plan = buildBulkPlan(srcParams, targets, activeStates, srcIdx);
     if (!plan.length) { pushToast('info', 'No other clips to apply to'); return; }
     pushToast('info', `Applying settings to ${plan.length} clip${plan.length === 1 ? '' : 's'}…`);
-    runBulk(plan);
+    runBulk(plan, activeJobId, activeUpdateState);
   };
 
   // Bulk editor "Apply": staged params from the modal → every selected clip.
   const applyBulkEdit = (params, targets) => {
+    const isHist = viewingHistory && historyJob;
+    const activeStates = isHist ? histClipStates : clipStates;
+    const activeJobId = isHist ? historyJob.jobId : jobId;
+    const activeUpdateState = isHist ? updateHistClipState : updateClipState;
+
     const srcParams = {
       reframeMode: params.reframeMode,
       toggles: params.toggles,
@@ -439,10 +477,10 @@ export default function RedesignApp() {
       gradeParams: params.gradeParams,
       bannerParams: params.bannerParams,
     };
-    const plan = buildBulkPlan(srcParams, targets, clipStates);
+    const plan = buildBulkPlan(srcParams, targets, activeStates);
     if (!plan.length) return;
     pushToast('info', `Reprocessing ${plan.length} clip${plan.length === 1 ? '' : 's'}…`);
-    runBulk(plan);
+    runBulk(plan, activeJobId, activeUpdateState);
   };
 
   return (
@@ -509,21 +547,13 @@ export default function RedesignApp() {
           <ResultsView clips={historyJob.results?.clips || []} jobId={historyJob.jobId} preselections={historyJob.preselections} embedded
             clipStates={histClipStates} onUpdateClipState={updateHistClipState}
             onPublish={openPublish} onPublishAll={openPublish} onEdit={(c, i) => setEditClip({ clip: c, idx: i })}
-            onApplyToAll={(srcIdx) => {
-              const histClips = historyJob.results?.clips || [];
-              const src = histClips[srcIdx];
-              if (!src) return;
-              const srcParams = clipStateToParams(histClipStates[srcIdx], historyJob.preselections, src);
-              const plan = buildBulkPlan(srcParams, histClips.map((c, i) => ({ i, c })).filter(({ i }) => !histClipStates[i]?.deleted), histClipStates, srcIdx);
-              if (!plan.length) { pushToast('info', 'No other clips to apply to'); return; }
-              pushToast('info', `Applying settings to ${plan.length} clip${plan.length === 1 ? '' : 's'}…`);
-              runBulk(plan);
-            }}
+            onApplyToAll={applyClipToAll}
             onEditSelected={(targets) => setBulkEdit({ targets })}
             pushToast={pushToast} />
         </div>
       )}
 
+      {tab === 'highlights' && <HighlightsStudioView apiKey={apiKey} onToast={(t) => pushToast(t.type, t.message)} />}
       {tab === 'settings' && <SettingsView apiKey={apiKey} onApiKey={setApiKey} cookiesConfigured={cookiesConfigured} onCookiesChange={setCookiesConfigured} pushToast={pushToast} />}
 
       {publishClips && (
@@ -544,6 +574,7 @@ export default function RedesignApp() {
           preselections={viewingHistory && historyJob ? historyJob.preselections : preselections}
           sourceBanner={(viewingHistory && historyJob ? historyJob.results : results)?.source_info?.banner}
           onClose={() => setEditClip(null)}
+          pushToast={pushToast}
           onApply={(params) => {
             if (viewingHistory && historyJob) {
               runApplyEdit({
@@ -565,36 +596,9 @@ export default function RedesignApp() {
           preselections={viewingHistory && historyJob ? historyJob.preselections : preselections}
           sourceBanner={(viewingHistory && historyJob ? historyJob.results : results)?.source_info?.banner}
           onClose={() => setBulkEdit(null)}
+          pushToast={pushToast}
           onApply={(params) => {
-            if (viewingHistory && historyJob) {
-              const srcParams = {
-                reframeMode: params.reframeMode,
-                toggles: params.toggles,
-                subtitleParams: params.subtitleParams,
-                hookParams: params.hookParams,
-                logoParams: params.logoParams,
-                gradeParams: params.gradeParams,
-                bannerParams: params.bannerParams,
-              };
-              const plan = buildBulkPlan(srcParams, bulkEdit.targets, histClipStates);
-              if (plan.length) {
-                pushToast('info', `Reprocessing ${plan.length} clip${plan.length === 1 ? '' : 's'}…`);
-                let next = 0;
-                const worker = async () => {
-                  while (next < plan.length) {
-                    const { idx, clip, params: p } = plan[next++];
-                    await runApplyEdit({
-                      jobId: historyJob.jobId, idx, apiIdx: clip?.original_index ?? idx, params: p,
-                      api: { reframeClip, composeClip },
-                      updateClipState: updateHistClipState, pushToast,
-                    });
-                  }
-                };
-                Promise.all(Array.from({ length: Math.min(2, plan.length) }, worker));
-              }
-            } else {
-              applyBulkEdit(params, bulkEdit.targets);
-            }
+            applyBulkEdit(params, bulkEdit.targets);
             setBulkEdit(null);
           }} />
       )}

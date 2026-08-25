@@ -1,3 +1,9 @@
+import sys
+if sys.stdout is not None:
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr is not None:
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import time
 import logging
 import cv2
@@ -715,9 +721,9 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--cookies', type=str, help="Path to cookies.txt file for yt-dlp")
     parser.add_argument('--instructions', type=str, help="Custom instructions for AI clip selection (e.g., 'find the funniest parts')")
     parser.add_argument('--no-zoom', action='store_true', help="Disable subtle auto-zoom effect on clips")
-    parser.add_argument('--reframe-mode', choices=['auto', 'disabled', 'subject', 'object'], default='auto',
+    parser.add_argument('--reframe-mode', choices=['auto', 'disabled', 'subject', 'object', 'split', 'screencast'], default='auto',
                         help='Reframe mode: auto (face tracking), subject (FrameShift face-first '
-                             'crop; "object" is a legacy alias), or disabled (4:3 crop with black bars)')
+                             'crop; "object" is a legacy alias), disabled (4:3 crop with black bars), split (stacked two speakers), or screencast (screen over speaker)')
     parser.add_argument('--letterbox-zoom', type=float, default=0.0,
                         help="Fixed zoom for --reframe-mode disabled: 0 = whole frame between the "
                              "black bars, 0.05-0.15 (or 5-15) crops that fraction off the width.")

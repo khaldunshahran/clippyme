@@ -1445,47 +1445,14 @@ class LiveMonitor:
         finally:
             self._draining = False
 
-    # -- delete published clip artifacts ---------------------------------
+        # -- delete published clip artifacts ---------------------------------
 
     def _delete_clip_artifacts(self, job_id: str, clip: dict, clip_path: str,
                                upload_path: str) -> None:
-        """Best-effort removal of a published clip's on-disk artifacts + a
-        metadata mark. Never raises — the publish already succeeded."""
-        try:
-            job_dir = os.path.join(self._output_dir, job_id)
-            clip_filename = os.path.basename(clip_path)
-            stem = os.path.splitext(clip_filename)[0]
-            idx = clip.get("original_index")
-            targets = [
-                clip_path,
-                upload_path,
-                os.path.join(job_dir, f"source_{clip_filename}"),
-                os.path.join(job_dir, f"{stem}_cover.jpg"),
-            ]
-            if idx is not None:
-                from clippyme.domain.clip_resolve import composed_clip_basename
-                targets.append(os.path.join(job_dir, composed_clip_basename(clip, idx)))
-            for path in targets:
-                _safe_remove(path)
-            self._mark_clip_deleted(job_id, idx)
-            self._maybe_remove_empty_job_dir(job_id, job_dir)
-        except Exception:
-            logger.warning("LiveMonitor %s: artifact cleanup failed for %s",
-                           self.id, job_id, exc_info=True)
-
-    def _mark_clip_deleted(self, job_id: str, idx) -> None:
-        """Mark the clip entry deleted instead of removing it. resolve_clip /
-        _build_clips key clips by list POSITION (original_index == index in
-        ``shorts``), so dropping an entry would shift every later clip's index
-        and break their per-clip endpoints. Marking keeps positions stable."""
-        if idx is None:
-            return
-        from clippyme.domain.job_artifacts import load_job_metadata, save_job_metadata
-        metadata_path, data = load_job_metadata(job_id, self._output_dir)
-        shorts = data.get("shorts", [])
-        if 0 <= idx < len(shorts):
-            shorts[idx]["deleted_after_publish"] = True
-            save_job_metadata(metadata_path, data)
+        """Forwarding artifact cleanup to domain/job_artifacts.py"""
+        from clippyme.domain.job_artifacts import delete_clip_artifacts
+        delete_clip_artifacts(job_id, clip, clip_path, upload_path, self._output_dir)
+        self._maybe_remove_empty_job_dir(job_id, os.path.join(self._output_dir, job_id))
 
     def _maybe_remove_empty_job_dir(self, job_id: str, job_dir: str) -> None:
         """Drop the whole job dir once no clip (.mp4) files remain — but only

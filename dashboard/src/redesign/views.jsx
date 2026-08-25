@@ -9,10 +9,12 @@ import {
   getZernio, saveZernio, discoverZernioAccounts,
   getWatchdog, saveWatchdog, testWatchdogAlert,
   listFonts, uploadFont, deleteFont, logoStatus, uploadLogo, deleteLogo,
+  researchProduct, generateUgcScripts, fetchViralTitles, refineViralTitles, fetchChapters, generateThumbnail,
 } from './realApi';
 import { SUB_FONTS } from './data';
 import { getApiToken, setApiToken } from '../lib/apiToken';
 import { relTime } from '../lib/relTime';
+import { triggerStorageCleanup } from '../lib/api';
 
 // Curated fallback when live discovery is unavailable (no key yet / offline).
 // Mirrors the allow-list prefixes (gemini-2.5- / gemini-3) the backend accepts.
@@ -150,6 +152,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
   const [wdDiscUrl, setWdDiscUrl] = useState('');
   const [wdWhUrl, setWdWhUrl] = useState('');
   const [testingWd, setTestingWd] = useState(false);
+  const [cleaningStorage, setCleaningStorage] = useState(false);
 
   // Pull the live model list from the backend (uses the saved key if the
   // header is empty). Merges discovery with the curated fallback + the
@@ -329,7 +332,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
         <KeyRow icon="audio-lines" name="Deepgram" desc="Nova-3 transcription" value={deepgram} present={present.deepgram}
           onChange={setDeepgram} onSave={() => saveKeys({ DEEPGRAM_API_KEY: deepgram })}
           onClear={() => { setDeepgram(''); saveKeys({ DEEPGRAM_API_KEY: '' }); }} placeholder="dg_…" />
-        <KeyRow icon="audio-lines" name="ElevenLabs" desc="Scribe transcription · audio-event tags" value={elevenlabs} present={present.elevenlabs}
+        <KeyRow icon="audio-lines" name="ElevenLabs" desc="Scribe transcription · audio-event tags · AI Dubbing" value={elevenlabs} present={present.elevenlabs}
           onChange={setElevenlabs} onSave={() => saveKeys({ ELEVENLABS_API_KEY: elevenlabs })}
           onClear={() => { setElevenlabs(''); saveKeys({ ELEVENLABS_API_KEY: '' }); }} placeholder="sk_…" />
         <KeyRow icon="scan-face" name="Hugging Face token" desc="Speaker diarization models" value={hf} present={present.hf}
@@ -534,6 +537,37 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
         </div>
       </Panel>
 
+      <Panel title="Storage & Disk Cleanup" sub="Manage local video files and purge published/failed task storage" icon="hard-drive" style={{ marginBottom: 18 }}>
+        <div className="opt" style={{ borderBottom: 0 }}>
+          <div className="oico"><Icon n="trash-2" /></div>
+          <div className="otxt">
+            <div className="ot">Disk cleanup</div>
+            <div className="od">Purge large source videos after publishing and delete partial download leftovers</div>
+          </div>
+          <div className="r" style={{ gap: 8 }}>
+            <Btn
+              variant="secondary"
+              size="sm"
+              icon="sparkles"
+              disabled={cleaningStorage}
+              onClick={async () => {
+                setCleaningStorage(true);
+                try {
+                  const res = await triggerStorageCleanup();
+                  pushToast?.('success', `Freed ${res.freed_mb || 0} MB across ${res.removed_files || 0} files`);
+                } catch (e) {
+                  pushToast?.('error', `Cleanup failed: ${e.message}`);
+                } finally {
+                  setCleaningStorage(false);
+                }
+              }}
+            >
+              {cleaningStorage ? 'Cleaning…' : 'Clean Storage Now'}
+            </Btn>
+          </div>
+        </div>
+      </Panel>
+
       <Panel title="Downloads" sub="For age- or region-restricted sources" icon="cookie">
         <div className="opt" style={{ borderBottom: 0 }}>
           <div className="oico"><Icon n="cookie" /></div>
@@ -570,6 +604,287 @@ export function ApiKeyModal({ onClose, onGoToSettings }) {
           <div className="mf-right"><Btn variant="primary" icon="settings" onClick={onGoToSettings}>Open settings</Btn></div>
         </div>
       </div>
+    </div>
+  );
+}
+
+export function AiShortsView() {
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [research, setResearch] = useState(null);
+  const [scripts, setScripts] = useState([]);
+  const [err, setErr] = useState('');
+
+  const handleResearch = async () => {
+    if (!input.trim()) return;
+    setBusy(true);
+    setErr('');
+    setResearch(null);
+    setScripts([]);
+    try {
+      const res = await researchProduct(input);
+      setResearch(res);
+      const sRes = await generateUgcScripts(res);
+      setScripts(sRes.scripts || []);
+    } catch (e) {
+      setErr(e.message || 'Generation failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="container narrow fade-in">
+      <Hero eyebrow="AI Shorts" line1="UGC Video Creator" sub="Turn any product URL or prompt into viral marketing scripts, talking heads, and shorts." />
+      <Panel title="Product or URL" sub="Enter your website, SaaS URL, or product description" icon="sparkles" style={{ marginBottom: 18 }}>
+        <div style={{ display: 'flex', gap: 8, flexDirection: 'column' }}>
+          <textarea
+            className="input-field"
+            rows={3}
+            placeholder="e.g. https://myproduct.com or 'A smart timer app that boosts deep work focus'"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+          />
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
+            <Btn variant="primary" icon={busy ? 'loader' : 'wand-sparkles'} disabled={busy || !input.trim()} onClick={handleResearch}>
+              {busy ? 'Researching & Writing…' : 'Generate Viral Scripts'}
+            </Btn>
+          </div>
+        </div>
+        {err && <div className="eo-d" style={{ color: '#ef4444', marginTop: 10 }}>❌ {err}</div>}
+      </Panel>
+
+      {research && (
+        <Panel title="Market & Product Research" sub={research.product_name || 'Insights'} icon="search" style={{ marginBottom: 18 }}>
+          <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--fg-2)' }}>
+            <div><b>Target Audience:</b> {research.target_audience}</div>
+            <div style={{ marginTop: 4 }}><b>Core Problem:</b> {research.core_problem}</div>
+            <div style={{ marginTop: 4 }}><b>Unique Solution:</b> {research.unique_solution}</div>
+          </div>
+        </Panel>
+      )}
+
+      {scripts.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <h3>Generated Viral Scripts ({scripts.length})</h3>
+          {scripts.map((s, idx) => (
+            <Panel key={idx} title={s.title || `Script ${idx + 1}`} sub={s.hook_text_overlay} icon="film">
+              <div style={{ fontSize: 14, lineHeight: 1.6, marginBottom: 10 }}>
+                <b>Spoken Voiceover:</b>
+                <p style={{ marginTop: 4, background: 'var(--bg-3)', padding: 10, borderRadius: 6 }}>{s.full_script_text}</p>
+              </div>
+              {s.segments && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <span className="field-label">Timeline Breakdown</span>
+                  {s.segments.map((seg, sIdx) => (
+                    <div key={sIdx} className="eo-d" style={{ background: 'var(--bg-2)', padding: '6px 10px', borderRadius: 4 }}>
+                      <b>[{seg.segment_type}]</b> {seg.voiceover} <span style={{ color: 'var(--fg-muted)' }}>({seg.visual_description})</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Panel>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function YoutubeStudioView() {
+  const [transcript, setTranscript] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [titlesData, setTitlesData] = useState(null);
+  const [chatPrompt, setChatPrompt] = useState('');
+  const [chatBusy, setChatBusy] = useState(false);
+  const [thumbTitle, setThumbTitle] = useState('');
+  const [thumbExtra, setThumbExtra] = useState('');
+  const [thumbRatio, setThumbRatio] = useState('16:9');
+  const [thumbBusy, setThumbBusy] = useState(false);
+  const [thumbPath, setThumbPath] = useState('');
+  const [err, setErr] = useState('');
+
+  const handleGetTitles = async () => {
+    if (!transcript.trim()) return;
+    setBusy(true);
+    setErr('');
+    setTitlesData(null);
+    try {
+      const res = await fetchViralTitles(transcript);
+      setTitlesData(res);
+      if (res.titles?.length) {
+        setThumbTitle(res.titles[0]);
+      }
+    } catch (e) {
+      setErr(e.message || 'Failed to generate titles');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRefine = async () => {
+    if (!chatPrompt.trim() || !titlesData) return;
+    setChatBusy(true);
+    try {
+      const res = await refineViralTitles(titlesData.summary || transcript.slice(0, 1000), chatPrompt);
+      if (res.titles) {
+        setTitlesData((prev) => ({ ...prev, titles: res.titles }));
+        setChatPrompt('');
+      }
+    } catch (e) {
+      setErr(e.message || 'Refinement failed');
+    } finally {
+      setChatBusy(false);
+    }
+  };
+
+  const handleGenerateThumbnail = async () => {
+    const title = thumbTitle.trim() || (titlesData?.titles?.[0] ?? '');
+    if (!title) {
+      setErr('Please enter a video title for thumbnail generation');
+      return;
+    }
+    setThumbBusy(true);
+    setErr('');
+    try {
+      const res = await generateThumbnail(title, transcript.slice(0, 1000), thumbExtra, thumbRatio);
+      if (res.thumbnail_path) {
+        const basename = res.thumbnail_path.split(/[\\/]/).pop();
+        setThumbPath(`/thumbnails/${basename}`);
+      }
+    } catch (e) {
+      setErr(e.message || 'Thumbnail generation failed');
+    } finally {
+      setThumbBusy(false);
+    }
+  };
+
+  return (
+    <div className="container narrow fade-in">
+      <Hero eyebrow="YouTube Studio" line1="Viral Titles & Thumbnails" sub="Generate high-CTR titles, chapters, and thumbnail concepts for your videos." />
+      <Panel title="Video Transcript or Summary" sub="Paste video content to analyze CTR potential" icon="file-text" style={{ marginBottom: 18 }}>
+        <textarea
+          className="input-field"
+          rows={4}
+          placeholder="Paste transcript or key video points here..."
+          value={transcript}
+          onChange={(e) => setTranscript(e.target.value)}
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+          <Btn variant="primary" icon={busy ? 'loader' : 'sparkles'} disabled={busy || !transcript.trim()} onClick={handleGetTitles}>
+            {busy ? 'Analyzing...' : 'Generate 10 Viral Titles'}
+          </Btn>
+        </div>
+        {err && <div className="eo-d" style={{ color: '#ef4444', marginTop: 10 }}>❌ {err}</div>}
+      </Panel>
+
+      {titlesData && (
+        <Panel title="Suggested Viral Titles" sub="10 CTR-optimized candidates with curiosity gaps" icon="list" style={{ marginBottom: 18 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
+            {titlesData.titles?.map((t, idx) => (
+              <div key={idx} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--bg-2)', borderRadius: 6 }}>
+                <span style={{ fontWeight: 500, fontSize: 14 }}>{idx + 1}. {t}</span>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <Btn size="sm" variant="secondary" icon="sparkles" onClick={() => setThumbTitle(t)}>Use for Thumbnail</Btn>
+                  <Btn size="sm" variant="ghost" icon="copy" onClick={() => navigator.clipboard.writeText(t)}>Copy</Btn>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            <span className="field-label">Refine Titles with AI</span>
+            <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+              <input
+                className="input-field"
+                style={{ flex: 1 }}
+                placeholder="e.g. Make them sound more urgent or focused on beginners..."
+                value={chatPrompt}
+                onChange={(e) => setChatPrompt(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleRefine(); }}
+              />
+              <Btn variant="secondary" disabled={chatBusy || !chatPrompt.trim()} onClick={handleRefine}>
+                {chatBusy ? 'Refining…' : 'Refine'}
+              </Btn>
+            </div>
+          </div>
+        </Panel>
+      )}
+
+      <Panel title="AI Thumbnail & Cover Generator (Nano Banana)" sub="Generate eye-catching high-CTR cover images with 16:9, 9:16 or 1:1 aspect ratios" icon="image" style={{ marginBottom: 18 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <span className="field-label" style={{ display: 'block', marginBottom: 4 }}>Video / Thumbnail Title</span>
+            <input
+              className="input-field"
+              placeholder="e.g. Why 99% Of People Fail At This..."
+              value={thumbTitle}
+              onChange={(e) => setThumbTitle(e.target.value)}
+            />
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span className="field-label" style={{ margin: 0 }}>Aspect Ratio:</span>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {[
+                { id: '16:9', label: '16:9 (YouTube)' },
+                { id: '9:16', label: '9:16 (Shorts/Reels)' },
+                { id: '1:1', label: '1:1 (Square/Feed)' },
+              ].map((r) => (
+                <button
+                  key={r.id}
+                  type="button"
+                  onClick={() => setThumbRatio(r.id)}
+                  style={{
+                    border: '1px solid ' + (thumbRatio === r.id ? 'var(--brand-teal)' : 'var(--border)'),
+                    background: thumbRatio === r.id ? 'rgba(2,197,191,0.15)' : 'transparent',
+                    color: thumbRatio === r.id ? 'var(--brand-teal)' : 'var(--fg-2)',
+                    padding: '4px 10px',
+                    borderRadius: '6px',
+                    fontSize: '12px',
+                    fontWeight: thumbRatio === r.id ? 600 : 400,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <span className="field-label" style={{ display: 'block', marginBottom: 4 }}>Design / Vibe Instructions (Optional)</span>
+            <input
+              className="input-field"
+              placeholder="e.g. Dramatic lighting, shocked expression, neon accents..."
+              value={thumbExtra}
+              onChange={(e) => setThumbExtra(e.target.value)}
+            />
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+            <Btn variant="primary" icon={thumbBusy ? 'loader' : 'sparkles'} disabled={thumbBusy || !thumbTitle.trim()} onClick={handleGenerateThumbnail}>
+              {thumbBusy ? 'Generating Cover…' : 'Generate Thumbnail'}
+            </Btn>
+          </div>
+
+          {thumbPath && (
+            <div style={{ marginTop: 14, textAlign: 'center', background: 'var(--bg-2)', padding: 14, borderRadius: 8, border: '1px solid var(--border)' }}>
+              <div style={{ marginBottom: 8, fontWeight: 600, fontSize: 13, color: 'var(--brand-teal)' }}>Generated AI Thumbnail ({thumbRatio})</div>
+              <img
+                src={thumbPath}
+                alt="AI Generated Thumbnail"
+                style={{
+                  maxWidth: '100%',
+                  maxHeight: thumbRatio === '9:16' ? 360 : 280,
+                  borderRadius: 6,
+                  boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
+                }}
+              />
+            </div>
+          )}
+        </div>
+      </Panel>
     </div>
   );
 }

@@ -11,8 +11,8 @@ from clippyme.domain.encode import x264_video_args
 
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi"}
 
-# Windows-forbidden filename characters + ASCII control chars.
-_FORBIDDEN_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Windows-forbidden filename characters + ASCII control chars + URL-breaking chars (#, %).
+_FORBIDDEN_CHARS_RE = re.compile(r'[<>:"/\\|?*#%\x00-\x1f]')
 _WHITESPACE_RE = re.compile(r"\s+")
 _RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}

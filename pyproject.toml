@@ -26,7 +26,7 @@ host-tests = [
     "starlette>=1.0.1",  # CVE-2026-48710 (BadHost auth bypass) fixed in 1.0.1
     "uvicorn==0.42.0",
     "python-multipart==0.0.31",
-    "yt-dlp>=2026.6.9,<2027",  # CVE-2026-50023 / CVE-2026-50574 fixed in 2026.6.9
+    "yt-dlp>=2026.8.19,<2027",  # CVE-2026-50023 / CVE-2026-50574 fixed in 2026.6.9, 403 fixed in 2026.8.19
     "google-genai>=1.70.0,<2.0.0",
     "python-dotenv==1.2.2",
     "Pillow>=12.3.0,<13",

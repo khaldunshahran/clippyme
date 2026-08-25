@@ -3,6 +3,8 @@
 *.webm
 *.mov
 *.mkv
+*.part
+source_info.json
 
 # YOLO model
 *.pt

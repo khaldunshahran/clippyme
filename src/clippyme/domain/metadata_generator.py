@@ -16,6 +16,7 @@ from google import genai
 from google.genai import types
 
 from clippyme.domain.errors import ValidationError
+from clippyme.pipeline.gemini_service import get_auxiliary_gemini_model
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ Emit ONLY valid JSON:
 def generate_clip_metadata(
     *,
     api_key: str,
-    model: str = "gemini-2.5-flash",
+    model: Optional[str] = None,
     clip_transcript: str,
     start: float,
     end: float,
@@ -83,12 +84,13 @@ def generate_clip_metadata(
 
     client = genai.Client(api_key=api_key)
 
-    # Prefer fast flash models
+    # Prefer lightweight auxiliary models for cost efficiency
+    primary_lite = model or get_auxiliary_gemini_model()
     candidate_models = [
-        model,
-        "gemini-2.5-flash",
-        "gemini-3-flash-preview",
+        primary_lite,
         "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash",
     ]
     # Deduplicate while preserving order
     seen = set()

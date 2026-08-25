@@ -4,7 +4,7 @@
 // conversational (Gemini) trim. State stays LIFTED in the modal via this
 // hook — tabs are conditionally rendered, so a tab component owning the
 // segments would lose them on every tab switch, and apply() needs dropRanges.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getClipTranscript, editClipAI } from '../redesign/realApi';
 import { dropSetFromRanges, segmentIndicesHit, rangesFromDropSet } from '../lib/trimSelection';
 
@@ -12,6 +12,10 @@ export function useManualTrim({ jobId, idx, active, initialDropRanges }) {
   const [segments, setSegments] = useState(null); // null = not loaded
   const [segErr, setSegErr] = useState(false);
   const [dropped, setDropped] = useState(() => new Set());
+  // Tracks whether we've already seeded `dropped` from initialDropRanges on the
+  // first transcript load. Prevents a parent re-render (toast, tab switch) from
+  // resetting the user's in-progress tap-to-cut selections while segments load.
+  const seededRef = useRef(false);
 
   // Lazy-load transcript segments the first time the Trim tab is opened
   // (`active` is false in bulk mode — manual trim is per-clip). Cheap GET;
@@ -23,11 +27,21 @@ export function useManualTrim({ jobId, idx, active, initialDropRanges }) {
       .then((d) => { if (!alive) return;
         const segs = d.segments || [];
         setSegments(segs);
-        setDropped(dropSetFromRanges(segs, initialDropRanges));
+        // Seed dropped segments only on the first successful load — never on a
+        // re-render-triggered re-run. initialDropRanges is intentionally excluded
+        // from the dep array below to avoid resetting user edits.
+        if (!seededRef.current) {
+          seededRef.current = true;
+          setDropped(dropSetFromRanges(segs, initialDropRanges));
+        }
       })
       .catch(() => { if (alive) setSegErr(true); });
     return () => { alive = false; };
-  }, [active, segments, jobId, idx, initialDropRanges]);
+  // initialDropRanges intentionally excluded: it's an array reference that
+  // changes identity on every parent render; including it would wipe in-progress
+  // trim selections. The seededRef gate ensures it's applied exactly once.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, segments, jobId, idx]);
 
   const toggleDrop = (i) => setDropped((prev) => {
     const next = new Set(prev);

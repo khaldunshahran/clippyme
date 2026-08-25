@@ -92,3 +92,19 @@ def test_legacy_supported_generation_methods_field(monkeypatch):
     monkeypatch.setattr(gs.genai, "Client", _FakeClient)
     out = gs.list_available_models("AIza" + "x" * 35)
     assert out["models"][0]["name"] == "gemini-3.5-flash"
+
+
+def test_model_routing_helpers(monkeypatch):
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_LITE_MODEL", raising=False)
+
+    # Test overrides
+    assert gs.get_primary_gemini_model("custom-primary") == "custom-primary"
+    assert gs.get_auxiliary_gemini_model("custom-lite") == "custom-lite"
+
+    # Test environment variable resolution
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.7-flash")
+    monkeypatch.setenv("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
+    assert gs.get_primary_gemini_model() == "gemini-3.7-flash"
+    assert gs.get_auxiliary_gemini_model() == "gemini-3.5-flash-lite"
+

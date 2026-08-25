@@ -42,13 +42,14 @@ def _make_client(monkeypatch, tmp_path, *, aspect):
     open(job_dir / "source_vid_clip_1.mp4", "wb").close()
     app_module.jobs[JOB_ID] = {"status": "completed", "result": {"clips": [{}]}}
 
+    import subprocess
     captured = {}
 
-    async def fake_exec(*cmd, **kwargs):
+    def fake_run(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
-        return _FakeProc()
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(app_module.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(subprocess, "run", fake_run)
     return TestClient(app_module.app, headers=ORIGIN), captured
 
 

@@ -1,27 +1,18 @@
-"""Per-clip async mutex shared by the post-hoc reframe and compose paths.
+"""Per-clip and per-job mutexes shared by reframe, compose, and highlights paths.
 
-Both paths write deterministic filenames derived only from the clip index
-(``<clip>.reframe.tmp.mp4``, ``composed_*_{i}.mp4``, and the final clip file
-itself), so two concurrent requests for the same clip clobber each other's
-in-flight files: a double-clicked "Apply & reprocess" spawns two
-``--reframe-only`` subprocesses racing ``os.replace`` on one tmp path, and an
-overlapping Download + Publish(compose_first) can delete an intermediate the
-other request is still reading. Serialising per ``(job_dir, clip_index)``
-fixes both; different clips stay fully parallel.
-
-Mirrors ``smartcut._CLIP_LOCKS`` (the threading version) including its
-refcounted registry — eviction can never hand two waiters different locks for
-one key — but is built on ``asyncio.Lock`` because every caller is a
-coroutine and must not block the event loop (or a thread-pool worker) while
-waiting. No guard lock is needed: all registry mutation happens between
-awaits on the single event loop thread.
+Prevents concurrent modifications to deterministic clip and job metadata files.
 """
 import asyncio
 import contextlib
 import os
+import threading
 
 # key -> [asyncio.Lock, refcount]
 _LOCKS: dict = {}
+
+# key -> [threading.RLock, refcount]
+_THREAD_JOB_LOCKS: dict = {}
+_THREAD_JOB_LOCKS_GUARD = threading.Lock()
 
 
 @contextlib.asynccontextmanager
@@ -40,3 +31,29 @@ async def clip_lock(job_dir: str, clip_index: int):
         entry[1] -= 1
         if entry[1] <= 0:
             _LOCKS.pop(key, None)
+
+
+@contextlib.contextmanager
+def job_metadata_lock(job_dir: str):
+    """Process-wide per-job re-entrant sync mutex: ``with job_metadata_lock(job_dir): ...``.
+
+    Serialises metadata read-modify-write and highlight operations for a job directory safely across threads.
+    Uses RLock so nested calls within the same thread (e.g. batch orchestrator -> render reel) do not self-deadlock.
+    """
+    key = os.path.abspath(job_dir)
+    with _THREAD_JOB_LOCKS_GUARD:
+        entry = _THREAD_JOB_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.RLock(), 0]
+            _THREAD_JOB_LOCKS[key] = entry
+        entry[1] += 1
+        lock = entry[0]
+    try:
+        with lock:
+            yield lock
+    finally:
+        with _THREAD_JOB_LOCKS_GUARD:
+            entry[1] -= 1
+            if entry[1] <= 0 and len(_THREAD_JOB_LOCKS) > 256:
+                if _THREAD_JOB_LOCKS.get(key) is entry:
+                    _THREAD_JOB_LOCKS.pop(key, None)

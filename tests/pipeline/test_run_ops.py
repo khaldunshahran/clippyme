@@ -85,7 +85,7 @@ def test_basename_uses_sanitized_title():
 
 
 def test_forbidden_chars_stripped():
-    assert clip_output_basename('a<b>c:d"e/f\\g|h?i*j', 0, "source") == "abcdefghij_clip_1"
+    assert clip_output_basename('a<b>c:d"e/f\\g|h?i*j#k%l', 0, "source") == "abcdefghijkl_clip_1"
 
 
 def test_control_chars_stripped():
