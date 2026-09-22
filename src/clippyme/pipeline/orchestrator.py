@@ -122,6 +122,31 @@ def _valid_file(path: str | None, minimum: int = 1) -> bool:
         return False
 
 
+def _valid_media_file(path: str | None, minimum: int = 1) -> bool:
+    if not _valid_file(path, minimum):
+        return False
+    try:
+        import subprocess, json
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15
+        )
+        if proc.returncode != 0:
+            return False
+        data = json.loads(proc.stdout)
+        dur = float(data.get("format", {}).get("duration", 0))
+        if dur <= 0:
+            return False
+        if not any(s.get("codec_type") == "video" for s in data.get("streams", [])):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _enabled(name: str, default: str = "1") -> bool:
     return str(os.getenv(name, default)).strip().lower() not in _FALSE_VALUES
 
@@ -568,25 +593,42 @@ def _render_one_clip(
         f"cutting clip {index + 1}/{total}",
         progress=62 + int(index / max(1, total) * 8),
     )
-    if not _valid_file(clip_source, 10_000):
-        if not _valid_file(input_video, 10_000):
+    if not _valid_media_file(clip_source, 10_000):
+        try:
+            if os.path.exists(clip_source):
+                os.remove(clip_source)
+        except OSError:
+            pass
+        if not _valid_media_file(input_video, 10_000):
             candidate = find_source_video_candidate(output_dir, min_size=10_000)
-            if candidate:
+            if candidate and _valid_media_file(candidate, 10_000):
                 input_video = candidate
                 print(f"♻️ Re-linked source video: {os.path.basename(input_video)}", flush=True)
-        if not _valid_file(input_video, 10_000):
+        if not _valid_media_file(input_video, 10_000):
             raise FileNotFoundError(f"Input source video file not found on disk: {input_video}")
-        command = build_cut_command(input_video, start, end, clip_source)
+        
+        temp_dest = clip_source + ".tmp.mp4"
+        command = build_cut_command(input_video, start, end, temp_dest)
         print(f"✂️ Clip {index + 1}/{total}: {start:.2f}s → {end:.2f}s", flush=True)
+        
+        clip_duration = float(end) - float(start)
+        timeout_factor = int(os.getenv("CLIPPYME_CUT_TIMEOUT_FACTOR", "8"))
+        timeout = max(600, int(clip_duration * timeout_factor))
+        
         process = subprocess.run(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=600,
+            timeout=timeout,
         )
         if process.returncode != 0:
             tail = (process.stderr or b"").decode("utf-8", errors="replace")[-1000:]
+            try:
+                os.remove(temp_dest)
+            except OSError:
+                pass
             raise RuntimeError(f"ffmpeg cut failed for clip {index + 1}: {tail}")
+        os.replace(temp_dest, clip_source)
     else:
         print(f"♻️ Resume: reusing source slice for clip {index + 1}", flush=True)
 

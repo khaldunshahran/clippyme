@@ -117,9 +117,9 @@ def build_cut_command(input_video: str, start: float, end: float, dest: str) -> 
         '-ss', f'{float(start):.3f}',
         '-i', input_video,
         '-t', f'{clip_duration:.3f}',
-        *x264_video_args(faststart=False),
-        '-vsync', 'cfr',
-        '-c:a', 'aac',
+        '-c:v', 'copy',
+        '-c:a', 'copy',
+        '-avoid_negative_ts', 'make_zero',
         dest,
     ]
 
