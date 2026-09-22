@@ -33,7 +33,7 @@ SOURCE_INFO_FILENAME = "source_info.json"
 def _resolve_cookies_path(cookies_file_path):
     if cookies_file_path and os.path.exists(cookies_file_path):
         return os.path.abspath(cookies_file_path)
-    repo_root_cookies = os.path.join(os.path.dirname(__file__), "..", "..", "..", "cookies.txt")
+    repo_root_cookies = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "cookies.txt")
     if os.path.exists(repo_root_cookies):
         return os.path.abspath(repo_root_cookies)
     env_cookies = os.environ.get("YOUTUBE_COOKIES")
