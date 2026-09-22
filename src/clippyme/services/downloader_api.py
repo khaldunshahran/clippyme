@@ -195,7 +195,9 @@ def download_video(req: DownloadRequest, request: Request = None):
     
     if cookies_path:
         attempts = [
-            ("default", True, True),
+            ("default", True, False),      # web + cookies, NO po token — full quality, most reliable
+            ("web_safari", True, False),   # safari + cookies, NO po token
+            ("default", True, True),       # cookies + po token (only if bgutil server running)
             ("web_safari", True, True),
             ("default", False, False),
             ("web_safari", False, False),
