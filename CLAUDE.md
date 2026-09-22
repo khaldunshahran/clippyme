@@ -347,6 +347,7 @@ through verbatim (the frontend parses per-platform 429 daily limits).
 
 API keys, Gemini model, transcription provider and cookies are managed from
 the dashboard Settings tab (persisted in `data/config.json`, git-ignored).
+YouTube cookies can also be placed in `data/cookies.txt` or set via the `YOUTUBE_COOKIES` env var.
 The full operational env-var reference (REFRAME_*, AE_*, CLIPPYME_*,
 DEEPGRAM_*, ELEVENLABS_*, ZERNIO_*, server knobs) lives in `.env.example`
 (commented, with defaults) and the README table — keep those two in sync when

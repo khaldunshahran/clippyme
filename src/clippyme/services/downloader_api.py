@@ -193,17 +193,22 @@ def download_video(req: DownloadRequest, request: Request = None):
     step_start_time = time.time()
     cookies_path = _resolve_cookies_path(req.cookies_file_path)
     
-    attempts = [
-        ("default", False, False),
-        ("web_safari", False, False),
-        ("default", False, True),
-        ("web_safari", False, True),
-    ]
     if cookies_path:
-        attempts.extend([
+        attempts = [
             ("default", True, True),
             ("web_safari", True, True),
-        ])
+            ("default", False, False),
+            ("web_safari", False, False),
+            ("default", False, True),
+            ("web_safari", False, True),
+        ]
+    else:
+        attempts = [
+            ("default", False, False),
+            ("web_safari", False, False),
+            ("default", False, True),
+            ("web_safari", False, True),
+        ]
     attempts.extend([
         ("android_vr", False, False),
         ("android", False, False),
@@ -292,6 +297,20 @@ def download_video(req: DownloadRequest, request: Request = None):
                     downloaded_file = max(mp4_candidates, key=os.path.getmtime)
             if not os.path.isfile(downloaded_file):
                 raise FileNotFoundError("yt-dlp completed without producing an MP4 file")
+
+            try:
+                probe_cmd = [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=height", "-of", "default=noprint_wrappers=1:nokey=1",
+                    downloaded_file
+                ]
+                probe_output = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
+                if probe_output.isdigit():
+                    height = int(probe_output)
+                    if height < 720:
+                        logger.warning(f"downloaded at {height}p, below 720p target — likely bot-degraded client")
+            except Exception as probe_err:
+                logger.warning(f"Failed to probe download quality: {probe_err}")
 
             return {"downloaded_file": downloaded_file, "sanitized_title": sanitized_title}
 
