@@ -181,6 +181,7 @@ def _extractor_args_for(attempt: str):
 def classify_download_error(msg: str) -> str:
     """Classify a yt-dlp error as ``retry`` or ``fatal``."""
     m = (msg or "").lower()
+    m = m.replace("\u2019", "'").replace("\u2018", "'")
     fatal_signals = (
         "private video",
         "this video is private",
