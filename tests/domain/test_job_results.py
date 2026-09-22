@@ -243,3 +243,48 @@ def test_load_final_result_includes_runtime_operations(tmp_path):
     result = load_final_result("job1", str(tmp_path))
     assert result["operations"]["stage"] == "quality"
     assert result["operations"]["progress"] == 92
+
+
+def test_build_clips_attaches_analytics_and_computes_duration_tier(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    (tmp_path / "vid_clip_1.mp4").write_bytes(b"\x00")
+    (tmp_path / "vid_clip_2.mp4").write_bytes(b"\x00")
+
+    fake_analytics = {
+        "version": 1,
+        "clips": {
+            "job1:0": {
+                "post_id": "p123",
+                "published_at": "2026-09-17T00:00:00Z",
+                "metrics": {
+                    "views": 45000,
+                    "likes": 3200,
+                    "shares": 1100,
+                    "comments": 420,
+                    "retention_rate": 0.84,
+                }
+            }
+        }
+    }
+
+    data = {
+        "shorts": [
+            {"start": 10.0, "end": 85.0},   # 75s duration -> mid tier
+            {"start": 100.0, "end": 130.0}, # 30s duration -> short tier
+        ]
+    }
+
+    with patch("clippyme.domain.analytics_service.load_analytics_data", return_value=fake_analytics):
+        clips = _build_clips(data, "vid", "job1", str(tmp_path), only_ready=False)
+
+    assert len(clips) == 2
+    # First clip was published and tracked in analytics
+    assert clips[0]["analytics"]["views"] == 45000
+    assert clips[0]["analytics"]["shares"] == 1100
+    assert clips[0]["published_at"] == "2026-09-17T00:00:00Z"
+    assert clips[0]["duration_tier"] == "mid"
+
+    # Second clip was not published
+    assert "analytics" not in clips[1]
+    assert clips[1]["duration_tier"] == "short"
+

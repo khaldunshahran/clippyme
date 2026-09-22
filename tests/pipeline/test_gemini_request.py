@@ -180,10 +180,11 @@ def test_model_chain_adds_lite_fallback_without_duplicates():
 def test_default_model_chain_exhausts_all_free_tier_fallbacks():
     assert build_model_chain("gemini-3.5-flash") == [
         "gemini-3.5-flash",
-        "gemini-3-flash-preview",
-        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
         "gemini-3.1-flash-lite",
-        "gemini-2.5-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-3.6-flash",
     ]
 
 
@@ -212,6 +213,35 @@ def test_generate_switches_model_after_primary_quota_exhaustion():
     assert used_model == "gemini-3.1-flash-lite"
     assert calls == ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
     assert sleeps == []
+
+
+def test_generate_switches_model_immediately_on_503_capacity_exhaustion():
+    calls = []
+    sleeps = []
+    logs = []
+
+    class Models:
+        def generate_content(self, *, model, contents, config):
+            calls.append(model)
+            if model == "gemini-3.8-flash":
+                raise RuntimeError("503 UNAVAILABLE: No capacity available for model on the server")
+            return "ok"
+
+    client = type("Client", (), {"models": Models()})()
+    response, used_model = generate_with_model_fallback(
+        client,
+        "prompt",
+        ["gemini-3.8-flash", "gemini-3.5-flash-lite"],
+        max_attempts=3,
+        sleep_fn=sleeps.append,
+        log_fn=logs.append,
+    )
+
+    assert response == "ok"
+    assert used_model == "gemini-3.5-flash-lite"
+    assert calls == ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    assert sleeps == []  # immediate switch, no futile sleep retries on overloaded model
+    assert any("[SWITCH]" in log and "503" in log for log in logs)
 
 
 def test_generate_skips_unavailable_preview_model():
@@ -282,3 +312,34 @@ def test_reformat_prompt_carries_error_and_broken_output_only():
     assert '{"shorts": [broken' in p
     # It must NOT embed the transcript/full template (cost + latency bound).
     assert "VIDEO_DURATION_SECONDS" not in p
+
+
+def test_build_viral_prompt_multi_tier_duration_mode():
+    transcript = {
+        "text": "Hello world",
+        "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 1.0}]}]
+    }
+    # When duration_mode is 'all', prompt must use multi-tier distribution instead of 15s-60s
+    prompt, _ = build_viral_prompt(transcript, video_duration=600.0, duration_mode="all")
+    assert "MULTI-TIER DURATION & RETENTION STRATEGY" in prompt
+    assert "TIER 1 - SHORTS / REELS" in prompt
+    assert "TIER 2 - MID-LENGTH SOCIAL" in prompt
+    assert "TIER 3 - EXTENDED DEEP DIVE" in prompt
+    assert "15s ≤ duration ≤ 300s" in prompt
+
+
+def test_build_viral_prompt_with_audience_intel():
+    transcript = {
+        "text": "Hello world",
+        "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 1.0}]}]
+    }
+    intel = {
+        "title": "Top Secret Hacks",
+        "top_comments": [{"text": "14:20 was unbelievable!", "like_count": 5000}],
+        "audience_timestamps": [{"timestamp": "14:20", "seconds": 860.0, "sample_comment": "14:20 was unbelievable!"}],
+    }
+    prompt, _ = build_viral_prompt(transcript, video_duration=600.0, audience_intel=intel)
+    assert "AUDIENCE INTELLIGENCE & SOCIAL SIGNALS" in prompt
+    assert "Top Secret Hacks" in prompt
+    assert "5000 likes" in prompt
+    assert "14:20 (860s)" in prompt

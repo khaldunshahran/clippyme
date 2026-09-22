@@ -299,9 +299,20 @@ def test_validate_config_vod_poll_default():
     assert cfg["channel"] == "@somebody"
 
 
-def test_validate_config_youtube_live_rejected():
-    with pytest.raises(ValidationError):
-        validate_monitor_config(_base_cfg(platform="youtube", mode="live", slug="@x"))
+def test_validate_config_youtube_live_accepted():
+    cfg = validate_monitor_config(_base_cfg(platform="youtube", mode="live", slug="@x"))
+    assert cfg["platform"] == "youtube"
+    assert cfg["mode"] == "live"
+    assert cfg["poll_interval"] == 60  # live default
+    assert cfg["channel"] == "@x"
+    assert cfg["stream_quality"] == "best"
+
+
+def test_validate_config_stream_quality_custom_and_partial_update():
+    cfg = validate_monitor_config(_base_cfg(stream_quality="1080p60,720p,best"))
+    assert cfg["stream_quality"] == "1080p60,720p,best"
+    updated = validate_monitor_partial_update({"stream_quality": "720p"}, cfg)
+    assert updated["stream_quality"] == "720p"
 
 
 def test_validate_config_bad_platform_or_mode():
@@ -1448,3 +1459,227 @@ def test_vod_start_offset_skips_prelive_only_where_a_prelive_exists():
     # A YouTube upload has no prelive — trimming would eat real content.
     yt = SimpleNamespace(platform="youtube", cfg=cfg)
     assert LiveMonitor._vod_start_offset(yt) == 0.0
+
+
+def test_youtube_strategy_get_live_state_and_capture_args(monkeypatch, tmp_path):
+    from clippyme.domain.live_monitor import YoutubeStrategy
+
+    strat = YoutubeStrategy("@TestCreator")
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        "clippyme.integrations.youtube_feed.check_youtube_live",
+        lambda chan: (True, "https://example.com/live.m3u8", now),
+    )
+    is_live, stream_url, started_at = strat.get_live_state()
+    assert is_live is True
+    assert stream_url == "https://example.com/live.m3u8"
+    assert started_at == now
+
+    # Direct URL capture args (ffmpeg copy)
+    args = strat.capture_args(str(tmp_path / "seg.mp4"), 1800, "https://example.com/live.m3u8")
+    assert args[0] == "ffmpeg"
+    assert "https://example.com/live.m3u8" in args
+    assert "-c" in args and "copy" in args
+
+    # Streamlink capture args fallback
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/streamlink" if cmd == "streamlink" else None)
+    monkeypatch.setattr(
+        "clippyme.integrations.youtube_feed.get_youtube_live_stream_url",
+        lambda url, quality="best": None,
+    )
+    args_sl = strat.capture_args(str(tmp_path / "seg.mp4"), 1800, "https://youtube.com/@TestCreator/live", quality="720p")
+    assert args_sl is not None
+    assert args_sl[0] == "streamlink"
+    assert "720p" in args_sl
+
+
+def test_strategy_quality_passed_to_capture_args(monkeypatch, tmp_path):
+    from clippyme.domain.live_monitor import KickStrategy, TwitchStrategy
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/streamlink" if cmd == "streamlink" else None)
+
+    kick = KickStrategy("streamer")
+    args_k = kick.capture_args(str(tmp_path / "seg.mp4"), 1800, None, quality="1080p60,best")
+    assert "1080p60,best" in args_k
+
+    client = type("TwitchClientMock", (), {})()
+    twitch = TwitchStrategy("streamer", client)
+    args_t = twitch.capture_args(str(tmp_path / "seg.mp4"), 1800, None, quality="720p60,best")
+    assert "720p60,best" in args_t
+
+
+def test_live_monitor_status_telemetry(tmp_path):
+    import time
+    from clippyme.domain.live_monitor import LiveMonitor
+
+    seg_file = tmp_path / "test_seg.mp4"
+    seg_file.write_bytes(b"X" * 1024)
+
+    mon = LiveMonitor(id="kick:test", jobs={}, job_queue=None, output_dir=str(tmp_path))
+    mon.state = "capturing"
+    mon._active_segment_path = str(seg_file)
+    mon._active_segment_start = time.time() - 10
+
+    st = mon.status()
+    assert st["current_segment_bytes"] == 1024
+    assert st["current_segment_seconds"] >= 9
+
+
+def test_live_monitor_anti_flap_check_reconnects():
+    import asyncio
+    from clippyme.domain.live_monitor import LiveMonitor
+
+    async def _run():
+        mon = LiveMonitor(id="kick:test", jobs={}, job_queue=None, output_dir="output")
+        mon.state = "capturing"
+
+        call_count = [0]
+        def mock_get_live():
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                return True, "url", None
+            return False, None, None
+
+        mon._strategy = type("StrategyMock", (), {"get_live_state": staticmethod(mock_get_live)})()
+        mon._interruptible_sleep = lambda secs: asyncio.sleep(0.001)
+
+        res = await mon._anti_flap_check()
+        assert res is True
+        assert mon.state == "capturing"
+
+    asyncio.run(_run())
+
+
+def test_live_monitor_anti_flap_check_confirms_offline():
+    import asyncio
+    from clippyme.domain.live_monitor import LiveMonitor
+
+    async def _run():
+        mon = LiveMonitor(id="kick:test", jobs={}, job_queue=None, output_dir="output")
+        mon.state = "capturing"
+
+        mon._strategy = type("StrategyMock", (), {"get_live_state": staticmethod(lambda: (False, None, None))})()
+        mon._interruptible_sleep = lambda secs: asyncio.sleep(0.001)
+
+        res = await mon._anti_flap_check()
+        assert res is False
+
+    asyncio.run(_run())
+
+
+def test_live_monitor_require_preview_config_and_status(tmp_path):
+    from clippyme.domain.live_monitor import LiveMonitor, validate_monitor_config
+
+    cfg = validate_monitor_config({
+        "platform": "kick",
+        "channel": "streamer",
+        "platforms": [{"platform": "tiktok", "accountId": "acc1"}],
+        "require_preview": True,
+    })
+    assert cfg["require_preview"] is True
+
+    mon = LiveMonitor(id="kick:streamer", jobs={}, job_queue=None, output_dir=str(tmp_path))
+    mon.cfg = cfg
+    status = mon.status()
+    assert status["require_preview"] is True
+    assert status["pending_clips"] == []
+
+
+def test_live_monitor_pending_clips_flow(tmp_path, monkeypatch):
+    import asyncio
+    from clippyme.domain.live_monitor import LiveMonitor
+
+    job_dir = tmp_path / "job1"
+    job_dir.mkdir()
+    clip_file = job_dir / "clip1.mp4"
+    clip_file.write_bytes(b"dummy")
+
+    published_calls = []
+    def mock_publish_clip(**kw):
+        published_calls.append(kw)
+
+    from clippyme.integrations import social_publisher as sp
+    monkeypatch.setattr(sp, "publish_clip", mock_publish_clip)
+
+    mon = LiveMonitor(id="kick:streamer", jobs={}, job_queue=None, output_dir=str(tmp_path))
+    mon.cfg = {
+        "channel": "streamer",
+        "platforms": [{"platform": "tiktok", "accountId": "acc1"}],
+        "require_preview": True,
+        "delete_after_publish": False,
+        "timezone": "Europe/Rome",
+    }
+    mon._zernio_key = "sk_test"
+
+    clip = {
+        "title": "Insane Play",
+        "video_title_for_youtube_short": "Insane Play",
+        "video_description": "Watch this insane play right now! #gaming #viral",
+        "hashtags": ["#gaming", "#viral"],
+        "speaker_name": "Streamer",
+        "start": 10.0,
+        "end": 45.0,
+        "viral_score": 95,
+        "video_url": "/videos/job1/clip1.mp4",
+    }
+
+    # Queue an entry as consolidated
+    entry = {
+        "id": "clip_abc",
+        "job_id": "job1",
+        "clip": clip,
+        "composed_path": str(clip_file),
+        "filename": "clip1.mp4",
+        "title": "Insane Play",
+        "caption": "Watch this insane play right now! #gaming #viral",
+        "speaker_name": "Streamer",
+        "hashtags": ["#gaming", "#viral"],
+        "viral_score": 95,
+        "duration": 35.0,
+        "status": "pending_preview",
+    }
+    mon._pending_publish.append(entry)
+
+    # 1. get_pending_clips returns formatted preview data
+    pending = mon.get_pending_clips()
+    assert len(pending) == 1
+    assert pending[0]["id"] == "clip_abc"
+    assert pending[0]["title"] == "Insane Play"
+    assert pending[0]["viral_score"] == 95
+    assert pending[0]["duration"] == 35.0
+    assert "/videos/monitor_kick_streamer/clip1.mp4" in pending[0]["video_url"]
+
+    # 2. publish_pending_clip publishes the clip with optional overrides
+    res = asyncio.run(mon.publish_pending_clip("clip_abc", overrides={
+        "title": "Updated Viral Title",
+        "caption": "Custom Caption #epic",
+        "schedule_mode": "manual",
+        "scheduled_for": "2026-09-07T12:00:00Z",
+    }))
+    assert res["success"] is True
+    assert len(mon._pending_publish) == 0
+    assert len(published_calls) == 1
+    assert published_calls[0]["title"] == "Updated Viral Title"
+    assert published_calls[0]["caption"] == "Custom Caption #epic"
+    assert published_calls[0]["schedule_mode"] == "manual"
+    assert published_calls[0]["scheduled_for"] == "2026-09-07T12:00:00Z"
+    assert mon.clips_published == 1
+
+    # 3. dismiss_pending_clip removes from queue and cleans file
+    clip_file2 = job_dir / "clip2.mp4"
+    clip_file2.write_bytes(b"dummy2")
+    entry2 = {
+        "id": "clip_xyz",
+        "job_id": "job1",
+        "clip": clip,
+        "composed_path": str(clip_file2),
+        "filename": "clip2.mp4",
+    }
+    mon._pending_publish.append(entry2)
+    assert len(mon.get_pending_clips()) == 1
+    dismiss_res = mon.dismiss_pending_clip("clip_xyz")
+    assert dismiss_res["success"] is True
+    assert len(mon.get_pending_clips()) == 0
+    assert not clip_file2.exists()
+
+

@@ -4,7 +4,7 @@ import os
 from typing import Optional, List, Dict, Any
 from PIL import Image
 
-TEXT_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
+TEXT_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
 
 
 def generate_viral_titles(
@@ -222,7 +222,7 @@ COMPOSITION GUIDELINES:
                     return out_file
         except Exception:
             # Fallback to multimodal content generation if generate_images encounters model restriction
-            target_model = "gemini-2.5-flash"
+            target_model = "gemini-3.5-flash"
 
     # Multimodal image generation path (Gemini native / Nano Banana with face/bg blending)
     prompt_parts = []
@@ -234,7 +234,7 @@ COMPOSITION GUIDELINES:
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash" if target_model.startswith("imagen") else target_model,
+            model="gemini-3.5-flash" if target_model.startswith("imagen") else target_model,
             contents=prompt_parts,
         )
         if hasattr(response, "candidates") and response.candidates:

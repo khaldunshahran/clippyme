@@ -15,7 +15,7 @@ def generate_ugc_scripts(
     from google.genai import types
 
     client = genai.Client(api_key=gemini_key)
-    model = model_name or os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
+    model = model_name or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
 
     prompt = f"""You are a master viral video creator specializing in TikTok, IG Reels, and YouTube Shorts marketing videos.
 Based on the following product research, create 3 distinct, high-converting 30-45 second video scripts.

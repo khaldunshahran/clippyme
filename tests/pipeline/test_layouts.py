@@ -50,6 +50,34 @@ def test_pair_in_frame_and_split_geometry():
     assert "pad=1080:1920:0:0" in fg
 
 
+def test_split_geometry_outer_third_centering_and_adaptive():
+    # Outer-third speakers (typical podcast host at cx=350, guest at cx=1550)
+    crop_w_l, crop_h_l, xl, yl, _ = split_geometry(1920, 1080, 1080, 1920, (350, 400))
+    # Must not clamp to 0 border
+    assert xl > 0
+    # Center of crop box must be exactly the face center cx=350
+    assert (xl + crop_w_l // 2) == 350
+
+    crop_w_r, crop_h_r, xr, yr, _ = split_geometry(1920, 1080, 1080, 1920, (1550, 400))
+    # Must not clamp to 1920 - crop_w border
+    assert xr < (1920 - crop_w_r)
+    # Center of crop box must be exactly cx=1550
+    assert (xr + crop_w_r // 2) == 1550
+
+    # Face-adaptive geometry
+    cw_adapt, ch_adapt, xa, ya, _ = split_geometry(1920, 1080, 1080, 1920, (400, 400), face_dim=(120, 160))
+    # Adaptive height scales with face height (160 * 3.0 = 480)
+    assert ch_adapt == 486 or ch_adapt >= 480
+    assert cw_adapt % 2 == 0
+    assert ch_adapt % 2 == 0
+    # Headroom check: eye-line comfortably in upper third (~35%)
+    assert ya <= 400
+
+    # Filtergraph with face dimensions
+    fg = split_filtergraph(1920, 1080, 1080, 1920, (350, 400), (1550, 400), left_dim=(120, 160), right_dim=(130, 170))
+    assert "vstack=inputs=2" in fg
+
+
 def test_screencast_layout():
     content_h, speaker_h = content_bands(1920, 1080, 1080, 1920)
     assert content_h + speaker_h == 1920

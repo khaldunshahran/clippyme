@@ -56,6 +56,11 @@ export function useJobSubmission({
 
     try {
       const resData = await submitProcessJob(withTaste(data), apiKey);
+      if (resData?.job_id && data.preselections) {
+        try {
+          localStorage.setItem(`clippyme_preselections_job_${resData.job_id}`, JSON.stringify(data.preselections));
+        } catch { /* ignore quota */ }
+      }
       setJobId(resData.job_id);
     } catch (e) {
       setStatus('error');

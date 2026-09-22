@@ -247,8 +247,14 @@ def _write_source_info(output_dir, info):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, os.path.join(output_dir, SOURCE_INFO_FILENAME))
+
+        # Capture and persist rich audience intelligence (comments, timestamps, description)
+        from clippyme.pipeline.audience_intel import parse_audience_intel, save_audience_intel
+        intel = parse_audience_intel(info)
+        if intel:
+            save_audience_intel(output_dir, intel)
     except Exception as exc:  # pragma: no cover - telemetry only, never fatal
-        print(f"   ⚠️  source_info capture skipped: {exc}")
+        print(f"   ⚠️  source_info/audience_intel capture skipped: {exc}")
 
 
 def download_youtube_video(url, output_dir=".", cookies_file_path=None):
@@ -270,9 +276,14 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
         "cookies_file_path": abs_cookies_file_path,
     }
 
+    headers = {}
+    internal_token = os.environ.get("CLIPPYME_INTERNAL_TOKEN") or os.environ.get("CLIPPYME_API_TOKEN")
+    if internal_token:
+        headers["X-API-Token"] = internal_token
+
     try:
         with httpx.Client(timeout=3600.0) as client:
-            response = client.post("http://127.0.0.1:8001/download", json=payload)
+            response = client.post("http://127.0.0.1:8001/download", json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
             downloaded_file = data["downloaded_file"]
@@ -281,10 +292,36 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
         step_end_time = time.time()
         print(f"✅ Video downloaded in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
         return downloaded_file, sanitized_title
+    except httpx.ConnectError as conn_err:
+        print(f"⚠️ Downloader microservice on port 8001 not reachable ({conn_err}). Falling back to in-process download...", file=sys.stderr)
+        try:
+            from clippyme.services.downloader_api import download_video as local_download, DownloadRequest
+            req = DownloadRequest(
+                url=url,
+                output_dir=abs_output_dir,
+                cookies_file_path=abs_cookies_file_path,
+            )
+            data = local_download(req)
+            downloaded_file = data["downloaded_file"]
+            sanitized_title = data["sanitized_title"]
+            step_end_time = time.time()
+            print(f"✅ Video downloaded via in-process fallback in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
+            return downloaded_file, sanitized_title
+        except Exception as fallback_err:
+            print(f"❌ In-process fallback failed: {fallback_err}", file=sys.stderr)
+            raise RuntimeError(f"Downloader microservice failed: {conn_err} (in-process fallback failed: {fallback_err})")
     except httpx.HTTPError as e:
-        print(f"❌ Downloader Microservice failed: {e}")
+        detail = ""
         if hasattr(e, "response") and e.response is not None:
-            print(f"Response: {e.response.text}")
+            try:
+                resp_json = e.response.json()
+                detail = resp_json.get("detail", "")
+            except Exception:
+                detail = e.response.text or ""
+
+        print(f"❌ Downloader Microservice failed: {e}")
+        if detail:
+            print(f"Response: {detail}")
 
         print("🚨 SOURCE DOWNLOAD ERROR 🚨", file=sys.stderr)
         error_msg = f"""
@@ -293,11 +330,12 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
 ❌ ================================================================= ❌
 
 The remote platform refused or could not complete the download.
-Technical Details: {e}
+Technical Details: {detail or e}
         """
         print(error_msg, file=sys.stdout)
         print(error_msg, file=sys.stderr)
         sys.stdout.flush()
         sys.stderr.flush()
-        raise RuntimeError(f"Downloader microservice failed: {e}")
+        err_str = f": {detail}" if detail else f": {e}"
+        raise RuntimeError(f"Downloader microservice failed{err_str}")
 

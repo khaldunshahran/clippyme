@@ -25,6 +25,10 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 
 class HighlightPlanRequest(BaseModel):
     target_duration: int = Field(60, ge=15, le=720)
+    content_mode: Optional[str] = "podcast"
+    output_style: Optional[str] = "recap"
+    theme: Optional[str] = None
+    merge_gap_seconds: float = Field(1.5, ge=0.0, le=10.0)
     model_name: Optional[str] = None
 
 
@@ -33,6 +37,10 @@ class HighlightGenerateAllRequest(BaseModel):
     reframe_mode: str = "blur_pad"
     subtitles: Optional[Dict[str, Any]] = None
     grade_preset: str = "none"
+    content_mode: Optional[str] = "podcast"
+    output_style: Optional[str] = "recap"
+    theme: Optional[str] = None
+    merge_gap_seconds: float = Field(1.5, ge=0.0, le=10.0)
     model_name: Optional[str] = None
 
 
@@ -44,6 +52,10 @@ class HighlightApplyEditRequest(BaseModel):
     grade_preset: Optional[str] = None
     cuts: Optional[List[Dict[str, Any]]] = None
     title: Optional[str] = None
+    content_mode: Optional[str] = None
+    output_style: Optional[str] = None
+    theme: Optional[str] = None
+    merge_gap_seconds: Optional[float] = None
 
 
 class HighlightRenderRequest(BaseModel):
@@ -56,6 +68,10 @@ class HighlightRenderRequest(BaseModel):
     hook: Optional[Dict[str, Any]] = None
     logo: Optional[Dict[str, Any]] = None
     grade_preset: str = "none"
+    content_mode: Optional[str] = "podcast"
+    output_style: Optional[str] = "recap"
+    theme: Optional[str] = None
+    merge_gap_seconds: float = Field(1.5, ge=0.0, le=10.0)
     model_name: Optional[str] = None
 
 
@@ -76,6 +92,10 @@ async def plan_highlights(
             plan_highlights_sync,
             job_id=job_id,
             target_duration=body.target_duration,
+            content_mode=body.content_mode,
+            output_style=body.output_style,
+            theme=body.theme,
+            merge_gap_seconds=body.merge_gap_seconds,
             output_root=OUTPUT_DIR,
             api_key=api_key,
             model_name=body.model_name,
@@ -112,6 +132,10 @@ async def render_highlight_reel(
             hook=body.hook,
             logo=body.logo,
             grade_preset=body.grade_preset,
+            content_mode=body.content_mode,
+            output_style=body.output_style,
+            theme=body.theme,
+            merge_gap_seconds=body.merge_gap_seconds,
             output_root=OUTPUT_DIR,
             api_key=api_key,
             model_name=body.model_name,
@@ -144,6 +168,10 @@ async def generate_all_highlights(
             reframe_mode=body.reframe_mode,
             subtitles=body.subtitles,
             grade_preset=body.grade_preset,
+            content_mode=body.content_mode,
+            output_style=body.output_style,
+            theme=body.theme,
+            merge_gap_seconds=body.merge_gap_seconds,
             output_root=OUTPUT_DIR,
             api_key=api_key,
             model_name=body.model_name,

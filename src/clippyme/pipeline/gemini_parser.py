@@ -207,6 +207,131 @@ def _viral_reason_is_generic(reason: str) -> bool:
 # so every downstream caller gets it automatically.
 
 
+def _extract_key_entities(text: str) -> set[str]:
+    """Extract notable proper nouns / entities (capitalized names, dollar amounts, large numbers)."""
+    if not text:
+        return set()
+    tokens = re.findall(r"\b(?:[A-Z][a-z0-9_]{3,}|\$\d+(?:,\d+)*(?:\.\d+)?[kKmMbB]?|\d+[kKmMbB])\b", text)
+    stopwords = {
+        "this", "that", "what", "when", "where", "which", "with", "from",
+        "about", "after", "before", "then", "they", "there", "here", "some",
+        "just", "more", "your", "their", "have", "been", "opens", "incredible",
+        "shocking", "speaker", "video", "short", "reel", "tiktok", "youtube",
+        "reveals", "detail", "pricing", "secret", "tactic", "first", "second",
+        "everyone", "anyone", "someone", "nothing", "everything", "always"
+    }
+    return {t.lower() for t in tokens if t.lower() not in stopwords}
+
+
+def _has_narrative_continuity(c1: Any, c2: Any) -> bool:
+    """Check if c2 is an explicit continuation of c1's narrative arc."""
+    d1 = c1.model_dump() if hasattr(c1, "model_dump") else c1
+    d2 = c2.model_dump() if hasattr(c2, "model_dump") else c2
+
+    t1_title = (d1.get("video_title_for_youtube_short") or "").strip()
+    t2_title = (d2.get("video_title_for_youtube_short") or "").strip()
+
+    # Discourse continuation cues in c2 (e.g. Giuliani responded, then sent photo, etc.)
+    t2_text = f"{t2_title} {d2.get('viral_reason', '')} {d2.get('viral_hook_text', '')}".lower()
+    continuation_cues = (
+        "responded by", "replied by", "then he", "then she", "then they",
+        "he lied about", "she lied about", "forgot about the photo",
+        "then sent", "later told", "turns out", "twist where",
+        "and he laughed", "and they published", "part 2", "continuation",
+    )
+    if any(cue in t2_text for cue in continuation_cues):
+        return True
+
+    # Shared proper entities between titled candidates
+    if t1_title and t2_title:
+        spk1 = (d1.get("speaker_name") or "").strip().lower()
+        spk2 = (d2.get("speaker_name") or "").strip().lower()
+        if spk1 and spk2 and spk1 != spk2:
+            return False
+
+        e1 = _extract_key_entities(f"{t1_title} {d1.get('viral_reason', '')}")
+        e2 = _extract_key_entities(f"{t2_title} {d2.get('viral_reason', '')}")
+        shared = e1.intersection(e2)
+        if len(shared) >= 1:
+            return True
+
+    return False
+
+
+def consolidate_narrative_continuations(
+    clips: List[Any],
+    max_gap_sec: float = 25.0,
+    max_combined_sec: float = 180.0,
+) -> List[Any]:
+    """Merge adjacent candidate clips that belong to the same continuous story arc."""
+    if len(clips) < 2:
+        return clips
+
+    def _get_start(c):
+        return c.start if hasattr(c, "start") else c.get("start", 0.0)
+
+    def _get_end(c):
+        return c.end if hasattr(c, "end") else c.get("end", 0.0)
+
+    sorted_clips = sorted(clips, key=_get_start)
+    merged: List[Any] = []
+
+    i = 0
+    while i < len(sorted_clips):
+        curr = sorted_clips[i]
+        while i + 1 < len(sorted_clips):
+            nxt = sorted_clips[i + 1]
+            c_start, c_end = _get_start(curr), _get_end(curr)
+            n_start, n_end = _get_start(nxt), _get_end(nxt)
+            gap = n_start - c_end
+            combined_dur = n_end - c_start
+
+            if 0.0 <= gap <= max_gap_sec and combined_dur <= max_combined_sec and _has_narrative_continuity(curr, nxt):
+                logger.info(
+                    "consolidate_narrative_continuations: fusing story fragments [%.1f–%.1f] and [%.1f–%.1f] into unified %.1fs clip",
+                    c_start, c_end, n_start, n_end, combined_dur,
+                )
+                is_model = hasattr(curr, "model_copy")
+                if is_model:
+                    from clippyme.schemas import ViralClip
+                    d1 = curr.model_dump()
+                    d2 = nxt.model_dump()
+                else:
+                    d1 = dict(curr)
+                    d2 = dict(nxt)
+
+                t1 = d1.get("video_title_for_youtube_short", "")
+                t2 = d2.get("video_title_for_youtube_short", "")
+                title = t1 if len(t1) >= len(t2) else t2
+                if t1 and t2 and t1 != t2 and len(f"{t1} — {t2}") <= 100:
+                    title = f"{t1} — {t2}"
+
+                tier = "short" if combined_dur <= 60.0 else ("mid" if combined_dur <= 120.0 else "extended")
+
+                merged_dict = {
+                    **d1,
+                    "start": c_start,
+                    "end": n_end,
+                    "viral_score": max(d1.get("viral_score", 0), d2.get("viral_score", 0)),
+                    "video_title_for_youtube_short": title,
+                    "viral_hook_text": d1.get("viral_hook_text") or d2.get("viral_hook_text", ""),
+                    "viral_reason": f"{d1.get('viral_reason', '')} Continues with: {d2.get('viral_reason', '')}".strip(),
+                    "duration_tier": tier,
+                }
+                if is_model:
+                    curr = ViralClip.model_validate(merged_dict)
+                else:
+                    curr = merged_dict
+                i += 1
+            else:
+                break
+
+        merged.append(curr)
+        i += 1
+
+    return merged
+
+
 def validate_and_dedupe(
     data: Dict[str, Any],
     video_duration: Optional[float] = None,
@@ -278,6 +403,9 @@ def validate_and_dedupe(
             logger.info(
                 "validate_and_dedupe: dropped %d clip(s) with generic viral_reason", dropped
             )
+
+    # Narrative Completeness: fuse adjacent story fragments into full arcs
+    candidates = consolidate_narrative_continuations(candidates)
 
     candidates.sort(key=lambda c: -c.viral_score)
 

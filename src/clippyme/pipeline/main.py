@@ -250,6 +250,9 @@ def _transcribe_whisper_chunked(model, audio_path: str, language: str | None, ch
     import subprocess
     import tempfile
 
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found for transcription: {audio_path}")
+
     # Get total audio duration via ffprobe
     probe_cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -288,7 +291,20 @@ def _transcribe_whisper_chunked(model, audio_path: str, language: str | None, ch
                 "ffmpeg", "-y", "-ss", str(offset), "-t", str(current_chunk_duration),
                 "-i", audio_path, "-ac", "1", "-ar", "16000", chunk_file
             ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode != 0:
+                # Fast seek failed or demuxer error; retry with accurate decoding seek (-i before -ss)
+                fallback_cmd = [
+                    "ffmpeg", "-y", "-i", audio_path, "-ss", str(offset), "-t", str(current_chunk_duration),
+                    "-ac", "1", "-ar", "16000", chunk_file
+                ]
+                res_fb = subprocess.run(fallback_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if res_fb.returncode != 0:
+                    err_msg = (res_fb.stderr or res.stderr or "").strip() or f"exit status {res_fb.returncode}"
+                    raise RuntimeError(
+                        f"FFmpeg chunk extraction failed for chunk {i+1}/{num_chunks} "
+                        f"({offset:.0f}s-{offset+current_chunk_duration:.0f}s): {err_msg}"
+                    )
             chunk_segs, info = model.transcribe(
                 chunk_file,
                 word_timestamps=True,
@@ -368,7 +384,8 @@ def transcribe_video(video_path):
         if provider == "deepgram":
             try:
                 from clippyme.pipeline.deepgram_transcribe import transcribe_with_deepgram, DeepgramError
-                return transcribe_with_deepgram(asr_input)
+                dg_input = asr_input if (asr_input and os.path.isfile(asr_input)) else video_path
+                return transcribe_with_deepgram(dg_input)
             except Exception as exc:  # noqa: BLE001 — broad catch for safe fallback
                 logging.getLogger("clippyme").warning(
                     "Deepgram transcription failed (%s) — falling back to Faster-Whisper", exc
@@ -377,7 +394,8 @@ def transcribe_video(video_path):
         elif provider == "elevenlabs":
             try:
                 from clippyme.pipeline.elevenlabs_transcribe import transcribe_with_elevenlabs
-                return transcribe_with_elevenlabs(asr_input)
+                el_input = asr_input if (asr_input and os.path.isfile(asr_input)) else video_path
+                return transcribe_with_elevenlabs(el_input)
             except Exception as exc:  # noqa: BLE001 — broad catch for safe fallback
                 logging.getLogger("clippyme").warning(
                     "ElevenLabs transcription failed (%s) — falling back to Faster-Whisper", exc
@@ -401,7 +419,19 @@ def transcribe_video(video_path):
             if os.getenv("DEEPGRAM_API_KEY"):
                 print(f"⚠️ Faster-Whisper transcription failed ({exc}) — falling back to Deepgram...")
                 from clippyme.pipeline.deepgram_transcribe import transcribe_with_deepgram
-                return transcribe_with_deepgram(asr_input)
+                fallback_input = asr_input if (asr_input and os.path.isfile(asr_input) and os.path.getsize(asr_input) > 0) else None
+                if not fallback_input and video_path and os.path.isfile(video_path):
+                    fallback_input = _extract_audio_for_asr(video_path)
+                if not fallback_input or not os.path.isfile(fallback_input) or os.path.getsize(fallback_input) == 0:
+                    # Everything vanished — last resort is the raw video file.
+                    fallback_input = video_path
+                try:
+                    return transcribe_with_deepgram(fallback_input)
+                except Exception as dg_err:
+                    if fallback_input != video_path and video_path and os.path.isfile(video_path):
+                        print(f"⚠️ Deepgram audio fallback failed ({dg_err}); retrying with original video file...")
+                        return transcribe_with_deepgram(video_path)
+                    raise
             raise
 
         # Convert to openai-whisper compatible format
@@ -494,6 +524,8 @@ def get_viral_clips(
     min_clips=None,
     max_clips=None,
     clip_type=None,
+    duration_mode=None,
+    audience_intel=None,
 ):
     print("🤖  Analyzing with Gemini...")
     get_viral_clips._last_gemini_exhausted = False
@@ -527,6 +559,8 @@ def get_viral_clips(
         min_clips=min_clips,
         max_clips=max_clips,
         clip_type=clip_type,
+        duration_mode=duration_mode,
+        audience_intel=audience_intel,
     )
 
     if not words:
@@ -584,7 +618,7 @@ def get_viral_clips(
             it to reformat. That avoids paying the input-token cost of
             the transcript twice and keeps the retry latency-bounded.
             """
-            retry_model = os.getenv("GEMINI_RETRY_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash"
+            retry_model = os.getenv("GEMINI_RETRY_MODEL", "gemini-3.5-flash-lite") or "gemini-3.5-flash-lite"
             retry_prompt = build_reformat_prompt(err_msg, text)
             try:
                 retry_chain = build_model_chain(
@@ -743,13 +777,14 @@ if __name__ == '__main__':
                              'fallbacks; empty transcript or Gemini exhaustion → zero clips.')
     parser.add_argument('--model', type=str, default=None,
                         help="Override the Gemini model for viral detection on THIS job (e.g. "
-                             "'gemini-2.5-pro', 'gemini-3.1-pro-preview'). When unset, the pipeline uses "
+                             "'gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.1-pro-preview'). When unset, the pipeline uses "
                              "GEMINI_MODEL from env / Settings (default gemini-3.5-flash).")
     parser.add_argument('--min-duration', type=float, default=None, help="Minimum clip duration in seconds.")
     parser.add_argument('--max-duration', type=float, default=None, help="Maximum clip duration in seconds.")
     parser.add_argument('--min-clips', type=int, default=None, help="Minimum number of clips to extract.")
     parser.add_argument('--max-clips', type=int, default=None, help="Maximum number of clips to extract.")
     parser.add_argument('--clip-type', type=str, default=None, help="Content focus (viral, educational, humor, storytelling, all).")
+    parser.add_argument('--duration-mode', type=str, default=None, help="Duration mode (shorts, mid, long, all, custom).")
 
     args = parser.parse_args()
 
@@ -902,6 +937,8 @@ if __name__ == '__main__':
             duration = 0.0
 
         # 4. Gemini Analysis
+        from clippyme.pipeline.audience_intel import load_audience_intel
+        audience_intel = load_audience_intel(output_dir)
         clips_data = get_viral_clips(
             transcript,
             duration,
@@ -911,6 +948,8 @@ if __name__ == '__main__':
             min_clips=args.min_clips,
             max_clips=args.max_clips,
             clip_type=args.clip_type,
+            duration_mode=getattr(args, "duration_mode", None),
+            audience_intel=audience_intel,
         )
 
         # Smarter no-AI fallback: when Gemini is unavailable (no key) or its

@@ -13,7 +13,8 @@ MIN_COEXISTENCE = 0.5
 MIN_SEPARATION = 0.20
 MIN_FACE_WIDTH = 0.045
 MIN_SCENE_SECONDS = 2.5
-SPLIT_TIGHTNESS = float(os.environ.get("SPLIT_TIGHTNESS", "0.8"))
+# 0.55 gives a balanced medium-close up crop (~660px on 1080p), preventing outer-third speaker clamping
+SPLIT_TIGHTNESS = float(os.environ.get("SPLIT_TIGHTNESS", "0.55"))
 MAX_FACE_OVERLAP = 0.30
 
 SECONDS_PER_SAMPLE = 1.5
@@ -74,7 +75,10 @@ def pair_in_frame(candidates, frame_w):
 
 
 def analyze_scene(sampled_frames, frame_w):
-    """Check if sampled frames consistently contain two separated faces."""
+    """Check if sampled frames consistently contain two separated faces.
+    
+    Returns (left_center, right_center, left_dims, right_dims).
+    """
     if not sampled_frames:
         return None
 
@@ -90,16 +94,31 @@ def analyze_scene(sampled_frames, frame_w):
     left_med = (float(np.median([c[0] for c in left_centers])), float(np.median([c[1] for c in left_centers])))
     right_med = (float(np.median([c[0] for c in right_centers])), float(np.median([c[1] for c in right_centers])))
 
-    return left_med, right_med
+    left_dims = (float(np.median([p[0][2] for p in coexistent])), float(np.median([p[0][3] for p in coexistent])))
+    right_dims = (float(np.median([p[1][2] for p in coexistent])), float(np.median([p[1][3] for p in coexistent])))
+
+    return left_med, right_med, left_dims, right_dims
 
 
-def split_geometry(orig_w, orig_h, out_w, out_h, centre):
-    """Crop box for one half of the stacked frame."""
+def split_geometry(orig_w, orig_h, out_w, out_h, centre, face_dim=None):
+    """Crop box for one half of the stacked frame with face-adaptive centering.
+    
+    Ensures faces situated in the outer thirds (standard podcast framing) are locked
+    in the center of their respective crop without hitting the canvas borders.
+    """
     half_h = out_h // 2
     half_h -= half_h % 2
     aspect = out_w / float(half_h)
 
-    crop_h = int(round(orig_h * max(0.3, min(SPLIT_TIGHTNESS, 1.0))))
+    # Adaptive vertical crop: if face height is known, frame relative to face size
+    if face_dim and len(face_dim) >= 2 and face_dim[1] > 0:
+        fh = face_dim[1]
+        # ~2.8-3.2x face height gives a natural portrait chest/head framing
+        adaptive_h = int(round(fh * 3.0))
+        crop_h = max(int(orig_h * 0.45), min(adaptive_h, int(orig_h * 0.70)))
+    else:
+        crop_h = int(round(orig_h * max(0.35, min(SPLIT_TIGHTNESS, 1.0))))
+
     crop_w = int(round(crop_h * aspect))
     if crop_w > orig_w:
         crop_w = orig_w
@@ -109,19 +128,22 @@ def split_geometry(orig_w, orig_h, out_w, out_h, centre):
     crop_h -= crop_h % 2
 
     cx, cy = centre[0], centre[1]
+    
+    # Lateral centering: target placing cx at crop_w / 2
     x = int(round(cx - crop_w / 2.0))
     x = max(0, min(x, orig_w - crop_w))
 
-    y = int(round(cy - crop_h * 0.42))
+    # Vertical headroom: eyes/face sit comfortably in the upper third (~35% from top)
+    y = int(round(cy - crop_h * 0.35))
     y = max(0, min(y, orig_h - crop_h))
 
     return crop_w, crop_h, x - (x % 2), y - (y % 2), half_h
 
 
-def split_filtergraph(orig_w, orig_h, out_w, out_h, left_centre, right_centre):
+def split_filtergraph(orig_w, orig_h, out_w, out_h, left_centre, right_centre, left_dim=None, right_dim=None):
     """Generate FFmpeg filtergraph for vertical split stack (left on top, right on bottom)."""
-    top_w, top_h, top_x, top_y, half_h = split_geometry(orig_w, orig_h, out_w, out_h, left_centre)
-    bot_w, bot_h, bot_x, bot_y, _ = split_geometry(orig_w, orig_h, out_w, out_h, right_centre)
+    top_w, top_h, top_x, top_y, half_h = split_geometry(orig_w, orig_h, out_w, out_h, left_centre, left_dim)
+    bot_w, bot_h, bot_x, bot_y, _ = split_geometry(orig_w, orig_h, out_w, out_h, right_centre, right_dim)
 
     return (
         f"[0:v]split=2[ta][ba];"
@@ -186,17 +208,17 @@ def detect_split_scenes(video_path, scenes, strategies=None, samples=None):
 
     return found
 
-def create_split_frame(frame, out_w, out_h, left_centre, right_centre):
+def create_split_frame(frame, out_w, out_h, left_centre, right_centre, left_dim=None, right_dim=None):
     import cv2
     import numpy as np
     orig_h, orig_w = frame.shape[:2]
     # left
-    crop_w_l, crop_h_l, x_l, y_l, half_h = split_geometry(orig_w, orig_h, out_w, out_h, left_centre)
+    crop_w_l, crop_h_l, x_l, y_l, half_h = split_geometry(orig_w, orig_h, out_w, out_h, left_centre, left_dim)
     left_crop = frame[y_l:y_l+crop_h_l, x_l:x_l+crop_w_l]
     left_scaled = cv2.resize(left_crop, (out_w, half_h))
     
     # right
-    crop_w_r, crop_h_r, x_r, y_r, _ = split_geometry(orig_w, orig_h, out_w, out_h, right_centre)
+    crop_w_r, crop_h_r, x_r, y_r, _ = split_geometry(orig_w, orig_h, out_w, out_h, right_centre, right_dim)
     right_crop = frame[y_r:y_r+crop_h_r, x_r:x_r+crop_w_r]
     right_scaled = cv2.resize(right_crop, (out_w, out_h - half_h))
     

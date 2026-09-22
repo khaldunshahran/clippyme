@@ -5,9 +5,20 @@
 import { useState, useEffect } from 'react';
 import { Hero } from './chrome';
 import { Icon, Panel, Btn, Badge, Switch, Segmented, PlatPill, PLATFORMS } from './primitives';
-import { getZernio, startLiveMonitor, stopLiveMonitor, updateMonitorConfig, setMonitorPublishing } from './realApi';
-import { PLAT } from './publish';
-import { validateSlug, buildPlatformTargets, classifyStartError, clampMonitorTimings, clipSelectionPayload, zoomToPercent, LETTERBOX_ZOOM_PERCENTS } from '../lib/liveMonitorForm';
+import {
+  getZernio,
+  startLiveMonitor,
+  stopLiveMonitor,
+  updateMonitorConfig,
+  setMonitorPublishing,
+  getPendingLiveClips,
+  publishPendingLiveClip,
+  dismissPendingLiveClip,
+  publishAllPendingLiveClips,
+  safeResolveUrl,
+} from './realApi';
+import { PLAT, PublishModal } from './publish';
+import { validateSlug, buildPlatformTargets, classifyStartError, clampMonitorTimings, clipSelectionPayload, zoomToPercent, LETTERBOX_ZOOM_PERCENTS, STREAM_QUALITY_OPTIONS } from '../lib/liveMonitorForm';
 import { buildMonitorBannerPayload } from '../lib/liveMonitorBanner';
 import { toComposeSubtitleParams, fromComposeSubtitleParams } from '../lib/subtitleComposeParams';
 import { BannerControls } from './bannerControls';
@@ -51,10 +62,11 @@ const STATE_LABEL = {
   capturing: 'Capturing segment',
   draining: 'Draining — finishing the last segment',
   watching: 'Watching for new uploads',
+  reconnecting: 'Reconnecting — waiting for stream',
 };
 
 const STATE_TONE = {
-  idle: 'out', waiting_live: 'amber', prelive: 'amber', capturing: 'teal', draining: 'amber', watching: 'teal',
+  idle: 'out', waiting_live: 'amber', prelive: 'amber', capturing: 'teal', draining: 'amber', watching: 'teal', reconnecting: 'amber',
 };
 
 const PLATFORM_OPTIONS = [
@@ -103,6 +115,10 @@ function MonitorSettings({ monitor, onApply, applying }) {
   const [smartCutTouched, setSmartCutTouched] = useState(false);
   const [zoom, setZoom] = useState(zoomToPercent(cfg.letterbox_zoom));
   const [zoomTouched, setZoomTouched] = useState(false);
+  const [streamQuality, setStreamQuality] = useState(cfg.stream_quality || 'best');
+  const [streamQualityTouched, setStreamQualityTouched] = useState(false);
+  const [requirePreview, setRequirePreview] = useState(cfg.require_preview !== false);
+  const [requirePreviewTouched, setRequirePreviewTouched] = useState(false);
 
   const apply = () => {
     const partial = {};
@@ -120,6 +136,8 @@ function MonitorSettings({ monitor, onApply, applying }) {
     if (minScore !== '') partial.min_viral_score = bounded.min_viral_score;
     if (smartCutTouched) partial.smart_cut = smartCut;
     if (zoomTouched) partial.letterbox_zoom = zoom;
+    if (streamQualityTouched) partial.stream_quality = streamQuality;
+    if (requirePreviewTouched) partial.require_preview = requirePreview;
     onApply(monitor.id, partial);
   };
 
@@ -195,10 +213,29 @@ function MonitorSettings({ monitor, onApply, applying }) {
           onChange={(v) => { setZoom(Number(v)); setZoomTouched(true); }}
           options={ZOOM_OPTIONS} />
       </div>
+      {monitor.mode !== 'vod' && (
+        <div className="field">
+          <span className="field-label">Stream quality ladder</span>
+          <select className="key-input" style={{ width: '100%', fontFamily: 'var(--font-sans)' }}
+            aria-label={`Settings stream quality ${monitor.id}`}
+            value={streamQuality}
+            onChange={(e) => { setStreamQuality(e.target.value); setStreamQualityTouched(true); }}>
+            {STREAM_QUALITY_OPTIONS.map((opt) => (
+              <option key={opt.id} value={opt.id}>{opt.label}</option>
+            ))}
+          </select>
+          <div className="od">Fallback ladder used by Streamlink/yt-dlp for capture.</div>
+        </div>
+      )}
       <div className="opt" style={{ borderBottom: 0, paddingLeft: 0, paddingRight: 0 }}>
         <div className="otxt"><div className="ot">Delete clip after publish</div><div className="od">Frees disk once a clip is confirmed published</div></div>
         <Switch on={deleteAfterPublish} label={`Delete after publish ${monitor.id}`}
           onChange={(on) => { setDeleteAfterPublish(on); setDeleteAfterPublishTouched(true); }} />
+      </div>
+      <div className="opt" style={{ borderBottom: 0, paddingLeft: 0, paddingRight: 0 }}>
+        <div className="otxt"><div className="ot">Require preview before publishing</div><div className="od">Hold newly generated clips in queue to preview video & AI captions before posting.</div></div>
+        <Switch on={requirePreview} label={`Require preview ${monitor.id}`}
+          onChange={(on) => { setRequirePreview(on); setRequirePreviewTouched(true); }} />
       </div>
       <Btn variant="secondary" size="sm" disabled={applying} onClick={apply} style={{ marginTop: 10 }}>
         {applying ? 'Applying…' : 'Apply'}
@@ -207,8 +244,83 @@ function MonitorSettings({ monitor, onApply, applying }) {
   );
 }
 
-function MonitorCard({ monitor, onStop, stopping, onApplySettings, applyingSettings, onTogglePublishing, togglingPublishing }) {
+function MonitorCard({
+  monitor,
+  onStop,
+  stopping,
+  onApplySettings,
+  applyingSettings,
+  onTogglePublishing,
+  togglingPublishing,
+  pushToast,
+  onRefresh,
+}) {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pendingOpen, setPendingOpen] = useState(false);
+  const [pendingClips, setPendingClips] = useState([]);
+  const [loadingPending, setLoadingPending] = useState(false);
+  const [publishingClipId, setPublishingClipId] = useState(null);
+  const [dismissingClipId, setDismissingClipId] = useState(null);
+  const [activePublishModalClip, setActivePublishModalClip] = useState(null);
+
+  const loadPending = async () => {
+    setLoadingPending(true);
+    try {
+      const list = await getPendingLiveClips(monitor.id);
+      setPendingClips(list || []);
+    } catch (err) {
+      pushToast?.('warn', `Failed to load pending clips: ${err?.message || err}`);
+    } finally {
+      setLoadingPending(false);
+    }
+  };
+
+  useEffect(() => {
+    if (pendingOpen) {
+      loadPending();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingOpen, monitor.pending_publish]);
+
+  const handleQuickPublish = async (clip) => {
+    setPublishingClipId(clip.id);
+    try {
+      await publishPendingLiveClip(monitor.id, clip.id);
+      pushToast?.('success', 'Clip queued for publishing!');
+      await loadPending();
+      onRefresh?.();
+    } catch (err) {
+      pushToast?.('warn', `Publish failed: ${err?.message || err}`);
+    } finally {
+      setPublishingClipId(null);
+    }
+  };
+
+  const handleDismiss = async (clip) => {
+    setDismissingClipId(clip.id);
+    try {
+      await dismissPendingLiveClip(monitor.id, clip.id);
+      pushToast?.('success', 'Clip dismissed from queue');
+      await loadPending();
+      onRefresh?.();
+    } catch (err) {
+      pushToast?.('warn', `Dismiss failed: ${err?.message || err}`);
+    } finally {
+      setDismissingClipId(null);
+    }
+  };
+
+  const handlePublishAll = async () => {
+    try {
+      await publishAllPendingLiveClips(monitor.id);
+      pushToast?.('success', 'All pending clips queued for publishing!');
+      await loadPending();
+      onRefresh?.();
+    } catch (err) {
+      pushToast?.('warn', `Batch publish failed: ${err?.message || err}`);
+    }
+  };
+
   return (
     <div className="opt" style={{ borderBottom: 0, flexDirection: 'column', alignItems: 'stretch' }}>
       <div style={{ display: 'flex', width: '100%' }}>
@@ -224,6 +336,14 @@ function MonitorCard({ monitor, onStop, stopping, onApplySettings, applyingSetti
               ? `${monitor.segments_captured || 0} item(s) processed · ${monitor.clips_published || 0} clip(s) published`
               : `${monitor.segments_captured || 0} segment(s) captured · ${monitor.clips_published || 0} clip(s) published`}
           </div>
+          {monitor.state === 'capturing' && typeof monitor.current_segment_seconds === 'number' && monitor.current_segment_seconds > 0 && (
+            <div className="od" style={{ color: 'var(--brand-teal)' }}>
+              Capturing: {Math.floor(monitor.current_segment_seconds / 60)}m {Math.floor(monitor.current_segment_seconds % 60)}s
+              {typeof monitor.current_segment_bytes === 'number' && monitor.current_segment_bytes > 0 && (
+                <> · {(monitor.current_segment_bytes / (1024 * 1024)).toFixed(1)} MB</>
+              )}
+            </div>
+          )}
           {monitor.current_job_id && <div className="od">Current job: {monitor.current_job_id}</div>}
           {monitor.last_error && <div className="od" style={{ color: 'var(--danger)' }}>{monitor.last_error}</div>}
           {monitor.gemini_exhausted_at && (
@@ -233,6 +353,14 @@ function MonitorCard({ monitor, onStop, stopping, onApplySettings, applyingSetti
           )}
         </div>
         <div className="r">
+          <Btn
+            variant={monitor.pending_publish > 0 ? 'grad' : 'secondary'}
+            size="sm"
+            icon="film"
+            onClick={() => setPendingOpen((v) => !v)}
+          >
+            {pendingOpen ? 'Hide Clips' : `Pending Clips (${monitor.pending_publish || 0})`}
+          </Btn>
           <Btn variant="secondary" size="sm" icon="sliders-horizontal" onClick={() => setSettingsOpen((v) => !v)}>
             Settings
           </Btn>
@@ -255,6 +383,142 @@ function MonitorCard({ monitor, onStop, stopping, onApplySettings, applyingSetti
 
       {settingsOpen && (
         <MonitorSettings monitor={monitor} onApply={onApplySettings} applying={applyingSettings} />
+      )}
+
+      {pendingOpen && (
+        <div className="pending-clips-panel">
+          <div className="pending-clips-header">
+            <div>
+              <div style={{ fontWeight: 700, fontSize: '14px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span>📋 Pending Clips for Review</span>
+                <Badge tone={pendingClips.length > 0 ? 'in' : 'out'}>{pendingClips.length}</Badge>
+              </div>
+              <div style={{ fontSize: '12px', color: 'var(--fg-3)', marginTop: 2 }}>
+                Preview generated clips, inspect auto AI captions, and approve before sending to social platforms.
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Btn variant="secondary" size="sm" icon="rotate-cw" loading={loadingPending} onClick={loadPending}>
+                Refresh
+              </Btn>
+              {pendingClips.length > 0 && (
+                <Btn variant="primary" size="sm" icon="send" onClick={handlePublishAll}>
+                  Publish All ({pendingClips.length})
+                </Btn>
+              )}
+            </div>
+          </div>
+
+          {loadingPending && pendingClips.length === 0 ? (
+            <div style={{ padding: '24px', textAlign: 'center', color: 'var(--fg-3)', fontSize: '13px' }}>
+              <Icon n="loader" style={{ width: 20, height: 20, margin: '0 auto 8px', display: 'block' }} />
+              Loading pending clips…
+            </div>
+          ) : pendingClips.length === 0 ? (
+            <div style={{ padding: '24px', textAlign: 'center', color: 'var(--fg-3)', fontSize: '13px' }}>
+              No pending clips waiting for review. New clips will appear here when captured.
+            </div>
+          ) : (
+            <div className="pending-clips-grid">
+              {pendingClips.map((clip) => {
+                const videoSrc = safeResolveUrl(clip.video_url || clip.composed_path);
+                return (
+                  <div key={clip.id} className="pending-clip-card">
+                    <div className="pc-video-wrap">
+                      <video
+                        src={videoSrc}
+                        controls
+                        playsInline
+                        preload="metadata"
+                      />
+                    </div>
+
+                    <div className="pc-title">{clip.title || 'Untitled Clip'}</div>
+
+                    <div className="pc-badges">
+                      {clip.viral_score ? <Badge tone="in">🔥 {clip.viral_score}/100</Badge> : null}
+                      {clip.duration ? <Badge tone="out">⏱️ {Math.round(clip.duration)}s</Badge> : null}
+                      {clip.speaker_name ? <Badge tone="neutral">🗣️ {clip.speaker_name}</Badge> : null}
+                    </div>
+
+                    {clip.caption ? (
+                      <div className="pc-caption" title={clip.caption}>
+                        {clip.caption}
+                      </div>
+                    ) : null}
+
+                    <div className="pc-actions">
+                      <Btn
+                        variant="grad"
+                        size="sm"
+                        icon="wand-sparkles"
+                        onClick={() => setActivePublishModalClip(clip)}
+                        style={{ flex: 1 }}
+                      >
+                        Review & Publish
+                      </Btn>
+                      <Btn
+                        variant="secondary"
+                        size="sm"
+                        icon="send"
+                        disabled={publishingClipId === clip.id}
+                        onClick={() => handleQuickPublish(clip)}
+                      >
+                        {publishingClipId === clip.id ? '…' : 'Publish'}
+                      </Btn>
+                      <button
+                        type="button"
+                        className="btn ghost-btn"
+                        title="Dismiss clip"
+                        disabled={dismissingClipId === clip.id}
+                        onClick={() => handleDismiss(clip)}
+                        style={{
+                          width: 32,
+                          height: 32,
+                          padding: 0,
+                          borderRadius: '8px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: 'var(--danger)',
+                          cursor: 'pointer',
+                          background: 'transparent',
+                          border: '1px solid rgba(255,68,68,0.2)',
+                        }}
+                      >
+                        <Icon n="trash" style={{ width: 14, height: 14 }} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {activePublishModalClip && (
+        <PublishModal
+          clips={[{
+            ...activePublishModalClip,
+            _idx: activePublishModalClip.clip_index ?? 0,
+            video_title_for_youtube_short: activePublishModalClip.title,
+            video_description: activePublishModalClip.caption,
+            video_url: activePublishModalClip.video_url || activePublishModalClip.composed_path,
+          }]}
+          jobId={activePublishModalClip.job_id}
+          onClose={() => setActivePublishModalClip(null)}
+          pushToast={pushToast}
+          onCustomPublish={async (clip, body) => {
+            await publishPendingLiveClip(monitor.id, activePublishModalClip.id, body);
+          }}
+          onPublished={() => {
+            pushToast?.('success', 'Clip published successfully!');
+            loadPending();
+            onRefresh?.();
+            setActivePublishModalClip(null);
+          }}
+        />
       )}
     </div>
   );
@@ -286,6 +550,8 @@ export function LiveMonitorView({ pushToast }) {
   const [zoom, setZoom] = useState(0);
   const [subOn, setSubOn] = useState(false);
   const [sub, setSub] = useState(SUB_DEFAULTS);
+  const [streamQuality, setStreamQuality] = useState('best');
+  const [requirePreview, setRequirePreview] = useState(true);
   const [starting, setStarting] = useState(false);
   const [stoppingId, setStoppingId] = useState(null);
   const [applyingSettingsId, setApplyingSettingsId] = useState(null);
@@ -294,9 +560,6 @@ export function LiveMonitorView({ pushToast }) {
   const [monitors, refreshMonitors, meta] = useLiveMonitorStatus();
 
   useEffect(() => { getZernio().then(setZernio).catch(() => setZernio({ configured: false })); }, []);
-
-  // YouTube has no "live" concept for this monitor (clips new uploads only).
-  useEffect(() => { if (platform === 'youtube' && mode !== 'vod') setMode('vod'); }, [platform, mode]);
 
   const accounts = zernio?.accounts || {};
   const toggle = (k) => setPlats((p) => ({ ...p, [k]: !p[k] }));
@@ -315,6 +578,7 @@ export function LiveMonitorView({ pushToast }) {
         platform,
         mode,
         platforms: targets,
+        stream_quality: streamQuality,
         ...clampMonitorTimings(segmentMin, preliveMin, minGapMin),
         ...clipSelectionPayload(clipSelection, maxClips, minScore),
         loop,
@@ -324,6 +588,7 @@ export function LiveMonitorView({ pushToast }) {
         caption_template: captionTemplate,
         title_template: titleTemplate,
         instructions,
+        require_preview: requirePreview,
         banner: buildMonitorBannerPayload(bannerMode, { platform: bannerPlatform, handle: bannerHandle, y_pct: bannerYPct }),
         ...(subOn ? { compose: { subtitle_params: toComposeSubtitleParams(sub) } } : {}),
       });
@@ -392,7 +657,8 @@ export function LiveMonitorView({ pushToast }) {
         {monitors.map((m) => (
           <MonitorCard key={m.id} monitor={m} onStop={onStop} stopping={stoppingId === m.id}
             onApplySettings={onApplySettings} applyingSettings={applyingSettingsId === m.id}
-            onTogglePublishing={onTogglePublishing} togglingPublishing={togglingPublishingId === m.id} />
+            onTogglePublishing={onTogglePublishing} togglingPublishing={togglingPublishingId === m.id}
+            pushToast={pushToast} onRefresh={refreshMonitors} />
         ))}
       </Panel>
 
@@ -407,8 +673,11 @@ export function LiveMonitorView({ pushToast }) {
           <span className="field-label">Mode</span>
           <Segmented value={mode} onChange={setMode}
             options={[{ id: 'live', label: 'Live' }, { id: 'vod', label: 'VOD' }]} full />
-          {platform === 'youtube' && (
+          {platform === 'youtube' && mode === 'vod' && (
             <div className="od">YouTube: clips every new long-form upload; Shorts excluded</div>
+          )}
+          {platform === 'youtube' && mode === 'live' && (
+            <div className="od">YouTube Live: monitors and captures active live streams</div>
           )}
         </div>
 
@@ -431,10 +700,25 @@ export function LiveMonitorView({ pushToast }) {
           </div>
         )}
 
+        {mode !== 'vod' && (
+          <div className="field">
+            <span className="field-label">Stream quality ladder</span>
+            <select className="key-input" style={{ width: '100%', fontFamily: 'var(--font-sans)' }}
+              aria-label="Stream quality"
+              value={streamQuality}
+              onChange={(e) => setStreamQuality(e.target.value)}>
+              {STREAM_QUALITY_OPTIONS.map((opt) => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
+            </select>
+            <div className="od">Quality priority order with automatic fallback (e.g. 1080p60 &rarr; 720p60 &rarr; best).</div>
+          </div>
+        )}
+
         {/* Segment length only exists for the live capture loop. Prelive skip
             survives into VOD mode for Kick/Twitch — those recordings start with
             the same waiting screen — but a YouTube upload has no prelive. */}
-        <div style={{ display: 'grid', gridTemplateColumns: !isVod && platform !== 'youtube' ? 'repeat(2,1fr)' : '1fr', gap: 8 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: !isVod && (!isVod || platform !== 'youtube') ? 'repeat(2,1fr)' : '1fr', gap: 8 }}>
           {!isVod && (
             <label className="field">
               <span className="field-label">Segment (min)</span>
@@ -442,7 +726,7 @@ export function LiveMonitorView({ pushToast }) {
                 value={segmentMin} onChange={(e) => setSegmentMin(e.target.value === '' ? '' : Number(e.target.value))} />
             </label>
           )}
-          {platform !== 'youtube' && (
+          {(!isVod || platform !== 'youtube') && (
             <label className="field">
               <span className="field-label">Prelive skip (min)</span>
               <input className="key-input" type="number" min="0" max="120" aria-label="Prelive skip minutes"
@@ -573,6 +857,13 @@ export function LiveMonitorView({ pushToast }) {
           <span className="field-label">Caption template (optional)</span>
           <textarea className="ta" rows="2" aria-label="Caption template" placeholder="{hook}"
             value={captionTemplate} onChange={(e) => setCaptionTemplate(e.target.value)}></textarea>
+        </div>
+        <div className="opt" style={{ borderBottom: 0, paddingLeft: 0, paddingRight: 0 }}>
+          <div className="otxt">
+            <div className="ot">Require preview before publishing</div>
+            <div className="od">Hold newly generated clips in queue to preview video & AI captions before posting.</div>
+          </div>
+          <Switch on={requirePreview} label="Require preview" onChange={setRequirePreview} />
         </div>
         </Group>
 

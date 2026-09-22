@@ -15,7 +15,7 @@ export { clipDownloadName };
 // treated as a relative path and resolved against our own backend. This stops
 // a malicious/compromised API response from injecting a scheme that executes
 // when set as an <a href> / <video src>.
-function safeResolveUrl(url) {
+export function safeResolveUrl(url) {
   const raw = url || '';
   try {
     const u = new URL(raw, window.location.origin);
@@ -202,7 +202,21 @@ export async function generateClipMetadata(jobId, index, instruction = '') {
     e.status = res.status;
     throw e;
   }
-  return res.json(); // { speaker_name, title, hashtags, caption }
+  return res.json(); // { speaker_name, title, hashtags, caption, platforms }
+}
+
+export async function generateAllClipMetadata(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/generate-metadata/${jobId}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json();
 }
 
 export async function restoreJob(jobId) {
@@ -444,6 +458,50 @@ export async function setMonitorPublishing(monitorId, enabled) {
   return res.json();
 }
 
+export async function getPendingLiveClips(monitorId) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/pending-clips`));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return data.pending_clips || [];
+}
+
+export async function publishPendingLiveClip(monitorId, clipId, overrides = null) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/publish-pending/${encodeURIComponent(clipId)}`), {
+    method: 'POST',
+    ...(overrides ? {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(overrides),
+    } : {}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function dismissPendingLiveClip(monitorId, clipId) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/pending-clip/${encodeURIComponent(clipId)}`), {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function publishAllPendingLiveClips(monitorId) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/publish-all-pending`), {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 // Map the redesign's flat `opts` into the preselections shape the existing
 // hooks + seedClipParams expect (subtitles/hook as truthy objects).
 export function optsToPreselections(opts) {
@@ -467,6 +525,7 @@ export function optsToPreselections(opts) {
     min_clips: opts.clipsAuto ? null : (Number(opts.minClips) || (Number(opts.clips) ? Math.max(1, Number(opts.clips) - 2) : null)),
     max_clips: opts.clipsAuto ? null : (Number(opts.maxClips) || Number(opts.clips) || null),
     clip_type: (opts.clipType || 'viral').trim(),
+    duration_mode: (opts.durationMode || 'all').trim(),
     subtitles: opts.subtitles
       ? {
           mode: opts.subMode, preset: opts.subPreset, position: opts.subPosition || 'bottom',
@@ -723,5 +782,171 @@ export async function retryJobApi(jobId, apiKey = '') {
   return res.json();
 }
 
+// ---------------------------------------------------------------------------
+// Trend Radar & AI Content Sourcing
+// ---------------------------------------------------------------------------
 
+export async function getTrends({ category = '', includeClipped = true } = {}) {
+  const params = new URLSearchParams();
+  if (category) params.set('category', category);
+  if (!includeClipped) params.set('include_clipped', 'false');
+  const qs = params.toString() ? `?${params.toString()}` : '';
+  const res = await apiFetch(getApiUrl(`/api/trends${qs}`));
+  if (!res.ok) {
+    return { topics: [], total: 0, last_scanned: null };
+  }
+  return res.json();
+}
+
+export async function triggerTrendScan(apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl('/api/trends/scan'), {
+    method: 'POST',
+    headers,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Scan failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function clipTrendVideo({ topicId = null, channelId = null, videoUrl, instructions = '', presetId = 'viral', reframeMode = 'auto' } = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const payload = {
+    topic_id: topicId,
+    channel_id: channelId,
+    video_url: videoUrl,
+    instructions,
+    preset_id: presetId,
+    reframe_mode: reframeMode,
+  };
+  const res = await apiFetch(getApiUrl('/api/trends/clip'), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `1-Click Clip failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getTrendConfig() {
+  const res = await apiFetch(getApiUrl('/api/trends/config'));
+  if (!res.ok) return { interval_hours: 3, auto_scan: true, categories: [] };
+  return res.json();
+}
+
+export async function updateTrendConfig(config) {
+  const res = await apiFetch(getApiUrl('/api/trends/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Config update failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Channel Management & Topic Routing
+// ---------------------------------------------------------------------------
+
+export async function getChannels() {
+  const res = await apiFetch(getApiUrl('/api/channels'));
+  if (!res.ok) return { channels: [], total: 0 };
+  return res.json();
+}
+
+export async function matchChannelForCategory(category = '') {
+  const qs = category ? `?category=${encodeURIComponent(category)}` : '';
+  const res = await apiFetch(getApiUrl(`/api/channels/match${qs}`));
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.matched || null;
+}
+
+export async function createChannel(data) {
+  const res = await apiFetch(getApiUrl('/api/channels'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Create channel failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function updateChannel(channelId, patch) {
+  const res = await apiFetch(getApiUrl(`/api/channels/${encodeURIComponent(channelId)}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Update channel failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function deleteChannel(channelId) {
+  const res = await apiFetch(getApiUrl(`/api/channels/${encodeURIComponent(channelId)}`), {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Delete channel failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Published Performance Analytics & Continuous Learning Loop
+// ---------------------------------------------------------------------------
+
+export async function getAnalyticsSummary() {
+  const res = await apiFetch(getApiUrl('/api/analytics/summary'));
+  if (!res.ok) return { total_published: 0, total_views: 0, total_shares: 0, total_likes: 0, total_comments: 0, avg_retention: 0, clips: [] };
+  return res.json();
+}
+
+export async function syncAnalytics() {
+  const res = await apiFetch(getApiUrl('/api/analytics/sync'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Sync analytics failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function trackClipAnalytics(clipId, metrics = {}) {
+  const res = await apiFetch(getApiUrl('/api/analytics/track'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clip_id: clipId, metrics }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Track analytics failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getAnalyticsInsights() {
+  const res = await apiFetch(getApiUrl('/api/analytics/insights'));
+  if (!res.ok) return { patterns: {}, prompt_snippet: '' };
+  return res.json();
+}
 

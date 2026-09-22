@@ -194,37 +194,307 @@ def relocate_root_job_artifacts(job_id: str, job_output_dir: str, output_dir: st
         return False
 
 
-def purge_partial_downloads(output_dir: str) -> dict:
-    """Scan output directory and subdirectories for partial/temporary download files.
+def _is_pid_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is currently alive."""
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            # On Windows, PermissionError indicates the process exists but is un-signalable.
+            return True
+        except (OSError, ProcessLookupError):
+            return False
 
-    Removes *.part, *.ytdl, *.tmp, *.temp files and returns freed_bytes and removed_count.
-    Never raises exceptions.
+
+def purge_partial_downloads(
+    target_dirs: str | list[str] | tuple[str, ...],
+    min_age_seconds: float = 0.0,
+    active_paths: tuple[str, ...] | set[str] | list[str] = (),
+    protected_job_ids: tuple[str, ...] | set[str] | list[str] = (),
+) -> dict:
+    """Scan directory or directories for partial, temporary, and orphaned ASR audio dumps.
+
+    Removes *.part, *.ytdl, *.tmp, *.temp, and orphaned .asr_*.flac/.wav audio files.
+    If min_age_seconds > 0, protects files modified more recently. Never raises exceptions.
+    Guarantees that files belonging to active jobs, active paths, or running PIDs are never deleted.
     """
     freed_bytes = 0
     removed_count = 0
-    if not os.path.exists(output_dir):
-        return {"freed_bytes": 0, "removed_count": 0}
-
+    dirs = [target_dirs] if isinstance(target_dirs, str) else list(target_dirs)
     partial_extensions = {".part", ".ytdl", ".tmp", ".temp"}
-    try:
-        for root, _, files in os.walk(output_dir):
-            for file in files:
-                lower = file.lower()
-                is_partial = any(lower.endswith(ext) for ext in partial_extensions) or (".f" in lower and lower.endswith(".mp4.part"))
-                if is_partial:
-                    file_path = os.path.join(root, file)
-                    try:
-                        size = os.path.getsize(file_path)
-                        os.remove(file_path)
-                        freed_bytes += size
-                        removed_count += 1
-                        logger.info("Purged partial download file: %s (%d bytes)", file_path, size)
-                    except OSError as exc:
-                        logger.debug("Failed to purge partial file %s: %s", file_path, exc)
-    except Exception as exc:
-        logger.warning("purge_partial_downloads encountered an error: %s", exc)
+    now = time.time()
+    active_paths_set = {os.path.abspath(p) for p in active_paths if p}
+    protected_jobs = {str(jid).strip().lower() for jid in protected_job_ids if jid}
+
+    for d in dirs:
+        if not d or not os.path.exists(d):
+            continue
+        if protected_jobs and os.path.basename(os.path.abspath(d)).lower() in protected_jobs:
+            continue
+        try:
+            for root, dirs_in_root, files in os.walk(d):
+                # Never descend into active job folders
+                if protected_jobs:
+                    dirs_in_root[:] = [sub for sub in dirs_in_root if sub.lower() not in protected_jobs]
+                if any(part.lower() in protected_jobs for part in os.path.relpath(root, d).replace("\\", "/").split("/")):
+                    continue
+
+                for file in files:
+                    lower = file.lower()
+                    is_asr_audio = (
+                        lower.startswith(".asr_")
+                        or (lower.startswith("temp_") and lower.endswith(".flac"))
+                        or (lower.endswith(".flac") and "asr" in lower)
+                    )
+                    is_partial = (
+                        any(lower.endswith(ext) for ext in partial_extensions)
+                        or (".f" in lower and lower.endswith(".mp4.part"))
+                        or is_asr_audio
+                    )
+                    if is_partial:
+                        file_path = os.path.join(root, file)
+                        if os.path.abspath(file_path) in active_paths_set:
+                            continue
+
+                        # If this is an .asr_ timestamp_pid file, check if owning process is still running
+                        if lower.startswith(".asr_"):
+                            name_part = file.rsplit(".", 1)[0]
+                            parts = name_part.split("_")
+                            if len(parts) >= 3 and parts[-1].isdigit():
+                                file_pid = int(parts[-1])
+                                if _is_pid_alive(file_pid):
+                                    logger.debug("Skipping .asr file owned by running PID %d: %s", file_pid, file_path)
+                                    continue
+
+                        try:
+                            if min_age_seconds > 0 and (now - os.path.getmtime(file_path) < min_age_seconds):
+                                continue
+                            size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            freed_bytes += size
+                            removed_count += 1
+                            logger.info("Purged transient/partial file: %s (%d bytes)", file_path, size)
+                        except OSError as exc:
+                            logger.debug("Failed to purge partial file %s: %s", file_path, exc)
+        except Exception as exc:
+            logger.warning("purge_partial_downloads encountered an error in %s: %s", d, exc)
 
     return {"freed_bytes": freed_bytes, "removed_count": removed_count}
+
+
+def purge_orphaned_uploads(
+    upload_dir: str,
+    active_paths: tuple[str, ...] | set[str] | list[str] = (),
+    min_age_seconds: float = 900.0,
+) -> dict:
+    """Scan uploads directory and remove files not currently active.
+
+    Files modified within min_age_seconds (default 15 minutes) are protected to
+    prevent deleting newly uploaded files that haven't yet been enqueued.
+    Files referenced in active_paths are strictly preserved.
+    """
+    freed_bytes = 0
+    removed_count = 0
+    if not upload_dir or not os.path.exists(upload_dir):
+        return {"freed_bytes": 0, "removed_count": 0}
+
+    now = time.time()
+    normalized_active = {os.path.abspath(p) for p in active_paths if p}
+    try:
+        for fname in os.listdir(upload_dir):
+            fpath = os.path.join(upload_dir, fname)
+            if not os.path.isfile(fpath) or os.path.islink(fpath):
+                continue
+            if os.path.abspath(fpath) in normalized_active:
+                continue
+            try:
+                mtime = os.path.getmtime(fpath)
+                if now - mtime < min_age_seconds:
+                    continue
+                size = os.path.getsize(fpath)
+                os.remove(fpath)
+                freed_bytes += size
+                removed_count += 1
+                logger.info("Purged orphaned upload: %s (%d bytes)", fpath, size)
+            except OSError as exc:
+                logger.debug("Failed to remove upload %s: %s", fpath, exc)
+    except Exception as exc:
+        logger.warning("purge_orphaned_uploads failed: %s", exc)
+
+    return {"freed_bytes": freed_bytes, "removed_count": removed_count}
+
+
+def is_job_completed_for_source_purge(job_dir: str, job_id: str) -> bool:
+    """True if a job has finished its pipeline and its raw source video can be purged safely."""
+    try:
+        # Check highlight reels
+        hl_matches = glob.glob(os.path.join(job_dir, "highlight_reel_*.mp4"))
+        if hl_matches:
+            return True
+
+        # Check regular shorts metadata
+        matches = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+        if not matches:
+            return False
+        meta_path = max(matches, key=os.path.getmtime)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        shorts = data.get("shorts") or data.get("clips") or []
+        if not shorts:
+            return False
+        # Confirms shorts exist in metadata
+        return True
+    except Exception:
+        return False
+
+
+def purge_completed_job_source_videos(
+    output_dir: str,
+    max_age_seconds: float | None = None,
+    protected_job_ids: tuple[str, ...] | set[str] | list[str] = (),
+) -> dict:
+    """Purge full-length raw source videos from completed jobs, keeping clips and slices intact.
+
+    If max_age_seconds is set (e.g. 3 * 86400 for 3 days), only jobs older than that age
+    will have their source video purged. If None, all completed jobs are eligible.
+    Never removes rendered clips, reframing slices (source_*_clip_*.mp4), or metadata.
+    """
+    freed_bytes = 0
+    removed_count = 0
+    cleaned_jobs = 0
+    if not os.path.exists(output_dir):
+        return {"freed_bytes": 0, "removed_count": 0, "cleaned_jobs": 0}
+
+    from clippyme.pipeline.run_ops import find_source_video_candidate, is_clip_artifact
+
+    now = time.time()
+    protected_jobs = {str(jid).strip().lower() for jid in protected_job_ids if jid}
+    try:
+        for entry in os.listdir(output_dir):
+            job_dir = os.path.join(output_dir, entry)
+            if not os.path.isdir(job_dir) or os.path.islink(job_dir):
+                continue
+            if entry.lower() in protected_jobs:
+                continue
+
+            if max_age_seconds is not None:
+                try:
+                    if now - os.path.getmtime(job_dir) < max_age_seconds:
+                        continue
+                except OSError:
+                    continue
+
+            if not is_job_completed_for_source_purge(job_dir, entry):
+                continue
+
+            src_candidate = find_source_video_candidate(job_dir)
+            if not src_candidate or not os.path.isfile(src_candidate):
+                continue
+
+            # Strict protection against clip artifacts
+            if is_clip_artifact(os.path.basename(src_candidate)):
+                continue
+
+            try:
+                sz = os.path.getsize(src_candidate)
+                os.remove(src_candidate)
+                freed_bytes += sz
+                removed_count += 1
+                cleaned_jobs += 1
+                logger.info("Purged raw source video for completed job %s: %s (%d bytes)", entry, src_candidate, sz)
+            except OSError as exc:
+                logger.debug("Failed to remove source video %s: %s", src_candidate, exc)
+    except Exception as exc:
+        logger.warning("purge_completed_job_source_videos encountered an error: %s", exc)
+
+    return {"freed_bytes": freed_bytes, "removed_count": removed_count, "cleaned_jobs": cleaned_jobs}
+
+
+def get_storage_breakdown(output_dir: str, upload_dir: str | None = None) -> dict:
+    """Analyze and categorize disk usage across output and upload directories."""
+    stats = {
+        "total_bytes": 0,
+        "total_mb": 0.0,
+        "source_videos_bytes": 0,
+        "source_videos_mb": 0.0,
+        "source_slices_bytes": 0,
+        "source_slices_mb": 0.0,
+        "rendered_clips_bytes": 0,
+        "rendered_clips_mb": 0.0,
+        "uploads_bytes": 0,
+        "uploads_mb": 0.0,
+        "transient_temp_bytes": 0,
+        "transient_temp_mb": 0.0,
+        "metadata_bytes": 0,
+        "metadata_mb": 0.0,
+        "total_jobs": 0,
+    }
+
+    if os.path.exists(output_dir):
+        try:
+            for entry in os.listdir(output_dir):
+                job_path = os.path.join(output_dir, entry)
+                if not os.path.isdir(job_path) or os.path.islink(job_path):
+                    continue
+                stats["total_jobs"] += 1
+                for root, _, files in os.walk(job_path):
+                    for file in files:
+                        fp = os.path.join(root, file)
+                        try:
+                            sz = os.path.getsize(fp)
+                        except OSError:
+                            continue
+                        stats["total_bytes"] += sz
+                        lower = file.lower()
+                        if lower.startswith(".asr_") or (lower.endswith(".flac") and "asr" in lower) or lower.endswith((".part", ".ytdl", ".tmp", ".temp")):
+                            stats["transient_temp_bytes"] += sz
+                        elif lower.startswith("source_") and lower.endswith(".mp4"):
+                            stats["source_slices_bytes"] += sz
+                        elif lower.startswith("composed_") or lower.startswith("highlight_reel_") or lower.startswith("clip_") or ("_clip_" in lower and lower.endswith(".mp4")):
+                            stats["rendered_clips_bytes"] += sz
+                        elif lower.endswith((".jpg", ".png", ".json", ".log", ".ass")):
+                            stats["metadata_bytes"] += sz
+                        elif lower.endswith((".mp4", ".mkv", ".webm", ".avi", ".mov")):
+                            stats["source_videos_bytes"] += sz
+                        else:
+                            stats["metadata_bytes"] += sz
+        except Exception as exc:
+            logger.warning("get_storage_breakdown error scanning output_dir: %s", exc)
+
+    if upload_dir and os.path.exists(upload_dir):
+        try:
+            for fname in os.listdir(upload_dir):
+                fp = os.path.join(upload_dir, fname)
+                if not os.path.isfile(fp) or os.path.islink(fp):
+                    continue
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    continue
+                stats["total_bytes"] += sz
+                lower = fname.lower()
+                if lower.startswith(".asr_") or lower.endswith(".flac") or lower.endswith((".part", ".tmp")):
+                    stats["transient_temp_bytes"] += sz
+                else:
+                    stats["uploads_bytes"] += sz
+        except Exception as exc:
+            logger.warning("get_storage_breakdown error scanning upload_dir: %s", exc)
+
+    stats["total_mb"] = round(stats["total_bytes"] / (1024 * 1024), 2)
+    stats["source_videos_mb"] = round(stats["source_videos_bytes"] / (1024 * 1024), 2)
+    stats["source_slices_mb"] = round(stats["source_slices_bytes"] / (1024 * 1024), 2)
+    stats["rendered_clips_mb"] = round(stats["rendered_clips_bytes"] / (1024 * 1024), 2)
+    stats["uploads_mb"] = round(stats["uploads_bytes"] / (1024 * 1024), 2)
+    stats["transient_temp_mb"] = round(stats["transient_temp_bytes"] / (1024 * 1024), 2)
+    stats["metadata_mb"] = round(stats["metadata_bytes"] / (1024 * 1024), 2)
+
+    return stats
 
 
 def cleanup_failed_job_artifacts(job_id: str, output_dir: str) -> dict:
@@ -291,7 +561,8 @@ def cleanup_published_job(job_id: str, output_dir: str, clip_index: int | None =
                             logger.info("Cleaned verified published clip video: %s (%d bytes)", target_path, size)
                         except OSError as exc:
                             logger.debug("Failed to remove published clip %s: %s", target_path, exc)
-                mark_clip_deleted(job_id, idx, output_dir)
+                if not clip.get("deleted_after_publish"):
+                    mark_clip_deleted(job_id, idx, output_dir)
 
         ready_clips = [c for c in shorts if c.get("qa", {}).get("ok", True)]
         all_ready_published = bool(ready_clips) and all(is_clip_verified_published(c) for c in ready_clips)
@@ -318,45 +589,110 @@ def cleanup_published_job(job_id: str, output_dir: str, clip_index: int | None =
     return {"freed_bytes": freed_bytes, "removed_count": removed_count}
 
 
-def run_storage_cleanup(output_dir: str) -> dict:
-    """Master storage cleanup pass: purges partial downloads and verified published clip video files.
+def run_storage_cleanup(
+    output_dir: str,
+    upload_dir: str | None = None,
+    purge_raw_sources: bool = False,
+    source_max_age_seconds: float | None = None,
+    active_paths: tuple[str, ...] | set[str] | list[str] = (),
+    partial_min_age_seconds: float = 0.0,
+    protected_job_ids: tuple[str, ...] | set[str] | list[str] = (),
+) -> dict:
+    """Master storage cleanup pass across all data tiers.
 
-    Returns summary dictionary with freed_bytes, freed_mb, removed_files, and cleaned_jobs.
-    Never raises. Never deletes unpublished clips.
+    - Purges partial downloads and orphaned ASR audio dumps across output and upload dirs.
+    - Purges orphaned uploads (unless referenced by active_paths).
+    - Cleans verified published clips and their source slices.
+    - Optionally purges completed job raw source videos (or those older than source_max_age_seconds).
+    - Never raises. Never deletes unpublished clips or active job files.
     """
     total_freed = 0
     total_files = 0
     cleaned_jobs = 0
 
-    if not os.path.exists(output_dir):
-        return {"freed_bytes": 0, "freed_mb": 0.0, "removed_files": 0, "cleaned_jobs": 0}
+    target_dirs = [output_dir]
+    if upload_dir and os.path.exists(upload_dir):
+        target_dirs.append(upload_dir)
 
+    protected_jobs = {str(jid).strip().lower() for jid in protected_job_ids if jid}
+
+    # 1. Purge partial downloads and transient ASR audio dumps
+    p_res = {"freed_bytes": 0, "removed_count": 0}
     try:
-        p_res = purge_partial_downloads(output_dir)
+        p_res = purge_partial_downloads(
+            target_dirs,
+            min_age_seconds=partial_min_age_seconds,
+            active_paths=active_paths,
+            protected_job_ids=protected_job_ids,
+        )
         total_freed += p_res["freed_bytes"]
         total_files += p_res["removed_count"]
-
-        for entry in os.listdir(output_dir):
-            job_dir = os.path.join(output_dir, entry)
-            if not os.path.isdir(job_dir) or os.path.islink(job_dir):
-                continue
-            job_id = entry
-
-            res = cleanup_published_job(job_id, output_dir)
-            if res["freed_bytes"] > 0:
-                total_freed += res["freed_bytes"]
-                total_files += res["removed_count"]
-                cleaned_jobs += 1
-
     except Exception as exc:
-        logger.warning("run_storage_cleanup encountered an error: %s", exc)
+        logger.warning("run_storage_cleanup partial purge error: %s", exc)
+
+    # 2. Purge orphaned uploads (if upload_dir provided)
+    u_res = {"freed_bytes": 0, "removed_count": 0}
+    if upload_dir and os.path.exists(upload_dir):
+        try:
+            u_res = purge_orphaned_uploads(upload_dir, active_paths=active_paths)
+            total_freed += u_res["freed_bytes"]
+            total_files += u_res["removed_count"]
+        except Exception as exc:
+            logger.warning("run_storage_cleanup orphaned uploads purge error: %s", exc)
+
+    # 3. Clean published clips in output_dir
+    pub_freed = 0
+    if os.path.exists(output_dir):
+        try:
+            for entry in os.listdir(output_dir):
+                job_dir = os.path.join(output_dir, entry)
+                if not os.path.isdir(job_dir) or os.path.islink(job_dir):
+                    continue
+                job_id = entry
+                if job_id.lower() in protected_jobs:
+                    continue
+
+                res = cleanup_published_job(job_id, output_dir)
+                if res["freed_bytes"] > 0:
+                    pub_freed += res["freed_bytes"]
+                    total_freed += res["freed_bytes"]
+                    total_files += res["removed_count"]
+                    cleaned_jobs += 1
+        except Exception as exc:
+            logger.warning("run_storage_cleanup published job sweep error: %s", exc)
+
+    # 4. Source videos of completed jobs (if requested or if source_max_age_seconds is set)
+    src_res = {"freed_bytes": 0, "removed_count": 0, "cleaned_jobs": 0}
+    if (purge_raw_sources or source_max_age_seconds is not None) and os.path.exists(output_dir):
+        try:
+            src_res = purge_completed_job_source_videos(
+                output_dir,
+                max_age_seconds=source_max_age_seconds,
+                protected_job_ids=protected_job_ids,
+            )
+            total_freed += src_res["freed_bytes"]
+            total_files += src_res["removed_count"]
+            cleaned_jobs += src_res.get("cleaned_jobs", 0)
+        except Exception as exc:
+            logger.warning("run_storage_cleanup source video purge error: %s", exc)
 
     freed_mb = round(total_freed / (1024 * 1024), 2)
-    logger.info("Storage cleanup pass complete: freed %s MB across %d files and %d jobs", freed_mb, total_files, cleaned_jobs)
+    logger.info(
+        "Storage cleanup pass complete: freed %s MB across %d files and %d jobs",
+        freed_mb,
+        total_files,
+        cleaned_jobs,
+    )
     return {
         "freed_bytes": total_freed,
         "freed_mb": freed_mb,
         "removed_files": total_files,
         "cleaned_jobs": cleaned_jobs,
+        "categories": {
+            "transient_temp_freed_bytes": p_res["freed_bytes"],
+            "orphaned_uploads_freed_bytes": u_res["freed_bytes"],
+            "published_clips_freed_bytes": pub_freed,
+            "source_videos_freed_bytes": src_res["freed_bytes"],
+        },
     }
 

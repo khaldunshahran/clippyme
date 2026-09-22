@@ -6,12 +6,72 @@ the main video pipeline.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 from typing import Any
+from urllib.parse import urlparse
 import httpx
+
+from clippyme.netutil import resolve_host_addresses
 
 logger = logging.getLogger("clippyme")
 _TIMEOUT = 10.0
+
+
+def is_safe_webhook_url(url: str) -> bool:
+    """Validate that a webhook URL is HTTP(S) and does not resolve to private/internal IPs."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            addrs = [ip_obj]
+        except ValueError:
+            addrs = resolve_host_addresses(host, timeout=5.0)
+
+        if not addrs:
+            return False
+
+        for a in addrs:
+            if (
+                a.is_private
+                or a.is_loopback
+                or a.is_link_local
+                or a.is_reserved
+                or a.is_multicast
+                or a.is_unspecified
+            ):
+                return False
+        return True
+    except Exception as exc:
+        logger.warning("SSRF validation failed for webhook URL %s: %s", url, exc)
+        return False
+
+
+def is_safe_discord_webhook_url(url: str) -> bool:
+    """Validate that a Discord webhook URL is an official HTTPS Discord endpoint."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme.lower() != "https":
+            return False
+        host = (parsed.hostname or "").lower()
+        if host not in ("discord.com", "www.discord.com", "discordapp.com", "www.discordapp.com"):
+            return False
+        if not parsed.path.startswith("/api/webhooks/"):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 async def send_ntfy(
@@ -30,6 +90,10 @@ async def send_ntfy(
     topic_clean = topic.strip().lstrip("/")
     base_server = (server or "https://ntfy.sh").rstrip("/")
     url = f"{base_server}/{topic_clean}"
+
+    if not is_safe_webhook_url(url):
+        logger.warning("Refusing to dispatch ntfy notification to unsafe / private URL: %s", url)
+        return False
 
     headers = {
         "Title": title[:200],
@@ -89,7 +153,8 @@ async def send_discord_webhook(
     fields: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Send a rich embed message via Discord Webhook."""
-    if not webhook_url or not webhook_url.startswith("http"):
+    if not is_safe_discord_webhook_url(webhook_url):
+        logger.warning("Refusing to send Discord webhook to invalid or non-Discord URL: %s", webhook_url)
         return False
     embed: dict[str, Any] = {
         "title": title[:250],
@@ -120,7 +185,8 @@ async def send_generic_webhook(
     payload: dict[str, Any],
 ) -> bool:
     """Send a JSON payload to a generic custom webhook."""
-    if not url or not url.startswith("http"):
+    if not is_safe_webhook_url(url):
+        logger.warning("Refusing to send generic webhook to unsafe or private URL: %s", url)
         return False
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:

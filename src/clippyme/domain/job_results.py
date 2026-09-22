@@ -61,6 +61,7 @@ def build_main_cmd(
     min_clips: int | None = None,
     max_clips: int | None = None,
     clip_type: str | None = None,
+    duration_mode: str | None = None,
     highlights: bool = False,
 ) -> list[str]:
     """Build argv for the checkpointed backend pipeline.
@@ -138,6 +139,8 @@ def build_main_cmd(
         cmd.extend(["--max-clips", str(int(max_clips))])
     if clip_type and clip_type.strip():
         cmd.extend(["--clip-type", clip_type.strip()])
+    if duration_mode and duration_mode.strip():
+        cmd.extend(["--duration-mode", duration_mode.strip()])
     if highlights:
         cmd.append("--highlights")
     return cmd
@@ -165,20 +168,49 @@ def _build_clips(data: dict, base_name: str, job_id: str, output_dir: str, only_
 
     result = []
     fake_metadata_path = f"{base_name}_metadata.json"
+    from clippyme.storage.r2_storage import get_remote_clip_url
+
+    analytics_clips = {}
+    try:
+        from clippyme.domain.analytics_service import load_analytics_data
+        analytics_data = load_analytics_data()
+        analytics_clips = analytics_data.get("clips", {})
+    except Exception as exc:
+        logger.debug("job_results: could not load analytics data: %s", exc)
+
     for index, clip in enumerate(clips):
         if clip.get("deleted_after_publish"):
             continue
         clip_filename = clip_filename_for(fake_metadata_path, clip, index)
         clip_path = os.path.join(output_dir, clip_filename)
-        exists = os.path.exists(clip_path) and os.path.getsize(clip_path) > 0
+        r2_url = get_remote_clip_url(job_id, clip_filename, output_dir)
+        exists = (os.path.exists(clip_path) and os.path.getsize(clip_path) > 0) or bool(r2_url)
         if only_ready and not exists:
             continue
-        clip["video_url"] = f"/videos/{job_id}/{clip_filename}"
+        clip["video_url"] = r2_url or f"/videos/{job_id}/{clip_filename}"
         composed_filename = f"composed_{clip_filename}"
         composed_path = os.path.join(output_dir, composed_filename)
-        if os.path.exists(composed_path) and os.path.getsize(composed_path) > 0:
-            clip["composed_video_url"] = f"/videos/{job_id}/{composed_filename}"
+        composed_r2 = get_remote_clip_url(job_id, composed_filename, output_dir)
+        if (os.path.exists(composed_path) and os.path.getsize(composed_path) > 0) or composed_r2:
+            clip["composed_video_url"] = composed_r2 or f"/videos/{job_id}/{composed_filename}"
         clip["original_index"] = index
+
+        # Attach real-world analytics if tracked
+        clip_id = f"{job_id}:{index}"
+        if clip_id in analytics_clips:
+            tracked = analytics_clips[clip_id]
+            if tracked.get("metrics"):
+                clip["analytics"] = tracked["metrics"]
+            if tracked.get("published_at"):
+                clip["published_at"] = tracked["published_at"]
+
+        # Ensure duration_tier is present for narrative portfolio display
+        if not clip.get("duration_tier"):
+            c_start = float(clip.get("start", 0.0) or 0.0)
+            c_end = float(clip.get("end", 0.0) or 0.0)
+            dur = max(0.0, c_end - c_start)
+            clip["duration_tier"] = "short" if dur <= 60.0 else ("mid" if dur <= 120.0 else "extended")
+
         result.append(clip)
     return result
 
@@ -239,6 +271,12 @@ def load_final_result(job_id: str, output_dir: str) -> dict | None:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+
+    try:
+        from clippyme.storage.r2_storage import sync_job_clips_to_r2
+        sync_job_clips_to_r2(job_id, output_dir)
+    except Exception as exc:
+        logger.warning("R2 sync failed for job %s: %s", job_id, exc)
 
     base_name = os.path.basename(target_json).replace("_metadata.json", "")
     clips = _build_clips(data, base_name, job_id, output_dir, only_ready=False)

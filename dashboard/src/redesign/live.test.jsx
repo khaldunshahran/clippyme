@@ -80,12 +80,80 @@ test('idle empty list shows "No monitors running."', async () => {
   expect(await screen.findByText('No monitors running.')).toBeInTheDocument();
 });
 
-test('selecting YouTube forces VOD mode and hides live-only fields', async () => {
+test('selecting YouTube in Live mode keeps live controls and allows starting live monitor', async () => {
+  const { startLiveMonitor } = await import('./realApi');
   render(<LiveMonitorView />);
   fireEvent.click(screen.getByRole('button', { name: 'YouTube' }));
+  expect(screen.getByLabelText('Segment minutes')).toBeInTheDocument();
+  expect(screen.getByLabelText('Stream quality')).toBeInTheDocument();
+  expect(screen.getByText(/YouTube Live: monitors and captures active live streams/)).toBeInTheDocument();
+
+  fireEvent.change(screen.getByLabelText('Channel'), { target: { value: '@PewDiePie' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: /Start monitor/ })).not.toBeDisabled());
+  fireEvent.click(screen.getByRole('button', { name: /Start monitor/ }));
+  await waitFor(() => expect(startLiveMonitor).toHaveBeenCalled());
+  expect(startLiveMonitor.mock.calls[0][0].platform).toBe('youtube');
+  expect(startLiveMonitor.mock.calls[0][0].mode).toBe('live');
+  expect(startLiveMonitor.mock.calls[0][0].stream_quality).toBe('best');
+});
+
+test('selecting YouTube in VOD mode hides live-only fields', async () => {
+  render(<LiveMonitorView />);
+  fireEvent.click(screen.getByRole('button', { name: 'YouTube' }));
+  fireEvent.click(screen.getByRole('button', { name: 'VOD' }));
   await waitFor(() => expect(screen.queryByLabelText('Segment minutes')).toBeNull());
   expect(screen.queryByLabelText('Prelive skip minutes')).toBeNull();
+  expect(screen.queryByLabelText('Stream quality')).toBeNull();
   expect(screen.getByText(/YouTube: clips every new long-form upload/)).toBeInTheDocument();
+});
+
+test('stream quality ladder dropdown sends selected quality in start payload', async () => {
+  const { startLiveMonitor } = await import('./realApi');
+  render(<LiveMonitorView />);
+  fireEvent.change(screen.getByLabelText('Channel'), { target: { value: 'xqc' } });
+  fireEvent.change(screen.getByLabelText('Stream quality'), { target: { value: '720p60,720p,best' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: /Start monitor/ })).not.toBeDisabled());
+  fireEvent.click(screen.getByRole('button', { name: /Start monitor/ }));
+  await waitFor(() => expect(startLiveMonitor).toHaveBeenCalled());
+  expect(startLiveMonitor.mock.calls[0][0].stream_quality).toBe('720p60,720p,best');
+});
+
+test('reconnecting monitor state renders with appropriate label', async () => {
+  mockStatus.mockResolvedValue({
+    monitors: [{ id: 'twitch:xqc', platform: 'twitch', mode: 'live', running: true, state: 'reconnecting', channel: 'xqc' }],
+  });
+  render(<LiveMonitorView />);
+  expect(await screen.findByText('Reconnecting — waiting for stream')).toBeInTheDocument();
+});
+
+test('capturing state displays active segment duration and size telemetry', async () => {
+  mockStatus.mockResolvedValue({
+    monitors: [{
+      id: 'kick:xqc', platform: 'kick', mode: 'live', running: true, state: 'capturing',
+      channel: 'xqc', current_segment_seconds: 125, current_segment_bytes: 15728640,
+    }],
+  });
+  render(<LiveMonitorView />);
+  expect(await screen.findByText(/Capturing: 2m 5s/)).toBeInTheDocument();
+  expect(screen.getByText(/15\.0 MB/)).toBeInTheDocument();
+});
+
+test('Settings drawer allows updating stream_quality ladder', async () => {
+  const { updateMonitorConfig } = await import('./realApi');
+  mockStatus.mockResolvedValue({
+    monitors: [{
+      id: 'kick:xqc', platform: 'kick', mode: 'live', running: true, state: 'capturing', channel: 'xqc',
+      config: { stream_quality: 'best' },
+    }],
+  });
+  render(<LiveMonitorView />);
+  await screen.findByText('xqc');
+  fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+  const qualitySelect = screen.getByLabelText('Settings stream quality kick:xqc');
+  expect(qualitySelect).toHaveValue('best');
+  fireEvent.change(qualitySelect, { target: { value: '480p,best' } });
+  fireEvent.click(screen.getByRole('button', { name: /Apply/ }));
+  await waitFor(() => expect(updateMonitorConfig).toHaveBeenCalledWith('kick:xqc', { stream_quality: '480p,best' }));
 });
 
 test('duplicate monitor (409) shows a warning toast', async () => {

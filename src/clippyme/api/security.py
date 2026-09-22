@@ -88,8 +88,6 @@ def is_trusted_origin(origin: Optional[str]) -> bool:
     norm = origin.rstrip("/").lower()
     if norm in ALLOWED_ORIGINS:
         return True
-    if norm.endswith(".trycloudflare.com") or ".trycloudflare.com" in norm:
-        return True
     if norm.endswith(".ts.net") or ".ts.net:" in norm:
         return True
     try:

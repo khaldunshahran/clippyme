@@ -1,5 +1,6 @@
 """Tests for clippyme.pipeline.download helpers (host-runnable; no network)."""
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -188,3 +189,103 @@ def test_classify_fatal(msg):
 def test_classify_bot_wall_beats_any_incidental_403():
     msg = "Sign in to confirm you're not a bot (HTTP Error 403)"
     assert dl.classify_download_error(msg) == "retry"
+
+
+def test_download_youtube_video_fallback_on_connect_error(monkeypatch, tmp_path):
+    """When port 8001 microservice is unreachable, download_youtube_video falls back in-process."""
+    import httpx
+    from unittest.mock import MagicMock
+
+    def _fail_client(*a, **k):
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.post.side_effect = httpx.ConnectError("Connection refused: [WinError 10061]")
+        mock_ctx.__enter__.return_value = mock_client
+        mock_ctx.__exit__.return_value = False
+        return mock_ctx
+
+    monkeypatch.setattr(httpx, "Client", _fail_client)
+
+    fallback_called = {}
+    def _mock_local_download(req):
+        fallback_called["url"] = req.url
+        fallback_called["output_dir"] = req.output_dir
+        return {
+            "downloaded_file": os.path.join(req.output_dir, "fallback_vid.mp4"),
+            "sanitized_title": "fallback_vid",
+        }
+
+    monkeypatch.setattr("clippyme.services.downloader_api.download_video", _mock_local_download)
+
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    out_file, title = dl.download_youtube_video(url, output_dir=str(tmp_path))
+
+    assert fallback_called.get("url") == url
+    assert title == "fallback_vid"
+    assert out_file.endswith("fallback_vid.mp4")
+
+
+def test_download_youtube_video_propagates_microservice_error_detail(monkeypatch, tmp_path):
+    import httpx
+    mock_resp = MagicMock()
+    mock_resp.status_code = 400
+    mock_resp.json.return_value = {"detail": "Fatal download error: Video unavailable"}
+    mock_resp.text = '{"detail": "Fatal download error: Video unavailable"}'
+
+    http_err = httpx.HTTPStatusError("Client error '400 Bad Request'", request=MagicMock(), response=mock_resp)
+
+    def _fail_client(*args, **kwargs):
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.post.side_effect = http_err
+        mock_ctx.__enter__.return_value = mock_client
+        mock_ctx.__exit__.return_value = False
+        return mock_ctx
+
+    monkeypatch.setattr(httpx, "Client", _fail_client)
+
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    with pytest.raises(RuntimeError) as exc_info:
+        dl.download_youtube_video(url, output_dir=str(tmp_path))
+
+    assert "Fatal download error: Video unavailable" in str(exc_info.value)
+
+
+def test_is_safe_output_dir_casing():
+    from clippyme.services.downloader_api import _is_safe_output_dir
+    assert _is_safe_output_dir("output/test") is True
+    assert _is_safe_output_dir(os.path.abspath("output/test").upper()) is True
+    assert _is_safe_output_dir(os.path.abspath("output/test").lower()) is True
+    assert _is_safe_output_dir(r"C:\Windows\System32") is False
+
+
+def test_downloader_api_rejects_ssrf_url():
+    from fastapi import HTTPException
+    from clippyme.services.downloader_api import download_video, DownloadRequest
+    req = DownloadRequest(
+        url="http://169.254.169.254/latest/meta-data/",
+        output_dir="output/safe",
+    )
+    with pytest.raises(HTTPException) as exc:
+        download_video(req)
+    assert exc.value.status_code == 400
+
+
+def test_downloader_api_rejects_external_host_without_token():
+    from fastapi import HTTPException
+    from clippyme.services.downloader_api import download_video, DownloadRequest
+    class MockClient:
+        host = "198.51.100.2"
+    class MockReq:
+        client = MockClient()
+        headers = {}
+
+    req = DownloadRequest(
+        url="https://www.youtube.com/watch?v=valid",
+        output_dir="output/safe",
+    )
+    with pytest.raises(HTTPException) as exc:
+        download_video(req, request=MockReq())
+    assert exc.value.status_code == 403
+
+

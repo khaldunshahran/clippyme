@@ -1,10 +1,9 @@
-// Optional API token for deliberate LAN deployments (CLIPPYME_API_TOKEN).
-// When the backend has a token configured, every /api request must carry it;
-// the token itself lives in localStorage (set in Settings) so the static
-// frontend needs no build-time secret. Empty token → apiFetch is plain fetch,
-// byte-identical request shape.
+// Optional API token for deliberate LAN deployments (CLIPPYME_API_TOKEN)
+// and multi-tenant Bearer JWT authentication for Supabase SaaS accounts.
+// Tokens live in localStorage so the static frontend needs no build-time secrets.
 
 const API_TOKEN_KEY = 'clippyme_api_token';
+const AUTH_TOKEN_KEY = 'clippyme_auth_token';
 
 function storage() {
   // Node (unit tests) has no localStorage; browsers can throw on access in
@@ -36,9 +35,39 @@ export function setApiToken(token) {
   }
 }
 
-/** fetch() that attaches X-API-Token when one is configured. */
+export function getAuthToken() {
+  try {
+    return storage()?.getItem(AUTH_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setAuthToken(token) {
+  try {
+    const s = storage();
+    if (!s) return;
+    const trimmed = (token || '').trim();
+    if (trimmed) s.setItem(AUTH_TOKEN_KEY, trimmed);
+    else s.removeItem(AUTH_TOKEN_KEY);
+  } catch {
+    // Persist failure
+  }
+}
+
+/** fetch() that attaches Authorization: Bearer and/or X-API-Token when configured. */
 export function apiFetch(url, init = {}) {
-  const token = getApiToken();
-  if (!token) return fetch(url, init);
-  return fetch(url, { ...init, headers: { ...(init.headers || {}), 'X-API-Token': token } });
+  const authToken = getAuthToken();
+  const apiToken = getApiToken();
+
+  if (!authToken && !apiToken) return fetch(url, init);
+
+  const headers = { ...(init.headers || {}) };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
+  if (apiToken) {
+    headers['X-API-Token'] = apiToken;
+  }
+  return fetch(url, { ...init, headers });
 }

@@ -232,6 +232,10 @@ def load_or_create_job_metadata(job_id: str, output_root: str = "output") -> Tup
 def plan_highlights_sync(
     job_id: str,
     target_duration: int = 60,
+    content_mode: Optional[str] = "podcast",
+    output_style: Optional[str] = "recap",
+    theme: Optional[str] = None,
+    merge_gap_seconds: float = 1.5,
     output_root: str = "output",
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -249,7 +253,7 @@ def plan_highlights_sync(
     if not gemini_key:
         raise ValidationError("Gemini API key is required to analyze and create highlights")
 
-    model = model_name or cfg.get("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+    model = model_name or cfg.get("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-3.5-flash"
     video_title = data.get("title", data.get("video_title", "Video"))
     video_dur = float(data.get("duration", 0.0))
     if not video_dur and words:
@@ -260,6 +264,9 @@ def plan_highlights_sync(
         target_duration_sec=target_duration,
         video_duration_sec=video_dur,
         video_title=video_title,
+        content_mode=content_mode,
+        output_style=output_style,
+        theme=theme,
     )
 
     from google import genai
@@ -274,7 +281,11 @@ def plan_highlights_sync(
         ),
     )
 
-    parsed = parse_supercut_response(response.text, target_duration_sec=target_duration)
+    parsed = parse_supercut_response(
+        response.text,
+        target_duration_sec=target_duration,
+        merge_gap_seconds=merge_gap_seconds,
+    )
     raw_cuts = parsed["cuts"]
     snapped_cuts = snap_supercut_timeline(raw_cuts, words, source_video_duration_sec=video_dur)
     if not snapped_cuts:
@@ -299,6 +310,10 @@ def render_highlight_reel_sync(
     hook: Optional[Dict[str, Any]] = None,
     logo: Optional[Dict[str, Any]] = None,
     grade_preset: str = "none",
+    content_mode: Optional[str] = "podcast",
+    output_style: Optional[str] = "recap",
+    theme: Optional[str] = None,
+    merge_gap_seconds: float = 1.5,
     output_root: str = "output",
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -322,6 +337,10 @@ def render_highlight_reel_sync(
             plan = plan_highlights_sync(
                 job_id=job_id,
                 target_duration=target_duration,
+                content_mode=content_mode,
+                output_style=output_style,
+                theme=theme,
+                merge_gap_seconds=merge_gap_seconds,
                 output_root=output_root,
                 api_key=api_key,
                 model_name=model_name,
@@ -524,6 +543,9 @@ def render_highlight_reel_sync(
             "actual_duration": round(total_duration, 2),
             "aspect": aspect,
             "reframe_mode": reframe_mode,
+            "content_mode": content_mode,
+            "output_style": output_style,
+            "theme": theme,
             "filename": final_filename,
             "video_url": f"/videos/{job_id}/{final_filename}",
             "cuts": snapped_cuts,
@@ -577,6 +599,10 @@ def generate_multi_tier_highlights_sync(
     hook: Optional[Dict[str, Any]] = None,
     logo: Optional[Dict[str, Any]] = None,
     grade_preset: str = "none",
+    content_mode: Optional[str] = "podcast",
+    output_style: Optional[str] = "recap",
+    theme: Optional[str] = None,
+    merge_gap_seconds: float = 1.5,
     output_root: str = "output",
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -596,11 +622,18 @@ def generate_multi_tier_highlights_sync(
         if not gemini_key:
             raise ValidationError("Gemini API key is required to analyze and generate highlights")
 
-        model = model_name or cfg.get("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+        model = model_name or cfg.get("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-3.5-flash"
         video_title = data.get("title", data.get("video_title", "Video"))
         video_dur = float(data.get("duration", 600.0))
 
-        prompt = build_multi_tier_highlights_prompt(words, video_duration_sec=video_dur, video_title=video_title)
+        prompt = build_multi_tier_highlights_prompt(
+            words,
+            video_duration_sec=video_dur,
+            video_title=video_title,
+            content_mode=content_mode,
+            output_style=output_style,
+            theme=theme,
+        )
 
         from google import genai
         from google.genai import types
@@ -614,7 +647,10 @@ def generate_multi_tier_highlights_sync(
             ),
         )
 
-        parsed_reels = parse_multi_tier_response(response.text)
+        parsed_reels = parse_multi_tier_response(
+            response.text,
+            merge_gap_seconds=merge_gap_seconds,
+        )
         rendered_highlights = []
 
         for reel_spec in parsed_reels:
@@ -642,6 +678,10 @@ def generate_multi_tier_highlights_sync(
                     hook=hook,
                     logo=logo,
                     grade_preset=grade_preset,
+                    content_mode=content_mode,
+                    output_style=output_style,
+                    theme=theme,
+                    merge_gap_seconds=merge_gap_seconds,
                     output_root=output_root,
                     title=title,
                     save_metadata=False,
@@ -696,6 +736,10 @@ def reprocess_highlight_reel_sync(
         hook = edit_params.get("hook") or target_reel.get("hook")
         logo = edit_params.get("logo") or target_reel.get("logo")
         grade_preset = edit_params.get("grade_preset") or target_reel.get("grade_preset", "none")
+        content_mode = edit_params.get("content_mode") or target_reel.get("content_mode", "podcast")
+        output_style = edit_params.get("output_style") or target_reel.get("output_style", "recap")
+        theme = edit_params.get("theme") or target_reel.get("theme")
+        merge_gap_seconds = float(edit_params.get("merge_gap_seconds", 1.5))
         cuts = edit_params.get("cuts") or target_reel.get("cuts")
         title = edit_params.get("title") or target_reel.get("title")
         target_duration = int(target_reel.get("target_duration", 60))
@@ -713,6 +757,10 @@ def reprocess_highlight_reel_sync(
             hook=hook,
             logo=logo,
             grade_preset=grade_preset,
+            content_mode=content_mode,
+            output_style=output_style,
+            theme=theme,
+            merge_gap_seconds=merge_gap_seconds,
             output_root=output_root,
             title=title,
             save_metadata=False,

@@ -176,3 +176,213 @@ def test_all_clips_published_cleans_source_and_preserves_meta(temp_output_dir):
     assert not os.path.exists(clip1)
     assert os.path.exists(cover1)
     assert os.path.exists(meta_file)
+
+
+def test_purge_partial_downloads_removes_flac_asr_dumps(temp_output_dir):
+    flac_asr = os.path.join(temp_output_dir, ".asr_1787037867_21724.flac")
+    temp_flac = os.path.join(temp_output_dir, "temp_audio.flac")
+    normal_flac = os.path.join(temp_output_dir, "music.flac")
+
+    with open(flac_asr, "wb") as f:
+        f.write(b"x" * 2048)
+    with open(temp_flac, "wb") as f:
+        f.write(b"y" * 1024)
+    with open(normal_flac, "wb") as f:
+        f.write(b"z" * 512)
+
+    res = purge_partial_downloads(temp_output_dir)
+    assert res["removed_count"] >= 2
+    assert not os.path.exists(flac_asr)
+    assert not os.path.exists(temp_flac)
+    assert os.path.exists(normal_flac)
+
+
+def test_purge_partial_downloads_preserves_alive_pid_asr(temp_output_dir):
+    my_pid = os.getpid()
+    active_asr = os.path.join(temp_output_dir, f".asr_1787037867_{my_pid}.flac")
+    dead_asr = os.path.join(temp_output_dir, ".asr_1787037867_9999999.flac")
+
+    with open(active_asr, "wb") as f:
+        f.write(b"alive" * 1024)
+    with open(dead_asr, "wb") as f:
+        f.write(b"dead" * 1024)
+
+    res = purge_partial_downloads(temp_output_dir)
+    assert os.path.exists(active_asr)
+    assert not os.path.exists(dead_asr)
+
+
+def test_purge_partial_downloads_protects_active_job_ids(temp_output_dir):
+    active_job_id = "job_in_flight_123"
+    active_dir = os.path.join(temp_output_dir, active_job_id)
+    os.makedirs(active_dir, exist_ok=True)
+
+    active_part = os.path.join(active_dir, "downloading.mp4.part")
+    active_flac = os.path.join(active_dir, ".asr_123_456.flac")
+    with open(active_part, "wb") as f:
+        f.write(b"part" * 500)
+    with open(active_flac, "wb") as f:
+        f.write(b"flac" * 500)
+
+    # Calling with protected_job_ids skips this directory completely
+    res = purge_partial_downloads(temp_output_dir, protected_job_ids=[active_job_id])
+    assert res["removed_count"] == 0
+    assert os.path.exists(active_part)
+    assert os.path.exists(active_flac)
+
+
+def test_purge_orphaned_uploads():
+    temp_upload_dir = tempfile.mkdtemp()
+    try:
+        active_file = os.path.join(temp_upload_dir, "active_upload.mp4")
+        stale_file = os.path.join(temp_upload_dir, "stale_upload.mp4")
+
+        with open(active_file, "wb") as f:
+            f.write(b"active" * 500)
+        with open(stale_file, "wb") as f:
+            f.write(b"stale" * 500)
+
+        # Set stale mtime to 1 hour ago
+        stale_mtime = os.path.getmtime(stale_file) - 3600
+        os.utime(stale_file, (stale_mtime, stale_mtime))
+
+        from clippyme.domain.job_artifacts import purge_orphaned_uploads
+        res = purge_orphaned_uploads(
+            temp_upload_dir,
+            active_paths=(active_file,),
+            min_age_seconds=900,
+        )
+        assert res["removed_count"] == 1
+        assert os.path.exists(active_file)
+        assert not os.path.exists(stale_file)
+    finally:
+        shutil.rmtree(temp_upload_dir, ignore_errors=True)
+
+
+def test_purge_completed_job_source_videos_preserves_slices_and_clips(temp_output_dir):
+    from clippyme.domain.job_artifacts import purge_completed_job_source_videos
+
+    job_id = "job_reclaim_test"
+    job_dir = os.path.join(temp_output_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    source_video = os.path.join(job_dir, "Big_Full_Interview.mp4")
+    reframe_slice = os.path.join(job_dir, "source_Big_Full_Interview_clip_1.mp4")
+    rendered_clip = os.path.join(job_dir, "Big_Full_Interview_clip_1.mp4")
+    cover = os.path.join(job_dir, "Big_Full_Interview_clip_1_cover.jpg")
+    meta_file = os.path.join(job_dir, f"{job_id}_metadata.json")
+
+    with open(source_video, "wb") as f:
+        f.write(b"SOURCE" * 10000)
+    with open(reframe_slice, "wb") as f:
+        f.write(b"SLICE" * 2000)
+    with open(rendered_clip, "wb") as f:
+        f.write(b"CLIP" * 2000)
+    with open(cover, "wb") as f:
+        f.write(b"COVER" * 100)
+
+    meta_data = {
+        "job_id": job_id,
+        "shorts": [
+            {
+                "clip_filename": "Big_Full_Interview_clip_1.mp4",
+                "qa": {"ok": True},
+                "published": [],  # NOT published
+            }
+        ],
+    }
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(meta_data, f)
+
+    res = purge_completed_job_source_videos(temp_output_dir, max_age_seconds=None)
+    assert res["removed_count"] == 1
+    assert res["cleaned_jobs"] == 1
+
+    # Raw full-length source video is purged:
+    assert not os.path.exists(source_video)
+
+    # Reframe slice, rendered clip, thumbnail, and metadata MUST remain intact:
+    assert os.path.exists(reframe_slice)
+    assert os.path.exists(rendered_clip)
+    assert os.path.exists(cover)
+    assert os.path.exists(meta_file)
+
+
+def test_purge_completed_job_source_videos_respects_3day_retention(temp_output_dir):
+    from clippyme.domain.job_artifacts import purge_completed_job_source_videos
+
+    job_id = "job_3day_retention_test"
+    job_dir = os.path.join(temp_output_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    source_video = os.path.join(job_dir, "Long_Video.mp4")
+    rendered_clip = os.path.join(job_dir, "Long_Video_clip_1.mp4")
+    meta_file = os.path.join(job_dir, f"{job_id}_metadata.json")
+
+    with open(source_video, "wb") as f:
+        f.write(b"S" * 20000)
+    with open(rendered_clip, "wb") as f:
+        f.write(b"C" * 2000)
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump({"job_id": job_id, "shorts": [{"clip_filename": "Long_Video_clip_1.mp4"}]}, f)
+
+    # 1. Fresh job (< 3 days): should NOT be purged
+    three_days_seconds = 3 * 86400
+    res_fresh = purge_completed_job_source_videos(temp_output_dir, max_age_seconds=three_days_seconds)
+    assert res_fresh["removed_count"] == 0
+    assert os.path.exists(source_video)
+
+    # 2. Stale job (set mtime to 4 days ago): should be purged
+    four_days_ago = os.path.getmtime(job_dir) - (4 * 86400)
+    os.utime(job_dir, (four_days_ago, four_days_ago))
+    res_stale = purge_completed_job_source_videos(temp_output_dir, max_age_seconds=three_days_seconds)
+    assert res_stale["removed_count"] == 1
+    assert not os.path.exists(source_video)
+    assert os.path.exists(rendered_clip)
+
+
+def test_get_storage_breakdown(temp_output_dir):
+    from clippyme.domain.job_artifacts import get_storage_breakdown
+
+    job_dir = os.path.join(temp_output_dir, "job_stats")
+    os.makedirs(job_dir, exist_ok=True)
+
+    with open(os.path.join(job_dir, "source.mp4"), "wb") as f:
+        f.write(b"A" * 1024 * 1024)  # 1 MB source video
+    with open(os.path.join(job_dir, "source_clip_1.mp4"), "wb") as f:
+        f.write(b"B" * 512 * 1024)   # 0.5 MB slice
+    with open(os.path.join(job_dir, "clip_1.mp4"), "wb") as f:
+        f.write(b"C" * 256 * 1024)   # 0.25 MB rendered clip
+    with open(os.path.join(job_dir, ".asr_test.flac"), "wb") as f:
+        f.write(b"D" * 128 * 1024)   # 0.125 MB temp audio
+
+    stats = get_storage_breakdown(temp_output_dir)
+    assert stats["total_jobs"] == 1
+    assert stats["source_videos_mb"] >= 0.9
+    assert stats["source_slices_mb"] >= 0.4
+    assert stats["rendered_clips_mb"] >= 0.2
+    assert stats["transient_temp_mb"] >= 0.1
+
+
+def test_is_pid_alive():
+    from clippyme.domain.job_artifacts import _is_pid_alive
+    assert _is_pid_alive(os.getpid()) is True
+    assert _is_pid_alive(0) is False
+    assert _is_pid_alive(-10) is False
+    assert _is_pid_alive(99999999) is False
+
+
+def test_purge_partial_downloads_protects_active_job_dir(temp_output_dir):
+    job_id = "job_active_123"
+    job_dir = os.path.join(temp_output_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    temp_asr = os.path.join(job_dir, f".asr_12345_{os.getpid()}.flac")
+    with open(temp_asr, "wb") as f:
+        f.write(b"AUDIO")
+
+    # Passing job_id in protected_job_ids must ensure the file is NOT purged
+    res = purge_partial_downloads(temp_output_dir, protected_job_ids=[job_id])
+    assert res["removed_count"] == 0
+    assert os.path.exists(temp_asr)
+
+

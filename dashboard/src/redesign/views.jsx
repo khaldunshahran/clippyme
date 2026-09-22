@@ -1,6 +1,7 @@
 // ClippyMe redesign — HistoryView + SettingsView + ApiKeyModal, wired to the
 // real backend (history list/restore/delete; config keys, cookies, Zernio).
 import { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useModalA11y } from './useModalA11y';
 import { Icon, Btn, Badge, Switch, Segmented, Panel } from './primitives';
 import { Hero } from './chrome';
@@ -9,20 +10,20 @@ import {
   getZernio, saveZernio, discoverZernioAccounts,
   getWatchdog, saveWatchdog, testWatchdogAlert,
   listFonts, uploadFont, deleteFont, logoStatus, uploadLogo, deleteLogo,
-  researchProduct, generateUgcScripts, fetchViralTitles, refineViralTitles, fetchChapters, generateThumbnail,
+  researchProduct, generateUgcScripts, fetchViralTitles, refineViralTitles, generateThumbnail,
 } from './realApi';
 import { SUB_FONTS } from './data';
 import { getApiToken, setApiToken } from '../lib/apiToken';
 import { relTime } from '../lib/relTime';
-import { triggerStorageCleanup } from '../lib/api';
+import { triggerStorageCleanup, getStorageBreakdown } from '../lib/api';
 
 // Curated fallback when live discovery is unavailable (no key yet / offline).
 // Mirrors the allow-list prefixes (gemini-2.5- / gemini-3) the backend accepts.
 const FALLBACK_MODELS = [
   { name: 'gemini-3.5-flash', display_name: 'Gemini 3.5 Flash — recommended' },
-  { name: 'gemini-2.5-flash', display_name: 'Gemini 2.5 Flash — budget' },
+  { name: 'gemini-3.6-flash', display_name: 'Gemini 3.6 Flash — high performance' },
+  { name: 'gemini-3.5-flash-lite', display_name: 'Gemini 3.5 Flash-Lite — budget' },
   { name: 'gemini-3.1-pro-preview', display_name: 'Gemini 3.1 Pro — max quality' },
-  { name: 'gemini-2.5-pro', display_name: 'Gemini 2.5 Pro — max quality' },
 ];
 
 export function HistoryView({ history, availableIds, onOpen, onDelete, onClear }) {
@@ -64,7 +65,7 @@ export function HistoryView({ history, availableIds, onOpen, onDelete, onClear }
               onKeyDown={(e) => { if (ok && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onOpen(h); } }}
               style={{ cursor: ok ? 'pointer' : 'default', opacity: removed ? 0.55 : 1 }}>
               <div className="hthumb" style={{ background: removed ? 'var(--bg-4)' : 'var(--grad-viral)' }}>{h.clipCount ?? 0}</div>
-              <div style={{ minWidth: 0 }}>
+              <div style={{ minWidth: 0, flex: 1 }}>
                 <div className="ht" title={h.title || h.source || h.jobId}
                   style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{h.title || h.source || h.jobId}</div>
                 <div className="hm">
@@ -100,7 +101,7 @@ function KeyRow({ icon, name, desc, value, onChange, onSave, onClear, placeholde
   return (
     <div className="keyrow">
       <div className="ki"><Icon n={icon} /></div>
-      <div style={{ minWidth: 0 }}>
+      <div style={{ minWidth: 0, flex: 1 }}>
         <div className="kt">{name}</div>
         <div className="kd">{desc}</div>
       </div>
@@ -153,6 +154,8 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
   const [wdWhUrl, setWdWhUrl] = useState('');
   const [testingWd, setTestingWd] = useState(false);
   const [cleaningStorage, setCleaningStorage] = useState(false);
+  const [cleaningDeep, setCleaningDeep] = useState(false);
+  const [storageStats, setStorageStats] = useState(null);
 
   // Pull the live model list from the backend (uses the saved key if the
   // header is empty). Merges discovery with the curated fallback + the
@@ -202,6 +205,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     cookiesStatus().then((s) => setCookies(!!s.configured)).catch(() => {});
     logoStatus().then((s) => setLogoOn(!!s.configured)).catch(() => {});
     listFonts().then(({ fonts: f }) => setFonts(Array.isArray(f) ? f : [])).catch(() => {});
+    getStorageBreakdown().then(setStorageStats).catch(() => {});
     // Mount-once bootstrap; loadModels reads the latest key via closure on call.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -414,7 +418,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
                 <div className="kd">Send instant alerts to your phone if a task fails or needs action</div>
               </div>
             </div>
-            <Switch checked={wdEnabled} onChange={(v) => { setWdEnabled(v); saveWatchdogCfg({ enabled: v }); }} />
+            <Switch on={wdEnabled} label="Mobile push alerts" onChange={(v) => { setWdEnabled(v); saveWatchdogCfg({ enabled: v }); }} />
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderTop: '1px solid var(--border-subtle, rgba(255,255,255,0.08))', paddingTop: 10 }}>
@@ -422,7 +426,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
               <div className="ot" style={{ fontSize: 13 }}>AI Error Diagnosis (Doctor)</div>
               <div className="od">Use Gemini to diagnose root causes & propose fixes automatically</div>
             </div>
-            <Switch checked={wdAi} onChange={(v) => { setWdAi(v); saveWatchdogCfg({ ai_diagnosis: v }); }} />
+            <Switch on={wdAi} label="AI error diagnosis" onChange={(v) => { setWdAi(v); saveWatchdogCfg({ ai_diagnosis: v }); }} />
           </div>
 
           <div style={{ borderTop: '1px solid var(--border-subtle, rgba(255,255,255,0.08))', paddingTop: 10 }}>
@@ -537,24 +541,36 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
         </div>
       </Panel>
 
-      <Panel title="Storage & Disk Cleanup" sub="Manage local video files and purge published/failed task storage" icon="hard-drive" style={{ marginBottom: 18 }}>
-        <div className="opt" style={{ borderBottom: 0 }}>
+      <Panel title="Storage & Disk Cleanup" sub="Manage local video files, temporary audio dumps, and completed source videos" icon="hard-drive" style={{ marginBottom: 18 }}>
+        {storageStats && (
+          <div style={{ padding: '12px 14px', background: 'var(--bg-subtle, rgba(255,255,255,0.03))', borderRadius: 8, marginBottom: 14, fontSize: '0.82rem', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10 }}>
+            <div><span style={{ opacity: 0.6 }}>Total Storage:</span> <b>{storageStats.total_mb > 1024 ? `${(storageStats.total_mb / 1024).toFixed(1)} GB` : `${storageStats.total_mb} MB`}</b></div>
+            <div><span style={{ opacity: 0.6 }}>Source Videos:</span> <b>{storageStats.source_videos_mb > 1024 ? `${(storageStats.source_videos_mb / 1024).toFixed(1)} GB` : `${storageStats.source_videos_mb} MB`}</b></div>
+            <div><span style={{ opacity: 0.6 }}>Reframe Slices:</span> <b>{storageStats.source_slices_mb > 1024 ? `${(storageStats.source_slices_mb / 1024).toFixed(1)} GB` : `${storageStats.source_slices_mb} MB`}</b></div>
+            <div><span style={{ opacity: 0.6 }}>Rendered Clips:</span> <b>{storageStats.rendered_clips_mb > 1024 ? `${(storageStats.rendered_clips_mb / 1024).toFixed(1)} GB` : `${storageStats.rendered_clips_mb} MB`}</b></div>
+            <div><span style={{ opacity: 0.6 }}>Uploads:</span> <b>{storageStats.uploads_mb > 1024 ? `${(storageStats.uploads_mb / 1024).toFixed(1)} GB` : `${storageStats.uploads_mb} MB`}</b></div>
+            <div><span style={{ opacity: 0.6 }}>Temp / Audio:</span> <b>{storageStats.transient_temp_mb} MB</b></div>
+          </div>
+        )}
+
+        <div className="opt">
           <div className="oico"><Icon n="trash-2" /></div>
           <div className="otxt">
-            <div className="ot">Disk cleanup</div>
-            <div className="od">Purge large source videos after publishing and delete partial download leftovers</div>
+            <div className="ot">Quick Clean (Safe)</div>
+            <div className="od">Purge transient ASR audio dumps (.flac), partial downloads, and stale uploads</div>
           </div>
           <div className="r" style={{ gap: 8 }}>
             <Btn
               variant="secondary"
               size="sm"
               icon="sparkles"
-              disabled={cleaningStorage}
+              disabled={cleaningStorage || cleaningDeep}
               onClick={async () => {
                 setCleaningStorage(true);
                 try {
-                  const res = await triggerStorageCleanup();
+                  const res = await triggerStorageCleanup({ mode: 'safe' });
                   pushToast?.('success', `Freed ${res.freed_mb || 0} MB across ${res.removed_files || 0} files`);
+                  getStorageBreakdown().then(setStorageStats).catch(() => {});
                 } catch (e) {
                   pushToast?.('error', `Cleanup failed: ${e.message}`);
                 } finally {
@@ -562,7 +578,37 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
                 }
               }}
             >
-              {cleaningStorage ? 'Cleaning…' : 'Clean Storage Now'}
+              {cleaningStorage ? 'Cleaning…' : 'Clean Temp & Uploads'}
+            </Btn>
+          </div>
+        </div>
+
+        <div className="opt" style={{ borderBottom: 0 }}>
+          <div className="oico"><Icon n="sparkles" /></div>
+          <div className="otxt">
+            <div className="ot">Reclaim Source Videos (Deep)</div>
+            <div className="od">Purge multi-GB raw source videos from completed jobs (reframe slices and clips are preserved)</div>
+          </div>
+          <div className="r" style={{ gap: 8 }}>
+            <Btn
+              variant="secondary"
+              size="sm"
+              icon="trash-2"
+              disabled={cleaningStorage || cleaningDeep}
+              onClick={async () => {
+                setCleaningDeep(true);
+                try {
+                  const res = await triggerStorageCleanup({ mode: 'deep', purgeRawSources: true });
+                  pushToast?.('success', `Freed ${res.freed_mb || 0} MB across ${res.removed_files || 0} files`);
+                  getStorageBreakdown().then(setStorageStats).catch(() => {});
+                } catch (e) {
+                  pushToast?.('error', `Reclaim failed: ${e.message}`);
+                } finally {
+                  setCleaningDeep(false);
+                }
+              }}
+            >
+              {cleaningDeep ? 'Reclaiming…' : 'Reclaim Source Videos'}
             </Btn>
           </div>
         </div>
@@ -587,7 +633,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
 
 export function ApiKeyModal({ onClose, onGoToSettings }) {
   const panelRef = useModalA11y(onClose);
-  return (
+  const modalNode = (
     // Backdrop click is a mouse-only convenience; keyboard users close via
     // Esc (useModalA11y). currentTarget guard replaces stopPropagation.
     <div className="overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -596,7 +642,7 @@ export function ApiKeyModal({ onClose, onGoToSettings }) {
         <div className="modal-head"><h3 id="apikey-modal-title">Add your Gemini key</h3><button className="x" onClick={onClose} aria-label="Close"><Icon n="x" /></button></div>
         <div className="modal-body">
           <p style={{ color: 'var(--fg-2)', fontSize: 14, lineHeight: 1.55 }}>
-            ClippyMe needs a Gemini key to score the transcript and find viral moments. It&apos;s stored locally and never leaves your machine.
+            Nugget needs a Gemini key to score the transcript and find viral moments. It&apos;s stored locally and never leaves your machine.
           </p>
         </div>
         <div className="modal-foot">
@@ -606,6 +652,8 @@ export function ApiKeyModal({ onClose, onGoToSettings }) {
       </div>
     </div>
   );
+
+  return typeof document !== 'undefined' ? createPortal(modalNode, document.body) : modalNode;
 }
 
 export function AiShortsView() {

@@ -144,7 +144,7 @@ def research_product_online(url_or_description: str, gemini_key: str, model_name
     from google.genai import types
 
     client = genai.Client(api_key=gemini_key)
-    model = model_name or os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
+    model = model_name or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
 
     prompt = f"""You are a senior product researcher. Research this product/website and extract market insights, real user pain points, competitor comparisons, and key value propositions:
 

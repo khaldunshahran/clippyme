@@ -32,6 +32,17 @@ test('seedBannerParams defaults disabled when neither is present', () => {
   assert.equal(seedBannerParams({ banner: false }, null).enabled, false);
 });
 
+test('seedBannerParams keeps disabled when preselections explicitly disable banner even with sourceBanner', () => {
+  assert.equal(
+    seedBannerParams({ banner: false }, { platform: 'youtube', handle: 'GrenBaudLounge' }).enabled,
+    false,
+  );
+  assert.equal(
+    seedBannerParams({ banner: { enabled: false } }, { platform: 'youtube', handle: 'GrenBaudLounge' }).enabled,
+    false,
+  );
+});
+
 test('seedToggles turns grade on only for a real preset', () => {
   assert.equal(seedToggles({ grade: { preset: 'warm_cinematic' } }).grade, true);
   assert.equal(seedToggles({ grade: { preset: 'none' } }).grade, false);

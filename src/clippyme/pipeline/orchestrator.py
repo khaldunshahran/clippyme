@@ -40,6 +40,8 @@ from clippyme.pipeline.reframe_ops import normalize_letterbox_zoom
 from clippyme.pipeline.run_ops import (
     build_cut_command,
     clip_output_basename,
+    find_source_video_candidate,
+    is_same_video_source,
     resolve_output_dir,
     sanitize_windows_basename,
     should_use_fallback,
@@ -187,6 +189,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-clips", type=int, default=None)
     parser.add_argument("--max-clips", type=int, default=None)
     parser.add_argument("--clip-type", type=str, default=None)
+    parser.add_argument("--duration-mode", type=str, default=None)
     parser.add_argument("--highlights", action="store_true", help="Generate full-video multi-tier highlight reels")
     return parser.parse_args(argv)
 
@@ -273,18 +276,9 @@ def _prepare_input(args: argparse.Namespace, output_dir: str, state: RuntimeStat
         video_title = os.path.splitext(os.path.basename(input_video))[0]
     else:
         prior = _safe_output_artifact(state.artifact("input_video"), output_dir)
-        same_url = state.artifact("source_url") == args.url
+        same_url = is_same_video_source(state.artifact("source_url"), args.url)
         if not _valid_file(prior, 10_000):
-            for candidate in os.listdir(output_dir):
-                full_c = os.path.join(output_dir, candidate)
-                if (
-                    candidate.endswith(".mp4")
-                    and not candidate.startswith("clip_")
-                    and not candidate.startswith("source_clip_")
-                    and _valid_file(full_c, 10_000)
-                ):
-                    prior = full_c
-                    break
+            prior = find_source_video_candidate(output_dir, min_size=10_000)
         if state.completed("acquiring") and same_url and _valid_file(prior, 10_000):
             input_video = prior
             video_title = str(state.artifact("video_title") or Path(prior).stem)
@@ -430,6 +424,8 @@ def _load_or_analyze(
     if args.skip_analysis:
         clips_data = _whole_video_fallback(video_title, duration)
     else:
+        from clippyme.pipeline.audience_intel import load_audience_intel
+        audience_intel = load_audience_intel(output_dir)
         clips_data = legacy.get_viral_clips(
             transcript,
             duration,
@@ -439,6 +435,8 @@ def _load_or_analyze(
             min_clips=args.min_clips,
             max_clips=args.max_clips,
             clip_type=args.clip_type,
+            duration_mode=getattr(args, "duration_mode", None),
+            audience_intel=audience_intel,
         )
         if not clips_data or "shorts" not in clips_data:
             if should_use_fallback(args.monitor):
@@ -572,17 +570,10 @@ def _render_one_clip(
     )
     if not _valid_file(clip_source, 10_000):
         if not _valid_file(input_video, 10_000):
-            for candidate in os.listdir(output_dir):
-                full_c = os.path.join(output_dir, candidate)
-                if (
-                    candidate.endswith(".mp4")
-                    and not candidate.startswith("clip_")
-                    and not candidate.startswith("source_clip_")
-                    and _valid_file(full_c, 10_000)
-                ):
-                    input_video = full_c
-                    print(f"♻️ Re-linked source video: {os.path.basename(input_video)}", flush=True)
-                    break
+            candidate = find_source_video_candidate(output_dir, min_size=10_000)
+            if candidate:
+                input_video = candidate
+                print(f"♻️ Re-linked source video: {os.path.basename(input_video)}", flush=True)
         if not _valid_file(input_video, 10_000):
             raise FileNotFoundError(f"Input source video file not found on disk: {input_video}")
         command = build_cut_command(input_video, start, end, clip_source)
@@ -744,6 +735,14 @@ def run(argv: list[str] | None = None) -> int:
             state.start("finalizing", f"completed {len(hl_list)} highlight reels", progress=98)
             state.finish(f"completed: {len(hl_list)} highlight reels ready")
             print(f"🎉 Generated {len(hl_list)} multi-tier highlight reels for full video in {time.time() - started:.2f}s", flush=True)
+            _cleanup_completed(
+                output_dir=output_dir,
+                state=state,
+                input_video=input_video,
+                is_url=args.url is not None,
+                keep_original=bool(args.keep_original),
+                all_clips_ready=bool(hl_list),
+            )
             return 0
 
         clips_data, metadata_file = _load_or_analyze(
@@ -801,7 +800,19 @@ def run(argv: list[str] | None = None) -> int:
                 print(f"❌ Clip {index + 1}/{len(clips)} failed: {exc}", flush=True)
                 logger.exception("clip %d failed", index + 1)
 
-        state.start("finalizing", "writing final metadata", progress=98)
+        state.start("finalizing", "generating situational platform captions & metadata", progress=98)
+        try:
+            from clippyme.domain.metadata_generator import generate_all_clips_metadata
+            jid = os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir)
+            generate_all_clips_metadata(jid, output_dir=output_dir, force=False)
+            print("✨ Generated situational platform captions & descriptions for all clips", flush=True)
+            refreshed = _load_json(metadata_file)
+            if refreshed and isinstance(refreshed.get("shorts"), list):
+                clips_data["shorts"] = refreshed["shorts"]
+        except Exception as exc:
+            logger.warning("Auto metadata generation failed: %s", exc)
+            print(f"⚠️ Platform metadata generation notice: {exc}", flush=True)
+
         _save_metadata(metadata_file, clips_data)
         if ready == 0:
             raise RuntimeError("all candidate clips failed rendering or QA")

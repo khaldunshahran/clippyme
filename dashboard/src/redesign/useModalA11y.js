@@ -1,10 +1,12 @@
 import { useEffect, useRef } from 'react';
 
+let openModalCount = 0;
+
 // Accessibility for modal dialogs: move focus into the dialog on open, keep
 // Tab/Shift+Tab cycling inside it (focus trap), close on Escape, and restore
 // focus to the previously-focused element on close. Returns a ref to attach to
 // the dialog panel element.
-export function useModalA11y(onClose) {
+export function useModalA11y(onClose, active = true) {
   const ref = useRef(null);
 
   // Keep a ref to the latest onClose so the keydown handler always calls the
@@ -17,8 +19,11 @@ export function useModalA11y(onClose) {
   useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
 
   useEffect(() => {
+    if (!active) return;
     const panel = ref.current;
     const prevActive = document.activeElement;
+    openModalCount++;
+    document.body.style.overflow = 'hidden';
 
     const focusables = () =>
       panel
@@ -58,11 +63,15 @@ export function useModalA11y(onClose) {
 
     document.addEventListener('keydown', onKey);
     return () => {
+      openModalCount = Math.max(0, openModalCount - 1);
+      if (openModalCount === 0) {
+        document.body.style.removeProperty('overflow');
+      }
       document.removeEventListener('keydown', onKey);
       // Restore focus to where it was before the modal opened.
       if (prevActive && typeof prevActive.focus === 'function') prevActive.focus();
     };
-  }, []); // run once on mount — onClose changes are handled via onCloseRef above
+  }, [active]);
 
   return ref;
 }

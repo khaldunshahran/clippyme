@@ -60,6 +60,16 @@ test('subtitles off → false; grade none → false; logo off → false', () => 
   assert.equal(p.logo, false);
 });
 
+test('banner off → banner: false in preselections', () => {
+  const p = optsToPreselections({ banner: false });
+  assert.equal(p.banner, false);
+});
+
+test('banner on → banner object with platform and handle in preselections', () => {
+  const p = optsToPreselections({ banner: true, bannerPlatform: 'kick', bannerHandle: 'streamer' });
+  assert.deepEqual(p.banner, { enabled: true, platform: 'kick', handle: 'streamer', y_pct: 0.85 });
+});
+
 test('grade preset flows through when set', () => {
   assert.deepEqual(optsToPreselections({ gradePreset: 'vivid_pop' }).grade, { preset: 'vivid_pop' });
 });

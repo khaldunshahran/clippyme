@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 from clippyme.domain.clip_resolve import clip_filename_for
 
@@ -33,11 +33,12 @@ def is_valid_job_id(job_id) -> bool:
     return bool(_JOB_ID_RE.match(job_id))
 
 
-def scan_history(output_dir: str) -> List[dict]:
+def scan_history(output_dir: str, user_id: Optional[str] = None) -> List[dict]:
     """Walk ``output_dir`` and build a history list of completed jobs.
 
     Returns a list sorted by directory mtime descending. Each entry has the
-    shape expected by the frontend HistoryTab component.
+    shape expected by the frontend HistoryTab component. If user_id is specified,
+    jobs belonging to other users are filtered out.
     """
     results: List[dict] = []
     try:
@@ -54,15 +55,29 @@ def scan_history(output_dir: str) -> List[dict]:
             try:
                 with open(meta_files[0], "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if user_id is not None:
+                    job_user = data.get("user_id")
+                    if not job_user:
+                        from clippyme.domain.runtime_state import load_runtime_state
+                        rt = load_runtime_state(job_dir)
+                        if rt:
+                            job_user = rt.get("user_id")
+                    if job_user and job_user != user_id:
+                        continue
+                    if not job_user and user_id != "default_user":
+                        continue
                 clips = data.get("shorts", [])
                 clip_files = []
+                from clippyme.storage.r2_storage import get_remote_clip_url
+
                 for i, clip in enumerate(clips):
                     clip_filename = clip_filename_for(meta_files[0], clip, i)
                     clip_path = os.path.join(job_dir, clip_filename)
-                    if os.path.exists(clip_path):
+                    r2_url = get_remote_clip_url(entry, clip_filename, job_dir)
+                    if os.path.exists(clip_path) or r2_url:
                         clip_files.append(
                             {
-                                "video_url": f"/videos/{entry}/{clip_filename}",
+                                "video_url": r2_url or f"/videos/{entry}/{clip_filename}",
                                 "title": clip.get("video_title_for_youtube_short", ""),
                                 "start": clip.get("start", 0),
                                 "end": clip.get("end", 0),

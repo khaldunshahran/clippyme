@@ -262,28 +262,45 @@ function BannerConfig({ opts, set }) {
   );
 }
 
-function OptionsPanel({ opts, set }) {
+function OptionsPanel({ opts, set, ready, onCreate, error }) {
   const [subCfg, setSubCfg] = useState(false);
   const [hookCfg, setHookCfg] = useState(false);
   const [logoCfg, setLogoCfg] = useState(false);
   const [bannerCfg, setBannerCfg] = useState(false);
+
   return (
-    <Panel title="Recipe" sub="What ClippyMe makes from each video" icon="sliders-horizontal">
-      <div className="label" style={{ marginBottom: 4 }}>Clip Strategy &amp; Duration</div>
-      <div className="opt">
-        <div className="oico"><Icon n="sparkles" /></div>
-        <div className="otxt">
-          <div className="ot">Content focus</div>
-          <div className="od">
-            {opts.clipType === 'educational' && 'Key insights, takeaways, tutorials & frameworks'}
-            {opts.clipType === 'humor' && 'Funny banter, comedic timing, bloopers & reactions'}
-            {opts.clipType === 'storytelling' && 'Complete narrative arcs, personal stories & drama'}
-            {opts.clipType === 'all' && 'Diverse curation across all categories'}
-            {(!opts.clipType || opts.clipType === 'viral') && 'High energy, pattern breaks, hot takes & hooks'}
-          </div>
+    <div className="recipe-panel">
+      <div className="head">
+        <div className="icon">
+          <Icon n="sliders-horizontal" />
         </div>
-        <div className="r" style={{ flex: '0 0 210px' }}>
-          <select className="sel" value={opts.clipType || 'viral'} onChange={(e) => set({ clipType: e.target.value })}>
+        <div>
+          <h2>Recipe</h2>
+          <p>Highlight synthesis &amp; styling controls</p>
+        </div>
+      </div>
+
+      <div className="group">
+        <div className="group-label">Highlight strategy &amp; duration</div>
+
+        {/* Content focus: Stacked Row */}
+        <div className="row stacked">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="sparkles" />
+            </div>
+            <div className="row-text">
+              <div className="title">Content focus</div>
+              <div className="desc">
+                {opts.clipType === 'educational' && 'Key insights, takeaways, tutorials & frameworks'}
+                {opts.clipType === 'humor' && 'Funny banter, comedic timing, bloopers & reactions'}
+                {opts.clipType === 'storytelling' && 'Complete narrative arcs, personal stories & drama'}
+                {opts.clipType === 'all' && 'Diverse curation across all categories'}
+                {(!opts.clipType || opts.clipType === 'viral') && 'High energy, viral hooks & punchy takeaways'}
+              </div>
+            </div>
+          </div>
+          <select className="sel dropdown" value={opts.clipType || 'viral'} onChange={(e) => set({ clipType: e.target.value })}>
             <option value="viral">🔥 Viral Hooks &amp; Hot Takes</option>
             <option value="educational">💡 Educational &amp; Insights</option>
             <option value="humor">😂 Humor &amp; Banter</option>
@@ -291,144 +308,353 @@ function OptionsPanel({ opts, set }) {
             <option value="all">🌐 Balanced Mix</option>
           </select>
         </div>
-      </div>
 
-      <div className="opt">
-        <div className="oico"><Icon n="clock" /></div>
-        <div className="otxt">
-          <div className="ot">Clip length &amp; format</div>
-          <div className="od">
-            {opts.durationMode === 'shorts' && '15s – 60s · Shorts, TikTok & Reels'}
-            {opts.durationMode === 'mid' && '60s – 3 min · Extended social reels & X videos'}
-            {opts.durationMode === 'long' && '3 min – 10 min · Deep-dive YouTube highlights & stories'}
-            {opts.durationMode === 'custom' && `${opts.minDuration || 15}s – ${opts.maxDuration || 60}s · Custom duration bounds`}
-          </div>
-        </div>
-        <div className="r">
-          <Segmented value={opts.durationMode || 'shorts'} onChange={(id) => set({ durationMode: id })}
-            options={[
-              { id: 'shorts', label: 'Shorts (15-60s)' },
-              { id: 'mid', label: 'Mid (1-3m)' },
-              { id: 'long', label: 'Long (3-10m)' },
-              { id: 'custom', label: 'Custom' },
-            ]} />
-        </div>
-      </div>
-      {opts.durationMode === 'custom' && (
-        <div className="cfg-drawer fade-in" style={{ display: 'flex', gap: 16, alignItems: 'center', justifyContent: 'flex-start', padding: '10px 14px', background: 'var(--bg-2)', borderRadius: 8, marginBottom: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span className="label">Min sec</span>
-            <input type="number" min={5} max={900} className="mono" style={{ width: 80, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--line-1)', background: 'var(--bg-1)', color: 'inherit' }}
-              value={opts.minDuration || 15} onChange={(e) => set({ minDuration: Number(e.target.value) })} />
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 16 }}>
-            <span className="label">Max sec</span>
-            <input type="number" min={10} max={900} className="mono" style={{ width: 80, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--line-1)', background: 'var(--bg-1)', color: 'inherit' }}
-              value={opts.maxDuration || 60} onChange={(e) => set({ maxDuration: Number(e.target.value) })} />
-          </div>
-        </div>
-      )}
-
-      <div className="opt">
-        <div className="oico"><Icon n="scissors" /></div>
-        <div className="otxt">
-          <div className="ot">Clips to extract</div>
-          <div className="od">{opts.clipsAuto ? 'Auto · Scales dynamically with video duration (up to 30)' : `Target range: ${opts.minClips || 5} to ${opts.maxClips || 15} clips`}</div>
-        </div>
-        <div className="r" style={{ gap: 9 }}>
-          {!opts.clipsAuto && (
-            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <span className="label">Min</span>
-              <Stepper value={opts.minClips || 5} set={(v) => set({ minClips: Math.max(1, v) })} max={opts.maxClips || 50} label="Min clips" />
-              <span className="label">Max</span>
-              <Stepper value={opts.maxClips || 15} set={(v) => set({ maxClips: Math.max(opts.minClips || 1, v) })} max={50} label="Max clips" />
+        {/* Clip length & format: Label-left / Control-right with Mix / All */}
+        <div className="row">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="clock" />
             </div>
-          )}
-          <Segmented value={opts.clipsAuto ? 'auto' : 'custom'}
-            onChange={(id) => set({ clipsAuto: id === 'auto' })}
-            options={[{ id: 'auto', label: 'Auto' }, { id: 'custom', label: 'Min/Max' }]} />
+            <div className="row-text">
+              <div className="title">Clip length &amp; format</div>
+              <div className="desc">
+                {opts.durationMode === 'all' && 'Diverse duration mix across all tiers'}
+                {opts.durationMode === 'shorts' && '15s – 60s · Shorts, TikTok & Reels'}
+                {opts.durationMode === 'mid' && '60s – 3 min · Extended social reels & X videos'}
+                {opts.durationMode === 'long' && '3 min – 10 min · Deep-dive highlights & stories'}
+                {opts.durationMode === 'custom' && `${opts.minDuration || 15}s – ${opts.maxDuration || 60}s · Custom bounds`}
+              </div>
+            </div>
+          </div>
+          <div className="row-control">
+            <Segmented
+              value={opts.durationMode || 'shorts'}
+              onChange={(id) => set({ durationMode: id })}
+              options={[
+                { id: 'all', label: 'Mix / All' },
+                { id: 'shorts', label: '<60s' },
+                { id: 'mid', label: '1–3m' },
+                { id: 'long', label: '3–10m' },
+                { id: 'custom', label: 'Custom' },
+              ]}
+            />
+          </div>
+        </div>
+
+        {opts.durationMode === 'custom' && (
+          <div
+            className="cfg-drawer fade-in"
+            style={{
+              display: 'flex',
+              gap: 16,
+              alignItems: 'center',
+              padding: '12px 16px',
+              background: 'var(--surface-deep)',
+              borderRadius: 'var(--r-input)',
+              boxShadow: 'var(--clay-pressed-sm)',
+              marginBottom: 12,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="label">Min sec</span>
+              <input
+                type="number"
+                min={5}
+                max={900}
+                className="mono"
+                style={{ width: 80 }}
+                value={opts.minDuration || 15}
+                onChange={(e) => set({ minDuration: Number(e.target.value) })}
+              />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 16 }}>
+              <span className="label">Max sec</span>
+              <input
+                type="number"
+                min={10}
+                max={900}
+                className="mono"
+                style={{ width: 80 }}
+                value={opts.maxDuration || 60}
+                onChange={(e) => set({ maxDuration: Number(e.target.value) })}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Extraction Count */}
+        <div className="row">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="scissors" />
+            </div>
+            <div className="row-text">
+              <div className="title">Clips to extract</div>
+              <div className="desc">
+                {opts.clipsAuto
+                  ? 'Auto · Scales dynamically with video duration'
+                  : `Target range: ${opts.minClips || 5} to ${opts.maxClips || 15} clips`}
+              </div>
+            </div>
+          </div>
+          <div className="row-control" style={{ gap: 8 }}>
+            {!opts.clipsAuto && (
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <span className="label">Min</span>
+                <Stepper value={opts.minClips || 5} set={(v) => set({ minClips: Math.max(1, v) })} max={opts.maxClips || 50} label="Min clips" />
+                <span className="label">Max</span>
+                <Stepper value={opts.maxClips || 15} set={(v) => set({ maxClips: Math.max(opts.minClips || 1, v) })} max={50} label="Max clips" />
+              </div>
+            )}
+            <Segmented
+              value={opts.clipsAuto ? 'auto' : 'custom'}
+              onChange={(id) => set({ clipsAuto: id === 'auto' })}
+              options={[{ id: 'auto', label: 'Auto' }, { id: 'custom', label: 'Min/Max' }]}
+            />
+          </div>
+        </div>
+
+        {/* Aspect ratio */}
+        <div className="row">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="crop" />
+            </div>
+            <div className="row-text">
+              <div className="title">Aspect ratio</div>
+              <div className="desc">9:16 vertical · 1:1 square · 16:9 widescreen</div>
+            </div>
+          </div>
+          <div className="row-control">
+            <Segmented
+              value={opts.aspect}
+              onChange={(id) => set({ aspect: id })}
+              options={[
+                { id: '9:16', label: '9:16' },
+                { id: '1:1', label: '1:1' },
+                { id: '16:9', label: '16:9' },
+              ]}
+            />
+          </div>
         </div>
       </div>
 
-      <div className="opt">
-        <div className="oico"><Icon n="crop" /></div>
-        <div className="otxt"><div className="ot">Aspect ratio</div><div className="od">9:16 vertical (Shorts/Reels) · 1:1 square · 16:9 horizontal (YouTube)</div></div>
-        <div className="r"><Segmented value={opts.aspect} onChange={(id) => set({ aspect: id })}
-          options={[{ id: '9:16', label: '9:16' }, { id: '1:1', label: '1:1' }, { id: '16:9', label: '16:9' }]} /></div>
-      </div>
+      <div className="group">
+        <div className="group-label">AI &amp; reframe</div>
 
-      <div className="label" style={{ margin: '16px 0 4px' }}>AI &amp; reframe</div>
-      <OptRow icon="sparkles" label="Find viral moments" desc="Gemini scores the transcript · off = whole video"
-        on={opts.detect} set={(v) => set({ detect: v })} />
-      {opts.detect && (
-        <div className="opt">
-          <div className="oico"><Icon n="sparkles" /></div>
-          <div className="otxt" style={{ flex: 1 }}><div className="ot">Gemini model</div><div className="od">Override for this job · blank uses the Settings default</div></div>
-          <div className="r" style={{ flex: '0 0 184px' }}>
-            <select className="sel" value={opts.model || ''} onChange={(e) => set({ model: e.target.value })}>
-              {GEMINI_MODELS.map(([v, l]) => <option key={v || 'default'} value={v}>{l}</option>)}
+        <OptRow
+          icon="sparkles"
+          label="Find viral moments"
+          desc="Gemini scores the transcript · off = whole video"
+          on={opts.detect}
+          set={(v) => set({ detect: v })}
+        />
+
+        {opts.detect && (
+          <div className="row">
+            <div className="row-left">
+              <div className="ricon">
+                <Icon n="sparkles" />
+              </div>
+              <div className="row-text">
+                <div className="title">Gemini model</div>
+                <div className="desc">Override for this job · blank uses Settings default</div>
+              </div>
+            </div>
+            <div className="row-control" style={{ minWidth: 180 }}>
+              <select className="sel dropdown" value={opts.model || ''} onChange={(e) => set({ model: e.target.value })}>
+                {GEMINI_MODELS.map(([v, l]) => (
+                  <option key={v || 'default'} value={v}>
+                    {l}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+
+        <div className="row">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="scan-face" />
+            </div>
+            <div className="row-text">
+              <div className="title">Reframe</div>
+              <div className="desc">Auto face-track · Subject FrameShift crop · Off letterbox</div>
+            </div>
+          </div>
+          <div className="row-control">
+            <Segmented
+              value={(opts.reframeMode === 'object' ? 'subject' : opts.reframeMode) || (opts.reframe === false ? 'disabled' : 'auto')}
+              onChange={(id) => set({ reframeMode: id })}
+              options={[
+                { id: 'auto', label: 'Auto' },
+                { id: 'subject', label: 'Subject' },
+                { id: 'disabled', label: 'Off' },
+              ]}
+            />
+          </div>
+        </div>
+
+        {((opts.reframeMode === 'disabled') || (!opts.reframeMode && opts.reframe === false)) && (
+          <div className="row">
+            <div className="row-left">
+              <div className="ricon">
+                <Icon n="zoom-in" />
+              </div>
+              <div className="row-text">
+                <div className="title">Letterbox zoom</div>
+                <div className="desc">Crop sides for a bigger picture and smaller bars</div>
+              </div>
+            </div>
+            <div className="row-control">
+              <Segmented
+                value={String(opts.letterboxZoom || 0)}
+                onChange={(id) => set({ letterboxZoom: Number(id) })}
+                options={[
+                  { id: '0', label: 'Off' },
+                  { id: '5', label: '5%' },
+                  { id: '10', label: '10%' },
+                  { id: '15', label: '15%' },
+                ]}
+              />
+            </div>
+          </div>
+        )}
+
+        <OptRow
+          icon="scissors"
+          label="Smart cut"
+          desc="Remove silence & filler words"
+          on={opts.smartcut}
+          set={(v) => set({ smartcut: v })}
+        />
+
+        <OptRow
+          icon="zoom-in"
+          label="Subtle zoom"
+          desc="Gentle Ken Burns motion (1.0→1.05x)"
+          on={opts.zoom}
+          set={(v) => set({ zoom: v })}
+        />
+
+        <div className="row">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="languages" />
+            </div>
+            <div className="row-text">
+              <div className="title">Spoken language</div>
+              <div className="desc">Single language boosts accuracy</div>
+            </div>
+          </div>
+          <div className="row-control" style={{ minWidth: 180 }}>
+            <select className="sel dropdown" value={opts.language} onChange={(e) => set({ language: e.target.value })}>
+              {LANGUAGES.map(([v, l]) => (
+                <option key={v} value={v}>
+                  {l}
+                </option>
+              ))}
             </select>
           </div>
         </div>
-      )}
-      <div className="opt">
-        <div className="oico"><Icon n="scan-face" /></div>
-        <div className="otxt"><div className="ot">Reframe</div><div className="od">Auto face-track · Subject FrameShift crop · Off letterbox bands</div></div>
-        <div className="r"><Segmented value={(opts.reframeMode === 'object' ? 'subject' : opts.reframeMode) || (opts.reframe === false ? 'disabled' : 'auto')} onChange={(id) => set({ reframeMode: id })}
-          options={[{ id: 'auto', label: 'Auto' }, { id: 'subject', label: 'Subject' }, { id: 'disabled', label: 'Off' }]} /></div>
       </div>
-      {((opts.reframeMode === 'disabled') || (!opts.reframeMode && opts.reframe === false)) && (
-        <div className="opt">
-          <div className="oico"><Icon n="zoom-in" /></div>
-          <div className="otxt">
-            <div className="ot">Letterbox zoom</div>
-            <div className="od">Crop the sides for a bigger picture and smaller black bars</div>
+
+      <div className="group">
+        <div className="group-label">Captions &amp; styling</div>
+
+        <OptRow
+          icon="captions"
+          label="Subtitles"
+          desc="Burn karaoke or classic captions"
+          on={opts.subtitles}
+          set={(v) => set({ subtitles: v })}
+          onConfig={() => setSubCfg(!subCfg)}
+          configActive={subCfg}
+        />
+        {opts.subtitles && subCfg && <SubConfig opts={opts} set={set} />}
+
+        <OptRow
+          icon="type"
+          label="Text hooks"
+          desc="Add a scroll-stopping opener"
+          on={opts.hooks}
+          set={(v) => set({ hooks: v })}
+          onConfig={() => setHookCfg(!hookCfg)}
+          configActive={hookCfg}
+        />
+        {opts.hooks && hookCfg && <HookConfig opts={opts} set={set} />}
+
+        <OptRow
+          icon="stamp"
+          label="Brand logo"
+          desc="Burn your logo onto every clip"
+          on={opts.logo}
+          set={(v) => set({ logo: v })}
+          onConfig={() => setLogoCfg(!logoCfg)}
+          configActive={logoCfg}
+        />
+        {opts.logo && logoCfg && <LogoConfig opts={opts} set={set} />}
+
+        <OptRow
+          icon="rss"
+          label="Attribution banner"
+          desc="Platform logo + handle burned bottom of clip"
+          on={opts.banner}
+          set={(v) => set({ banner: v })}
+          onConfig={() => setBannerCfg(!bannerCfg)}
+          configActive={bannerCfg}
+        />
+        {opts.banner && bannerCfg && <BannerConfig opts={opts} set={set} />}
+
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="palette" />
+            </div>
+            <div className="row-text">
+              <div className="title">Colour grade</div>
+              <div className="desc">Cinematic colour pass on every clip</div>
+            </div>
           </div>
-          <div className="r"><Segmented value={String(opts.letterboxZoom || 0)}
-            onChange={(id) => set({ letterboxZoom: Number(id) })}
-            options={[{ id: '0', label: 'Off' }, { id: '5', label: '5%' }, { id: '10', label: '10%' }, { id: '15', label: '15%' }]} /></div>
-        </div>
-      )}
-      <OptRow icon="scissors" label="Smart cut" desc="Remove silence & filler words"
-        on={opts.smartcut} set={(v) => set({ smartcut: v })} />
-      <OptRow icon="zoom-in" label="Subtle zoom" desc="Gentle Ken Burns motion (1.0→1.05x)"
-        on={opts.zoom} set={(v) => set({ zoom: v })} />
-      <div className="opt">
-        <div className="oico"><Icon n="languages" /></div>
-        <div className="otxt" style={{ flex: 1 }}><div className="ot">Spoken language</div><div className="od">Single language boosts accuracy</div></div>
-        <div className="r" style={{ flex: '0 0 184px' }}>
-          <select className="sel" value={opts.language} onChange={(e) => set({ language: e.target.value })}>
-            {LANGUAGES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-          </select>
+          <div className="row-control">
+            <GradeControls
+              withOff
+              full={false}
+              preset={opts.gradePreset || 'none'}
+              onChange={(p) => set({ gradePreset: p.preset })}
+            />
+          </div>
         </div>
       </div>
 
-      <div className="label" style={{ margin: '16px 0 4px' }}>Captions &amp; hooks</div>
-      <OptRow icon="captions" label="Subtitles" desc="Burn karaoke or classic captions"
-        on={opts.subtitles} set={(v) => set({ subtitles: v })} onConfig={() => setSubCfg(!subCfg)} configActive={subCfg} />
-      {opts.subtitles && subCfg && <SubConfig opts={opts} set={set} />}
-      <OptRow icon="type" label="Text hooks" desc="Add a scroll-stopping opener"
-        on={opts.hooks} set={(v) => set({ hooks: v })} onConfig={() => setHookCfg(!hookCfg)} configActive={hookCfg} />
-      {opts.hooks && hookCfg && <HookConfig opts={opts} set={set} />}
-      <OptRow icon="stamp" label="Brand logo" desc="Burn your logo onto every clip"
-        on={opts.logo} set={(v) => set({ logo: v })} onConfig={() => setLogoCfg(!logoCfg)} configActive={logoCfg} />
-      {opts.logo && logoCfg && <LogoConfig opts={opts} set={set} />}
-      <OptRow icon="rss" label="Attribution banner" desc="Platform logo + handle burned bottom of clip"
-        on={opts.banner} set={(v) => set({ banner: v })} onConfig={() => setBannerCfg(!bannerCfg)} configActive={bannerCfg} />
-      {opts.banner && bannerCfg && <BannerConfig opts={opts} set={set} />}
-      <div className="opt">
-        <div className="oico"><Icon n="palette" /></div>
-        <div className="otxt"><div className="ot">Colour grade</div><div className="od">Cinematic colour pass on every clip</div></div>
-        <div className="r"><GradeControls withOff full={false} preset={opts.gradePreset || 'none'}
-          onChange={(p) => set({ gradePreset: p.preset })} /></div>
-      </div>
-    </Panel>
+      {/* Integrated Synthesis Action Footer */}
+      <SummaryBar opts={opts} ready={ready} onCreate={onCreate} error={error} />
+    </div>
   );
 }
 
-function SummaryBar({ opts, ready, count, onCreate, error }) {
-  const durationLabel = opts.durationMode === 'mid' ? '1–3m mid' : opts.durationMode === 'long' ? '3–10m long' : opts.durationMode === 'custom' ? `${opts.minDuration || 15}–${opts.maxDuration || 60}s` : '15–60s shorts';
-  const focusLabel = opts.clipType === 'educational' ? '💡 educational' : opts.clipType === 'humor' ? '😂 humor' : opts.clipType === 'storytelling' ? '🎙️ stories' : opts.clipType === 'all' ? '🌐 mix' : '🔥 viral';
+function SummaryBar({ opts, ready, onCreate, error }) {
+  const durationLabel =
+    opts.durationMode === 'all'
+      ? '🌐 mix duration'
+      : opts.durationMode === 'mid'
+      ? '1–3m mid'
+      : opts.durationMode === 'long'
+      ? '3–10m long'
+      : opts.durationMode === 'custom'
+      ? `${opts.minDuration || 15}–${opts.maxDuration || 60}s`
+      : '<60s shorts';
+  const focusLabel =
+    opts.clipType === 'educational'
+      ? '💡 educational'
+      : opts.clipType === 'humor'
+      ? '😂 humor'
+      : opts.clipType === 'storytelling'
+      ? '🎙️ stories'
+      : opts.clipType === 'all'
+      ? '🌐 mix'
+      : '🔥 viral';
   const clipsLabel = opts.clipsAuto ? 'auto clips' : `${opts.minClips || 5}–${opts.maxClips || 15} clips`;
 
   const chips = [
@@ -437,22 +663,42 @@ function SummaryBar({ opts, ready, count, onCreate, error }) {
     durationLabel,
     clipsLabel,
     opts.detect ? 'AI analyze' : 'whole video',
-    (() => { const m = opts.reframeMode || (opts.reframe === false ? 'disabled' : 'auto'); return (m === 'subject' || m === 'object') ? 'subject crop' : m === 'disabled' ? 'letterbox' : 'reframe'; })(),
+    (() => {
+      const m = opts.reframeMode || (opts.reframe === false ? 'disabled' : 'auto');
+      return m === 'subject' || m === 'object' ? 'subject crop' : m === 'disabled' ? 'letterbox' : 'reframe';
+    })(),
     opts.smartcut && 'smart-cut',
-    opts.subtitles && (opts.subMode + ' subs'),
+    opts.subtitles && opts.subMode + ' subs',
     opts.hooks && 'hooks',
   ].filter(Boolean);
+
   return (
-    <div className="summary">
-      <div>
-        <div className="s-main">{ready ? (opts.clipsAuto ? 'ClippyMe will extract the best moments' : `Extracting ${opts.minClips || 5} to ${opts.maxClips || 15} clips`) : 'Add a source to get started'}</div>
-        <div className="s-sub">
-          {chips.map((c) => <span key={c} className="chip">{c}</span>)}
+    <div className="recipe-footer summary">
+      <div className="rf-left">
+        <div className="rf-status s-main">
+          {ready
+            ? opts.clipsAuto
+              ? 'Ready to synthesize · Dynamic clip extraction'
+              : `Ready to extract ${opts.minClips || 5} to ${opts.maxClips || 15} clips`
+            : 'Add a video link or drop a file above to begin'}
         </div>
-        {error && <div className="field-error" role="alert">{error}</div>}
+        <div className="rf-chips s-sub">
+          {chips.map((c) => (
+            <span key={c} className="chip">
+              {c}
+            </span>
+          ))}
+        </div>
+        {error && (
+          <div className="field-error" role="alert">
+            {error}
+          </div>
+        )}
       </div>
-      <div className="s-right">
-        <Btn variant="grad" size="lg" icon="wand-sparkles" onClick={onCreate} disabled={!ready}>Create clips</Btn>
+      <div className="rf-right s-right">
+        <Btn variant="grad" size="lg" icon="wand-sparkles" onClick={onCreate} disabled={!ready}>
+          Create clips
+        </Btn>
       </div>
     </div>
   );
@@ -461,24 +707,33 @@ function SummaryBar({ opts, ready, count, onCreate, error }) {
 export function CreateView({ opts, set, onPickPreset, onCreate, presets, defaultId, onSetDefault, onDelete, onSaveCurrent }) {
   const validation = validateCreateOptions(opts);
   const ready = validation.valid;
-  const nSources = Math.max(1, validation.sourceCount);
-  const count = opts.detect ? opts.clips * nSources : nSources;
+
   return (
     <div className="container fade-in">
-      <Hero eyebrow="Drop a link · get scroll-stopping shorts" line1="Long videos in." grad="Viral shorts out."
-        sub="Drop a link from YouTube, Twitch, or Kick (or upload a file) and ClippyMe does the rest: transcribes it, finds the best moments, reframes and trims them, and queues the top clips to post." />
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-        {/* Order: pick a source first, then optionally start from a preset,
-            then fine-tune the recipe by hand. */}
+      <Hero
+        eyebrow="Drop a link · get scroll-stopping shorts"
+        line1="Long videos in."
+        grad="Viral shorts out."
+        sub="Drop a link from YouTube, Twitch, or Kick (or upload a file) and Nugget does the rest: transcribes it, finds the best moments, reframes and trims them, and queues the top clips to post."
+      />
+      <div className="create-workbench">
         <SourcePanel opts={opts} set={set} />
         <div>
-          <div className="label" style={{ marginBottom: 12 }}>Start from a preset, or set everything by hand below</div>
-          <PresetCards presets={presets} active={opts.preset} defaultId={defaultId}
-            onPick={onPickPreset} onSetDefault={onSetDefault} onDelete={onDelete} onSaveCurrent={onSaveCurrent} />
+          <div className="label" style={{ marginBottom: 10, fontWeight: 700 }}>
+            Start from a preset, or customize below
+          </div>
+          <PresetCards
+            presets={presets}
+            active={opts.preset}
+            defaultId={defaultId}
+            onPick={onPickPreset}
+            onSetDefault={onSetDefault}
+            onDelete={onDelete}
+            onSaveCurrent={onSaveCurrent}
+          />
         </div>
-        <OptionsPanel opts={opts} set={set} />
+        <OptionsPanel opts={opts} set={set} ready={ready} onCreate={onCreate} error={validation.firstError} />
       </div>
-      <SummaryBar opts={opts} ready={ready} count={count} onCreate={onCreate} error={validation.firstError} />
     </div>
   );
 }

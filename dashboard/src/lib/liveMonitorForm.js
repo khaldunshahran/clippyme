@@ -93,3 +93,12 @@ export function classifyStartError(message) {
   if (/twitch/i.test(m) && /credential|client_id|client_secret/i.test(m)) return 'twitch_creds';
   return 'other';
 }
+
+export const STREAM_QUALITY_OPTIONS = [
+  { id: 'best', label: 'Best (Source)' },
+  { id: '1080p60,720p60,best', label: '1080p60 / Best' },
+  { id: '720p60,720p,best', label: '720p / Best' },
+  { id: '720p', label: '720p only' },
+  { id: '480p,best', label: '480p / Low Bandwidth' },
+];
+

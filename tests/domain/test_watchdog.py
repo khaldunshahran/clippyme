@@ -39,6 +39,20 @@ class TestWatchdog(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await send_discord_webhook("invalid-url", title="T", description="D"))
         self.assertFalse(await send_generic_webhook("invalid-url", payload={}))
 
+    async def test_notifier_rejects_ssrf_and_private_targets(self):
+        # Localhost / private IP SSRF attempts
+        self.assertFalse(await send_generic_webhook("http://127.0.0.1:8000/api/config", payload={}))
+        self.assertFalse(await send_generic_webhook("http://localhost:8000/api/config", payload={}))
+        self.assertFalse(await send_generic_webhook("http://169.254.169.254/latest/meta-data", payload={}))
+        self.assertFalse(await send_generic_webhook("http://192.168.1.1/admin", payload={}))
+
+        # Discord dispatcher must reject non-Discord domains
+        self.assertFalse(await send_discord_webhook("https://evil.attacker.com/api/webhooks/123/xyz", title="T", description="D"))
+        self.assertFalse(await send_discord_webhook("http://discord.com/api/webhooks/123/xyz", title="T", description="D"))
+
+        # ntfy dispatcher rejects private server IP
+        self.assertFalse(await send_ntfy("topic", title="T", message="M", server="http://127.0.0.1:8080"))
+
     async def test_dispatch_alert_disabled_is_noop(self):
         res = await dispatch_alert(
             title="Test",

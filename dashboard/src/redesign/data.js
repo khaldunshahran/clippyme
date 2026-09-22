@@ -28,9 +28,9 @@ export const PRESETS = [
 export const GEMINI_MODELS = [
   ['', 'Default (Settings)'],
   ['gemini-3.5-flash', '3.5 Flash · recommended'],
-  ['gemini-2.5-flash', '2.5 Flash · budget'],
+  ['gemini-3.6-flash', '3.6 Flash · high performance'],
+  ['gemini-3.5-flash-lite', '3.5 Flash-Lite · budget'],
   ['gemini-3.1-pro-preview', '3.1 Pro · max quality'],
-  ['gemini-2.5-pro', '2.5 Pro · max quality'],
 ];
 
 // Classic-mode subtitle fonts. Values are the bundled TTF basenames libass

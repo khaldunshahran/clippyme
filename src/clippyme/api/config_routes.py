@@ -20,6 +20,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Header, HTTPException, Request, UploadFile
 
+from clippyme.api.auth import is_auth_enabled, require_admin
 from clippyme.api.schemas import ConfigUpdateRequest, WatchdogConfigRequest, ZernioConfigRequest
 from clippyme.api.security import require_trusted_config_request
 from clippyme.pipeline.gemini_service import list_available_models
@@ -41,6 +42,14 @@ from clippyme.domain.subtitles import (
     _FONT_NAME_RE as _FONT_NAME_RE,
     _FONT_EXTS as _FONT_EXTS,
 )
+
+
+def enforce_config_access(request: Request) -> None:
+    """Gate configuration endpoints: requires trusted origin and admin privileges in multi-tenant mode."""
+    require_trusted_config_request(request)
+    if is_auth_enabled():
+        require_admin(request)
+
 
 router = APIRouter()
 
@@ -96,14 +105,14 @@ async def list_gemini_models(
     api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
 ):
     """List available Gemini models using the provided API key."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     return await asyncio.to_thread(list_available_models, api_key or os.environ.get("GEMINI_API_KEY"))
 
 
 @router.get("/api/config")
 async def get_config(request: Request):
     """Return current active configuration (keys are partially masked for safety)."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     config = await asyncio.to_thread(load_persistent_config)
     env_gemini = os.environ.get("GEMINI_API_KEY", "").strip()
     active_gemini = env_gemini or config.get("GEMINI_API_KEY", "")
@@ -132,7 +141,7 @@ async def get_config(request: Request):
 @router.post("/api/config")
 async def update_config(req: ConfigUpdateRequest, request: Request):
     """Update and persist API keys."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     if await asyncio.to_thread(save_persistent_config, req.keys):
         return {"success": True, "message": "Configuration updated and persisted."}
     else:
@@ -145,7 +154,7 @@ COOKIES_MAX_BYTES = 10 * 1024 * 1024  # 10 MB hard cap
 @router.post("/api/config/cookies")
 async def upload_cookies(request: Request, cookies_file: UploadFile = File(...)):
     """Upload and persist a Netscape-format cookies.txt file."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     os.makedirs("data", exist_ok=True)
     cookies_path = os.path.join("data", "cookies.txt")
 
@@ -176,7 +185,7 @@ async def upload_cookies(request: Request, cookies_file: UploadFile = File(...))
 @router.get("/api/config/cookies/status")
 async def cookies_status(request: Request):
     """Check if a cookies file is configured."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     cookies_path = os.path.join("data", "cookies.txt")
     return {"configured": await asyncio.to_thread(os.path.exists, cookies_path)}
 
@@ -184,7 +193,7 @@ async def cookies_status(request: Request):
 @router.delete("/api/config/cookies")
 async def delete_cookies(request: Request):
     """Remove the persisted cookies file."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     cookies_path = os.path.join("data", "cookies.txt")
     try:
         await asyncio.to_thread(os.remove, cookies_path)
@@ -233,7 +242,7 @@ def _valid_sfnt(content: bytes) -> bool:
 @router.get("/api/config/fonts")
 async def list_fonts(request: Request):
     """List every font face available for burn-in (bundled + user-uploaded)."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     return {"fonts": await asyncio.to_thread(_list_fonts)}
 
 
@@ -241,7 +250,7 @@ async def list_fonts(request: Request):
 async def upload_font(request: Request, font_file: UploadFile = File(...)):
     """Upload and persist a .ttf/.otf font so it appears in the subtitle font
     picker and resolves at burn time."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     raw_name = os.path.basename(font_file.filename or "")
     stem, ext = os.path.splitext(raw_name)
     if ext.lower() not in _FONT_EXTS:
@@ -270,7 +279,7 @@ async def upload_font(request: Request, font_file: UploadFile = File(...)):
 @router.delete("/api/config/fonts/{name}")
 async def delete_font(name: str, request: Request):
     """Remove an uploaded font face by name. Bundled faces cannot be deleted."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     if not _FONT_NAME_RE.match(name):
         raise HTTPException(status_code=400, detail="Invalid font name")
     removed = await asyncio.to_thread(_delete_uploaded_font, name)
@@ -311,14 +320,14 @@ def _validate_logo_png(content: bytes) -> None:
 @router.get("/api/config/logo/status")
 async def logo_status(request: Request):
     """Check whether a brand logo has been uploaded."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     return {"configured": await asyncio.to_thread(os.path.exists, _LOGO_PATH)}
 
 
 @router.post("/api/config/logo")
 async def upload_logo(request: Request, logo_file: UploadFile = File(...)):
     """Upload and persist a transparent PNG logo used by the compose logo layer."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     chunks: list[bytes] = []
     total = 0
     while chunk := await logo_file.read(64 * 1024):
@@ -337,7 +346,7 @@ async def upload_logo(request: Request, logo_file: UploadFile = File(...)):
 @router.delete("/api/config/logo")
 async def delete_logo(request: Request):
     """Remove the persisted brand logo."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     try:
         await asyncio.to_thread(os.remove, _LOGO_PATH)
     except FileNotFoundError:
@@ -348,14 +357,14 @@ async def delete_logo(request: Request):
 @router.get("/api/config/zernio")
 async def get_zernio_config(request: Request):
     """Return persisted Zernio settings (api_key masked)."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     return await asyncio.to_thread(zernio_config_status)
 
 
 @router.post("/api/config/zernio")
 async def update_zernio_config(req: ZernioConfigRequest, request: Request):
     """Update Zernio API key + accounts + timezone (merge semantics)."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     ok = await asyncio.to_thread(
         save_zernio_config,
         api_key=req.api_key,
@@ -370,7 +379,7 @@ async def update_zernio_config(req: ZernioConfigRequest, request: Request):
 @router.get("/api/zernio/accounts")
 async def list_zernio_accounts(request: Request):
     """Discovery: list connected social accounts via Zernio API."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     cfg = await asyncio.to_thread(load_zernio_config)
     api_key = cfg.get("api_key")
     if not api_key:
@@ -387,14 +396,14 @@ async def list_zernio_accounts(request: Request):
 @router.get("/api/config/watchdog")
 async def get_watchdog_config_endpoint(request: Request):
     """Return persisted Watchdog alert settings (tokens/URLs masked)."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     return await asyncio.to_thread(watchdog_config_status)
 
 
 @router.post("/api/config/watchdog")
 async def update_watchdog_config_endpoint(req: WatchdogConfigRequest, request: Request):
     """Update Watchdog notification provider and alert settings."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     updates = req.model_dump(exclude_unset=True)
     ok = await asyncio.to_thread(save_watchdog_config, updates)
     if not ok:
@@ -405,7 +414,7 @@ async def update_watchdog_config_endpoint(req: WatchdogConfigRequest, request: R
 @router.post("/api/config/watchdog/test")
 async def test_watchdog_alert_endpoint(request: Request, req: Optional[WatchdogConfigRequest] = None):
     """Send an immediate test alert to verify the configured notification channel."""
-    require_trusted_config_request(request)
+    enforce_config_access(request)
     from clippyme.domain.watchdog import send_test_alert
     override = req.model_dump(exclude_unset=True) if req else None
     success = await send_test_alert(cfg_override=override)

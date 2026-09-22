@@ -62,7 +62,7 @@ function HighlightsMetric({ label, value, hint }) {
   );
 }
 
-function HighlightsOperations({ runtime, preflight, stage }) {
+function HighlightsOperations({ runtime, preflight }) {
   if (!runtime && !preflight) return null;
   const isAcquiring = runtime?.stage === 'acquiring' || runtime?.stage === 'downloading';
   const dlPercent = runtime?.download_percent;
@@ -108,7 +108,6 @@ function HighlightsProcessingView({
   status,
   statusText,
   logs = [],
-  opts = {},
   onCancel,
   onRetry,
 }) {
@@ -201,7 +200,7 @@ function HighlightsProcessingView({
                 <div style={{ marginLeft: 'auto' }}>
                   <button type="button" className="action-btn" title="Copy console output" aria-label="Copy console output"
                     onClick={() => {
-                      try { navigator.clipboard?.writeText?.(visibleLogs.join('\n')); } catch {}
+                      try { navigator.clipboard?.writeText?.(visibleLogs.join('\n')); } catch { /* ignore */ }
                     }}>
                     <Icon n="clipboard" />
                   </button>
@@ -394,17 +393,21 @@ function SourcePanel({ opts, set, disabled }) {
 
 function OptRow({ icon, label, desc, on, set, onConfig, configActive }) {
   return (
-    <div className={'opt' + (on ? ' on' : '')}>
-      <div className="oico"><Icon n={icon} /></div>
-      <div className="otxt">
-        <div className="ot">{label}</div>
-        <div className="od">{desc}</div>
+    <div className={'row opt' + (on ? ' on' : '')}>
+      <div className="row-left">
+        <div className="ricon">
+          <Icon n={icon} />
+        </div>
+        <div className="row-text">
+          <div className="title">{label}</div>
+          <div className="desc">{desc}</div>
+        </div>
       </div>
-      <div className="r">
+      <div className="row-control">
         {onConfig && on && (
           <button
             type="button"
-            className={'cfg' + (configActive ? ' active' : '')}
+            className={'cfg-btn' + (configActive ? ' active' : '')}
             onClick={onConfig}
             aria-label={'Configure ' + label}
           >
@@ -507,246 +510,393 @@ function BannerConfig({ opts, set }) {
   );
 }
 
-function OptionsPanel({ opts, set }) {
+function OptionsPanel({ opts, set, ready, onGenerate, processing, statusText }) {
   const [subCfg, setSubCfg] = useState(false);
   const [hookCfg, setHookCfg] = useState(false);
   const [logoCfg, setLogoCfg] = useState(false);
   const [bannerCfg, setBannerCfg] = useState(false);
 
   return (
-    <Panel title="Recipe" sub="Highlight synthesis & styling controls" icon="sliders-horizontal">
-      <div className="label" style={{ marginBottom: 4 }}>Highlight Strategy & Duration</div>
-      
-      {/* Content Focus */}
-      <div className="opt">
-        <div className="oico"><Icon n="sparkles" /></div>
-        <div className="otxt">
-          <div className="ot">Content focus</div>
-          <div className="od">
-            {opts.clipType === 'educational' && 'Key takeaways, framework breakdowns & tutorials'}
-            {opts.clipType === 'humor' && 'Banter, comedic reactions & funny bloopers'}
-            {opts.clipType === 'storytelling' && 'Complete narrative arcs & emotional moments'}
-            {opts.clipType === 'all' && 'Balanced mix across all story beats'}
-            {(!opts.clipType || opts.clipType === 'viral') && 'High energy, viral hooks & punchy takeaways'}
-          </div>
+    <div className="recipe-panel raised">
+      <div className="recipe-head">
+        <div className="ricon">
+          <Icon n="sliders-horizontal" />
         </div>
-        <div className="r" style={{ flex: '0 0 210px' }}>
-          <select className="sel" value={opts.clipType || 'viral'} onChange={(e) => set({ clipType: e.target.value })}>
-            <option value="viral">🔥 Viral Hooks &amp; Hot Takes</option>
-            <option value="educational">💡 Educational &amp; Insights</option>
-            <option value="humor">😂 Humor &amp; Banter</option>
-            <option value="storytelling">🎙️ Storytelling &amp; Deep Dives</option>
-            <option value="all">🌐 Balanced Mix</option>
-          </select>
+        <div className="recipe-title-block">
+          <h3>Recipe</h3>
+          <span className="sub">Highlight synthesis &amp; styling controls</span>
         </div>
       </div>
 
-      {/* Target Highlights Tier */}
-      <div className="opt">
-        <div className="oico"><Icon n="clock" /></div>
-        <div className="otxt">
-          <div className="ot">Highlights generation tiers</div>
-          <div className="od">
-            {opts.tierMode === 'micro' && 'Under 60s micro supercuts for Shorts, TikTok & Reels'}
-            {opts.tierMode === 'story' && '1–3 min cohesive story digests for LinkedIn & Feed'}
-            {opts.tierMode === 'extended' && '3–10 min extended highlight compilations for YouTube'}
-            {(!opts.tierMode || opts.tierMode === 'all') && 'All tiers: generates Micro (<60s), Story (~2m), & Extended (3-10m)'}
+      <div className="group">
+        <div className="group-label">Highlight strategy &amp; duration</div>
+
+        {/* Content Mode */}
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="mic" />
+            </div>
+            <div className="row-text">
+              <div className="title">Content mode</div>
+              <div className="desc">
+                {opts.contentMode === 'podcast' && 'Multi-speaker conversational dialogue & interview debates'}
+                {opts.contentMode === 'lecture' && 'Structured tutorials, presentations & educational lessons'}
+                {opts.contentMode === 'meeting' && 'Business demos, product reviews & strategic discussions'}
+                {opts.contentMode === 'vlog' && 'Personal experiences, storytelling & daily vlogs'}
+                {(!opts.contentMode || opts.contentMode === 'social') && 'High-energy commentary & fast talking-head clips'}
+              </div>
+            </div>
           </div>
-        </div>
-        <div className="r">
-          <Segmented
-            value={opts.tierMode || 'all'}
-            onChange={(id) => set({ tierMode: id })}
-            options={[
-              { id: 'all', label: 'All Tiers' },
-              { id: 'micro', label: '<60s' },
-              { id: 'story', label: '~2m' },
-              { id: 'extended', label: '3-10m' },
-            ]}
-          />
-        </div>
-      </div>
-
-      {/* Aspect Ratio */}
-      <div className="opt">
-        <div className="oico"><Icon n="crop" /></div>
-        <div className="otxt">
-          <div className="ot">Aspect ratio</div>
-          <div className="od">9:16 vertical (Shorts/Reels) · 1:1 square · 16:9 horizontal (YouTube) · 4:5 portrait</div>
-        </div>
-        <div className="r">
-          <Segmented
-            value={opts.aspect || '9:16'}
-            onChange={(id) => set({ aspect: id })}
-            options={[
-              { id: '9:16', label: '9:16' },
-              { id: '1:1', label: '1:1' },
-              { id: '16:9', label: '16:9' },
-              { id: '4:5', label: '4:5' },
-            ]}
-          />
-        </div>
-      </div>
-
-      <div className="label" style={{ margin: '16px 0 4px' }}>AI &amp; reframe</div>
-
-      <OptRow
-        icon="sparkles"
-        label="Find viral moments"
-        desc="Gemini scores the transcript · off = whole video"
-        on={opts.detect !== false}
-        set={(v) => set({ detect: v })}
-      />
-
-      {opts.detect !== false && (
-        <div className="opt">
-          <div className="oico"><Icon n="sparkles" /></div>
-          <div className="otxt" style={{ flex: 1 }}>
-            <div className="ot">Gemini model</div>
-            <div className="od">Override for this job · blank uses the Settings default</div>
-          </div>
-          <div className="r" style={{ flex: '0 0 184px' }}>
-            <select className="sel" value={opts.model || ''} onChange={(e) => set({ model: e.target.value })}>
-              {GEMINI_MODELS.map(([v, l]) => <option key={v || 'default'} value={v}>{l}</option>)}
+          <div className="row-control" style={{ minWidth: 220 }}>
+            <select className="sel dropdown" value={opts.contentMode || 'podcast'} onChange={(e) => set({ contentMode: e.target.value })}>
+              <option value="podcast">🎙️ Podcast / Interview</option>
+              <option value="lecture">💡 Tutorial / Lecture</option>
+              <option value="meeting">💼 Meeting / Demo</option>
+              <option value="vlog">📹 Vlog / Storytelling</option>
+              <option value="social">⚡ Social / Talking Head</option>
             </select>
           </div>
         </div>
-      )}
 
-      {/* Reframe Mode */}
-      <div className="opt">
-        <div className="oico"><Icon n="scan-face" /></div>
-        <div className="otxt">
-          <div className="ot">Reframe</div>
-          <div className="od">Auto face-track · Subject FrameShift crop · Off letterbox bands</div>
-        </div>
-        <div className="r">
-          <Segmented
-            value={(opts.reframeMode === 'object' ? 'subject' : opts.reframeMode) || (opts.reframe === false ? 'disabled' : 'auto')}
-            onChange={(id) => set({ reframeMode: id })}
-            options={[
-              { id: 'auto', label: 'Auto' },
-              { id: 'subject', label: 'Subject' },
-              { id: 'blur_pad', label: 'Blur BG' },
-              { id: 'disabled', label: 'Off' },
-            ]}
-          />
-        </div>
-      </div>
-
-      {((opts.reframeMode === 'disabled' || opts.reframeMode === 'letterbox') || (!opts.reframeMode && opts.reframe === false)) && (
-        <div className="opt">
-          <div className="oico"><Icon n="zoom-in" /></div>
-          <div className="otxt">
-            <div className="ot">Letterbox zoom</div>
-            <div className="od">Crop the sides for a bigger picture and smaller black bars</div>
+        {/* Output Style */}
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="film" />
+            </div>
+            <div className="row-text">
+              <div className="title">Output style</div>
+              <div className="desc">
+                {(!opts.outputStyle || opts.outputStyle === 'recap') && 'Cohesive chronological digest from setup to conclusion'}
+                {opts.outputStyle === 'trailer' && 'High-suspense teaser with hooks withholding the ending'}
+                {opts.outputStyle === 'educational' && 'Milestone summary of key concepts & actionable takeaways'}
+                {opts.outputStyle === 'best_moments' && 'Peak excitement, funniest banter & climax highlights'}
+                {opts.outputStyle === 'decision_log' && 'Decisions, action items, verdicts & strategic outcomes'}
+              </div>
+            </div>
           </div>
-          <div className="r">
+          <div className="row-control" style={{ minWidth: 220 }}>
+            <select className="sel dropdown" value={opts.outputStyle || 'recap'} onChange={(e) => set({ outputStyle: e.target.value })}>
+              <option value="recap">📖 Story Recap (Full Arc)</option>
+              <option value="trailer">🎬 Curiosity Trailer (Hooks)</option>
+              <option value="educational">🧠 Educational Digest</option>
+              <option value="best_moments">🔥 Peak Moments</option>
+              <option value="decision_log">📋 Decision / Action Log</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Focus Theme / Topic */}
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="target" />
+            </div>
+            <div className="row-text">
+              <div className="title">Focus theme / topic</div>
+              <div className="desc">Optional topic filter steering AI to specific arguments or moments</div>
+            </div>
+          </div>
+          <div className="row-control" style={{ minWidth: 220, maxWidth: 320, width: '100%' }}>
+            <input
+              type="text"
+              aria-label="Focus theme or topic"
+              style={{
+                width: '100%',
+                padding: '7px 12px',
+                borderRadius: '8px',
+                border: '1px solid var(--line-2, #ddd)',
+                background: 'var(--surface, #fff)',
+                color: 'var(--fg, #111)',
+                fontSize: '13px',
+              }}
+              value={opts.theme || ''}
+              placeholder="e.g. Focus on pricing model or competitor debate"
+              onChange={(e) => set({ theme: e.target.value })}
+            />
+          </div>
+        </div>
+
+        {/* Smooth Gap Merging */}
+        <OptRow
+          icon="git-merge"
+          label="Adjacent gap merging"
+          desc="Merge cuts separated by <= 1.5s pauses to eliminate jarring micro-cuts"
+          on={opts.mergeGap !== false}
+          set={(v) => set({ mergeGap: v })}
+        />
+
+        {/* Content Focus */}
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="sparkles" />
+            </div>
+            <div className="row-text">
+              <div className="title">Content focus</div>
+              <div className="desc">
+                {opts.clipType === 'educational' && 'Key takeaways, framework breakdowns & tutorials'}
+                {opts.clipType === 'humor' && 'Banter, comedic reactions & funny bloopers'}
+                {opts.clipType === 'storytelling' && 'Complete narrative arcs & emotional moments'}
+                {opts.clipType === 'all' && 'Balanced mix across all story beats'}
+                {(!opts.clipType || opts.clipType === 'viral') && 'High energy, viral hooks & punchy takeaways'}
+              </div>
+            </div>
+          </div>
+          <div className="row-control" style={{ minWidth: 220 }}>
+            <select className="sel dropdown" value={opts.clipType || 'viral'} onChange={(e) => set({ clipType: e.target.value })}>
+              <option value="viral">🔥 Viral Hooks &amp; Hot Takes</option>
+              <option value="educational">💡 Educational &amp; Insights</option>
+              <option value="humor">😂 Humor &amp; Banter</option>
+              <option value="storytelling">🎙️ Storytelling &amp; Deep Dives</option>
+              <option value="all">🌐 Balanced Mix</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Target Highlights Tier */}
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="clock" />
+            </div>
+            <div className="row-text">
+              <div className="title">Highlights generation tiers</div>
+              <div className="desc">
+                {opts.tierMode === 'micro' && 'Under 60s micro supercuts for Shorts, TikTok & Reels'}
+                {opts.tierMode === 'story' && '1–3 min cohesive story digests for LinkedIn & Feed'}
+                {opts.tierMode === 'extended' && '3–10 min extended highlight compilations for YouTube'}
+                {(!opts.tierMode || opts.tierMode === 'all') && 'All tiers: Micro (<60s), Story (~2m), & Extended (3-10m)'}
+              </div>
+            </div>
+          </div>
+          <div className="row-control">
             <Segmented
-              value={String(opts.letterboxZoom || 0)}
-              onChange={(id) => set({ letterboxZoom: Number(id) })}
+              value={opts.tierMode || 'all'}
+              onChange={(id) => set({ tierMode: id })}
               options={[
-                { id: '0', label: 'Off' },
-                { id: '5', label: '5%' },
-                { id: '10', label: '10%' },
-                { id: '15', label: '15%' },
+                { id: 'all', label: 'All Tiers' },
+                { id: 'micro', label: '<60s' },
+                { id: 'story', label: '~2m' },
+                { id: 'extended', label: '3-10m' },
               ]}
             />
           </div>
         </div>
-      )}
 
-      <OptRow
-        icon="scissors"
-        label="Smart cut"
-        desc="Remove silence & filler words between cuts"
-        on={opts.smartcut !== false}
-        set={(v) => set({ smartcut: v })}
-      />
-
-      <OptRow
-        icon="zoom-in"
-        label="Subtle zoom"
-        desc="Gentle Ken Burns motion (1.0→1.05x)"
-        on={!!opts.zoom}
-        set={(v) => set({ zoom: v })}
-      />
-
-      <div className="opt">
-        <div className="oico"><Icon n="languages" /></div>
-        <div className="otxt" style={{ flex: 1 }}>
-          <div className="ot">Spoken language</div>
-          <div className="od">Single language boosts transcription accuracy</div>
-        </div>
-        <div className="r" style={{ flex: '0 0 184px' }}>
-          <select className="sel" value={opts.language || 'multi'} onChange={(e) => set({ language: e.target.value })}>
-            {LANGUAGES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-          </select>
+        {/* Aspect Ratio */}
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="crop" />
+            </div>
+            <div className="row-text">
+              <div className="title">Aspect ratio</div>
+              <div className="desc">9:16 vertical (Shorts/Reels) · 1:1 square · 16:9 horizontal · 4:5 portrait</div>
+            </div>
+          </div>
+          <div className="row-control">
+            <Segmented
+              value={opts.aspect || '9:16'}
+              onChange={(id) => set({ aspect: id })}
+              options={[
+                { id: '9:16', label: '9:16' },
+                { id: '1:1', label: '1:1' },
+                { id: '16:9', label: '16:9' },
+                { id: '4:5', label: '4:5' },
+              ]}
+            />
+          </div>
         </div>
       </div>
 
-      <div className="label" style={{ margin: '16px 0 4px' }}>Captions, Overlays &amp; Branding</div>
-      
-      <OptRow
-        icon="captions"
-        label="Subtitles &amp; Karaoke"
-        desc="Burn synchronized karaoke or classic captions"
-        on={opts.subtitles !== false}
-        set={(v) => set({ subtitles: v })}
-        onConfig={() => setSubCfg(!subCfg)}
-        configActive={subCfg}
-      />
-      {opts.subtitles !== false && subCfg && <SubConfig opts={opts} set={set} />}
+      <div className="group">
+        <div className="group-label">AI &amp; reframe</div>
 
-      <OptRow
-        icon="type"
-        label="Text hooks"
-        desc="Add a scroll-stopping headline banner"
-        on={opts.hooks}
-        set={(v) => set({ hooks: v })}
-        onConfig={() => setHookCfg(!hookCfg)}
-        configActive={hookCfg}
-      />
-      {opts.hooks && hookCfg && <HookConfig opts={opts} set={set} />}
+        <OptRow
+          icon="sparkles"
+          label="Find viral moments"
+          desc="Gemini scores the transcript · off = whole video"
+          on={opts.detect !== false}
+          set={(v) => set({ detect: v })}
+        />
 
-      <OptRow
-        icon="stamp"
-        label="Brand logo"
-        desc="Burn your brand logo onto the highlight reels"
-        on={opts.logo}
-        set={(v) => set({ logo: v })}
-        onConfig={() => setLogoCfg(!logoCfg)}
-        configActive={logoCfg}
-      />
-      {opts.logo && logoCfg && <LogoConfig opts={opts} set={set} />}
+        {opts.detect !== false && (
+          <div className="row opt">
+            <div className="row-left">
+              <div className="ricon">
+                <Icon n="sparkles" />
+              </div>
+              <div className="row-text">
+                <div className="title">Gemini model</div>
+                <div className="desc">Override for this job · blank uses the Settings default</div>
+              </div>
+            </div>
+            <div className="row-control" style={{ minWidth: 200 }}>
+              <select className="sel dropdown" value={opts.model || ''} onChange={(e) => set({ model: e.target.value })}>
+                {GEMINI_MODELS.map(([v, l]) => <option key={v || 'default'} value={v}>{l}</option>)}
+              </select>
+            </div>
+          </div>
+        )}
 
-      <OptRow
-        icon="rss"
-        label="Attribution banner"
-        desc="Platform logo + social handle overlay"
-        on={opts.banner}
-        set={(v) => set({ banner: v })}
-        onConfig={() => setBannerCfg(!bannerCfg)}
-        configActive={bannerCfg}
-      />
-      {opts.banner && bannerCfg && <BannerConfig opts={opts} set={set} />}
-
-      <div className="opt">
-        <div className="oico"><Icon n="palette" /></div>
-        <div className="otxt">
-          <div className="ot">Colour grade</div>
-          <div className="od">Cinematic color grading filter on every highlight reel</div>
+        {/* Reframe Mode */}
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="scan-face" />
+            </div>
+            <div className="row-text">
+              <div className="title">Reframe</div>
+              <div className="desc">Auto face-track · Subject FrameShift crop · Off letterbox bands</div>
+            </div>
+          </div>
+          <div className="row-control">
+            <Segmented
+              value={(opts.reframeMode === 'object' ? 'subject' : opts.reframeMode) || (opts.reframe === false ? 'disabled' : 'auto')}
+              onChange={(id) => set({ reframeMode: id })}
+              options={[
+                { id: 'auto', label: 'Auto' },
+                { id: 'subject', label: 'Subject' },
+                { id: 'blur_pad', label: 'Blur BG' },
+                { id: 'disabled', label: 'Off' },
+              ]}
+            />
+          </div>
         </div>
-        <div className="r">
-          <GradeControls
-            withOff
-            full={false}
-            preset={opts.gradePreset || 'none'}
-            onChange={(p) => set({ gradePreset: p.preset })}
-          />
+
+        {((opts.reframeMode === 'disabled' || opts.reframeMode === 'letterbox') || (!opts.reframeMode && opts.reframe === false)) && (
+          <div className="row opt">
+            <div className="row-left">
+              <div className="ricon">
+                <Icon n="zoom-in" />
+              </div>
+              <div className="row-text">
+                <div className="title">Letterbox zoom</div>
+                <div className="desc">Crop sides for a bigger picture and smaller bars</div>
+              </div>
+            </div>
+            <div className="row-control">
+              <Segmented
+                value={String(opts.letterboxZoom || 0)}
+                onChange={(id) => set({ letterboxZoom: Number(id) })}
+                options={[
+                  { id: '0', label: 'Off' },
+                  { id: '5', label: '5%' },
+                  { id: '10', label: '10%' },
+                  { id: '15', label: '15%' },
+                ]}
+              />
+            </div>
+          </div>
+        )}
+
+        <OptRow
+          icon="scissors"
+          label="Smart cut"
+          desc="Remove silence & filler words between cuts"
+          on={opts.smartcut !== false}
+          set={(v) => set({ smartcut: v })}
+        />
+
+        <OptRow
+          icon="zoom-in"
+          label="Subtle zoom"
+          desc="Gentle Ken Burns motion (1.0→1.05x)"
+          on={!!opts.zoom}
+          set={(v) => set({ zoom: v })}
+        />
+
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="languages" />
+            </div>
+            <div className="row-text">
+              <div className="title">Spoken language</div>
+              <div className="desc">Single language boosts transcription accuracy</div>
+            </div>
+          </div>
+          <div className="row-control" style={{ minWidth: 180 }}>
+            <select className="sel dropdown" value={opts.language || 'multi'} onChange={(e) => set({ language: e.target.value })}>
+              {LANGUAGES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </div>
         </div>
       </div>
-    </Panel>
+
+      <div className="group">
+        <div className="group-label">Captions, overlays &amp; branding</div>
+
+        <OptRow
+          icon="captions"
+          label="Subtitles &amp; Karaoke"
+          desc="Burn synchronized karaoke or classic captions"
+          on={opts.subtitles !== false}
+          set={(v) => set({ subtitles: v })}
+          onConfig={() => setSubCfg(!subCfg)}
+          configActive={subCfg}
+        />
+        {opts.subtitles !== false && subCfg && <SubConfig opts={opts} set={set} />}
+
+        <OptRow
+          icon="type"
+          label="Text hooks"
+          desc="Add a scroll-stopping headline banner"
+          on={opts.hooks}
+          set={(v) => set({ hooks: v })}
+          onConfig={() => setHookCfg(!hookCfg)}
+          configActive={hookCfg}
+        />
+        {opts.hooks && hookCfg && <HookConfig opts={opts} set={set} />}
+
+        <OptRow
+          icon="stamp"
+          label="Brand logo"
+          desc="Burn your brand logo onto the highlight reels"
+          on={opts.logo}
+          set={(v) => set({ logo: v })}
+          onConfig={() => setLogoCfg(!logoCfg)}
+          configActive={logoCfg}
+        />
+        {opts.logo && logoCfg && <LogoConfig opts={opts} set={set} />}
+
+        <OptRow
+          icon="rss"
+          label="Attribution banner"
+          desc="Platform logo + social handle overlay"
+          on={opts.banner}
+          set={(v) => set({ banner: v })}
+          onConfig={() => setBannerCfg(!bannerCfg)}
+          configActive={bannerCfg}
+        />
+        {opts.banner && bannerCfg && <BannerConfig opts={opts} set={set} />}
+
+        <div className="row opt">
+          <div className="row-left">
+            <div className="ricon">
+              <Icon n="palette" />
+            </div>
+            <div className="row-text">
+              <div className="title">Colour grade</div>
+              <div className="desc">Cinematic color grading filter on every highlight reel</div>
+            </div>
+          </div>
+          <div className="row-control">
+            <GradeControls
+              withOff
+              full={false}
+              preset={opts.gradePreset || 'none'}
+              onChange={(p) => set({ gradePreset: p.preset })}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Integrated Synthesis Action Footer */}
+      <SummaryBar opts={opts} ready={ready} onGenerate={onGenerate} processing={processing} statusText={statusText} />
+    </div>
   );
 }
 
@@ -754,6 +904,10 @@ function SummaryBar({ opts, ready, onGenerate, processing, statusText }) {
   const chips = [
     opts.aspect || '9:16',
     opts.tierMode === 'micro' ? '<60s micro' : opts.tierMode === 'story' ? '~2m story' : opts.tierMode === 'extended' ? '3-10m supercut' : 'all tiers',
+    opts.contentMode && `${opts.contentMode} mode`,
+    opts.outputStyle && `${opts.outputStyle} style`,
+    opts.theme && `theme: "${opts.theme.slice(0, 14)}${opts.theme.length > 14 ? '…' : ''}"`,
+    opts.mergeGap !== false && 'gap merge',
     opts.reframeMode === 'blur_pad' ? 'blur bg' : opts.reframeMode === 'letterbox' ? 'fit' : 'crop',
     opts.smartcut && 'smart-cut',
     opts.subtitles !== false && ((opts.subMode || 'karaoke') + ' subs'),
@@ -762,20 +916,24 @@ function SummaryBar({ opts, ready, onGenerate, processing, statusText }) {
   ].filter(Boolean);
 
   return (
-    <div className="summary">
-      <div>
-        <div className="s-main">
+    <div className="recipe-footer summary">
+      <div className="rf-left">
+        <div className="rf-status s-main">
           {processing
             ? (statusText || 'Synthesizing AI Highlight Reels...')
             : ready
-            ? 'ClippyMe will analyze and construct multi-tier highlight reels'
-            : 'Paste a link or drop a video to get started'}
+            ? 'Ready to synthesize · Multi-tier highlight reels'
+            : 'Paste a link or drop a video above to begin'}
         </div>
-        <div className="s-sub">
-          {chips.map((c) => <span key={c} className="chip">{c}</span>)}
+        <div className="rf-chips s-sub">
+          {chips.map((c) => (
+            <span key={c} className="chip">
+              {c}
+            </span>
+          ))}
         </div>
       </div>
-      <div className="s-right">
+      <div className="rf-right s-right">
         <Btn
           variant="grad"
           size="lg"
@@ -806,6 +964,10 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
     preset: 'all_tiers',
     tierMode: 'all',
     aspect: '9:16',
+    contentMode: 'podcast',
+    outputStyle: 'recap',
+    theme: '',
+    mergeGap: true,
     model: '',
     reframeMode: 'auto',
     letterboxZoom: 0,
@@ -913,6 +1075,10 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
               const genRes = await generateAllHighlights(jobId, {
                 aspect: currentOpts.aspect,
                 reframe_mode: currentOpts.reframeMode,
+                content_mode: currentOpts.contentMode || 'podcast',
+                output_style: currentOpts.outputStyle || 'recap',
+                theme: currentOpts.theme || undefined,
+                merge_gap_seconds: currentOpts.mergeGap !== false ? 1.5 : 0.0,
                 subtitles: {
                   enabled: currentOpts.subtitles !== false,
                   preset: currentOpts.subPreset,
@@ -974,11 +1140,16 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
 
     try {
       const effectiveKey = getEffectiveKey();
+      const effectiveInstructions = [
+        opts.instructions?.trim(),
+        opts.theme?.trim() ? `Focus Theme: ${opts.theme.trim()}` : null,
+      ].filter(Boolean).join(' · ') || undefined;
+
       const dataPayload = opts.source === 'url'
         ? {
             type: 'url',
             payload: opts.url.trim(),
-            instructions: opts.instructions || undefined,
+            instructions: effectiveInstructions,
             highlights: true,
             aspect: opts.aspect,
             reframe_mode: opts.reframeMode,
@@ -990,7 +1161,7 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
         : {
             type: 'file',
             payload: opts.file,
-            instructions: opts.instructions || undefined,
+            instructions: effectiveInstructions,
             highlights: true,
             aspect: opts.aspect,
             reframe_mode: opts.reframeMode,
@@ -1027,6 +1198,7 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
   };
 
   // Edit Reel Apply
+  // Edit Reel Apply
   const handleApplyEdit = async (staged) => {
     if (editingIndex === null || !highlights[editingIndex]) return;
     const targetReel = highlights[editingIndex];
@@ -1035,15 +1207,15 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
 
     try {
       const payload = {
-        title: staged.hookParams?.text || targetReel.title,
+        title: (staged.toggles?.hook && staged.hookParams?.text) ? staged.hookParams.text : targetReel.title,
         aspect: staged.aspect || targetReel.aspect || '9:16',
-        reframe_mode: staged.reframeMode || targetReel.reframe_mode || 'blur_pad',
-        subtitles: staged.subtitleParams,
-        hook: staged.hookParams,
-        grade_preset: staged.gradeParams?.preset,
+        reframe_mode: staged.reframeMode || targetReel.reframe_mode || 'auto',
+        subtitles: staged.toggles?.subtitles ? staged.subtitleParams : { enabled: false },
+        hook: staged.toggles?.hook ? staged.hookParams : { enabled: false },
+        grade_preset: staged.toggles?.grade ? staged.gradeParams?.preset : 'none',
       };
 
-      const res = await applyEditHighlight(activeJobId, targetReel.id, payload, getEffectiveKey());
+      const res = await applyEditHighlight(activeJobId, targetReel.id || targetReel.filename, payload, getEffectiveKey());
       if (res.highlight) {
         setHighlights((prev) => prev.map((h, i) => (i === editingIndex ? res.highlight : h)));
         onToast?.({ type: 'success', message: 'Highlight reel reprocessed!' });
@@ -1059,7 +1231,7 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
       await deleteHighlight(activeJobId, filename);
       setHighlights((prev) => prev.filter((h) => h.filename !== filename));
       onToast?.({ type: 'info', message: 'Highlight reel deleted' });
-    } catch (err) {
+    } catch {
       onToast?.({ type: 'error', message: 'Failed to delete reel' });
     }
   };
@@ -1107,16 +1279,16 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
         eyebrow="Drop a link · get viral highlight reels"
         line1="Long videos in."
         grad="Supercut highlights out."
-        sub="Drop a link from YouTube, Twitch, or Kick (or upload a file) and ClippyMe synthesizes multi-tier highlight packages (<60s, ~120s, 180s–720s) with complete video editing controls."
+        sub="Drop a link from YouTube, Twitch, or Kick (or upload a file) and Nugget synthesizes multi-tier highlight packages (<60s, ~120s, 180s–720s) with complete video editing controls."
       />
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <div className="create-workbench">
         {/* Source Panel */}
         <SourcePanel opts={opts} set={updateOpts} disabled={status === 'processing'} />
 
         {/* Preset Cards */}
         <div>
-          <div className="label" style={{ marginBottom: 12 }}>
+          <div className="label" style={{ marginBottom: 10, fontWeight: 700 }}>
             Start from a highlight preset, or fine-tune the recipe below
           </div>
           <PresetCards
@@ -1126,22 +1298,20 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
           />
         </div>
 
-        {/* Options Panel (Recipe) */}
-        <OptionsPanel opts={opts} set={updateOpts} />
+        {/* Options Panel (Recipe) with Integrated Synthesis Action Deck */}
+        <OptionsPanel
+          opts={opts}
+          set={updateOpts}
+          ready={isReady}
+          onGenerate={handleGenerate}
+          processing={status === 'processing' || status === 'synthesizing'}
+          statusText={statusText}
+        />
       </div>
 
-      {/* Summary Bar */}
-      <SummaryBar
-        opts={opts}
-        ready={isReady}
-        onGenerate={handleGenerate}
-        processing={false}
-        statusText={statusText}
-      />
-
-      {/* Results View: Clipping-Style Cards Grid */}
+      {/* Results View: Clipping-Style Cards Grid Aligned with Workbench */}
       {highlights.length > 0 && (
-        <div style={{ marginTop: 36, paddingTop: 28, borderTop: '1px solid var(--line-1)' }}>
+        <div className="create-workbench" style={{ marginTop: 36, paddingTop: 28, borderTop: '1px solid var(--line-1)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
             <div>
               <h2 style={{ fontSize: '20px', fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -1166,9 +1336,11 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
               const tierLabel = reel.tier === 'micro' ? 'Micro-Short (<60s)' : reel.tier === 'extended' ? 'Extended Supercut' : 'Story Digest (~2m)';
               const durText = fmtDuration(0, reel.actual_duration || reel.target_duration);
 
+              const isLandscape = reel.aspect === '16:9' || reel.tier === 'extended' || opts.aspect === '16:9';
+
               return (
                 <article key={reel.id || idx} className={`clip${score !== null && score >= 90 ? ' top' : ''}`}>
-                  <div className="clip-media" style={{ padding: 0, background: '#000' }}>
+                  <div className={`clip-media${isLandscape ? ' landscape' : ''}`} style={{ padding: 0, background: '#000' }}>
                     <LazyVideo
                       src={reel.video_url}
                       controls
@@ -1238,6 +1410,7 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
         <EditClipModal
           clip={{
             ...highlights[editingIndex],
+            video_url: highlights[editingIndex].video_url || highlights[editingIndex].url,
             video_title_for_youtube_short: highlights[editingIndex].title,
             viral_score: highlights[editingIndex].viral_score,
             start: 0,
@@ -1245,11 +1418,18 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
           }}
           idx={editingIndex}
           jobId={activeJobId}
+          appliedMode={highlights[editingIndex].reframe_mode || 'auto'}
           initial={{
             reframeMode: highlights[editingIndex].reframe_mode || 'auto',
             subtitleParams: highlights[editingIndex].subtitles,
             hookParams: highlights[editingIndex].hook,
             gradeParams: { preset: highlights[editingIndex].grade_preset || 'none' },
+            toggles: {
+              subtitles: highlights[editingIndex].subtitles?.enabled !== false && !!highlights[editingIndex].subtitles,
+              hook: highlights[editingIndex].hook?.enabled !== false && !!highlights[editingIndex].hook,
+              grade: !!highlights[editingIndex].grade_preset && highlights[editingIndex].grade_preset !== 'none',
+              smartcut: true,
+            },
           }}
           preselections={{
             subtitles: { preset: opts.subPreset, mode: opts.subMode },

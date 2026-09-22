@@ -100,6 +100,7 @@ class ProcessRequest(BaseModel):
     min_clips: Optional[int] = Field(None, ge=1, le=50)
     max_clips: Optional[int] = Field(None, ge=1, le=50)
     clip_type: Optional[str] = Field(None, max_length=64)
+    duration_mode: Optional[str] = Field(None, max_length=32)
     highlights: Optional[bool] = False
 
     @field_validator("url")
@@ -134,6 +135,7 @@ class BatchRequest(BaseModel):
     min_clips: Optional[int] = Field(None, ge=1, le=50)
     max_clips: Optional[int] = Field(None, ge=1, le=50)
     clip_type: Optional[str] = Field(None, max_length=64)
+    duration_mode: Optional[str] = Field(None, max_length=32)
 
     @field_validator("urls")
     @classmethod
@@ -421,6 +423,10 @@ class LiveMonitorStartRequest(BaseModel):
     smart_cut: bool = False
     # Fixed zoom on the monitor's letterbox render (percent; 0 = whole frame).
     letterbox_zoom: float = Field(0, ge=0, le=15)
+    # Streamlink stream quality ladder (e.g. "1080p60,720p60,best" or "best").
+    stream_quality: Optional[str] = Field("best", max_length=64)
+    # Require preview before direct publishing (default True).
+    require_preview: bool = True
 
     @field_validator("timezone")
     @classmethod

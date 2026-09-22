@@ -1,6 +1,7 @@
 """YouTube uploads-feed poller (long-form only) + channel-id resolution."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import re
 import urllib.error
@@ -15,9 +16,11 @@ MAX_FEED_BYTES = 2 * 1024 * 1024
 CHANNEL_RESOLVE_TIMEOUT = 15
 
 _UC_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
-_PLAYLIST_RE = re.compile(r"^UULF[A-Za-z0-9_-]{22}$")
+_PLAYLIST_RE = re.compile(r"^(?:UULF|UU)[A-Za-z0-9_-]{22}$")
 _VIDEO_ID_XML_RE = re.compile(r"<yt:videoId>([^<]+)</yt:videoId>")
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+CHANNEL_FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -43,6 +46,14 @@ def feed_url(playlist_id: str) -> str:
     return FEED_URL.format(playlist=playlist)
 
 
+def channel_feed_url(channel_id: str) -> str:
+    """Canonical channel_id feed URL for fallback when UULF playlist is unavailable."""
+    cid = (channel_id or "").strip()
+    if not _UC_RE.fullmatch(cid):
+        raise ValueError(f"expected a canonical UC channel id, got {channel_id!r}")
+    return CHANNEL_FEED_URL.format(channel_id=cid)
+
+
 def parse_feed(xml) -> list:
     """Return ``[{id, url}]`` in feed order from a small Atom document."""
     text = xml.decode("utf-8", "replace") if isinstance(xml, (bytes, bytearray)) else (xml or "")
@@ -60,9 +71,17 @@ def _validate_feed_url(url: str) -> str:
         raise ValueError("feed URL must use https://www.youtube.com")
     if parsed.path != "/feeds/videos.xml":
         raise ValueError("unexpected YouTube feed path")
-    playlist_values = parse_qs(parsed.query, strict_parsing=True).get("playlist_id", [])
-    if len(playlist_values) != 1 or not _PLAYLIST_RE.fullmatch(playlist_values[0]):
-        raise ValueError("invalid playlist_id in feed URL")
+    qs = parse_qs(parsed.query, strict_parsing=True)
+    playlist_values = qs.get("playlist_id", [])
+    channel_values = qs.get("channel_id", [])
+    if playlist_values and not channel_values:
+        if len(playlist_values) != 1 or not _PLAYLIST_RE.fullmatch(playlist_values[0]):
+            raise ValueError("invalid playlist_id in feed URL")
+    elif channel_values and not playlist_values:
+        if len(channel_values) != 1 or not _UC_RE.fullmatch(channel_values[0]):
+            raise ValueError("invalid channel_id in feed URL")
+    else:
+        raise ValueError("feed URL must contain valid playlist_id or channel_id")
     return parsed.geturl()
 
 
@@ -142,3 +161,98 @@ def resolve_channel_id(channel_input: str) -> str:
     if not channel_id or not _UC_RE.fullmatch(str(channel_id)):
         raise ValueError(f"could not resolve YouTube channel id from {channel_input!r}")
     return str(channel_id)
+
+
+def canonical_youtube_live_url(channel_input: str) -> str:
+    """Convert an @handle, UC channel id, or channel URL to its official /live URL."""
+    raw = (channel_input or "").strip()
+    if not raw:
+        raise ValueError("channel is required")
+    if raw.startswith("@"):
+        return f"https://www.youtube.com/{raw}/live"
+    if _UC_RE.fullmatch(raw):
+        return f"https://www.youtube.com/channel/{raw}/live"
+    lowered = raw.lower()
+    if lowered.startswith(("http://", "https://")):
+        url = raw
+    elif lowered.startswith(("youtube.com/", "www.youtube.com/")):
+        url = f"https://{raw}"
+    else:
+        url = f"https://www.youtube.com/{raw.lstrip('/')}"
+    parsed = urlparse(url)
+    clean_path = parsed.path.rstrip("/")
+    if clean_path.endswith("/live"):
+        return f"https://www.youtube.com{clean_path}"
+    return f"https://www.youtube.com{clean_path}/live"
+
+
+def check_youtube_live(channel_input: str, timeout: float = 15.0) -> tuple[bool, str | None, datetime | None]:
+    """Check whether a YouTube channel is currently live.
+
+    Returns (is_live, stream_or_live_url, stream_started_at).
+    """
+    try:
+        live_url = canonical_youtube_live_url(channel_input)
+    except Exception as exc:
+        logger.debug("canonical_youtube_live_url failed for %s: %s", channel_input, exc)
+        return False, None, None
+
+    from yt_dlp import YoutubeDL
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": True,
+        "noplaylist": True,
+        "socket_timeout": timeout,
+        "retries": 2,
+        "extractor_retries": 2,
+        "cachedir": False,
+    }
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(live_url, download=False, process=False) or {}
+    except Exception as exc:
+        logger.debug("YouTube live probe error for %s: %s", live_url, exc)
+        return False, None, None
+
+    is_live = bool(info.get("is_live") or info.get("live_status") == "is_live")
+    if not is_live:
+        return False, None, None
+
+    started_at = None
+    ts = info.get("release_timestamp") or info.get("timestamp")
+    if ts and isinstance(ts, (int, float)) and ts > 0:
+        try:
+            started_at = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError):
+            started_at = None
+
+    playback_url = info.get("url") or live_url
+    return True, playback_url, started_at
+
+
+def get_youtube_live_stream_url(live_url: str, quality: str = "best") -> str | None:
+    """Extract direct HLS/stream playback URL using yt-dlp."""
+    from yt_dlp import YoutubeDL
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "format": quality or "best",
+        "socket_timeout": 20,
+        "retries": 2,
+        "cachedir": False,
+    }
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(live_url, download=False) or {}
+            url = info.get("url")
+            if url:
+                return str(url)
+    except Exception as exc:
+        logger.warning("Failed to extract direct YouTube stream URL for %s: %s", live_url, exc)
+    return None
+

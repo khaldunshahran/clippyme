@@ -90,6 +90,8 @@ class ViralClip(BaseModel):
     hashtags: list[str] = Field(default_factory=list)
     video_description: str = ""
     clip_type: str = ""
+    duration_tier: str = ""
+    target_platforms: list[str] = Field(default_factory=list)
 
     @field_validator(
         "viral_reason",
@@ -100,6 +102,7 @@ class ViralClip(BaseModel):
         "speaker_name",
         "video_description",
         "clip_type",
+        "duration_tier",
     )
     @classmethod
     def _normalize_whitespace(cls, v: str) -> str:

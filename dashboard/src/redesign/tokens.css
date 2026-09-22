@@ -1,154 +1,140 @@
 /* ============================================================
-   ClippyMe — Colors & Type foundations (the LIVE design system)
-   Self-hosted AI video platform: long-form → viral 9:16 shorts.
-   Aesthetic: dark · flat · editorial. The viral gradient is a SIGNAL
-   only (logo, primary CTA, score, hero word) — no glows, no decorative
-   gradient borders, no glassmorphism on content. tokens.css + app.css
-   are the source of truth; they load AFTER index.css and win the
-   cascade (app.css's unlayered rules beat index.css's @layer base).
-   ------------------------------------------------------------
-   Fonts loaded from Google Fonts CDN (substitutions flagged in
-   README → swap for bundled files if you have them):
-     • Geist        → UI sans  (shadcn default stack replacement)
-     • Geist Mono   → logs / code / numbers / API keys
-     • Anton        → loud "viral" display (hooks, big numbers)
+   ClippyMe — Tactile Clay Design Tokens
+   Organic Warm Clay · Dual-Source Lighting · Asymmetrical Pods
    ============================================================ */
-@import url('https://fonts.googleapis.com/css2?family=Anton&family=Geist:wght@300;400;500;600;700;800;900&family=Geist+Mono:wght@400;500;600&display=swap');
+
+@import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800&family=Space+Mono:wght@400;700&display=swap');
+
+@property --pct {
+  syntax: '<percentage>';
+  inherits: false;
+  initial-value: 0%;
+}
 
 :root {
-  /* ---------- Brand ramp (sampled from the logo) ---------- */
-  --brand-amber:   #F7BC59;  /* logo spine / warm accent       */
-  --brand-pink:    #E6428D;  /* gradient start                 */
-  --brand-purple:  #9850C3;  /* gradient mid                   */
-  --brand-indigo:  #675ADD;  /* gradient mid                   */
-  --brand-blue:    #0A81D9;  /* PRIMARY — buttons, links, focus */
-  --brand-teal:    #02C5BF;  /* success-ish / fresh accent     */
-  --brand-cyan:    #00D9FF;  /* highlight / glow               */
+  /* ---------- 1. Color Foundations -------------------------- */
+  --bg:             #DCD7CD;  /* Warm stone canvas backdrop */
+  --surface:        #EAE5DB;  /* Raised clay surface */
+  --surface-deep:   #CFC9BC;  /* Pressed / sunken track / input well */
+  --surface-dark:   #332E26;  /* Deep dark clay for contrasting overlays */
 
-  /* primary scale (around brand blue) */
-  --blue-50:  #E6F4FE;
-  --blue-100: #BFE2FB;
-  --blue-300: #5CB4EE;
-  --blue-500: #0A81D9;
-  --blue-600: #0869B3;
-  --blue-700: #074F87;
+  /* Dual-Source Clay Lighting */
+  --shadow-r:       rgba(140, 130, 110, 0.55);  /* Deep diffuse shadow (bottom-right) */
+  --shadow-l:       rgba(255, 255, 255, 0.90);  /* Soft specular highlight (top-left) */
 
-  /* ---------- Dark foundation (surfaces, back→front) ------- */
-  --bg-0: #050507;   /* page void                         */
-  --bg-1: #0F0F13;   /* app shell / deepest panel         */
-  --bg-2: #16161D;   /* card / raised surface             */
-  --bg-3: #1E1E28;   /* hover surface / input / popover   */
-  --bg-4: #272733;   /* active / pressed surface          */
+  /* Text & Ink Hierarchy */
+  --ink:            #332E26;  /* Primary deep warm charcoal */
+  --ink-dim:        #736B5B;  /* Secondary muted earth brown */
+  --ink-faint:      #A39B8B;  /* Placeholder / disabled ink */
+  --ink-light:      #FAF7F2;  /* Light ink on dark surfaces */
 
-  /* ---------- Foreground (text on dark) ------------------- */
-  --fg-1: #F4F4F6;   /* primary text / headings           */
-  --fg-2: #B4B4C0;   /* secondary / body                  */
-  --fg-3: #8B8B9B;   /* tertiary / captions, placeholders (≥4.5:1 on bg-2) */
-  --fg-4: #70707C;   /* disabled / faint                  */
+  /* Earthy Clay Semantic Accents */
+  --rust:           #BB5A3C;  /* Primary Action / Hook Score / Attention */
+  --rust-deep:      #9B4126;  /* Primary Gradient Bottom / Pressed State */
+  --sage:           #6E7F5C;  /* Success / Coherence Score / Published */
+  --sage-deep:      #566349;  /* Sage accent dark */
+  --plum:           #7A4F63;  /* Payoff Score / Focus Ring / Secondary Highlight */
+  --plum-deep:      #603D4E;  /* Plum accent dark */
+  --gold:           #C99A44;  /* Legendary Virality / Star / High-Score */
+  --gold-deep:      #A57B33;  /* Gold accent dark */
+  --grey:           #8B8474;  /* Common Tier / Neutral Badge */
 
-  /* ---------- Hairlines & borders ------------------------- */
-  --line-1: rgba(255,255,255,0.08);  /* default hairline   */
-  --line-2: rgba(255,255,255,0.14);  /* stronger / hover   */
-  --line-3: rgba(255,255,255,0.22);  /* focus-ring base    */
+  /* Legacy alias mappings for components */
+  --brand-blue:     var(--rust);
+  --brand-teal:     var(--sage);
+  --brand-amber:    var(--gold);
+  --brand-pink:     var(--plum);
+  --brand-purple:   var(--plum-deep);
+  --brand-indigo:   var(--plum);
+  --success:        var(--sage);
+  --warning:        var(--gold);
+  --danger:         var(--rust);
+  --info:           var(--plum);
+  --success-bg:     rgba(110, 127, 92, 0.16);
+  --warning-bg:     rgba(201, 154, 68, 0.16);
+  --danger-bg:      rgba(187, 90, 60, 0.16);
+  --info-bg:        rgba(122, 79, 99, 0.16);
 
-  /* ---------- Semantic status ----------------------------- */
-  --success: #02C5BF;
-  --warning: #F7BC59;
-  --danger:  #FF5470;
-  --info:    #0A81D9;
-  --success-bg: rgba(2,197,191,0.12);
-  --warning-bg: rgba(247,188,89,0.12);
-  --danger-bg:  rgba(255,84,112,0.12);
-  --info-bg:    rgba(10,129,217,0.12);
+  /* Brand Gradients */
+  --grad-rust:      linear-gradient(160deg, var(--rust), var(--rust-deep));
+  --grad-sage:      linear-gradient(160deg, var(--sage), var(--sage-deep));
+  --grad-plum:      linear-gradient(160deg, var(--plum), var(--plum-deep));
+  --grad-gold:      linear-gradient(160deg, var(--gold), var(--gold-deep));
+  --grad-viral:     linear-gradient(135deg, var(--rust) 0%, var(--plum) 50%, var(--gold) 100%);
+  --grad-viral-full: linear-gradient(135deg, var(--gold) 0%, var(--rust) 35%, var(--plum) 70%, var(--sage) 100%);
+  --grad-cool:      linear-gradient(120deg, var(--sage) 0%, var(--plum) 100%);
 
-  /* ---------- Brand gradients ----------------------------- */
-  --grad-viral: linear-gradient(100deg, #E6428D 0%, #9850C3 38%, #675ADD 62%, #0A81D9 100%);
-  --grad-viral-full: linear-gradient(100deg, #F7BC59 -8%, #E6428D 14%, #9850C3 40%, #675ADD 60%, #0A81D9 82%, #02C5BF 104%);
-  --grad-cool: linear-gradient(120deg, #0A81D9 0%, #02C5BF 100%);
+  /* ---------- 2. Preset Organic Radii (The Geometry System) - */
+  --r-blob:         48% 52% 42% 58% / 55% 45% 58% 42%;  /* Hero upload pods, floating blobs */
+  --r-blob-inner:   40% 60% 55% 45% / 50% 55% 45% 50%;  /* Sunken dropzone inside pod */
+  --r-panel:        34px 40px 30px 44px;                 /* Boss telemetry panels, section wrappers */
+  --r-card:         30px 34px 26px 34px;                 /* Grid video cards, monitor pods */
+  --r-input:        16px 18px 14px 18px;                 /* Form inputs, textareas */
+  --r-pill:         999px;                               /* Buttons, badges, segmented rails */
 
-  /* ---------- Glass ---------------------------------------- */
-  --glass-fill:  rgba(22,22,29,0.62);
-  --glass-fill-2:rgba(30,30,40,0.55);
-  --glass-line:  rgba(255,255,255,0.10);
-  --glass-blur:  16px;
+  --r-xs:           8px;
+  --r-sm:           12px;
+  --r-md:           16px;
+  --r-lg:           24px;
+  --r-xl:           34px;
 
-  /* ---------- Elevation (neutral shadows only) ------------ */
-  --shadow-sm: 0 1px 2px rgba(0,0,0,0.40);
-  --shadow-md: 0 6px 20px rgba(0,0,0,0.40);
-  --shadow-lg: 0 20px 50px rgba(0,0,0,0.50);
+  /* ---------- 3. Elevation & Depression Levels -------------- */
+  --clay-raised-lg:    10px 10px 22px var(--shadow-r), -10px -10px 22px var(--shadow-l);
+  --clay-raised-md:    6px 6px 14px var(--shadow-r), -4px -4px 10px var(--shadow-l);
+  --clay-raised-sm:    4px 4px 9px var(--shadow-r), -3px -3px 7px var(--shadow-l);
+  --clay-raised-hover: 14px 16px 26px var(--shadow-r), -8px -8px 18px var(--shadow-l);
 
-  /* ---------- Radii ---------------------------------------- */
-  --r-xs: 6px;
-  --r-sm: 9px;
-  --r-md: 12px;    /* default control / input radius */
-  --r-lg: 16px;    /* cards                          */
-  --r-xl: 22px;    /* modals / large panels          */
-  --r-pill: 999px;
+  --clay-pressed-lg:   inset 6px 6px 13px var(--shadow-r), inset -6px -6px 13px var(--shadow-l);
+  --clay-pressed-md:   inset 4px 4px 8px var(--shadow-r), inset -4px -4px 8px var(--shadow-l);
+  --clay-pressed-sm:   inset 2px 2px 5px var(--shadow-r), inset -2px -2px 5px var(--shadow-l);
 
-  /* ---------- Spacing (4px base) -------------------------- */
-  --sp-1: 4px;
-  --sp-2: 8px;
-  --sp-3: 12px;
-  --sp-4: 16px;
-  --sp-5: 20px;
-  --sp-6: 24px;
-  --sp-8: 32px;
-  --sp-10: 40px;
-  --sp-12: 48px;
-  --sp-16: 64px;
+  /* Shadows legacy mapping */
+  --shadow-sm:      var(--clay-raised-sm);
+  --shadow-md:      var(--clay-raised-md);
+  --shadow-lg:      var(--clay-raised-lg);
 
-  /* ---------- Type families ------------------------------- */
-  --font-sans:    'Geist', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --font-mono:    'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
-  --font-display: 'Anton', 'Geist', sans-serif; /* loud viral type */
+  /* ---------- 4. Typography Scale --------------------------- */
+  --font-display:   'Fredoka', sans-serif;
+  --font-body:      'Nunito', sans-serif;
+  --font-sans:      'Nunito', sans-serif;
+  --font-mono:      'Space Mono', monospace;
 
-  /* ---------- Type scale (UI chrome) ----------------------
-     app.css references these by name so the scale is the single source of
-     truth for every font-size. The xs..4xl steps are the semantic scale;
-     the -Npx aliases below cover the in-between chrome sizes the dense
-     dashboard UI genuinely needs (badges, labels, captions). */
-  --text-4xs:  9px;
-  --text-3xs:  10px;
-  --text-2xs:  11px;
-  --text-xs:   12px;
-  --text-sm:   13px;
-  --text-14:   14px;
-  --text-base: 15px;
-  --text-16:   16px;
-  --text-md:   17px;
-  --text-18:   18px;
-  --text-lg:   20px;
-  --text-21:   21px;
-  --text-22:   22px;
-  --text-24:   24px;
-  --text-xl:   26px;
-  --text-2xl:  34px;
-  --text-3xl:  46px;
-  --text-4xl:  62px;
+  --text-4xs:       10px;
+  --text-3xs:       11px;
+  --text-2xs:       12px;
+  --text-xs:        13px;
+  --text-sm:        14px;
+  --text-14:        14px;
+  --text-base:      15.5px;
+  --text-16:        16px;
+  --text-md:        18px;
+  --text-18:        18px;
+  --text-lg:        21px;
+  --text-21:        21px;
+  --text-22:        22px;
+  --text-24:        24px;
+  --text-xl:        28px;
+  --text-2xl:       36px;
+  --text-3xl:       48px;
+  --text-4xl:       60px;
 
-  --lh-tight: 1.05;
-  --lh-snug:  1.25;
-  --lh-body:  1.55;
+  --lh-tight:       1.1;
+  --lh-snug:        1.3;
+  --lh-body:        1.6;
 
-  --track-tight: -0.02em;
-  --track-normal: 0;
-  --track-wide: 0.06em;
-}
+  /* Surfaces mapping for legacy code */
+  --bg-0:           var(--bg);
+  --bg-1:           var(--surface);
+  --bg-2:           var(--surface);
+  --bg-3:           var(--surface-deep);
+  --bg-4:           var(--surface-deep);
 
-/* ============================================================
-   Semantic element styles. Only the classes the UI actually uses ship here.
-   ============================================================ */
-.cm-title {              /* card / section title */
-  font-family: var(--font-sans);
-  font-weight: 600;
-  font-size: var(--text-md);
-  line-height: var(--lh-snug);
-  color: var(--fg-1);
-}
-.cm-small {
-  font-family: var(--font-sans);
-  font-weight: 400;
-  font-size: var(--text-sm);
-  line-height: var(--lh-snug);
-  color: var(--fg-3);
+  --fg-1:           var(--ink);
+  --fg-2:           var(--ink-dim);
+  --fg-3:           var(--ink-dim);
+  --fg-4:           var(--ink-faint);
+
+  --line-1:         rgba(140, 130, 110, 0.25);
+  --line-2:         rgba(140, 130, 110, 0.40);
+  --line-3:         var(--plum);
 }

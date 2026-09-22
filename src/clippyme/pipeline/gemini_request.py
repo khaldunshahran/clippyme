@@ -13,7 +13,11 @@ import time
 # Per-model pricing ($ per 1M tokens) — update when Google changes rates
 MODEL_PRICING = {
     "gemini-3.5-flash": {"input": 1.50, "output": 9.00},
+    "gemini-3.6-flash": {"input": 1.50, "output": 9.00},
     "gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00},
+    "gemini-3.5-flash-lite": {"input": 0.25, "output": 1.50},
+    "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50},
+    "gemini-3-flash-preview": {"input": 1.50, "output": 9.00},
     "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
     "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
     "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
@@ -23,6 +27,7 @@ MODEL_PRICING = {
 GEMINI_PROMPT_TEMPLATE = """
 You are a senior video editor specialized in social media virality across YouTube Shorts, TikTok, IG Reels, and YouTube Highlights. Read the ENTIRE transcript + word-level timestamps and select {target_moments_instruction} MOST COMPELLING {duration_descriptor} moments.
 {clip_type_focus_block}
+{audience_intel_block}
 
 ## IS THIS MOMENT EVEN WORTH CUTTING? (gate — apply BEFORE scoring)
 A clip must hit at least ONE of these HARD. A moment that is merely pleasant,
@@ -41,6 +46,16 @@ moments: a weak clip costs the account more than a missing one.
 The reaction beat is PART of the clip — the laugh, the silence after the reveal,
 the "cosa?!". End after it lands, never before.
 
+## NARRATIVE COMPLETENESS & WHOLE-STORY INTEGRITY (MANDATORY RULE)
+Every clip must deliver a complete, self-contained story arc with high viewer retention:
+1. SETUP & CONTEXT: Establish who, what, and why. The viewer must understand the premise immediately without confusion. Avoid cold-open ambiguity.
+2. ESCALATION & CONFLICT: The rising action, debate, conflict, or revelation that builds tension.
+3. CLIMAX / PEAK BEAT: The shocking quote, discovery, confrontation, or critical point.
+4. RESOLUTION & PUNCHLINE: The conclusion, consequence, reaction, or aftermath.
+CRITICAL MANDATES:
+- NEVER SPLIT A CONTINUOUS ANECDOTE: If someone recounts a specific story, event, or incident (e.g. an encounter, a negotiation, a lie exposed by evidence, a shocking personal experience), it MUST remain as ONE single complete clip. Slicing an anecdote into separate clips (e.g. one clip with only the setup and another with only the punchline) is an absolute failure that destroys viewer retention and shareability.
+- DURATION SERVES THE STORY: Do not artificially truncate a story just to make it short. If a complete story takes 45s, 85s, or 140s to deliver the setup, context, and punchline, capture the entire story! A complete 90s story that delivers a satisfying punchline achieves vastly higher retention, watch time, and social shares than an incomplete 30s fragment.
+
 ## VIRAL_SCORE RUBRIC (1–100)
 Score each axis from 1 to 20 and sum (cap at 100):
 - HOOK_STRENGTH: do the first 1–3s grab attention? (pattern-break, bold claim,
@@ -51,10 +66,12 @@ Score each axis from 1 to 20 and sum (cap at 100):
   awe — and does it LAND on screen? Score the surprise and the reaction, not
   the subject matter. A polarizing take that will split the comments counts.
 - QUOTABILITY: is there a line viewers would screenshot, repeat, or argue with?
-- SELF_CONTAINED: makes sense without context from the rest of the video?
+- SELF_CONTAINED & STORY INTEGRITY: makes sense without context from the rest of the video,
+  and carries the full narrative arc through to its natural resolution or punchline. An unresolved clip
+  cut off before the payoff scores near zero here.
 - DENSITY: no dead air, no rambling, every second earns its place. Silence and
-  tangents are the top retention killer — prefer moments that are already tight
-  over good moments buried in filler.
+  tangents are the top retention killer — prefer moments that are already tight,
+  but NEVER cut away essential story context, premise setup, or punchlines.
 
 ## SPEAKER SIGNAL (when available)
 Each segment may carry a ``speaker`` integer (0, 1, 2…) from speaker
@@ -78,7 +95,8 @@ signals — treat them as STRONG evidence of EMOTIONAL_PAYOFF and virality:
   they are signal only, never overlay text.
 Absence of these markers means the provider didn't tag audio events; score
 normally on the words alone.
-
+{duration_strategy_block}
+{learned_patterns_block}
 ## HARD CONSTRAINTS (violating = clip REJECTED)
 - {duration_constraint}
 - start on a complete sentence boundary; end on a natural beat
@@ -264,6 +282,8 @@ Output schema:
       "video_title_for_youtube_short": "<max 100 chars, engagement-first bait per TITLE & CAPTION COPY — stakes/speculation/comment trigger, grounded in the clip, never a flat summary>",
       "viral_hook_text": "<REQUIRED, 3-8 words, scroll-stopping overlay copy — NOT a transcript quote. Use curiosity gap, POV, counter-claim, question, number, or warning pattern. Same language as transcript.>",
       "speaker_name": "<Identified speaker name or prominent subject in this moment if detectable from dialogue or context (e.g. 'John Kiriakou', 'Judge Napolitano', or empty if unknown)>",
+      "duration_tier": "<REQUIRED: 'short' (30-60s) | 'mid' (60-180s) | 'extended' (180-300s)>",
+      "target_platforms": ["#tiktok", "#youtube_shorts", "#instagram_reels"],
       "hashtags": ["#shorts", "#topicTag1", "#topicTag2", "#topicTag3", "#trending"],
       "video_description": "<Rich complete YouTube Shorts description with hook, speaker attribution, key takeaway, and hashtags>"
     }}
@@ -336,6 +356,9 @@ def build_viral_prompt(
     min_clips=None,
     max_clips=None,
     clip_type=None,
+    duration_mode=None,
+    audience_intel=None,
+    learned_patterns=None,
 ):
     """Return ``(prompt, words)`` for the primary Gemini call.
 
@@ -347,6 +370,8 @@ def build_viral_prompt(
     — the speaker-attribution rule in the template still forbids putting a
     quote in a named mouth.
     """
+    from clippyme.pipeline.audience_intel import format_audience_intel_prompt
+
     words = extract_prompt_words(transcript_result)
 
     user_instructions_block = ""
@@ -375,14 +400,52 @@ def build_viral_prompt(
             "clip: guests and co-streamers exist (see SPEAKER ATTRIBUTION RULE)."
         )
 
-    # Resolve duration bounds
-    min_dur = float(min_duration) if min_duration is not None and min_duration > 0 else 15.0
-    max_dur = float(max_duration) if max_duration is not None and max_duration > 0 else 60.0
-    if max_dur < min_dur:
-        max_dur = max(min_dur + 15.0, 60.0)
+    # Resolve audience intelligence block
+    audience_intel_block = format_audience_intel_prompt(audience_intel)
 
-    duration_descriptor = f"{min_dur:.0f}–{max_dur:.0f}s"
-    duration_constraint = f"{min_dur:.0f}s ≤ duration ≤ {max_dur:.0f}s"
+    # Resolve learned patterns from real published clip performance
+    learned_patterns_block = ""
+    if learned_patterns is not None:
+        learned_patterns_block = str(learned_patterns).strip()
+    else:
+        try:
+            from clippyme.domain.performance_feedback import get_learned_patterns_prompt
+            learned_patterns_block = get_learned_patterns_prompt()
+        except Exception:
+            learned_patterns_block = ""
+
+    # Resolve multi-tier duration bounds vs fixed bounds
+    dmode = (duration_mode or "").strip().lower()
+    ctype = (clip_type or "").strip().lower()
+    is_multi_tier = (
+        dmode in ("all", "auto", "mixed", "portfolio")
+        or (min_duration is None and max_duration is None)
+    )
+
+    if is_multi_tier:
+        min_dur = 15.0
+        # Allow extended social clips up to 300s (5m), bounded by actual video duration
+        max_dur = min(float(video_duration or 300.0), 300.0)
+        if max_dur < 30.0:
+            max_dur = max(min_dur + 10.0, float(video_duration or 30.0))
+        duration_descriptor = f"15s–{max_dur:.0f}s (Dynamic Multi-Tier Portfolio Mix)"
+        duration_constraint = f"15s ≤ duration ≤ {max_dur:.0f}s (let the natural story arc determine the exact duration)"
+        duration_strategy_block = (
+            "\n## MULTI-TIER DURATION & RETENTION STRATEGY (MANDATORY MIX)\n"
+            "Do NOT output clips of uniform duration. Top platforms (like OpusClip) succeed by letting the story content dictate the length. Curate a diversified portfolio distributed across:\n"
+            "1. TIER 1 - SHORTS / REELS (20s – 60s): Fast-paced, instant hook in first 0-3s, quick punchy payoff. Perfect for rapid-scroll YouTube Shorts / IG Reels.\n"
+            "2. TIER 2 - MID-LENGTH SOCIAL (60s – 120s / 1m – 2m): Complete narrative arc, escalating argument, or storytelling anecdote with thorough setup and payoff. Crucial for high-retention TikTok watch time and Reels.\n"
+            "3. TIER 3 - EXTENDED DEEP DIVE (120s – 300s / 2m – 5m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
+            "Every clip in your response MUST designate its 'duration_tier' ('short', 'mid', or 'extended') and list recommended 'target_platforms'."
+        )
+    else:
+        min_dur = float(min_duration) if min_duration is not None and min_duration > 0 else 15.0
+        max_dur = float(max_duration) if max_duration is not None and max_duration > 0 else 120.0
+        if max_dur < min_dur:
+            max_dur = max(min_dur + 15.0, 120.0)
+        duration_descriptor = f"{min_dur:.0f}–{max_dur:.0f}s"
+        duration_constraint = f"{min_dur:.0f}s ≤ duration ≤ {max_dur:.0f}s"
+        duration_strategy_block = ""
 
     # Resolve target clip count
     if min_clips is not None and max_clips is not None and min_clips > 0 and max_clips >= min_clips:
@@ -402,7 +465,6 @@ def build_viral_prompt(
 
     # Resolve clip focus block
     clip_type_focus_block = ""
-    ctype = (clip_type or "").strip().lower()
     if ctype == "educational":
         clip_type_focus_block = (
             "\n## CONTENT FOCUS: EDUCATIONAL & KEY INSIGHTS\n"
@@ -439,6 +501,9 @@ def build_viral_prompt(
         duration_descriptor=duration_descriptor,
         duration_constraint=duration_constraint,
         clip_type_focus_block=clip_type_focus_block,
+        audience_intel_block=audience_intel_block,
+        duration_strategy_block=duration_strategy_block,
+        learned_patterns_block=learned_patterns_block,
         transcript_text=json.dumps(transcript_result.get('text', '')),
         words_toon=encode_words_toon(words),
         user_instructions_block=user_instructions_block,
@@ -467,12 +532,11 @@ def backoff_seconds(rate_limited: bool, attempt: int) -> int:
 def build_model_chain(primary_model: str, fallback_models: str | None = None) -> list[str]:
     """Return a de-duplicated primary → fallback model chain."""
     raw = fallback_models if fallback_models is not None else (
-        # Full flash models first (better clip selection), lite tiers last.
-        # NB: pro models (gemini-*-pro-*) have limit:0 on the free API tier —
-        # they 429 instantly, so they are intentionally NOT in the default
-        # chain. Add one here (or via GEMINI_FALLBACK_MODELS) only on a paid plan.
-        "gemini-3-flash-preview,gemini-2.5-flash,"
-        "gemini-3.1-flash-lite,gemini-2.5-flash-lite"
+        # Lite tiers have high capacity and availability when full flash is under load.
+        # Primary models provide high quality clip selection;
+        # 3.5-flash-lite and 3.1-flash-lite provide rock-solid immediate fallbacks.
+        "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.5-flash,"
+        "gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-3.6-flash"
     )
     models = [primary_model, *(part.strip() for part in raw.split(","))]
     return list(dict.fromkeys(model for model in models if model))
@@ -481,7 +545,14 @@ def build_model_chain(primary_model: str, fallback_models: str | None = None) ->
 def _is_retryable_model_error(exc) -> bool:
     message = str(exc).lower()
     return is_rate_limit_error(exc) or any(signal in message for signal in (
-        "503", "504", "unavailable", "deadline_exceeded", "high demand",
+        "503", "504", "unavailable", "deadline_exceeded", "high demand", "capacity",
+    ))
+
+
+def _is_capacity_or_overload_error(exc) -> bool:
+    message = str(exc).lower()
+    return any(signal in message for signal in (
+        "503", "unavailable", "high demand", "no capacity", "overloaded", "capacity",
     ))
 
 
@@ -522,25 +593,31 @@ def generate_with_model_fallback(
             except Exception as exc:
                 last_error = exc
                 if _is_unavailable_model_error(exc):
-                    log_fn(f"⏭️  Gemini model {model_name} unavailable; skipping it")
+                    log_fn(f"[SKIP] Gemini model {model_name} unavailable; skipping it")
                     break
                 if not _is_retryable_model_error(exc):
                     raise
                 rate_limited = is_rate_limit_error(exc)
-                if rate_limited:
-                    log_fn(f"🔀 Gemini {model_name} quota exhausted; switching model")
+                capacity_limited = _is_capacity_or_overload_error(exc)
+
+                # If rate-limited (429) or capacity-overloaded (503), switch immediately
+                # to the next model if one is available in the chain.
+                if (rate_limited or capacity_limited) and model_index < len(models) - 1:
+                    reason = "quota exhausted (429)" if rate_limited else "high demand / no capacity (503)"
+                    log_fn(f"[SWITCH] Gemini {model_name} {reason}; switching model")
                     break
+
                 if attempt < attempts - 1:
                     wait = backoff_seconds(rate_limited, attempt)
-                    reason = "rate-limited" if rate_limited else "transient error"
+                    reason = "rate-limited" if rate_limited else ("capacity-limited" if capacity_limited else "transient error")
                     log_fn(
-                        f"⚠️  Gemini {model_name} {reason} "
+                        f"[WARN] Gemini {model_name} {reason} "
                         f"(attempt {attempt + 1}/{attempts}): {exc}. "
                         f"Retrying in {wait}s..."
                     )
                     sleep_fn(wait)
         if model_index < len(models) - 1:
-            log_fn(f"🔀 Gemini {model_name} unavailable — trying {models[model_index + 1]}")
+            log_fn(f"[SWITCH] Gemini {model_name} unavailable -> trying {models[model_index + 1]}")
     if last_error is not None:
         raise last_error
     raise RuntimeError("No Gemini models configured")

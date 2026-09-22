@@ -14,13 +14,18 @@ import { PublishModal } from './publish';
 import { HistoryView, SettingsView, ApiKeyModal } from './views';
 import { HighlightsStudioView } from './highlightsStudio';
 import { LiveMonitorView } from './live';
+import { TrendRadarView } from './trendRadar';
+import { ChannelsView } from './channels';
+import { AnalyticsView } from './analyticsView';
 import { EditClipModal } from './captions';
-import { optsToPreselections, restoreJob, listBackendJobIds, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig } from './realApi';
+import { AuthModal } from './AuthModal';
+import { getCurrentUser, isAuthEnabled, onAuthStateChange, signOut } from '../lib/supabaseClient';
+import { optsToPreselections, restoreJob, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig, generateAllClipMetadata } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
 import { clipStateToParams, buildBulkPlan } from '../lib/bulkApply';
+import { seedToggles } from '../lib/seedClipParams';
 import { runApplyEdit } from '../lib/applyEdit';
-import { pollJob } from '../lib/api';
 
 import { useJobSubmission } from '../hooks/useJobSubmission';
 import { useJobPolling } from '../hooks/useJobPolling';
@@ -80,6 +85,21 @@ function Toasts({ items, onDismiss }) {
   );
 }
 
+function loadSavedCreateOpts() {
+  try {
+    const saved = localStorage.getItem('clippyme_create_opts');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      delete parsed.file;
+      delete parsed.batchFiles;
+      delete parsed.url;
+      delete parsed.batch;
+      return parsed;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
 export default function RedesignApp() {
   const restoredSession = useMemo(() => loadPersistedSession(), []);
   // The Gemini key is persisted in localStorage in cleartext. This is an
@@ -91,6 +111,16 @@ export default function RedesignApp() {
   // server-issued token or sessionStorage.
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
   const [showKeyModal, setShowKeyModal] = useState(false);
+  const [user, setUser] = useState(() => getCurrentUser());
+  const [showAuthModal, setShowAuthModal] = useState(false);
+
+  useEffect(() => {
+    const unsub = onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+    });
+    return unsub;
+  }, []);
+
   const [tab, setTab] = useState(() => {
     const t = restoredSession?.activeTab;
     return (t === 'ai-shorts' || t === 'studio') ? 'create' : (t || 'create');
@@ -102,9 +132,26 @@ export default function RedesignApp() {
   const [currentStep, setCurrentStep] = useState(null);
   const [processingMedia, setProcessingMedia] = useState(restoredSession?.processingMedia || null);
   const [paused, setPaused] = useState(false);
-  // Seed Create from the user's default preset (if any) so their preferred
-  // settings are already applied on load.
-  const [opts, setOpts] = useState(() => ({ ...DEFAULT_OPTS, ...(getDefaultPresetOpts() || {}) }));
+  // Seed Create from the user's default preset or saved create options so their preferred
+  // recipe, subtitle style, and banner settings are remembered across sessions.
+  const [opts, setOpts] = useState(() => ({
+    ...DEFAULT_OPTS,
+    ...(getDefaultPresetOpts() || {}),
+    ...(loadSavedCreateOpts() || {}),
+  }));
+
+  // Auto-persist active create options (excluding transient media) across page reloads
+  useEffect(() => {
+    try {
+      const toSave = { ...opts };
+      delete toSave.file;
+      delete toSave.batchFiles;
+      delete toSave.url;
+      delete toSave.batch;
+      localStorage.setItem('clippyme_create_opts', JSON.stringify(toSave));
+    } catch { /* ignore quota */ }
+  }, [opts]);
+
   const [presetsVersion, setPresetsVersion] = useState(0);
   const [defaultPresetId, setDefaultPresetId] = useState(getDefaultPresetId());
   // presetsVersion is a manual cache-bust trigger: allPresets() reads from
@@ -183,6 +230,16 @@ export default function RedesignApp() {
     toastTimerIds.current.push(tid);
   }, []);
 
+  const handleSignOut = useCallback(async () => {
+    try {
+      await signOut();
+      setUser(null);
+      pushToast('info', 'Signed out');
+    } catch (err) {
+      pushToast('error', 'Sign out failed: ' + (err.message || err));
+    }
+  }, [pushToast]);
+
   // Background clip reprocess: the Edit modal stages the changes and hands them
   // here, then closes immediately. The reframe (subprocess) + compose
   // (subtitles → smart-cut → hook) run here, OUTSIDE the modal lifecycle, so the
@@ -227,17 +284,91 @@ export default function RedesignApp() {
     pushToast('info', 'Preset deleted');
   };
 
+  // Bounded-concurrency runner for bulk reprocessing. Each reprocessClip spawns
+  // heavy backend work (reframe = YOLO/MediaPipe subprocess, compose = ffmpeg)
+  // and the server only throttles the MAIN job worker — these endpoints are
+  // ungated, so the client is the only throttle. Cap at 2 (matches AE_MAX_PARALLEL).
+  const runBulk = useCallback(async (plan, targetJobId, targetUpdateState, limit = 2, quiet = false) => {
+    const effectiveJobId = targetJobId ?? (viewingHistory && historyJob ? historyJob.jobId : jobId);
+    const effectiveUpdateState = targetUpdateState ?? (viewingHistory && historyJob ? updateHistClipState : updateClipState);
+    let next = 0;
+    const toastHandler = quiet ? (type, msg) => { if (type === 'error') pushToast(type, msg); } : pushToast;
+    const worker = async () => {
+      while (next < plan.length) {
+        const { idx, clip, params } = plan[next++];
+        await runApplyEdit({
+          jobId: effectiveJobId,
+          idx,
+          apiIdx: clip?.original_index ?? idx,
+          params,
+          api: { reframeClip, composeClip },
+          updateClipState: effectiveUpdateState,
+          pushToast: toastHandler,
+        });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, plan.length) }, worker));
+    if (quiet && plan.length > 0) {
+      pushToast('success', `Recipe applied to ${plan.length} clip${plan.length === 1 ? '' : 's'}`);
+    }
+  }, [viewingHistory, historyJob, jobId, updateHistClipState, updateClipState, pushToast]);
+
+  const autoComposeRecipe = useCallback((rawClips, targetJobId) => {
+    try {
+      if (!rawClips || rawClips.length === 0 || !targetJobId) return;
+      const activePre = preselections || (() => {
+        try {
+          const raw = localStorage.getItem(`clippyme_preselections_job_${targetJobId}`);
+          return raw ? JSON.parse(raw) : null;
+        } catch { return null; }
+      })();
+      const toggles = seedToggles(activePre);
+      const anyCompose = Object.values(toggles).some(Boolean);
+      if (!anyCompose) return;
+      const srcParams = clipStateToParams(undefined, activePre, undefined);
+      const targets = rawClips.map((c, i) => ({ i, c }));
+      const plan = buildBulkPlan(srcParams, targets, {});
+      if (plan.length > 0) {
+        pushToast('info', `Rendering recipe styling & subtitles on ${plan.length} clips…`);
+        runBulk(plan, targetJobId, updateClipState, 2, true);
+      }
+    } catch (e) {
+      console.warn('autoComposeRecipe error:', e);
+    }
+  }, [preselections, updateClipState, pushToast, runBulk]);
+
+  const ensurePlatformMetadata = useCallback((rawClips, targetJobId) => {
+    try {
+      if (!rawClips || rawClips.length === 0 || !targetJobId) return;
+      const missing = rawClips.some((c) => !c.platforms || !c.platforms.tiktok);
+      if (missing) {
+        generateAllClipMetadata(targetJobId)
+          .then((res) => {
+            if (res?.success) {
+              restoreJob(targetJobId).then((fresh) => {
+                if (fresh?.result?.clips) setResults(fresh.result);
+              }).catch(() => {});
+            }
+          })
+          .catch((e) => console.warn('ensurePlatformMetadata background notice:', e));
+      }
+    } catch (e) {
+      console.warn('ensurePlatformMetadata error:', e);
+    }
+  }, [setResults]);
+
   useJobPolling({
     jobId,
     isActive: status === 'processing',
     onResult: setResults,
     onCompleted: (data) => {
+      const activeJobId = data?.job_id || jobId;
       setStatus('complete');
       setConfetti(true);
       setTimeout(() => setConfetti(false), 3000);
       pushToast('success', `${data.result?.clips?.length || 0} clips ready`);
       saveToHistory({
-        jobId,
+        jobId: activeJobId,
         status: 'complete',
         timestamp: Date.now(),
         source: processingMedia?.type === 'url' ? processingMedia.payload : processingMedia?.payload?.name || 'Local file',
@@ -245,15 +376,18 @@ export default function RedesignApp() {
         clipCount: data.result?.clips?.length || 0,
         cost: data.result?.cost_analysis?.total_cost || null,
       });
+      autoComposeRecipe(data.result?.clips, activeJobId);
+      ensurePlatformMetadata(data.result?.clips, activeJobId);
     },
     onStopped: (data) => {
       // Graceful stop kept the finished clips — route to the editable results
       // view just like a normal completion.
+      const activeJobId = data?.job_id || jobId;
       setStatus('complete');
       setPaused(false);
       pushToast('info', `Stopped — kept ${data.result?.clips?.length || 0} clip(s)`);
       saveToHistory({
-        jobId,
+        jobId: activeJobId,
         status: 'stopped',
         timestamp: Date.now(),
         source: processingMedia?.type === 'url' ? processingMedia.payload : processingMedia?.payload?.name || 'Local file',
@@ -261,6 +395,8 @@ export default function RedesignApp() {
         clipCount: data.result?.clips?.length || 0,
         cost: data.result?.cost_analysis?.total_cost || null,
       });
+      autoComposeRecipe(data.result?.clips, activeJobId);
+      ensurePlatformMetadata(data.result?.clips, activeJobId);
     },
     onCancelled: () => { setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setCurrentStep(null); setPaused(false); },
     onFailed: (errorMsg) => {
@@ -288,6 +424,10 @@ export default function RedesignApp() {
   });
 
   const startJob = () => {
+    if (isAuthEnabled() && !user) {
+      setShowAuthModal(true);
+      return;
+    }
     const pre = optsToPreselections(opts);
     // The backend has no clip-count parameter — Gemini decides how many clips
     // the video is worth. When the user opts out of Auto and sets a target, we
@@ -312,6 +452,10 @@ export default function RedesignApp() {
   };
 
   const retryJob = async () => {
+    if (isAuthEnabled() && !user) {
+      setShowAuthModal(true);
+      return;
+    }
     if (jobId) {
       try {
         setStatus('processing');
@@ -345,6 +489,7 @@ export default function RedesignApp() {
     if (status === 'processing' && jobId) cancelJob(jobId);
     setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setProcessingMedia(null);
     setCurrentStep(null); setViewingHistory(false); setTab('create'); setPaused(false);
+    setOpts((o) => ({ ...o, url: '', file: null, fileName: '', batch: '', batchFiles: [] }));
     clearPersistedSession();
   };
 
@@ -372,6 +517,7 @@ export default function RedesignApp() {
   const goTab = (next) => {
     if (next === 'create' && (status === 'complete' || status === 'error')) {
       setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setProcessingMedia(null); setCurrentStep(null);
+      setOpts((o) => ({ ...o, url: '', file: null, fileName: '', batch: '', batchFiles: [] }));
     }
     setViewingHistory(false);
     setHistoryJob(null);
@@ -393,6 +539,17 @@ export default function RedesignApp() {
         preselections: saved,
       });
       setViewingHistory(true);
+      if (data.result?.clips?.some((c) => !c.platforms || !c.platforms.tiktok)) {
+        generateAllClipMetadata(h.jobId)
+          .then((res) => {
+            if (res?.success) {
+              restoreJob(h.jobId).then((fresh) => {
+                setHistoryJob((prev) => (prev && prev.jobId === h.jobId ? { ...prev, results: fresh.result } : prev));
+              }).catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }
     } catch (err) {
       // The clip files are gone from disk (typically a docker rebuild/cleanup
       // wiped output/ while the localStorage entry lingered). Drop the dead
@@ -408,37 +565,6 @@ export default function RedesignApp() {
   };
 
   const clips = results?.clips || [];
-
-  // Visible (non-removed) clips as {i, c} — shared by both bulk paths.
-  const visibleClips = () => clips.map((c, i) => ({ i, c })).filter(({ i }) => !clipStates[i]?.deleted);
-
-  // Bounded-concurrency runner for bulk reprocessing. Each reprocessClip spawns
-  // heavy backend work (reframe = YOLO/MediaPipe subprocess, compose = ffmpeg)
-  // and the server only throttles the MAIN job worker — these endpoints are
-  // ungated, so the client is the only throttle. A bare forEach would fire all
-  // N at once and thrash/OOM the box. Cap at 2 (matches AE_MAX_PARALLEL); this
-  // is the same reason results.jsx:exportMany runs sequentially. reprocessClip
-  // swallows its own errors, so a failed clip never breaks the pool.
-  const runBulk = async (plan, targetJobId, targetUpdateState, limit = 2) => {
-    const effectiveJobId = targetJobId ?? (viewingHistory && historyJob ? historyJob.jobId : jobId);
-    const effectiveUpdateState = targetUpdateState ?? (viewingHistory && historyJob ? updateHistClipState : updateClipState);
-    let next = 0;
-    const worker = async () => {
-      while (next < plan.length) {
-        const { idx, clip, params } = plan[next++];
-        await runApplyEdit({
-          jobId: effectiveJobId,
-          idx,
-          apiIdx: clip?.original_index ?? idx,
-          params,
-          api: { reframeClip, composeClip },
-          updateClipState: effectiveUpdateState,
-          pushToast,
-        });
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(limit, plan.length) }, worker));
-  };
 
   // "Apply to all": take one clip's saved settings (or the global seeds if it
   // was never edited) and reprocess every OTHER visible clip with them. Manual
@@ -485,7 +611,14 @@ export default function RedesignApp() {
 
   return (
     <div>
-      <TopNav tab={tab} setTab={goTab} busy={status === 'processing'} />
+      <TopNav
+        tab={tab}
+        setTab={goTab}
+        busy={status === 'processing'}
+        user={user}
+        onSignIn={() => setShowAuthModal(true)}
+        onSignOut={handleSignOut}
+      />
       {confetti && <Confetti />}
 
       {status === 'processing' && tab !== 'create' && (
@@ -530,6 +663,40 @@ export default function RedesignApp() {
           onApplyToAll={applyClipToAll} onEditSelected={(targets) => setBulkEdit({ targets })}
           pushToast={pushToast} />
       )}
+
+      {tab === 'trends' && (
+        <TrendRadarView
+          apiKey={apiKey}
+          pushToast={pushToast}
+          onStartClip={(startedJobId, url) => {
+            setJobId(startedJobId);
+            setStatus('processing');
+            setProcessingMedia({ type: 'url', payload: url });
+            setTab('create');
+          }}
+          onCustomizeClip={({ url, instructions, preset }) => {
+            setOpts((prev) => ({
+              ...prev,
+              source: 'url',
+              url,
+              instructions: instructions || prev.instructions,
+              preset: preset || prev.preset,
+            }));
+            setTab('create');
+            pushToast('info', 'Loaded trending video into Create tab');
+          }}
+          onGoToChannels={() => setTab('channels')}
+        />
+      )}
+
+      {tab === 'channels' && (
+        <ChannelsView
+          pushToast={pushToast}
+          onSelectChannelForRadar={() => setTab('trends')}
+        />
+      )}
+
+      {tab === 'analytics' && <AnalyticsView pushToast={pushToast} />}
 
       {tab === 'live' && <LiveMonitorView pushToast={pushToast} />}
 
@@ -603,6 +770,17 @@ export default function RedesignApp() {
           }} />
       )}
       {showKeyModal && <ApiKeyModal onClose={() => setShowKeyModal(false)} onGoToSettings={() => { setShowKeyModal(false); setTab('settings'); }} />}
+
+      {showAuthModal && (
+        <AuthModal
+          isOpen={showAuthModal}
+          onClose={() => setShowAuthModal(false)}
+          onSuccess={(data) => {
+            setUser(data?.user || null);
+            pushToast('success', 'Signed in successfully');
+          }}
+        />
+      )}
 
       <Toasts items={toasts} onDismiss={dismissToast} />
     </div>

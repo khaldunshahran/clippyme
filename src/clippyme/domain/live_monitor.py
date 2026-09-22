@@ -255,8 +255,6 @@ def validate_monitor_config(config: dict, default_timezone: str = "Europe/Rome")
     mode = str(config.get("mode") or "live").strip().lower()
     if mode not in ("live", "vod"):
         raise ValidationError("mode must be 'live' or 'vod'")
-    if platform == "youtube" and mode == "live":
-        raise ValidationError("live mode not supported for youtube (use mode='vod')")
 
     channel = _validate_channel(platform, config.get("channel") or config.get("slug"))
 
@@ -326,6 +324,11 @@ def validate_monitor_config(config: dict, default_timezone: str = "Europe/Rome")
         # Fixed zoom on the letterbox render (monitors always run reframe
         # 'disabled'). 0 = whole frame between the bars, else 0.05-0.15.
         "letterbox_zoom": _letterbox_zoom_or_zero(config.get("letterbox_zoom")),
+        # Streamlink stream quality ladder (e.g. "1080p60,720p60,best" or "best").
+        "stream_quality": str(config.get("stream_quality") or "best").strip()[:64],
+        # Require preview before publishing: default True so clips are reviewed
+        # and approved with video preview before going to direct publishing.
+        "require_preview": _validate_bool(config.get("require_preview", True), "require_preview"),
     }
 
 
@@ -336,7 +339,8 @@ _UPDATABLE_CONFIG_FIELDS = (
     "instructions", "caption_template", "title_template", "min_gap_seconds",
     "segment_seconds", "prelive_skip_seconds", "platforms", "banner", "compose",
     "poll_interval", "delete_after_publish", "max_clips", "clip_selection",
-    "min_viral_score", "smart_cut", "letterbox_zoom",
+    "min_viral_score", "smart_cut", "letterbox_zoom", "stream_quality",
+    "require_preview",
 )
 
 # The full set of cfg keys worth persisting/restoring (mirrors
@@ -347,6 +351,7 @@ _SNAPSHOT_CONFIG_FIELDS = (
     "instructions", "caption_template", "title_template", "timezone",
     "banner", "compose", "catchup", "delete_after_publish", "max_clips",
     "clip_selection", "min_viral_score", "smart_cut", "letterbox_zoom",
+    "stream_quality", "require_preview",
 )
 
 
@@ -440,13 +445,13 @@ class KickStrategy:
         ch = self._client.get_channel(self.channel)
         return is_live(ch), playback_url(ch), stream_started_at(ch)
 
-    def capture_args(self, seg_path: str, seconds: int, url):
+    def capture_args(self, seg_path: str, seconds: int, url, quality: str = "best"):
         if url:
             return ["ffmpeg", "-hide_banner", "-loglevel", "warning",
                     "-i", url, "-c", "copy", "-t", str(seconds), "-y", seg_path]
         if shutil.which("streamlink"):
             return ["streamlink", "--hls-duration", _hhmmss(seconds),
-                    f"https://kick.com/{self.channel}", "best", "-o", seg_path]
+                    f"https://kick.com/{self.channel}", quality or "best", "-o", seg_path]
         return None
 
     def fetch_vods(self):
@@ -468,11 +473,11 @@ class TwitchStrategy:
         streams = self._client.get_stream(self.channel)
         return stream_is_live(streams), None, stream_started_at(streams)
 
-    def capture_args(self, seg_path: str, seconds: int, url):
+    def capture_args(self, seg_path: str, seconds: int, url, quality: str = "best"):
         if not shutil.which("streamlink"):
             return None
         return ["streamlink", "--twitch-disable-ads", "--hls-duration", _hhmmss(seconds),
-                f"twitch.tv/{self.channel}", "best", "-o", seg_path]
+                f"twitch.tv/{self.channel}", quality or "best", "-o", seg_path]
 
     def fetch_vods(self):
         from clippyme.integrations.twitch_client import parse_vods
@@ -499,6 +504,7 @@ class TwitchStrategy:
 
 class YoutubeStrategy:
     def __init__(self, channel: str):
+        self.channel = channel
         self._input = channel
         self._channel_id = None
 
@@ -506,10 +512,33 @@ class YoutubeStrategy:
         from clippyme.integrations.youtube_feed import resolve_channel_id
         self._channel_id = resolve_channel_id(self._input)
 
+    def get_live_state(self):
+        from clippyme.integrations.youtube_feed import check_youtube_live
+        return check_youtube_live(self._input)
+
+    def capture_args(self, seg_path: str, seconds: int, url, quality: str = "best"):
+        from clippyme.integrations.youtube_feed import get_youtube_live_stream_url
+        direct_url = url
+        is_direct = direct_url and (".m3u8" in direct_url or ".mpd" in direct_url or "googlevideo.com" in direct_url)
+        if not is_direct:
+            resolved = get_youtube_live_stream_url(url or self._input, quality=quality or "best")
+            if resolved:
+                direct_url = resolved
+        if direct_url and (is_direct or direct_url != url):
+            return ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+                    "-i", direct_url, "-c", "copy", "-t", str(seconds), "-y", seg_path]
+        if shutil.which("streamlink"):
+            target = url or f"https://www.youtube.com/{self._input}/live"
+            return ["streamlink", "--hls-duration", _hhmmss(seconds),
+                    target, quality or "best", "-o", seg_path]
+        return None
+
     def fetch_vods(self):
         from clippyme.integrations.youtube_feed import (
             fetch_feed, feed_url, parse_feed, uploads_playlist_id,
         )
+        if self._channel_id is None:
+            self.resolve()
         pid = uploads_playlist_id(self._channel_id)
         return parse_feed(fetch_feed(feed_url(pid)))
 
@@ -590,6 +619,9 @@ class LiveMonitor:
         self._covered_elapsed: int = 0
         self._covered_stream_start: str | None = None
         self._vod_baseline_ids: set = set()
+        # Telemetry: active segment capture progress
+        self._active_segment_path: str | None = None
+        self._active_segment_start: float | None = None
 
     # -- public API ------------------------------------------------------
 
@@ -597,6 +629,16 @@ class LiveMonitor:
         return self._task is not None and not self._task.done()
 
     def status(self) -> dict:
+        cur_bytes = 0
+        cur_secs = 0
+        if self.state == "capturing" and self._active_segment_path and os.path.isfile(self._active_segment_path):
+            try:
+                cur_bytes = os.path.getsize(self._active_segment_path)
+            except OSError:
+                cur_bytes = 0
+            if self._active_segment_start:
+                cur_secs = max(0, int(time.time() - self._active_segment_start))
+
         return {
             "id": self.id,
             "platform": self.platform,
@@ -614,13 +656,107 @@ class LiveMonitor:
             "resume_on_start": self.resume_on_start,
             "publishing_enabled": self.publishing_enabled,
             "pending_publish": len(self._pending_publish),
+            "require_preview": bool(self.cfg.get("require_preview", True)),
+            "pending_clips": self.get_pending_clips(),
             "gemini_exhausted_at": self._gemini_exhausted_at,
+            "current_segment_bytes": cur_bytes,
+            "current_segment_seconds": cur_secs,
             # Same allow-list snapshot() persists — no secrets by construction
             # (validate_monitor_config never puts any in cfg). Lets the
             # frontend Settings drawer seed from the monitor's current config
             # instead of opening blank.
             "config": {k: self.cfg.get(k) for k in _SNAPSHOT_CONFIG_FIELDS},
         }
+
+    def get_pending_clips(self) -> list[dict]:
+        """Return formatted pending preview clips awaiting approval."""
+        safe_id = self.id.replace(":", "_")
+        out = []
+        for i, p in enumerate(self._pending_publish):
+            fname = p.get("filename") or os.path.basename(p.get("composed_path", ""))
+            clip = p.get("clip") or {}
+            out.append({
+                "id": p.get("id") or str(i),
+                "job_id": p.get("job_id"),
+                "clip_index": p.get("clip_index") if p.get("clip_index") is not None else clip.get("original_index", 0),
+                "filename": fname,
+                "composed_path": p.get("composed_path", ""),
+                "video_url": p.get("video_url") or f"/videos/monitor_{safe_id}/{fname}",
+                "title": p.get("title") or clip.get("video_title_for_youtube_short") or clip.get("title") or "Clip",
+                "caption": p.get("caption") or clip.get("video_description") or "",
+                "speaker_name": p.get("speaker_name") or clip.get("speaker_name") or "",
+                "hashtags": p.get("hashtags") or clip.get("hashtags") or ["#shorts", "#trending"],
+                "viral_score": p.get("viral_score") or clip.get("viral_score", 0),
+                "duration": p.get("duration") or round(max(0.0, float(clip.get("end", 0)) - float(clip.get("start", 0))), 1),
+                "created_at": p.get("created_at") or "",
+                "status": p.get("status") or "pending_preview",
+                "clip": clip,
+            })
+        return out
+
+    async def publish_pending_clip(self, clip_id: str, overrides: dict | None = None) -> dict:
+        """Approve and publish a single previewed clip with optional edited overrides."""
+        target = None
+        target_idx = -1
+        for i, entry in enumerate(self._pending_publish):
+            if str(entry.get("id")) == str(clip_id) or str(i) == str(clip_id):
+                target = entry
+                target_idx = i
+                break
+        if target is None:
+            raise NotFoundError(f"pending clip {clip_id} not found")
+
+        if overrides and isinstance(overrides, dict):
+            if overrides.get("title"):
+                target["title"] = str(overrides["title"])[:100]
+                if "clip" in target and isinstance(target["clip"], dict):
+                    target["clip"]["title"] = target["title"]
+                    target["clip"]["video_title_for_youtube_short"] = target["title"]
+            if overrides.get("caption"):
+                target["caption"] = str(overrides["caption"])[:2200]
+                if "clip" in target and isinstance(target["clip"], dict):
+                    target["clip"]["video_description"] = target["caption"]
+            if overrides.get("platforms"):
+                target["platform_targets"] = overrides["platforms"]
+            if overrides.get("schedule_mode"):
+                target["schedule_mode"] = str(overrides["schedule_mode"])
+            if overrides.get("scheduled_for"):
+                target["scheduled_for"] = str(overrides["scheduled_for"])
+            if overrides.get("start_date"):
+                target["start_date"] = str(overrides["start_date"])
+            if overrides.get("tiktok_settings"):
+                target["tiktok_settings"] = overrides["tiktok_settings"]
+
+        self._pending_publish.pop(target_idx)
+        self._persist()
+
+        await self._publish_one(target, force=True)
+        return {"success": True, "published_id": clip_id, "remaining_pending": len(self._pending_publish)}
+
+    def dismiss_pending_clip(self, clip_id: str) -> dict:
+        """Dismiss/reject a pending preview clip, cleaning up on-disk composed artifacts."""
+        target_idx = -1
+        target = None
+        for i, entry in enumerate(self._pending_publish):
+            if str(entry.get("id")) == str(clip_id) or str(i) == str(clip_id):
+                target = entry
+                target_idx = i
+                break
+        if target is None:
+            raise NotFoundError(f"pending clip {clip_id} not found")
+
+        removed = self._pending_publish.pop(target_idx)
+        _safe_remove(removed.get("composed_path"))
+        self._persist()
+        return {"success": True, "dismissed_id": clip_id, "remaining_pending": len(self._pending_publish)}
+
+    async def publish_all_pending(self) -> dict:
+        """Publish all pending preview clips for this monitor."""
+        count = len(self._pending_publish)
+        if count == 0:
+            return {"published": 0}
+        self._track_task(asyncio.create_task(self._drain_pending()))
+        return {"publishing": count}
 
     def snapshot(self) -> dict:
         """Persistable per-monitor state (never secrets / Popen / logs)."""
@@ -837,14 +973,20 @@ class LiveMonitor:
         while not self._stop.is_set():
             live, url, _ = await asyncio.to_thread(self._strategy.get_live_state)
             if not live:
+                if await self._anti_flap_check():
+                    continue
                 break
             seg_path = await self._capture_segment(url)
             if seg_path is None:
+                if await self._anti_flap_check():
+                    continue
                 break
             duration = await asyncio.to_thread(probe_duration, seg_path)
             early_exit = duration < self.cfg["segment_seconds"] - 30
             if not should_process_segment(duration):
                 _safe_remove(seg_path)
+                if await self._anti_flap_check():
+                    continue
                 break
             self.segments_captured += 1
             job_id = await self._submit_segment_job(seg_path)
@@ -857,13 +999,43 @@ class LiveMonitor:
                     self._covered_elapsed,
                     int((datetime.now(timezone.utc) - started_at).total_seconds()))
             self._persist()
-            if early_exit:  # capture stopped before a full segment → stream ended
+            if early_exit:  # capture stopped before a full segment → stream ended or transient drop
+                if await self._anti_flap_check():
+                    continue
                 break
         self.state = "draining"
         # Kick has no in-progress VOD — recover the missed window now that the
         # session is over and the replay VOD can appear.
         if self.platform == "kick" and self._missed_windows:
             self._track_task(asyncio.create_task(self._recover_kick_backfill()))
+
+    async def _anti_flap_check(self) -> bool:
+        """Probe live state across a brief grace window to tolerate transient drops
+        (OBS restarts, scene switching, network blips). Returns True if stream
+        reconnected/active, False if genuinely offline."""
+        if self._stop.is_set():
+            return False
+        prev_state = self.state
+        self.state = "reconnecting"
+        self._persist()
+        logger.info("LiveMonitor %s: stream drop detected, checking for transient reconnect...", self.id)
+        # 3 probes spaced 10s apart (total ~30s grace window)
+        for probe_num in range(3):
+            await self._interruptible_sleep(10.0)
+            if self._stop.is_set():
+                return False
+            try:
+                live, _, _ = await asyncio.to_thread(self._strategy.get_live_state)
+                if live:
+                    logger.info("LiveMonitor %s: stream reconnected (probe %d/3), continuing marathon", self.id, probe_num + 1)
+                    self.state = "capturing"
+                    self._persist()
+                    return True
+            except Exception:
+                logger.debug("LiveMonitor %s: live check probe %d failed", self.id, probe_num + 1, exc_info=True)
+        logger.info("LiveMonitor %s: stream confirmed offline after grace window", self.id)
+        self.state = prev_state
+        return False
 
     async def _skip_prelive(self, started_at=None) -> bool:
         """Sleep out the (remainder of the) prelive window, aborting if the
@@ -892,16 +1064,21 @@ class LiveMonitor:
         os.makedirs(self._upload_dir, exist_ok=True)
         seg_path = os.path.join(
             self._upload_dir, f"live_{self.platform}_{self.cfg['channel']}_{int(time.time())}.mp4")
-        args = self._strategy.capture_args(seg_path, self.cfg["segment_seconds"], url)
+        quality = self.cfg.get("stream_quality") or "best"
+        args = self._strategy.capture_args(seg_path, self.cfg["segment_seconds"], url, quality=quality)
         if args is None:
             logger.warning("LiveMonitor %s: no capture method (streamlink not installed?)", self.id)
             self.last_error = "no capture tool available (streamlink not installed?)"
             return None
 
+        self._active_segment_path = seg_path
+        self._active_segment_start = time.time()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         except FileNotFoundError:
+            self._active_segment_path = None
+            self._active_segment_start = None
             logger.error("LiveMonitor %s: capture tool not found (%s)", self.id, args[0])
             self.last_error = f"{args[0]} not installed"
             return None
@@ -910,6 +1087,8 @@ class LiveMonitor:
             await proc.wait()
         finally:
             self._ffmpeg_proc = None
+            self._active_segment_path = None
+            self._active_segment_start = None
 
         if not os.path.isfile(seg_path) or os.path.getsize(seg_path) == 0:
             _safe_remove(seg_path)
@@ -1236,10 +1415,11 @@ class LiveMonitor:
             if clips:
                 self._gemini_exhausted_at = None  # a good segment clears the notice
             # Compose every good clip into the per-monitor folder first, then
+            # Compose every good clip into the per-monitor folder first, then
             # publish the consolidated files (upload matches what's on disk).
             consolidated = await self._consolidate_clips(job_id, clips)
             for i, entry in enumerate(consolidated):
-                if i:
+                if i and not self.cfg.get("require_preview", True):
                     await asyncio.sleep(PUBLISH_SPACING_SECONDS)
                 await self._publish_one(entry)
         except asyncio.CancelledError:
@@ -1252,7 +1432,7 @@ class LiveMonitor:
     async def _consolidate_clips(self, job_id: str, clips: list[dict]) -> list[dict]:
         """Compose every good clip of a finished job into ``self._clip_dir``,
         title-named with the continuous collision counter, and return
-        ``[{"job_id", "clip", "composed_path"}]`` for the ones that composed."""
+        ``[{"job_id", "clip", "composed_path", ...}]`` for the ones that composed."""
         os.makedirs(self._clip_dir, exist_ok=True)
         existing = set(os.listdir(self._clip_dir))
         out = []
@@ -1269,7 +1449,85 @@ class LiveMonitor:
                 # permanently reserve its title filename).
                 await asyncio.to_thread(shutil.copyfile, composed, dest + ".tmp")
                 os.replace(dest + ".tmp", dest)
-                out.append({"job_id": job_id, "clip": clip, "composed_path": dest})
+
+                # Contextual AI metadata extraction / generation
+                clip_title = render_template(self.cfg.get("title_template", ""), clip) or clip.get("video_title_for_youtube_short") or clip.get("title") or "Viral Clip"
+                clip_hook = clip.get("viral_hook_text") or ""
+                clip_speaker = clip.get("speaker_name") or ""
+                clip_tags = list(clip.get("hashtags") or [])
+                if not clip_tags:
+                    clip_tags = ["#shorts", "#trending", "#viral", f"#{self.platform}"]
+
+                configured_caption = render_template(self.cfg.get("caption_template", ""), clip).strip()
+                if configured_caption:
+                    clip_caption = configured_caption
+                elif clip.get("video_description"):
+                    clip_caption = clip.get("video_description")
+                elif clip.get("video_description_for_tiktok"):
+                    clip_caption = clip.get("video_description_for_tiktok")
+                    if clip_tags and not any(t in clip_caption for t in clip_tags):
+                        clip_caption += "\n\n" + " ".join(clip_tags)
+                else:
+                    hook_part = f"{clip_hook}\n\n" if clip_hook else ""
+                    speaker_part = f"Featuring {clip_speaker} — " if clip_speaker else ""
+                    clip_caption = f"{hook_part}{speaker_part}{clip_title}\n\nWhat do you think about this? Let us know in the comments below!\n\n{' '.join(clip_tags)}"
+
+                # If Gemini API key is available, enrich metadata with deeper dialogue context
+                if self._gemini_key and (not clip.get("video_description") or not clip.get("speaker_name")):
+                    try:
+                        job_entry = self._jobs.get(job_id, {})
+                        transcript = job_entry.get("result", {}).get("transcript") or {}
+                        from clippyme.domain.smartcut import clip_transcript_segments
+                        start_s = float(clip.get("start", 0))
+                        end_s = float(clip.get("end", 0))
+                        segs = clip_transcript_segments(transcript, start_s, end_s)
+                        clip_transcript_text = " ".join(s.get("text", "") for s in segs if s.get("text"))
+                        if clip_transcript_text.strip():
+                            from clippyme.domain.metadata_generator import generate_clip_metadata
+                            ai_res = await asyncio.to_thread(
+                                generate_clip_metadata,
+                                api_key=self._gemini_key,
+                                clip_transcript=clip_transcript_text,
+                                start=start_s,
+                                end=end_s,
+                                video_title=clip_title,
+                                uploader=self.cfg.get("channel") or "",
+                                instructions=self.cfg.get("instructions") or "",
+                            )
+                            if ai_res:
+                                if ai_res.get("title") and not self.cfg.get("title_template"):
+                                    clip_title = ai_res["title"]
+                                if ai_res.get("caption") and not self.cfg.get("caption_template"):
+                                    clip_caption = ai_res["caption"]
+                                if ai_res.get("speaker_name"):
+                                    clip_speaker = ai_res["speaker_name"]
+                                if ai_res.get("hashtags"):
+                                    clip_tags = ai_res["hashtags"]
+                    except Exception as exc:
+                        logger.debug("LiveMonitor %s: automatic AI metadata enrichment skipped: %s", self.id, exc)
+
+                entry_id = str(uuid.uuid4())[:8]
+                safe_id = self.id.replace(":", "_")
+                web_url = f"/videos/monitor_{safe_id}/{fname}"
+                duration_val = round(max(0.0, float(clip.get("end", 0)) - float(clip.get("start", 0))), 1)
+
+                out.append({
+                    "id": entry_id,
+                    "job_id": job_id,
+                    "clip": clip,
+                    "composed_path": dest,
+                    "clip_index": idx,
+                    "filename": fname,
+                    "video_url": web_url,
+                    "title": clip_title,
+                    "caption": clip_caption,
+                    "speaker_name": clip_speaker,
+                    "hashtags": clip_tags,
+                    "viral_score": clip.get("viral_score", 0),
+                    "duration": duration_val,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "pending_preview",
+                })
             except Exception:
                 logger.exception("LiveMonitor %s: consolidate/compose failed for %s/%s",
                                  self.id, job_id, idx)
@@ -1309,10 +1567,10 @@ class LiveMonitor:
                 raise
             return base_path
 
-    async def _publish_one(self, entry: dict) -> None:
+    async def _publish_one(self, entry: dict, force: bool = False) -> None:
         """Publish one consolidated entry ``{"job_id", "clip", "composed_path"}``
         — uploads the composed file directly (no re-compose), dedupes on the RAW
-        clip path, and queues when paused."""
+        clip path, and queues when paused or awaiting preview approval."""
         from clippyme.integrations.social_publisher import ZernioError, publish_clip
 
         job_id = entry["job_id"]
@@ -1322,9 +1580,11 @@ class LiveMonitor:
         # Dedupe on the BASE clip path (stable across compose/consolidate).
         if clip_path in self._published:
             return
-        # Paused: queue the entry (public metadata + composed path only) and
-        # drain it on resume.
-        if not self.publishing_enabled:
+        # Paused or require_preview enabled (when not force-published): queue the
+        # entry for user preview / approval and drain on approval/resume.
+        if not force and (not self.publishing_enabled or self.cfg.get("require_preview", False)):
+            if "id" not in entry:
+                entry["id"] = str(uuid.uuid4())[:8]
             self._pending_publish.append(entry)
             self._persist()
             return
@@ -1333,8 +1593,14 @@ class LiveMonitor:
             # Restored pending entry whose composed file vanished → recompose.
             upload_path = await self._compose_for_publish(job_id, clip)
 
-        title = render_template(self.cfg["title_template"], clip) or clip.get("title") or "Clip"
-        caption = render_template(self.cfg["caption_template"], clip)
+        title = entry.get("title") or render_template(self.cfg.get("title_template", ""), clip) or clip.get("title") or "Clip"
+        caption = entry.get("caption") or render_template(self.cfg.get("caption_template", ""), clip) or ""
+        platform_targets = entry.get("platform_targets") or self.cfg["platforms"]
+        schedule_mode = entry.get("schedule_mode") or "auto"
+        scheduled_for = entry.get("scheduled_for")
+        start_date = entry.get("start_date") or None
+        tiktok_settings = entry.get("tiktok_settings")
+
         # Serialise publishes GLOBALLY (shared lock) so the shared scheduler's
         # picked_slots list (mutated inside publish_clip's worker thread) stays
         # race-free across every monitor.
@@ -1343,7 +1609,6 @@ class LiveMonitor:
         async with self._publish_lock:
             attempt = 0
             day_rolls = 0
-            start_date = None  # None → scheduler picks today/tomorrow
             while True:
                 try:
                     await asyncio.to_thread(
@@ -1352,9 +1617,11 @@ class LiveMonitor:
                         clip_path=upload_path,
                         title=title[:100],
                         caption=caption,
-                        platform_targets=self.cfg["platforms"],
-                        schedule_mode="auto",
+                        platform_targets=platform_targets,
+                        schedule_mode=schedule_mode,
+                        scheduled_for=scheduled_for,
                         timezone=self.cfg["timezone"],
+                        tiktok_settings=tiktok_settings,
                         scheduler=self._scheduler,
                         start_date=start_date,
                     )
@@ -1433,7 +1700,7 @@ class LiveMonitor:
                 entry = self._pending_publish.pop(0)
                 self._persist()
                 try:
-                    await self._publish_one(entry)
+                    await self._publish_one(entry, force=True)
                 except Exception:
                     # A recompose (vanished composed_path) can raise — re-queue
                     # the entry so it retries rather than being lost, and keep
@@ -1647,6 +1914,36 @@ class LiveMonitorRegistry:
         if mon is None:
             raise NotFoundError(f"no such monitor: {monitor_id}")
         result = mon.set_publishing(enabled)
+        self.persist()
+        return result
+
+    def get_pending_clips(self, monitor_id: str) -> list[dict]:
+        mon = self._monitors.get(monitor_id)
+        if mon is None:
+            raise NotFoundError(f"no such monitor: {monitor_id}")
+        return mon.get_pending_clips()
+
+    async def publish_pending_clip(self, monitor_id: str, clip_id: str, overrides: dict | None = None) -> dict:
+        mon = self._monitors.get(monitor_id)
+        if mon is None:
+            raise NotFoundError(f"no such monitor: {monitor_id}")
+        result = await mon.publish_pending_clip(clip_id, overrides)
+        self.persist()
+        return result
+
+    def dismiss_pending_clip(self, monitor_id: str, clip_id: str) -> dict:
+        mon = self._monitors.get(monitor_id)
+        if mon is None:
+            raise NotFoundError(f"no such monitor: {monitor_id}")
+        result = mon.dismiss_pending_clip(clip_id)
+        self.persist()
+        return result
+
+    async def publish_all_pending(self, monitor_id: str) -> dict:
+        mon = self._monitors.get(monitor_id)
+        if mon is None:
+            raise NotFoundError(f"no such monitor: {monitor_id}")
+        result = await mon.publish_all_pending()
         self.persist()
         return result
 

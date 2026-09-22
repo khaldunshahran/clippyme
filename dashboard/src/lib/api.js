@@ -46,6 +46,7 @@ export async function submitProcessJob(data, apiKey, { signal } = {}) {
   const minClips = Number(data.min_clips ?? data.preselections?.min_clips) || null;
   const maxClips = Number(data.max_clips ?? data.preselections?.max_clips) || null;
   const clipType = (data.clip_type || data.preselections?.clip_type || '').trim() || null;
+  const durationMode = (data.duration_mode || data.preselections?.duration_mode || '').trim() || null;
   const highlights = data.highlights === true || data.preselections?.highlights === true;
 
   if (data.type === 'url') {
@@ -65,6 +66,7 @@ export async function submitProcessJob(data, apiKey, { signal } = {}) {
     if (minClips) jsonBody.min_clips = minClips;
     if (maxClips) jsonBody.max_clips = maxClips;
     if (clipType) jsonBody.clip_type = clipType;
+    if (durationMode) jsonBody.duration_mode = durationMode;
     body = JSON.stringify(jsonBody);
   } else {
     if (data.payload?.size > 16 * 1024 * 1024 * 1024) throw new Error('File too large. Maximum size is 16 GB.');
@@ -84,6 +86,7 @@ export async function submitProcessJob(data, apiKey, { signal } = {}) {
     if (minClips) formData.append('min_clips', String(minClips));
     if (maxClips) formData.append('max_clips', String(maxClips));
     if (clipType) formData.append('clip_type', clipType);
+    if (durationMode) formData.append('duration_mode', durationMode);
     body = formData;
   }
 
@@ -107,6 +110,7 @@ export async function submitBatchJob(data, apiKey, { signal } = {}) {
   if (Number(data.preselections?.min_clips)) batchBody.min_clips = Number(data.preselections.min_clips);
   if (Number(data.preselections?.max_clips)) batchBody.max_clips = Number(data.preselections.max_clips);
   if ((data.preselections?.clip_type || '').trim()) batchBody.clip_type = data.preselections.clip_type.trim();
+  if ((data.preselections?.duration_mode || '').trim()) batchBody.duration_mode = data.preselections.duration_mode.trim();
   const res = await apiFetch(getApiUrl('/api/batch'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Gemini-Key': apiKey },
@@ -117,8 +121,19 @@ export async function submitBatchJob(data, apiKey, { signal } = {}) {
   return res.json();
 }
 
-export async function triggerStorageCleanup({ signal } = {}) {
-  const res = await apiFetch(getApiUrl('/api/storage/cleanup'), { method: 'POST', signal });
+export async function getStorageBreakdown({ signal } = {}) {
+  const res = await apiFetch(getApiUrl('/api/storage/breakdown'), { signal });
+  if (!res.ok) await throwFromResponse(res);
+  return res.json();
+}
+
+export async function triggerStorageCleanup({ mode = 'safe', purgeRawSources = false, signal } = {}) {
+  const res = await apiFetch(getApiUrl('/api/storage/cleanup'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode, purge_raw_sources: purgeRawSources }),
+    signal,
+  });
   if (!res.ok) await throwFromResponse(res);
   return res.json();
 }

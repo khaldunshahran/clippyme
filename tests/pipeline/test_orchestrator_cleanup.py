@@ -69,3 +69,22 @@ def test_partial_success_keeps_checkpoint_for_resume(tmp_path, monkeypatch):
     )
 
     assert Path(checkpoint).exists()
+
+
+def test_relink_source_ignores_viral_clips(tmp_path):
+    from clippyme.pipeline.run_ops import find_source_video_candidate
+
+    # Viral clip from a prior pass (does not start with 'clip_')
+    viral_clip = tmp_path / "Epstein's brother reveals the truth_clip_1.mp4"
+    viral_clip.write_bytes(b"V" * 40_000)
+
+    # Viral clip's preserved source slice
+    source_slice = tmp_path / "source_Epstein's brother reveals the truth_clip_1.mp4"
+    source_slice.write_bytes(b"S" * 45_000)
+
+    # The actual full source video
+    true_source = tmp_path / "Q&A With An Ex-CIA Agent.mp4"
+    true_source.write_bytes(b"ORIGINAL_LONG_VIDEO" * 5000)
+
+    candidate = find_source_video_candidate(str(tmp_path))
+    assert candidate == str(true_source)

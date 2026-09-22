@@ -767,11 +767,14 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                         output_frame = create_general_frame(frame, output_width, output_height)
                     elif strat == 'SPLIT':
                         from clippyme.pipeline.layouts.split_layout import create_split_frame
-                        left_c, right_c = (split_metadata or {}).get(
+                        split_entry = (split_metadata or {}).get(
                             current_scene_idx,
                             ((original_width / 2, original_height / 2), (original_width / 2, original_height / 2))
                         )
-                        output_frame = create_split_frame(frame, output_width, output_height, left_c, right_c)
+                        left_c, right_c = split_entry[0], split_entry[1]
+                        left_d = split_entry[2] if len(split_entry) > 2 else None
+                        right_d = split_entry[3] if len(split_entry) > 3 else None
+                        output_frame = create_split_frame(frame, output_width, output_height, left_c, right_c, left_d, right_d)
                     elif strat == 'SCREENCAST':
                         from clippyme.pipeline.layouts.screencast_layout import create_screencast_frame
                         face_c = (screen_metadata or {}).get(
@@ -1115,8 +1118,11 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
 
                     elif current_strategy == 'SPLIT':
                         from clippyme.pipeline.layouts.split_layout import create_split_frame
-                        left_c, right_c = split_metadata.get(current_scene_index, ((original_width/2, original_height/2), (original_width/2, original_height/2)))
-                        output_frame = create_split_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT, left_c, right_c)
+                        split_entry = split_metadata.get(current_scene_index, ((original_width/2, original_height/2), (original_width/2, original_height/2)))
+                        left_c, right_c = split_entry[0], split_entry[1]
+                        left_d = split_entry[2] if len(split_entry) > 2 else None
+                        right_d = split_entry[3] if len(split_entry) > 3 else None
+                        output_frame = create_split_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT, left_c, right_c, left_d, right_d)
                     elif current_strategy == 'SCREENCAST':
                         from clippyme.pipeline.layouts.screencast_layout import create_screencast_frame
                         face_c = screen_metadata.get(current_scene_index, (original_width/2, original_height/2))

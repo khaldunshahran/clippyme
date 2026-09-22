@@ -9,6 +9,10 @@ from clippyme.pipeline.run_ops import (
     build_cut_command,
     build_vfr_normalization_command,
     clip_output_basename,
+    extract_youtube_video_id,
+    find_source_video_candidate,
+    is_clip_artifact,
+    is_same_video_source,
     resolve_output_dir,
 )
 
@@ -136,3 +140,91 @@ def test_suffix_always_matches_index():
 
 def test_unicode_preserved():
     assert clip_output_basename("Café Émoji 🎬 Clip", 0, "source") == "Café Émoji 🎬 Clip_clip_1"
+
+
+# --- is_clip_artifact & find_source_video_candidate --------------------------
+
+def test_is_clip_artifact():
+    assert is_clip_artifact("source_clip.mp4")
+    assert is_clip_artifact("clip_1.mp4")
+    assert is_clip_artifact("clip_10.mp4")
+    assert is_clip_artifact("Epstein's brother reveals the truth_clip_1.mp4")
+    assert is_clip_artifact("source_Epstein's brother reveals the truth_clip_1.mp4")
+    assert is_clip_artifact("composed_clip_1.mp4")
+    assert is_clip_artifact("composed_Viral Title_clip_2.mp4")
+    assert is_clip_artifact("temp.render.tmp.mp4")
+    assert is_clip_artifact("test.tmp.mp4")
+    assert is_clip_artifact("file.tmp")
+
+    # The actual source videos must NOT be considered clip artifacts
+    assert not is_clip_artifact("Original Long Video.mp4")
+    assert not is_clip_artifact("trimmed_Original Long Video.mp4")
+    assert not is_clip_artifact("＂Would I Run For President？＂ ｜ Q&A With An Ex-CIA Agent.mp4")
+
+
+def test_find_source_video_candidate_ignores_viral_clips(tmp_path):
+    # Simulate a job directory with rendered viral clips and the true source
+    clip_1 = tmp_path / "Epstein's brother reveals the truth_clip_1.mp4"
+    clip_1.write_bytes(b"A" * 50_000)
+
+    src_clip_1 = tmp_path / "source_Epstein's brother reveals the truth_clip_1.mp4"
+    src_clip_1.write_bytes(b"B" * 60_000)
+
+    clip_2 = tmp_path / "How the CIA secretly hides operations_clip_2.mp4"
+    clip_2.write_bytes(b"C" * 40_000)
+
+    true_source = tmp_path / "＂Would I Run For President？＂ ｜ Q&A.mp4"
+    true_source.write_bytes(b"S" * 200_000)
+
+    candidate = find_source_video_candidate(str(tmp_path))
+    assert candidate == str(true_source)
+
+
+def test_find_source_video_candidate_prefers_trimmed_source(tmp_path):
+    untrimmed = tmp_path / "source_video.mp4"
+    untrimmed.write_bytes(b"U" * 500_000)
+
+    trimmed = tmp_path / "trimmed_source_video.mp4"
+    trimmed.write_bytes(b"T" * 450_000)
+
+    clip = tmp_path / "Viral Title_clip_1.mp4"
+    clip.write_bytes(b"C" * 30_000)
+
+    candidate = find_source_video_candidate(str(tmp_path))
+    assert candidate == str(trimmed)
+
+
+def test_find_source_video_candidate_returns_none_if_only_clips(tmp_path):
+    clip = tmp_path / "Viral Title_clip_1.mp4"
+    clip.write_bytes(b"C" * 30_000)
+    assert find_source_video_candidate(str(tmp_path)) is None
+
+
+# --- extract_youtube_video_id & is_same_video_source -------------------------
+
+def test_extract_youtube_video_id():
+    assert extract_youtube_video_id("https://youtu.be/j09ZaBP3Bu8?is=VaH-WbQFJJqfwKav") == "j09ZaBP3Bu8"
+    assert extract_youtube_video_id("https://www.youtube.com/watch?v=j09ZaBP3Bu8") == "j09ZaBP3Bu8"
+    assert extract_youtube_video_id("https://www.youtube.com/live/bEMsJi2P6PA?si=123") == "bEMsJi2P6PA"
+    assert extract_youtube_video_id("https://www.youtube.com/shorts/Qtl8lJwbd4g") == "Qtl8lJwbd4g"
+    assert extract_youtube_video_id("https://m.youtube.com/watch?v=j09ZaBP3Bu8") == "j09ZaBP3Bu8"
+    assert extract_youtube_video_id("https://notyoutube.com/video") is None
+    assert extract_youtube_video_id(None) is None
+
+
+def test_is_same_video_source():
+    # Exactly same string
+    assert is_same_video_source("https://example.com/stream", "https://example.com/stream")
+
+    # YouTube URL variant with query params vs canonical
+    url1 = "https://youtu.be/j09ZaBP3Bu8?is=VaH-WbQFJJqfwKav"
+    url2 = "https://www.youtube.com/watch?v=j09ZaBP3Bu8"
+    assert is_same_video_source(url1, url2)
+
+    # Different videos
+    url3 = "https://www.youtube.com/watch?v=A0MbO-zsN1w"
+    assert not is_same_video_source(url1, url3)
+
+    # None handling
+    assert not is_same_video_source(None, url1)
+    assert not is_same_video_source(url1, None)

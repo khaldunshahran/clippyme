@@ -122,7 +122,23 @@ def extract_audio_for_asr(video_path: str) -> str | None:
             check=True,
             timeout=1800,
         )
+        # FFmpeg can exit 0 but produce no output (e.g. no audio stream,
+        # codec mismatch) — verify the file is actually usable.
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            print("   ⚠️  FFmpeg exited 0 but produced no audio; using source file.")
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except OSError:
+                pass
+            return None
         return out_path
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
         print(f"   ⚠️  Could not extract audio for transcription ({exc}); using source file.")
+        # Clean up partial output that FFmpeg may have written before failing.
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except OSError:
+            pass
         return None

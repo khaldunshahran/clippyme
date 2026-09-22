@@ -7,6 +7,9 @@ from clippyme.domain.highlights_ops import (
     parse_multi_tier_response,
     snap_supercut_timeline,
     fuse_supercut_subtitles,
+    merge_adjacent_cuts,
+    snap_cut_boundaries_guarded,
+    _format_editorial_steering,
     _parse_safe_score,
     _deduplicate_and_trim_overlaps,
     _enforce_tier_duration,
@@ -23,11 +26,22 @@ def test_build_supercut_prompt():
         {"word": "a", "start": 2.0, "end": 2.2},
         {"word": "test.", "start": 2.2, "end": 2.8},
     ]
-    prompt = build_supercut_prompt(words, target_duration_sec=60, video_duration_sec=600.0, video_title="Sample Video")
+    prompt = build_supercut_prompt(
+        words,
+        target_duration_sec=60,
+        video_duration_sec=600.0,
+        video_title="Sample Video",
+        content_mode="lecture",
+        output_style="trailer",
+        theme="pricing model",
+    )
     assert "Sample Video" in prompt
     assert "~60 seconds" in prompt
     assert "50s to 70s" in prompt
     assert "[0.00s - 2.80s] Hello world this is a test." in prompt
+    assert "Content Mode (lecture)" in prompt
+    assert "Output Style (trailer)" in prompt
+    assert 'Custom Focus Theme**: "pricing model"' in prompt
 
 
 def test_parse_supercut_response_valid():
@@ -174,12 +188,67 @@ def test_snap_supercut_timeline():
         {"role": "hook", "start": 9.8, "end": 12.0, "summary": "H"},
         {"role": "beat", "start": 19.9, "end": 21.8, "summary": "B"},
     ]
+    # Test default 0.20s start padding and 0.35s end padding
     snapped = snap_supercut_timeline(raw_cuts, words, source_video_duration_sec=30.0)
     assert len(snapped) == 2
-    assert snapped[0]["start"] == 9.95
-    assert snapped[0]["end"] == 11.88
-    assert snapped[1]["start"] == 19.95
-    assert snapped[1]["end"] == 21.58
+    assert snapped[0]["start"] == 9.80   # 10.0 - 0.20
+    assert snapped[0]["end"] == 12.15     # 11.8 + 0.35
+    assert snapped[1]["start"] == 19.80  # 20.0 - 0.20
+    assert snapped[1]["end"] == 21.85    # 21.5 + 0.35
+
+    # Test explicit legacy padding
+    snapped_custom = snap_supercut_timeline(
+        raw_cuts, words, source_video_duration_sec=30.0,
+        start_padding=0.05, end_padding=0.08, collision_guard=0.0
+    )
+    assert snapped_custom[0]["start"] == 9.95
+    assert snapped_custom[0]["end"] == 11.88
+
+
+def test_merge_adjacent_cuts():
+    # Cut 1: 10.0s to 15.0s. Cut 2: 15.8s to 20.0s (0.8s gap <= 1.5s -> should merge)
+    # Cut 3: 25.0s to 30.0s (5.0s gap > 1.5s -> should remain separate)
+    cuts = [
+        {"role": "setup", "start": 10.0, "end": 15.0, "summary": "Intro"},
+        {"role": "beat", "start": 15.8, "end": 20.0, "summary": "Follow-up thought"},
+        {"role": "outro", "start": 25.0, "end": 30.0, "summary": "Outro"},
+    ]
+    merged = merge_adjacent_cuts(cuts, merge_gap_seconds=1.5)
+    assert len(merged) == 2
+    assert merged[0]["start"] == 10.0
+    assert merged[0]["end"] == 20.0
+    assert merged[0]["duration"] == 10.0
+    assert "Intro; Follow-up thought" in merged[0]["summary"]
+    assert merged[1]["start"] == 25.0
+    assert merged[1]["end"] == 30.0
+
+
+def test_snap_cut_boundaries_collision_guard():
+    # Word 1: 5.0 to 6.0.
+    # Word 2 (adjacent): 6.15 to 7.0.
+    # If a cut only covers Word 1, end padding (0.35s) would normally reach 6.35s (colliding into Word 2).
+    # With collision guard (0.10s), max allowed end must be 6.15 - 0.10 = 6.05s!
+    words = [
+        {"word": "Target", "start": 5.0, "end": 6.0},
+        {"word": "NextSentence", "start": 6.15, "end": 7.0},
+    ]
+    start, end = snap_cut_boundaries_guarded(
+        5.0, 6.0, words,
+        start_padding=0.20,
+        end_padding=0.35,
+        collision_guard=0.10,
+    )
+    assert start == 4.80  # 5.0 - 0.20
+    assert end == 6.05    # Guarded from 6.15: 6.15 - 0.10 = 6.05
+
+
+def test_format_editorial_steering():
+    steering = _format_editorial_steering(content_mode="meeting", output_style="decision_log", theme="budget cut")
+    assert "Content Mode (meeting)" in steering
+    assert "Business discussions" in steering
+    assert "Output Style (decision_log)" in steering
+    assert "Action items" in steering
+    assert 'Custom Focus Theme**: "budget cut"' in steering
 
 
 def test_fuse_supercut_subtitles():

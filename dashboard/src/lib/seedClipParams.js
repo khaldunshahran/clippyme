@@ -30,6 +30,9 @@ export function seedBannerParams(preselections, sourceBanner) {
     if (b && b.enabled) {
         return { enabled: true, platform: b.platform || 'kick', handle: b.handle || '', y_pct: b.y_pct ?? 0.85 };
     }
+    if (b === false || (b && !b.enabled)) {
+        return { enabled: false, platform: b?.platform || sourceBanner?.platform || 'kick', handle: b?.handle || sourceBanner?.handle || '', y_pct: b?.y_pct ?? 0.85 };
+    }
     if (sourceBanner && sourceBanner.platform) {
         return { enabled: true, platform: sourceBanner.platform, handle: sourceBanner.handle || '', y_pct: 0.85 };
     }

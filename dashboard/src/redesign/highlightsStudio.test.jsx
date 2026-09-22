@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, test, vi, beforeEach } from 'vitest';
 import { HighlightsStudioView } from './highlightsStudio';
 import * as realApi from './realApi';
@@ -132,6 +132,26 @@ test('shows Retry from Checkpoint button on failed session and triggers retry', 
   expect(screen.getByText(/Something broke\./i)).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /Retry from Checkpoint/i })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /Cancel & Start Over/i })).toBeInTheDocument();
+});
+
+test('renders editorial steering controls: content mode, output style, focus theme, and gap merging', () => {
+  render(<HighlightsStudioView onToast={vi.fn()} />);
+
+  expect(screen.getByText(/Content mode/i)).toBeInTheDocument();
+  expect(screen.getByText(/Output style/i)).toBeInTheDocument();
+  expect(screen.getByText(/Focus theme \/ topic/i)).toBeInTheDocument();
+  expect(screen.getByText(/Adjacent gap merging/i)).toBeInTheDocument();
+
+  // Change theme
+  const themeInput = screen.getByLabelText(/Focus theme or topic/i);
+  fireEvent.change(themeInput, { target: { value: 'Cryptocurrency and Web3 debate' } });
+  expect(themeInput.value).toBe('Cryptocurrency and Web3 debate');
+
+  // Verify theme chip is displayed in the SummaryBar
+  expect(screen.getByText(/theme: "Cryptocurrency…"/i)).toBeInTheDocument();
+  expect(screen.getByText(/gap merge/i)).toBeInTheDocument();
+  expect(screen.getByText(/podcast mode/i)).toBeInTheDocument();
+  expect(screen.getByText(/recap style/i)).toBeInTheDocument();
 });
 
 

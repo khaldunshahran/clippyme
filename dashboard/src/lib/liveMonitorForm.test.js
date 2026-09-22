@@ -110,3 +110,12 @@ test('clipSelectionPayload: fixed vs auto, bounds and garbage input', () => {
     clip_selection: 'auto', max_clips: 5, min_viral_score: 70,
   });
 });
+
+test('STREAM_QUALITY_OPTIONS: includes source best and fallback ladders', async () => {
+  const { STREAM_QUALITY_OPTIONS } = await import('./liveMonitorForm.js');
+  assert.ok(Array.isArray(STREAM_QUALITY_OPTIONS));
+  assert.ok(STREAM_QUALITY_OPTIONS.length >= 3);
+  assert.equal(STREAM_QUALITY_OPTIONS[0].id, 'best');
+  assert.ok(STREAM_QUALITY_OPTIONS.some((opt) => opt.id.includes('720p')));
+});
+

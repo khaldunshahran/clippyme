@@ -140,10 +140,24 @@ def make_workers(
                         except Exception as exc:
                             logger.warning("Cleanup skipped cache %s: %s", filename, exc)
 
-                # Storage sweep: purge partial downloads, failed task leftovers, and published video assets
+                # Storage sweep: purge partial downloads, ASR audio dumps, orphaned uploads,
+                # published video assets, and completed job source videos older than 3 days.
                 try:
                     from clippyme.domain.job_artifacts import run_storage_cleanup
-                    await asyncio.to_thread(run_storage_cleanup, output_dir)
+                    from clippyme.domain.job_control import ACTIVE_STATES
+                    protected_uploads = active_input_paths(jobs)
+                    active_job_ids = {jid for jid, job in jobs.items() if job.get("status") in ACTIVE_STATES}
+                    source_retention = int(os.environ.get("SOURCE_VIDEO_RETENTION_SECONDS", str(3 * 86400)))
+                    await asyncio.to_thread(
+                        run_storage_cleanup,
+                        output_dir=output_dir,
+                        upload_dir=upload_dir,
+                        purge_raw_sources=True,
+                        source_max_age_seconds=source_retention,
+                        active_paths=protected_uploads,
+                        partial_min_age_seconds=1800.0,
+                        protected_job_ids=active_job_ids,
+                    )
                 except Exception as exc:
                     logger.warning("Periodic storage cleanup failed: %s", exc)
 

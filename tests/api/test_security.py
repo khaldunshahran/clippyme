@@ -84,6 +84,11 @@ def test_is_trusted_origin_rejects_none_and_empty(monkeypatch):
     assert is_trusted_origin("") is False
 
 
+def test_is_trusted_origin_rejects_arbitrary_trycloudflare(monkeypatch):
+    monkeypatch.setattr(security, "ALLOWED_ORIGINS", ["http://localhost:5175"])
+    assert is_trusted_origin("https://attacker-random-tunnel.trycloudflare.com") is False
+
+
 # --- is_trusted_client_host ------------------------------------------------
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost", "LOCALHOST"])

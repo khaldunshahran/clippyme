@@ -1,11 +1,12 @@
-import os
-import time
-import subprocess
+import hmac
 import json
 import logging
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
+import subprocess
+import time
 from typing import Optional, Tuple
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
 import yt_dlp
 from yt_dlp.utils import sanitize_filename
 
@@ -61,8 +62,14 @@ def _write_source_info(output_dir, info):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(tmp, os.path.join(output_dir, SOURCE_INFO_FILENAME))
+
+        # Capture and persist audience intelligence (comments, timestamps, description)
+        from clippyme.pipeline.audience_intel import parse_audience_intel, save_audience_intel
+        intel = parse_audience_intel(info)
+        if intel:
+            save_audience_intel(output_dir, intel)
     except Exception as exc:
-        logger.warning(f"source_info capture skipped: {exc}")
+        logger.warning(f"source_info/audience_intel capture skipped: {exc}")
 
 def _extractor_args_for(attempt: str):
     if not attempt or attempt.lower() == "default":
@@ -143,12 +150,12 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 def _is_safe_output_dir(target_dir: str) -> bool:
     if not target_dir:
         return False
-    abs_target = os.path.abspath(target_dir)
+    abs_target = os.path.normcase(os.path.abspath(target_dir))
     allowed_roots = [
-        REPO_ROOT,
-        os.path.abspath(os.getenv("OUTPUT_DIR", "output")),
-        os.path.abspath("data"),
-        os.path.abspath("tmp"),
+        os.path.normcase(REPO_ROOT),
+        os.path.normcase(os.path.abspath(os.getenv("OUTPUT_DIR", "output"))),
+        os.path.normcase(os.path.abspath("data")),
+        os.path.normcase(os.path.abspath("tmp")),
     ]
     for root in allowed_roots:
         try:
@@ -160,9 +167,29 @@ def _is_safe_output_dir(target_dir: str) -> bool:
 
 
 @app.post("/download")
-def download_video(req: DownloadRequest):
+def download_video(req: DownloadRequest, request: Request = None):
+    # Enforce loopback or internal token authorization if called via HTTP
+    if request:
+        client_host = request.client.host if request.client else ""
+        internal_token = os.environ.get("CLIPPYME_INTERNAL_TOKEN") or os.environ.get("CLIPPYME_API_TOKEN")
+        if internal_token:
+            provided_token = request.headers.get("X-API-Token") or request.headers.get("Authorization", "").replace("Bearer ", "")
+            if not provided_token or not hmac.compare_digest(internal_token, provided_token):
+                raise HTTPException(status_code=401, detail="Unauthorized downloader access")
+        elif client_host not in ("127.0.0.1", "::1", "localhost", "testclient"):
+            raise HTTPException(status_code=403, detail="Downloader microservice only accessible from localhost")
+
     if not _is_safe_output_dir(req.output_dir):
         raise HTTPException(status_code=400, detail="Invalid or unauthorized output_dir")
+
+    # SSRF & supported source URL validation
+    try:
+        from clippyme.pipeline.download import validate_supported_source_url, _reject_rebound_internal
+        validate_supported_source_url(req.url)
+        _reject_rebound_internal(req.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     step_start_time = time.time()
     cookies_path = _resolve_cookies_path(req.cookies_file_path)
     
@@ -223,7 +250,16 @@ def download_video(req: DownloadRequest):
             attempt_opts['extractor_args'] = extractor_args
 
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            info_opts = dict(attempt_opts)
+            info_opts['getcomments'] = True
+            ext_args = dict(info_opts.get('extractor_args') or {})
+            yt_args = dict(ext_args.get('youtube') or {})
+            yt_args.setdefault('comment_sort', ['top'])
+            yt_args.setdefault('max_comments', ['50'])
+            ext_args['youtube'] = yt_args
+            info_opts['extractor_args'] = ext_args
+
+            with yt_dlp.YoutubeDL(info_opts) as ydl:
                 info = ydl.extract_info(req.url, download=False)
                 video_title = info.get('title', 'remote_video')
                 sanitized_title = sanitize_filename(video_title)

@@ -43,16 +43,19 @@ async def submit_job(
     on_change=None,
     cleanup_paths=(),
     input_path: str | None = None,
+    user_id: str = "default_user",
 ) -> None:
     """Register and enqueue a job, rolling every artefact back on queue-full."""
     max_attempts = configured_max_attempts()
     env["CLIPPYME_JOB_ID"] = job_id
     env["CLIPPYME_JOB_MAX_ATTEMPTS"] = str(max_attempts)
+    env["CLIPPYME_USER_ID"] = user_id
 
     runtime = RuntimeState(job_output_dir, job_id=job_id)
     runtime.data["max_attempts"] = max_attempts
     runtime.data["attempt"] = 0
     runtime.data["detail"] = "waiting for a worker"
+    runtime.data["user_id"] = user_id
     runtime.save()
 
     jobs[job_id] = {
@@ -62,6 +65,7 @@ async def submit_job(
         "env": env,
         "output_dir": job_output_dir,
         "input_path": input_path,
+        "user_id": user_id,
         "result": {"clips": [], **runtime_result_fields(job_output_dir)},
         "attempt": 0,
         "max_attempts": max_attempts,

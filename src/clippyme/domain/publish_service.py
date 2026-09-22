@@ -172,6 +172,15 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
                 "at": datetime.now(timezone.utc).isoformat(),
             },
         )
+        from clippyme.domain.analytics_service import record_published_clip as record_analytics
+        await asyncio.to_thread(
+            record_analytics,
+            job_id,
+            clip_index,
+            resolved.clip_info,
+            result,
+            req.get("platforms"),
+        )
     except Exception as e:
         logger.warning("publish: failed to persist publish record for %s/%d: %s", job_id, clip_index, e)
 

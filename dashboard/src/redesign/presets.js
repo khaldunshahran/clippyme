@@ -16,9 +16,12 @@ const DEFAULT_KEY = 'clippyme_default_preset_v1';
 export const PRESET_KEYS = [
   'clipsAuto', 'clips', 'aspect', 'detect', 'reframe', 'reframeMode', 'letterboxZoom', 'model',
   'smartcut', 'zoom',
-  'subtitles', 'subMode', 'subPreset', 'subPosition', 'subFont', 'subColor',
+  'subtitles', 'subMode', 'subPreset', 'subPosition', 'subAlign', 'subFont', 'subColor',
+  'subStroke', 'subOffsetY', 'subFontSize', 'subOutlineW', 'subBg',
   'hooks', 'hookPos', 'hookSize', 'hookStyle',
-  'logo', 'logoPos', 'logoSize', 'language',
+  'logo', 'logoPos', 'logoSize', 'gradePreset',
+  'banner', 'bannerPlatform', 'bannerHandle', 'bannerYPct',
+  'durationMode', 'minDuration', 'maxDuration', 'clipType', 'language',
 ];
 
 export function captureOpts(opts) {

@@ -17,6 +17,7 @@
 // opener). Only shared config — reframe / smart-cut / subtitles / hook style /
 // logo — is applied across the selected clips (see lib/bulkApply.js).
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Icon, Btn } from './primitives';
 import { HOOK_STYLE_DEFAULT } from './data';
 import { useModalA11y } from './useModalA11y';
@@ -57,7 +58,11 @@ export function EditClipModal({ clip, idx, jobId, initial, appliedMode, preselec
   const [subsOn, setSubsOn] = useState(t0.subtitles ?? !!pre.subtitles);
   const [hookOn, setHookOn] = useState(t0.hook ?? !!pre.hook);
   const [logoOn, setLogoOn] = useState(t0.logo ?? !!pre.logo);
-  const [bannerOn, setBannerOn] = useState(t0.banner ?? !!(pre.banner || sourceBanner));
+  const [bannerOn, setBannerOn] = useState(() => {
+    if (t0.banner !== undefined) return !!t0.banner;
+    if (pre.banner !== undefined) return !!(pre.banner && pre.banner.enabled);
+    return false;
+  });
 
   const lp0 = initial?.logoParams || seedLogoParams(preselections);
   const [logo, setLogo] = useState(() => ({
@@ -165,7 +170,7 @@ export function EditClipModal({ clip, idx, jobId, initial, appliedMode, preselec
       dropRanges: effSmartcut ? dropRanges : [] });
   };
 
-  return (
+  const modalNode = (
     // Backdrop click is a mouse-only convenience; keyboard users close via
     // Esc (useModalA11y). currentTarget guard replaces stopPropagation.
     <div className="overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -192,7 +197,7 @@ export function EditClipModal({ clip, idx, jobId, initial, appliedMode, preselec
             </div>
           </div>
 
-          <div>
+          <div className="edit-pane">
             <div className="edit-tabs" role="tablist">
               {TABS.map((t) => (
                 <button key={t.id} type="button" role="tab" aria-selected={tab === t.id}
@@ -248,4 +253,6 @@ export function EditClipModal({ clip, idx, jobId, initial, appliedMode, preselec
       </div>
     </div>
   );
+
+  return typeof document !== 'undefined' ? createPortal(modalNode, document.body) : modalNode;
 }

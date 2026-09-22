@@ -113,3 +113,76 @@ def test_resolve_channel_id_rejects_http_and_non_channel_urls():
         yf.resolve_channel_id("http://www.youtube.com/@creator")
     with pytest.raises(ValueError):
         yf.resolve_channel_id("https://www.youtube.com/watch?v=abc123XYZ_1")
+
+
+def test_canonical_youtube_live_url():
+    assert yf.canonical_youtube_live_url("@MrBeast") == "https://www.youtube.com/@MrBeast/live"
+    assert yf.canonical_youtube_live_url("UC1234567890123456789012") == "https://www.youtube.com/channel/UC1234567890123456789012/live"
+    assert yf.canonical_youtube_live_url("https://youtube.com/@x") == "https://www.youtube.com/@x/live"
+    assert yf.canonical_youtube_live_url("https://www.youtube.com/@x/live") == "https://www.youtube.com/@x/live"
+
+
+def test_check_youtube_live_detects_live_stream(monkeypatch):
+    class FakeYDL:
+        def __init__(self, options):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, **kwargs):
+            return {
+                "is_live": True,
+                "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist.m3u8",
+                "timestamp": 1700000000,
+            }
+
+    import sys
+    from types import SimpleNamespace
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYDL))
+
+    is_live, stream_url, started_at = yf.check_youtube_live("@streamer")
+    assert is_live is True
+    assert "hls_playlist.m3u8" in stream_url
+    assert started_at is not None
+
+
+def test_check_youtube_live_detects_offline(monkeypatch):
+    class FakeYDL:
+        def __init__(self, options):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, **kwargs):
+            return {"is_live": False, "live_status": "not_live"}
+
+    import sys
+    from types import SimpleNamespace
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYDL))
+
+    is_live, stream_url, started_at = yf.check_youtube_live("@streamer")
+    assert is_live is False
+    assert stream_url is None
+    assert started_at is None
+
+
+def test_get_youtube_live_stream_url(monkeypatch):
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, **kwargs):
+            return {"url": "https://manifest.googlevideo.com/live.m3u8"}
+
+    import sys
+    from types import SimpleNamespace
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYDL))
+
+    url = yf.get_youtube_live_stream_url("https://youtube.com/@test/live", quality="720p")
+    assert url == "https://manifest.googlevideo.com/live.m3u8"
+

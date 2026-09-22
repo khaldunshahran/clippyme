@@ -5,17 +5,40 @@ Host-testable with no heavy ML or cv2 dependencies.
 import json
 import logging
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from clippyme.pipeline.cut_ops import snap_clip_to_words
 
 logger = logging.getLogger("clippyme.highlights")
 
 
+CONTENT_MODES = {
+    "podcast": "Multi-speaker dialogue, interviews, conversational banter, and debates.",
+    "lecture": "Educational instruction, step-by-step tutorials, slide explanations, and structured lessons.",
+    "meeting": "Business discussions, product demonstrations, status updates, and strategic reviews.",
+    "vlog": "Personal narrative, daily experiences, travel, and personal storytelling.",
+    "social": "Fast-paced talking head, punchy commentary, opinion rants, and reaction videos.",
+}
+
+OUTPUT_STYLES = {
+    "recap": "Complete chronological story digest from setup to conclusion, capturing the full narrative journey.",
+    "trailer": "High-suspense teaser with provocative hooks and cliffhangers that withholds the resolution to drive viewers to the full video.",
+    "educational": "Insight-driven summary focusing on core concepts, frameworks, definitions, and actionable takeaways.",
+    "best_moments": "Peak excitement, funniest jokes, highest-energy climaxes, and most memorable highlights.",
+    "decision_log": "Action items, agreements, verdicts, key decisions, and strategic outcomes.",
+}
+
+DEFAULT_WORD_START_PADDING_SECONDS = 0.20
+DEFAULT_WORD_END_PADDING_SECONDS = 0.35
+DEFAULT_WORD_COLLISION_GUARD_SECONDS = 0.10
+
+
 MULTI_TIER_HIGHLIGHT_PROMPT_TEMPLATE = """You are a world-class documentary director and master video recap editor.
 Your task is to analyze the full video transcript and construct a series of TRUE RECAP HIGHLIGHT REELS that summarize the entire video narrative from beginning to end.
 
 A viewer watching these reels should understand the full story, key arguments, progression, and final conclusion without having to watch the full video.
+
+{editorial_steering}
 
 ## CRITICAL NARRATIVE & RECAP RULES:
 1. **COMPLETE CHRONOLOGICAL STORY ARC (0% to 100%)**:
@@ -75,6 +98,8 @@ TRANSCRIPT WITH WORD-LEVEL TIMESTAMPS:
 
 SINGLE_SUPERCUT_PROMPT_TEMPLATE = """You are a world-class documentary director and master video recap editor.
 Your task is to analyze the full video transcript and construct a single, cohesive RECAP HIGHLIGHT REEL that summarizes the entire video narrative from beginning to end in chronological order.
+
+{editorial_steering}
 
 ## RECAP RULES:
 1. **Target Duration**: ~{target_duration} seconds (strict window: {min_dur}s to {max_dur}s).
@@ -160,6 +185,53 @@ def _deduplicate_and_trim_overlaps(cuts: List[Dict[str, Any]]) -> List[Dict[str,
             })
 
     return cleaned
+
+
+def merge_adjacent_cuts(
+    cuts: List[Dict[str, Any]],
+    merge_gap_seconds: float = 1.5,
+) -> List[Dict[str, Any]]:
+    """Merge cuts separated by small pauses (<= merge_gap_seconds) into cohesive segments.
+
+    Eliminates jarring micro jump-cuts between adjacent sentences within the same thought,
+    preserving natural speech cadence.
+    """
+    if not cuts:
+        return []
+
+    if merge_gap_seconds <= 0:
+        return [dict(c) for c in cuts]
+
+    sorted_cuts = sorted(cuts, key=lambda x: float(x.get("start", 0.0)))
+    merged: List[Dict[str, Any]] = []
+
+    for c in sorted_cuts:
+        if not merged:
+            merged.append(dict(c))
+            continue
+
+        prev = merged[-1]
+        prev_end = float(prev["end"])
+        curr_start = float(c["start"])
+        curr_end = float(c["end"])
+
+        # If current cut begins within merge_gap_seconds after prev_end (or overlaps)
+        if curr_start <= prev_end + merge_gap_seconds:
+            new_end = max(prev_end, curr_end)
+            prev["end"] = round(new_end, 2)
+            prev["duration"] = round(prev["end"] - prev["start"], 2)
+
+            curr_summary = str(c.get("summary", "")).strip()
+            prev_summary = str(prev.get("summary", "")).strip()
+            if curr_summary and curr_summary not in prev_summary:
+                if prev_summary:
+                    prev["summary"] = f"{prev_summary}; {curr_summary}"
+                else:
+                    prev["summary"] = curr_summary
+        else:
+            merged.append(dict(c))
+
+    return merged
 
 
 TIER_DURATION_BOUNDS = {
@@ -322,10 +394,37 @@ def _chunk_transcript(
     return "\n".join(lines)
 
 
+def _format_editorial_steering(
+    content_mode: Optional[str] = "podcast",
+    output_style: Optional[str] = "recap",
+    theme: Optional[str] = None,
+) -> str:
+    """Format editorial guidelines and theme into prompt instructions."""
+    cm_key = (content_mode or "podcast").lower().strip()
+    cm_desc = CONTENT_MODES.get(cm_key, CONTENT_MODES["podcast"])
+
+    os_key = (output_style or "recap").lower().strip()
+    os_desc = OUTPUT_STYLES.get(os_key, OUTPUT_STYLES["recap"])
+
+    lines = [
+        "## EDITORIAL STEERING & FOCUS:",
+        f"- **Content Mode ({cm_key})**: {cm_desc}",
+        f"- **Output Style ({os_key})**: {os_desc}",
+    ]
+    if theme and theme.strip():
+        lines.append(
+            f'- **Custom Focus Theme**: "{theme.strip()}". PRIORITIZE moments, discussions, and arguments relevant to this theme while preserving the narrative arc.'
+        )
+    return "\n".join(lines)
+
+
 def build_multi_tier_highlights_prompt(
     transcript_words: List[Dict[str, Any]],
     video_duration_sec: float = 600.0,
     video_title: str = "",
+    content_mode: Optional[str] = "podcast",
+    output_style: Optional[str] = "recap",
+    theme: Optional[str] = None,
 ) -> str:
     """Build the prompt for Gemini to generate multiple highlight packages across duration tiers."""
     dur = float(video_duration_sec or 600.0)
@@ -338,16 +437,21 @@ def build_multi_tier_highlights_prompt(
         extended_tier_desc = ""
 
     transcript_text = _chunk_transcript(transcript_words, max_chunks=4000)
+    editorial_steering = _format_editorial_steering(content_mode, output_style, theme)
 
     return MULTI_TIER_HIGHLIGHT_PROMPT_TEMPLATE.format(
         video_title=video_title or "Untitled Video",
         video_duration=int(dur),
         extended_tier_desc=extended_tier_desc,
         transcript_text=transcript_text,
+        editorial_steering=editorial_steering,
     )
 
 
-def parse_multi_tier_response(raw_response: str) -> List[Dict[str, Any]]:
+def parse_multi_tier_response(
+    raw_response: str,
+    merge_gap_seconds: float = 1.5,
+) -> List[Dict[str, Any]]:
     """Parse and validate the multi-tier JSON response from Gemini."""
     text = (raw_response or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
@@ -400,8 +504,10 @@ def parse_multi_tier_response(raw_response: str) -> List[Dict[str, Any]]:
             if validated_cuts:
                 # 1. Deduplicate & trim overlapping spans
                 deduped = _deduplicate_and_trim_overlaps(validated_cuts)
-                # 2. Enforce duration limits for tier with anchor protection
-                bounded = _enforce_tier_duration(deduped, tier)
+                # 2. Merge adjacent cuts separated by small pauses
+                merged = merge_adjacent_cuts(deduped, merge_gap_seconds=merge_gap_seconds)
+                # 3. Enforce duration limits for tier with anchor protection
+                bounded = _enforce_tier_duration(merged, tier)
 
                 if bounded:
                     total_dur = sum(c["duration"] for c in bounded)
@@ -428,6 +534,9 @@ def build_supercut_prompt(
     target_duration_sec: int = 60,
     video_duration_sec: float = 600.0,
     video_title: str = "",
+    content_mode: Optional[str] = "podcast",
+    output_style: Optional[str] = "recap",
+    theme: Optional[str] = None,
 ) -> str:
     """Build the prompt for Gemini to select an ordered highlight reel timeline for a single target duration."""
     target_duration = max(30, min(300, int(target_duration_sec)))
@@ -436,6 +545,7 @@ def build_supercut_prompt(
     dur = float(video_duration_sec or 600.0)
 
     transcript_text = _chunk_transcript(transcript_words, max_chunks=4000)
+    editorial_steering = _format_editorial_steering(content_mode, output_style, theme)
 
     return SINGLE_SUPERCUT_PROMPT_TEMPLATE.format(
         video_title=video_title or "Untitled Video",
@@ -444,12 +554,14 @@ def build_supercut_prompt(
         min_dur=min_dur,
         max_dur=max_dur,
         transcript_text=transcript_text,
+        editorial_steering=editorial_steering,
     )
 
 
 def parse_supercut_response(
     raw_response: str,
     target_duration_sec: Optional[int] = None,
+    merge_gap_seconds: float = 1.5,
 ) -> Dict[str, Any]:
     """Parse and validate the JSON response from Gemini for a single supercut timeline."""
     text = (raw_response or "").strip()
@@ -506,14 +618,17 @@ def parse_supercut_response(
     if not cleaned_cuts:
         raise ValueError("No valid non-overlapping cuts found in response")
 
-    # 2. Enforce duration bounds with anchor protection if target duration provided
+    # 2. Merge adjacent cuts separated by small pauses
+    merged_cuts = merge_adjacent_cuts(cleaned_cuts, merge_gap_seconds=merge_gap_seconds)
+
+    # 3. Enforce duration bounds with anchor protection if target duration provided
     if target_duration_sec is not None:
         target_d = int(target_duration_sec)
         min_d = max(15.0, float(target_d - 15))
         max_d = float(target_d + 15)
-        bounded_cuts = _enforce_duration_bounds(cleaned_cuts, min_d=min_d, max_d=max_d, tier_name="supercut")
+        bounded_cuts = _enforce_duration_bounds(merged_cuts, min_d=min_d, max_d=max_d, tier_name="supercut")
     else:
-        bounded_cuts = cleaned_cuts
+        bounded_cuts = merged_cuts
 
     total_dur = sum(c["duration"] for c in bounded_cuts)
     return {
@@ -525,13 +640,106 @@ def parse_supercut_response(
     }
 
 
+def snap_cut_boundaries_guarded(
+    start: float,
+    end: float,
+    words: List[Dict[str, Any]],
+    *,
+    start_padding: float = DEFAULT_WORD_START_PADDING_SECONDS,
+    end_padding: float = DEFAULT_WORD_END_PADDING_SECONDS,
+    collision_guard: float = DEFAULT_WORD_COLLISION_GUARD_SECONDS,
+    source_duration: Optional[float] = None,
+    max_snap: float = 0.6,
+) -> Tuple[float, float]:
+    """Snap cut boundaries to transcript words with acoustic headroom padding and collision guards.
+
+    - Snaps to first and last kept words matching [start, end].
+    - Applies start_padding (default 0.20s) before first word, guarded by prev_word.end + collision_guard.
+    - Applies end_padding (default 0.35s) after last word, guarded by next_word.start - collision_guard.
+    - Clamps to [0, source_duration] without collapsing the range.
+    """
+    try:
+        start = float(start)
+        end = float(end)
+    except (TypeError, ValueError):
+        return start, end
+
+    if end <= start or not words:
+        return start, end
+
+    # Find the nearest boundary word indices
+    first_idx = None
+    best_start_dist = max_snap
+    for i, w in enumerate(words):
+        w_start = float(w.get("start", 0.0))
+        dist = abs(w_start - start)
+        if dist <= best_start_dist:
+            best_start_dist = dist
+            first_idx = i
+
+    last_idx = None
+    best_end_dist = max_snap
+    for i, w in enumerate(words):
+        w_end = float(w.get("end", 0.0))
+        dist = abs(w_end - end)
+        if dist <= best_end_dist:
+            best_end_dist = dist
+            last_idx = i
+
+    if first_idx is not None and last_idx is not None and last_idx >= first_idx:
+        raw_start = float(words[first_idx]["start"])
+        raw_end = float(words[last_idx]["end"])
+
+        # Calculate padded start with collision guard
+        padded_start = raw_start - start_padding
+        if first_idx > 0:
+            prev_word_end = float(words[first_idx - 1]["end"])
+            min_allowed_start = prev_word_end + collision_guard
+            padded_start = max(padded_start, min_allowed_start)
+        else:
+            padded_start = max(0.0, padded_start)
+
+        # Calculate padded end with collision guard
+        padded_end = raw_end + end_padding
+        if last_idx < len(words) - 1:
+            next_word_start = float(words[last_idx + 1]["start"])
+            max_allowed_end = next_word_start - collision_guard
+            padded_end = min(padded_end, max_allowed_end)
+
+        new_start = max(0.0, round(padded_start, 3))
+        new_end = round(padded_end, 3)
+    else:
+        # Fallback to snap_clip_to_words if word lookup is ambiguous
+        new_start, new_end = snap_clip_to_words(
+            start,
+            end,
+            words,
+            pre_pad=start_padding,
+            post_pad=end_padding,
+            max_snap=max_snap,
+            source_duration=source_duration,
+        )
+
+    if source_duration is not None:
+        new_start = max(0.0, min(new_start, float(source_duration)))
+        new_end = max(0.0, min(new_end, float(source_duration)))
+
+    if new_end <= new_start:
+        return start, end
+
+    return new_start, new_end
+
+
 def snap_supercut_timeline(
     cuts: List[Dict[str, Any]],
     transcript_words: List[Dict[str, Any]],
     source_video_duration_sec: Optional[float] = None,
     max_duration_sec: Optional[float] = None,
+    start_padding: float = DEFAULT_WORD_START_PADDING_SECONDS,
+    end_padding: float = DEFAULT_WORD_END_PADDING_SECONDS,
+    collision_guard: float = DEFAULT_WORD_COLLISION_GUARD_SECONDS,
 ) -> List[Dict[str, Any]]:
-    """Snap each micro-cut to natural word boundaries and clamp within source video bounds."""
+    """Snap each micro-cut to natural word boundaries with acoustic headroom and clamp within source video bounds."""
     if not cuts:
         return []
 
@@ -544,10 +752,13 @@ def snap_supercut_timeline(
         raw_end = float(c.get("end", 0.0))
 
         if transcript_words:
-            start, end = snap_clip_to_words(
+            start, end = snap_cut_boundaries_guarded(
                 raw_start,
                 raw_end,
                 transcript_words,
+                start_padding=start_padding,
+                end_padding=end_padding,
+                collision_guard=collision_guard,
                 source_duration=effective_source_dur,
             )
         else:

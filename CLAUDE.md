@@ -5,10 +5,54 @@ design history and rationale live in `docs/` (see the pointers at the bottom).
 
 ## Project
 
-ClippyMe is a self-hosted AI video platform that turns long-form videos
-(YouTube or local uploads) into viral 9:16 vertical shorts. Fork of OpenShorts.
-Backend: FastAPI + a subprocess video pipeline. Frontend: React 18 + Vite 6 +
-Tailwind v4.
+ClippyMe (brand name: **Nugget**) is a self-hosted AI video platform that turns
+long-form videos (YouTube or local uploads) into viral 9:16 vertical shorts. Fork
+of OpenShorts. Backend: FastAPI + a subprocess video pipeline. Frontend: React 18
++ Vite 6 + Tailwind v4.
+
+## Brand Book & UI Design System: Nugget
+
+Locked brand direction for all agents working on the product, UI, and copy.
+
+- **Name**: Nugget
+- **Tagline**: *Find the moment worth keeping.*
+- **Marketing Headline**: *Stop scrubbing. Start posting.*
+- **Positioning**: For creators sitting on hours of raw recordings, Nugget is the
+  clip tool that finds the one moment worth posting — and takes it the rest of
+  the way, from raw footage to a captioned, reframed, on-brand clip — built by
+  someone who actually uses it on their own channel.
+- **Voice & Tone**: "A working creator, not a growth team."
+  - Be specific and confident: *"Here's the moment most likely to hook someone."*
+  - Plain terms for errors/empty states: *"Upload something and Nugget will find the moment."*,
+    *"Scoring your recording — this usually takes a few minutes."*,
+    *"That upload didn't finish. Try again, or check your connection."*,
+    *"Clip saved. Ready to post."*
+  - Call features what the product calls them: Live Monitor, Studio, Highlights.
+  - Never use corporate buzzwords (*"Unlock viral growth with AI-powered content intelligence"*)
+    or cutesy apologetic filler (*"Oops! Something went a little wrong!"*).
+- **The Mark & Favicon (Preserved)**:
+  - The project's existing pre-rebrand logo (`dashboard/public/logo.svg` and the `.mark` organic clay element in `chrome.jsx` / `app.css`) is kept untouched and locked as the official logo and favicon.
+  - The pebble mark from the external PDF is NOT used.
+- **Clay Palette**:
+  - Coral (`#E8654A`, 300: `#F2A392`, 700: `#B84631`): Primary action color, mark, buttons.
+  - Moss (`#5E7F5E`, 300: `#9BB89B`): Success and "kept" states.
+  - Gold (`#DE9A34`, 300: `#F0C685`): Scarce virality/score gauge signal only (not decoration).
+  - Putty (`#EFE6D8`, 700: `#DCCFBC`): Neutral surface / well track.
+  - Ink (`#2A211C`): Neutral deep charcoal text.
+  - Screen ratio: 60% Putty/Ink, 30% Coral, 10% Moss/Gold.
+- **Typography Hierarchy**:
+  - Headings / Display: `Fredoka 600` (H1 / Display), `Fredoka 500` (H2).
+  - Body & UI: `Nunito 600` (Body), `Nunito 700` (Captions / Badges).
+  - Timestamps & Telemetry: `Space Mono` (e.g. `00:14:32 → 00:15:09 · score 94`).
+- **Strict Brand Boundary**:
+  - Rebranding is strictly confined to frontend UI assets and copy in `dashboard/`.
+  - NEVER rename the backend Python package (`src/clippyme/`), API routes (`/api/*`),
+    environment variables (`CLIPPYME_*`), or storage/journal files (`data/jobs_journal.json`,
+    `.clippyme_runtime.json`).
+  - Do NOT confuse Nugget app branding with the user video watermark feature
+    (`POST /api/config/logo`, `logo.py`, `layerControls.jsx`), which is an end-user
+    rendering capability for burning custom overlays onto clips.
+
 
 ## Strict Port Allocation & Project Boundary Policy
 
@@ -296,6 +340,7 @@ through verbatim (the frontend parses per-platform 429 daily limits).
 | POST | `/api/reframe/{job_id}/{clip_index}` | Switch reframe mode post-hoc |
 | POST | `/api/publish/{job_id}/{clip_index}` | Upload + schedule via Zernio |
 | GET/POST/DELETE | `/api/config*` | Keys, cookies, logo, fonts, Zernio (trusted clients) |
+| GET/POST | `/api/trends*` | Trend Radar (AI US trend discovery, scan, 1-click clip) |
 | GET | `/api/history` · POST `/api/history/{id}/restore` · DELETE `/api/history/{id}` | Past jobs |
 
 ## Configuration

@@ -62,7 +62,7 @@ def list_available_models(api_key: Optional[str]) -> dict:
         return {"models": [], "error": _redact_key(str(e))}
 
 
-DEFAULT_PRIMARY_MODEL = "gemini-3.5-flash"
+DEFAULT_PRIMARY_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_AUXILIARY_MODEL = "gemini-3.5-flash-lite"
 
 

@@ -122,3 +122,81 @@ def build_cut_command(input_video: str, start: float, end: float, dest: str) -> 
         '-c:a', 'aac',
         dest,
     ]
+
+
+_CLIP_SUFFIX_RE = re.compile(r"_clip_\d+\.mp4$", re.IGNORECASE)
+_YT_VIDEO_ID_RE = re.compile(r"(?:v=|\/embed\/|\/live\/|\/shorts\/|youtu\.be\/|\/v\/)([A-Za-z0-9_-]{11})")
+
+
+def is_clip_artifact(filename: str) -> bool:
+    """Return True if filename is an output or intermediate clip artifact, not a source video."""
+    base = os.path.basename(filename)
+    low = base.lower()
+    return bool(
+        low.startswith("source_")
+        or low.startswith("clip_")
+        or low.startswith("composed_")
+        or low.startswith("highlight_reel_")
+        or low.endswith(".tmp.mp4")
+        or low.endswith(".render.tmp.mp4")
+        or low.endswith(".tmp")
+        or bool(_CLIP_SUFFIX_RE.search(low))
+    )
+
+
+def find_source_video_candidate(output_dir: str, min_size: int = 10_000) -> str | None:
+    """Find the most likely original or trimmed source video in output_dir, ignoring clips.
+
+    If multiple candidates exist, files starting with 'trimmed_' (head-trimmed source)
+    take priority, followed by the largest file by byte size.
+    """
+    if not os.path.isdir(output_dir):
+        return None
+    candidates: list[tuple[str, int, str]] = []
+    try:
+        entries = os.listdir(output_dir)
+    except OSError:
+        return None
+
+    for item in entries:
+        if not item.lower().endswith(".mp4"):
+            continue
+        if is_clip_artifact(item):
+            continue
+        full_path = os.path.join(output_dir, item)
+        try:
+            sz = os.path.getsize(full_path)
+            if sz >= min_size:
+                candidates.append((item, sz, full_path))
+        except OSError:
+            continue
+
+    if not candidates:
+        return None
+
+    trimmed = [c for c in candidates if c[0].lower().startswith("trimmed_")]
+    if trimmed:
+        return max(trimmed, key=lambda c: c[1])[2]
+    return max(candidates, key=lambda c: c[1])[2]
+
+
+def extract_youtube_video_id(url: str | None) -> str | None:
+    """Extract standard 11-char YouTube video id from various URL shapes, or None."""
+    if not url or not isinstance(url, str):
+        return None
+    match = _YT_VIDEO_ID_RE.search(url)
+    return match.group(1) if match else None
+
+
+def is_same_video_source(url_a: str | None, url_b: str | None) -> bool:
+    """Compare two source URLs, treating matching YouTube video IDs as identical."""
+    if not url_a or not url_b:
+        return False
+    if url_a == url_b:
+        return True
+    id_a = extract_youtube_video_id(url_a)
+    id_b = extract_youtube_video_id(url_b)
+    if id_a and id_b:
+        return id_a == id_b
+    return False
+

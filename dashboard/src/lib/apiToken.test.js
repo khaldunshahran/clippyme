@@ -1,4 +1,4 @@
-// Node unit tests for the optional API token helper (LAN deploys).
+// Node unit tests for the optional API token helper (LAN deploys) and Bearer auth tokens.
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
 
@@ -11,7 +11,7 @@ globalThis.localStorage = {
   removeItem: (k) => store.delete(k),
 };
 
-const { getApiToken, setApiToken, apiFetch } = await import('./apiToken.js');
+const { getApiToken, setApiToken, getAuthToken, setAuthToken, apiFetch } = await import('./apiToken.js');
 
 test('token round-trip + trim', () => {
   store.clear();
@@ -25,6 +25,21 @@ test('empty/whitespace token clears storage', () => {
   setApiToken('s3cret');
   setApiToken('   ');
   assert.equal(getApiToken(), '');
+  assert.equal(store.size, 0);
+});
+
+test('authToken round-trip + trim', () => {
+  store.clear();
+  assert.equal(getAuthToken(), '');
+  setAuthToken('  jwt-bearer-token  ');
+  assert.equal(getAuthToken(), 'jwt-bearer-token');
+});
+
+test('empty/whitespace authToken clears storage', () => {
+  store.clear();
+  setAuthToken('jwt-bearer-token');
+  setAuthToken('   ');
+  assert.equal(getAuthToken(), '');
   assert.equal(store.size, 0);
 });
 
@@ -46,4 +61,13 @@ test('apiFetch with token attaches X-API-Token and keeps existing headers', asyn
   assert.equal(captured.init.headers['X-API-Token'], 's3cret');
   assert.equal(captured.init.headers['Content-Type'], 'application/json');
   assert.equal(captured.init.method, 'POST');
+});
+
+test('apiFetch with authToken attaches Authorization: Bearer header', async () => {
+  store.clear();
+  setAuthToken('my-supabase-jwt');
+  let captured;
+  globalThis.fetch = (url, init) => { captured = { url, init }; return Promise.resolve('ok'); };
+  await apiFetch('/api/status/123', { method: 'GET' });
+  assert.equal(captured.init.headers['Authorization'], 'Bearer my-supabase-jwt');
 });

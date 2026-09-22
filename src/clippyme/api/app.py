@@ -2,6 +2,7 @@ import os
 import sys
 import uuid
 import shutil
+import glob
 import asyncio
 import logging
 from dotenv import load_dotenv
@@ -25,17 +26,19 @@ if sys.version_info < (3, 11):
     )
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header
+from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
+from clippyme.api.auth import AuthUser, get_current_user
+
 from clippyme.domain.job_results import build_main_cmd, canonical_reframe_mode
 from clippyme.domain.compose import compose_layers
 from clippyme.domain.reframe_service import run_reframe
-from clippyme.domain.errors import ClippyMeError
+from clippyme.domain.errors import ClippyMeError, NotFoundError, ValidationError
 from clippyme.domain.uploads import stream_upload_within_limit, FileTooLarge
 from clippyme.domain.clip_endpoints import run_smart_cut, restore_job_from_disk
 from clippyme.domain.clip_resolve import resolve_clip
@@ -76,6 +79,9 @@ from clippyme.api.dubbing_routes import router as dubbing_router
 from clippyme.api.studio_routes import router as studio_router
 from clippyme.api.ugc_routes import router as ugc_router
 from clippyme.api.highlight_routes import router as highlight_router
+from clippyme.api.billing_routes import router as billing_router
+from clippyme.api.trend_routes import make_trend_router
+from clippyme.api.channel_routes import router as channel_router
 
 load_dotenv()
 
@@ -172,6 +178,39 @@ async def lifespan(app: FastAPI):
     )
     telegram_task = asyncio.create_task(telegram_listener.start())
 
+    # Trend Radar background poller: periodic AI trend research for US topics
+    async def trend_radar_poller():
+        from clippyme.api.trend_routes import load_trend_config
+        from clippyme.domain.trend_discovery import run_trend_discovery, load_trend_radar
+        while True:
+            try:
+                cfg = load_trend_config()
+                if cfg.get("auto_scan", True):
+                    radar = load_trend_radar()
+                    last_scanned = radar.get("last_scanned")
+                    interval_sec = cfg.get("interval_hours", 3) * 3600
+                    should_scan = False
+                    if not last_scanned:
+                        should_scan = True
+                    else:
+                        try:
+                            last_dt = datetime.fromisoformat(last_scanned)
+                            if (datetime.now(timezone.utc) - last_dt).total_seconds() >= interval_sec:
+                                should_scan = True
+                        except Exception:
+                            should_scan = True
+                    if should_scan:
+                        persisted = await asyncio.to_thread(load_persistent_config)
+                        api_key = (persisted.get("GEMINI_API_KEY") if persisted else None) or os.environ.get("GEMINI_API_KEY")
+                        await asyncio.to_thread(run_trend_discovery, api_key=api_key, categories=cfg.get("categories"))
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Trend radar background poller encountered error: %s", exc)
+            await asyncio.sleep(600)  # Check every 10 minutes
+
+    trend_poller_task = asyncio.create_task(trend_radar_poller())
+
     # Bring back every monitor that was still marked resume_on_start when the
     # process last went down (durable auto-resume). Never fatal to startup —
     # a per-monitor failure stays visible via its status() instead.
@@ -191,7 +230,7 @@ async def lifespan(app: FastAPI):
     # Cancel ALL background tasks on shutdown — not just the updater. Leaving
     # the worker/cleanup loops pending blocks uvicorn's graceful exit and logs
     # "Task was destroyed but it is pending!" tracebacks.
-    _bg_tasks = (worker_task, cleanup_task, ae_updater_task, telegram_task)
+    _bg_tasks = (worker_task, cleanup_task, ae_updater_task, telegram_task, trend_poller_task)
     for _t in _bg_tasks:
         _t.cancel()
     for _t in _bg_tasks:
@@ -268,7 +307,6 @@ async def _unhandled_error_handler(request: Request, exc: Exception):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https?://.*\.trycloudflare\.com",
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "Authorization", "X-Gemini-Key", "X-API-Token"],
@@ -312,6 +350,15 @@ app.include_router(dubbing_router)
 app.include_router(studio_router)
 app.include_router(ugc_router)
 app.include_router(highlight_router)
+app.include_router(billing_router)
+trend_router = make_trend_router(
+    jobs=jobs,
+    job_queue=job_queue,
+    output_dir=OUTPUT_DIR,
+    on_change=persist_jobs,
+)
+app.include_router(trend_router)
+app.include_router(channel_router)
 
 
 @app.get("/")
@@ -326,7 +373,8 @@ async def health():
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None)
+    url: Optional[str] = Form(None),
+    user: AuthUser = Depends(get_current_user),
 ):
     # CSRF/origin gate so a malicious page can't trigger compute jobs against
     # a locally-running backend. Same trust model as the config endpoints.
@@ -360,6 +408,7 @@ async def process_endpoint(
     min_clips = None
     max_clips = None
     clip_type = None
+    duration_mode = None
     highlights = False
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -384,6 +433,7 @@ async def process_endpoint(
         min_clips = validated.min_clips
         max_clips = validated.max_clips
         clip_type = validated.clip_type
+        duration_mode = validated.duration_mode
         highlights = bool(validated.highlights)
 
     # For multipart/form-data uploads, extract reframe_mode + language from form fields
@@ -405,6 +455,7 @@ async def process_endpoint(
         min_clips = int(form["min_clips"]) if form.get("min_clips") else min_clips
         max_clips = int(form["max_clips"]) if form.get("max_clips") else max_clips
         clip_type = form.get("clip_type", clip_type) or None
+        duration_mode = form.get("duration_mode", duration_mode) or None
         highlights = str(form.get("highlights", "")).lower() in {"1", "true", "yes"} or highlights
         # Validate the multipart values through the same schema for
         # consistency — we drop the url requirement since we're using
@@ -425,6 +476,7 @@ async def process_endpoint(
                 "min_clips": min_clips,
                 "max_clips": max_clips,
                 "clip_type": clip_type,
+                "duration_mode": duration_mode,
                 "highlights": highlights,
             })
         except ValidationError as exc:
@@ -432,6 +484,11 @@ async def process_endpoint(
 
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
+
+    from clippyme.domain.quota_service import check_user_quota
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
 
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
@@ -498,6 +555,7 @@ async def process_endpoint(
             min_clips=min_clips,
             max_clips=max_clips,
             clip_type=clip_type,
+            duration_mode=duration_mode,
             highlights=highlights,
         )
     except ValueError as exc:
@@ -514,13 +572,18 @@ async def process_endpoint(
         jobs=jobs, job_queue=job_queue, job_id=job_id,
         cmd=cmd, env=env, job_output_dir=job_output_dir,
         on_change=persist_jobs, cleanup_paths=(input_path,), input_path=input_path,
+        user_id=user.id,
     )
 
     return {"job_id": job_id, "status": "queued"}
 
 
 @app.post("/api/batch")
-async def batch_process(req: BatchRequest, request: Request):
+async def batch_process(
+    req: BatchRequest,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
     """Submit multiple URLs for batch processing. Each URL becomes a separate job."""
     require_trusted_config_request(request)
     # Each batch can enqueue up to 20 jobs, so limit batch calls more tightly.
@@ -533,6 +596,11 @@ async def batch_process(req: BatchRequest, request: Request):
     )
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+
+    from clippyme.domain.quota_service import check_user_quota
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
 
     batch_jobs = []
 
@@ -563,6 +631,7 @@ async def batch_process(req: BatchRequest, request: Request):
                 min_clips=getattr(req, "min_clips", None),
                 max_clips=getattr(req, "max_clips", None),
                 clip_type=getattr(req, "clip_type", None),
+                duration_mode=getattr(req, "duration_mode", None),
             )
         except ValueError as exc:
             # This item's output dir was already created above but it never
@@ -577,7 +646,7 @@ async def batch_process(req: BatchRequest, request: Request):
             await submit_job(
                 jobs=jobs, job_queue=job_queue, job_id=job_id,
                 cmd=cmd, env=env, job_output_dir=job_output_dir, batch=True,
-                on_change=persist_jobs,
+                on_change=persist_jobs, user_id=user.id,
             )
             batch_jobs.append({"url": url, "job_id": job_id})
         except QueueFullError:
@@ -592,10 +661,61 @@ async def batch_process(req: BatchRequest, request: Request):
     return {"jobs": batch_jobs, "total": len(batch_jobs)}
 
 
+def _check_job_ownership(job_dict: dict, user: AuthUser) -> None:
+    if user.is_admin:
+        return
+    job_user = job_dict.get("user_id", "default_user")
+    if job_user != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+
+def _verify_job_ownership(job_id: str, user: AuthUser) -> None:
+    """Verify that user owns the job (or is an admin).
+
+    Checks both in-memory job state and on-disk runtime metadata.
+    Raises HTTPException(404) if job does not exist or belongs to another user.
+    """
+    if user.is_admin:
+        return
+    if job_id in jobs:
+        _check_job_ownership(jobs[job_id], user)
+        return
+
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_user = None
+    runtime_path = os.path.join(job_dir, ".clippyme_runtime.json")
+    if os.path.isfile(runtime_path):
+        try:
+            with open(runtime_path, "r", encoding="utf-8") as f:
+                rt_data = json.load(f)
+            job_user = rt_data.get("user_id")
+        except Exception:
+            pass
+
+    if not job_user:
+        meta_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+        if meta_files:
+            try:
+                with open(meta_files[0], "r", encoding="utf-8") as f:
+                    meta_data = json.load(f)
+                job_user = meta_data.get("user_id")
+            except Exception:
+                pass
+
+    job_user = job_user or "default_user"
+    if job_user != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+
 @app.get("/api/jobs/active")
-async def get_active_jobs():
+async def get_active_jobs(user: AuthUser = Depends(get_current_user)):
     active = []
     for j_id, j in jobs.items():
+        if not user.is_admin and j.get("user_id", "default_user") != user.id:
+            continue
         if j.get("status") in ("queued", "processing", "paused"):
             cmd = j.get("cmd") or []
             source = j.get("input_path")
@@ -613,7 +733,7 @@ async def get_active_jobs():
 
 
 @app.get("/api/status/{job_id}")
-async def get_status(job_id: str):
+async def get_status(job_id: str, user: AuthUser = Depends(get_current_user)):
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
     if job_id not in jobs:
@@ -625,6 +745,10 @@ async def get_status(job_id: str):
                 try:
                     with open(runtime_path, "r", encoding="utf-8") as f:
                         rt_data = json.load(f)
+                    if not user.is_admin:
+                        rt_user = rt_data.get("user_id", "default_user")
+                        if rt_user != user.id:
+                            raise HTTPException(status_code=404, detail="Job not found")
                     status = "complete" if rt_data.get("completed_at") else (
                         "failed" if rt_data.get("failed_at") else "processing"
                     )
@@ -633,11 +757,13 @@ async def get_status(job_id: str):
                         "logs": rt_data.get("logs", []),
                         "result": rt_data.get("artifacts"),
                     }
+                except HTTPException:
+                    raise
                 except Exception:
                     pass
             try:
                 files = os.listdir(job_dir)
-                if files:
+                if files and user.is_admin:
                     return {
                         "status": "complete",
                         "logs": ["Job loaded from storage"],
@@ -648,6 +774,7 @@ async def get_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
+    _check_job_ownership(job, user)
     return {
         "status": job['status'],
         "logs": job.get('logs', [])[-500:],
@@ -655,7 +782,7 @@ async def get_status(job_id: str):
     }
 
 @app.post("/api/cancel/{job_id}")
-async def cancel_job(job_id: str, request: Request):
+async def cancel_job(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Cancel a running job by killing its subprocess."""
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
@@ -663,6 +790,7 @@ async def cancel_job(job_id: str, request: Request):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    _check_job_ownership(jobs[job_id], user)
     try:
         return await cancel_job_action(job_id, jobs[job_id])
     finally:
@@ -670,7 +798,7 @@ async def cancel_job(job_id: str, request: Request):
 
 
 @app.post("/api/pause/{job_id}")
-async def pause_job(job_id: str, request: Request):
+async def pause_job(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Suspend a running job's process tree (SIGSTOP/SuspendThread via psutil)."""
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
@@ -679,6 +807,7 @@ async def pause_job(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
+    _check_job_ownership(job, user)
     if not job_control.can_pause(job['status']):
         raise HTTPException(status_code=400, detail="Job cannot be paused")
 
@@ -695,7 +824,7 @@ async def pause_job(job_id: str, request: Request):
 
 
 @app.post("/api/resume/{job_id}")
-async def resume_job(job_id: str, request: Request):
+async def resume_job(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Resume a paused job's process tree."""
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
@@ -704,6 +833,7 @@ async def resume_job(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
+    _check_job_ownership(job, user)
     if not job_control.can_resume(job['status']):
         raise HTTPException(status_code=400, detail="Job is not paused")
 
@@ -720,7 +850,7 @@ async def resume_job(job_id: str, request: Request):
 
 
 @app.post("/api/stop/{job_id}")
-async def stop_job(job_id: str, request: Request):
+async def stop_job(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Graceful stop: kill the subprocess but KEEP finished clips.
 
     Unlike ``/api/cancel`` (hard discard), this promotes the partial result to
@@ -732,6 +862,7 @@ async def stop_job(job_id: str, request: Request):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    _check_job_ownership(jobs[job_id], user)
     try:
         return await stop_job_action(job_id, jobs[job_id])
     finally:
@@ -740,11 +871,12 @@ async def stop_job(job_id: str, request: Request):
 
 @app.post("/api/retry/{job_id}")
 @app.post("/api/jobs/{job_id}/retry")
-async def retry_job_endpoint(job_id: str, request: Request):
+async def retry_job_endpoint(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Resume and retry a failed or interrupted job directly from its latest checkpoints."""
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
 
     persisted = await asyncio.to_thread(load_persistent_config)
     api_key = (
@@ -767,15 +899,44 @@ async def retry_job_endpoint(job_id: str, request: Request):
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
+@app.post("/api/jobs/{job_id}/rescore")
+async def rescore_job_endpoint(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Rescore clips in an existing job with AI virality scores and titles."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+
+    persisted = await asyncio.to_thread(load_persistent_config)
+    api_key = (
+        request.headers.get("X-Gemini-Key")
+        or (persisted.get("GEMINI_API_KEY") if persisted else None)
+        or os.environ.get("GEMINI_API_KEY")
+    )
+
+    from clippyme.domain.rescore_service import rescore_job
+    try:
+        return await asyncio.to_thread(
+            rescore_job,
+            job_id=job_id,
+            output_dir=OUTPUT_DIR,
+            api_key=api_key,
+        )
+    except ClippyMeError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    except Exception as exc:
+        logger.error("Unexpected error rescoring job %s: %s", job_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/api/smartcut/{job_id}/{clip_index}")
-async def smart_cut_clip(job_id: str, clip_index: int, request: Request):
+async def smart_cut_clip(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
     """Generate a smart-cut version of a clip (silences + filler words removed)."""
     require_trusted_config_request(request)
     enforce_rate_limit(request, "smartcut", capacity=20, refill_per_sec=20 / 60)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+    _verify_job_ownership(job_id, user)
     resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, OUTPUT_DIR)
     # Optional manual-trim spans (flycut-style interactive cut). Legacy callers
     # POST no body — tolerate that and fall back to pure auto Smart Cut.
@@ -805,13 +966,14 @@ async def smart_cut_clip(job_id: str, clip_index: int, request: Request):
 
 
 @app.get("/api/transcript/{job_id}/{clip_index}")
-async def clip_transcript(job_id: str, clip_index: int, request: Request):
+async def clip_transcript(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
     """Per-clip transcript segments (clip-relative seconds) for the manual-trim
     UI. Each segment is {index, text, start, end}; the frontend lets the user
     mark segments to drop and posts the resulting spans as `drop_ranges`."""
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
     resolved = await asyncio.to_thread(
         resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
     transcript = resolved.metadata.get("transcript") or {}
@@ -832,6 +994,7 @@ async def edit_clip_ai(
     clip_index: int,
     req: EditAIRequest,
     request: Request,
+    user: AuthUser = Depends(get_current_user),
     api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
 ):
     """Conversational clip trim: a plain-English instruction → Gemini → the
@@ -840,6 +1003,7 @@ async def edit_clip_ai(
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
     resolved = await asyncio.to_thread(
         resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
     clip = resolved.clip_info
@@ -868,18 +1032,49 @@ async def edit_clip_ai(
     return {"drop_ranges": result["drops"], "explanation": result["explanation"]}
 
 
+@app.post("/api/generate-metadata/{job_id}")
+async def generate_all_metadata_endpoint(
+    job_id: str,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+):
+    """Batch generate situational platform metadata and captions for all clips in a job."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+
+    cfg = load_persistent_config() or {}
+    key = api_key or os.environ.get("GEMINI_API_KEY") or cfg.get("GEMINI_API_KEY")
+    if not key:
+        raise HTTPException(status_code=400, detail="Gemini API key not configured")
+
+    from clippyme.domain.metadata_generator import generate_all_clips_metadata
+    result = await asyncio.to_thread(
+        generate_all_clips_metadata,
+        job_id=job_id,
+        output_dir=OUTPUT_DIR,
+        api_key=key,
+        force=True,
+    )
+    return result
+
+
 @app.post("/api/generate-metadata/{job_id}/{clip_index}")
 async def generate_clip_metadata_endpoint(
     job_id: str,
     clip_index: int,
     req: GenerateMetadataRequest,
     request: Request,
+    user: AuthUser = Depends(get_current_user),
     api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
 ):
     """AI speaker identification, trending hashtags, title, and viral caption generation."""
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
 
     resolved = await asyncio.to_thread(
         resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
@@ -894,9 +1089,13 @@ async def generate_clip_metadata_endpoint(
     video_title = resolved.metadata.get("title") or clip.get("video_title_for_youtube_short") or ""
     uploader = resolved.metadata.get("uploader") or ""
 
+    from clippyme.pipeline.audience_intel import load_audience_intel
+    audience_intel = load_audience_intel(resolved.job_dir)
+    source_info = resolved.metadata.get("source_info") or {}
+
     cfg = load_persistent_config() or {}
     key = api_key or os.environ.get("GEMINI_API_KEY") or cfg.get("GEMINI_API_KEY")
-    model = req.model or cfg.get("GEMINI_LITE_MODEL") or "gemini-2.5-flash-lite"
+    model = req.model or cfg.get("GEMINI_LITE_MODEL") or "gemini-3.5-flash-lite"
     if not key:
         raise HTTPException(status_code=400, detail="Gemini API key not configured")
 
@@ -911,12 +1110,38 @@ async def generate_clip_metadata_endpoint(
         video_title=video_title,
         uploader=uploader,
         instructions=req.instruction or "",
+        audience_intel=audience_intel,
+        source_info=source_info,
     )
+
+    # Persist the newly generated metadata back to disk
+    if isinstance(result, dict) and result.get("platforms"):
+        clip["platforms"] = result["platforms"]
+        clip["speaker_name"] = result.get("speaker_name") or clip.get("speaker_name", "")
+        clip["hashtags"] = result.get("hashtags") or clip.get("hashtags", [])
+        clip["caption"] = result.get("caption") or clip.get("caption", "")
+        clip["video_description_for_tiktok"] = result["platforms"]["tiktok"]["caption"]
+        clip["video_description_for_instagram"] = result["platforms"]["instagram"]["caption"]
+        clip["video_description"] = result["platforms"]["youtube"]["description"]
+        if result.get("title") and not clip.get("video_title_for_youtube_short"):
+            clip["video_title_for_youtube_short"] = result["title"]
+        try:
+            from clippyme.domain.job_artifacts import save_job_metadata
+            save_job_metadata(resolved.metadata_path, resolved.metadata)
+        except Exception as exc:
+            logger.warning("Failed to persist updated clip metadata: %s", exc)
+
     return result
 
 
 @app.post("/api/reframe/{job_id}/{clip_index}")
-async def reframe_clip(job_id: str, clip_index: int, req: ReframeRequest, request: Request):
+async def reframe_clip(
+    job_id: str,
+    clip_index: int,
+    req: ReframeRequest,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
     """Switch a clip between reframe modes (auto / subject / disabled) after generation.
 
     Requires the per-clip 16:9 source slice (``source_<clip>.mp4``) to still
@@ -929,6 +1154,7 @@ async def reframe_clip(job_id: str, clip_index: int, req: ReframeRequest, reques
     enforce_rate_limit(request, "reframe", capacity=20, refill_per_sec=20 / 60)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job_id")
+    _verify_job_ownership(job_id, user)
     mode = (req.reframe_mode or "auto").strip().lower()
     if mode not in ("auto", "disabled", "subject", "object", "split", "screencast"):
         raise HTTPException(status_code=400, detail="reframe_mode must be 'auto', 'subject', 'disabled', 'split', or 'screencast'")
@@ -947,25 +1173,63 @@ async def reframe_clip(job_id: str, clip_index: int, req: ReframeRequest, reques
 
 
 @app.get("/api/history")
-async def list_history(request: Request):
+async def list_history(request: Request, user: AuthUser = Depends(get_current_user)):
     """Scan output/ for past jobs with metadata files."""
     require_trusted_config_request(request)
-    return {"jobs": await asyncio.to_thread(scan_history, OUTPUT_DIR)}
+    filter_user = None if user.is_admin else user.id
+    return {"jobs": await asyncio.to_thread(scan_history, OUTPUT_DIR, user_id=filter_user)}
+
+@app.get("/api/storage/breakdown")
+async def get_storage_stats(request: Request):
+    """Return categorized disk usage breakdown across output/ and uploads/."""
+    require_trusted_config_request(request)
+    from clippyme.domain.job_artifacts import get_storage_breakdown
+    return await asyncio.to_thread(get_storage_breakdown, OUTPUT_DIR, UPLOAD_DIR)
 
 @app.post("/api/storage/cleanup")
 async def trigger_storage_cleanup(request: Request):
-    """Run manual storage cleanup pass: purges partial downloads, failed job assets, and published clip videos."""
+    """Run manual storage cleanup pass: purges partial downloads, ASR audio, uploads, and optionally source videos."""
     require_trusted_config_request(request)
+    body = {}
+    if request.headers.get("content-type", "").startswith("application/json"):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    purge_raw_sources = bool(
+        body.get("purge_raw_sources")
+        or request.query_params.get("purge_raw_sources") in ("1", "true", "yes")
+        or body.get("mode") == "deep"
+    )
+    source_max_days = body.get("source_max_days") or request.query_params.get("source_max_days")
+    source_max_age_seconds = float(source_max_days) * 86400 if source_max_days is not None else None
+
     from clippyme.domain.job_artifacts import run_storage_cleanup
-    res = await asyncio.to_thread(run_storage_cleanup, OUTPUT_DIR)
+    from clippyme.domain.job_worker import active_input_paths
+    from clippyme.domain.job_control import ACTIVE_STATES
+    protected = active_input_paths(jobs)
+    active_job_ids = {jid for jid, job in jobs.items() if job.get("status") in ACTIVE_STATES}
+
+    res = await asyncio.to_thread(
+        run_storage_cleanup,
+        output_dir=OUTPUT_DIR,
+        upload_dir=UPLOAD_DIR,
+        purge_raw_sources=purge_raw_sources,
+        source_max_age_seconds=source_max_age_seconds,
+        active_paths=protected,
+        protected_job_ids=active_job_ids,
+        partial_min_age_seconds=1800.0,
+    )
     return res
 
 @app.delete("/api/history/{job_id}")
-async def delete_history(job_id: str, request: Request):
+async def delete_history(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Delete a job's output directory and all its files."""
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
     job = jobs.get(job_id)
     if job is not None and not job_control.can_purge(job.get("status")):
         raise HTTPException(
@@ -993,16 +1257,24 @@ async def delete_history(job_id: str, request: Request):
             except OSError:
                 logger.warning("Could not remove uploaded input %s", input_path, exc_info=True)
         persist_jobs()
+    # Sweep any upload file matching job_id from uploads/
+    for up_match in glob.glob(os.path.join(UPLOAD_DIR, f"{job_id}*")):
+        try:
+            if os.path.isfile(up_match):
+                await asyncio.to_thread(os.remove, up_match)
+        except OSError:
+            pass
     logger.info("Deleted job %s and all files", job_id)
     return {"success": True}
 
 @app.post("/api/compose/{job_id}/{clip_index}")
-async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, request: Request):
+async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, request: Request, user: AuthUser = Depends(get_current_user)):
     """Compose a final video from active toggle layers (Smart Cut → Hook → Subtitles)."""
     require_trusted_config_request(request)
     enforce_rate_limit(request, "compose", capacity=30, refill_per_sec=30 / 60)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
 
     resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, OUTPUT_DIR)
 
@@ -1034,7 +1306,7 @@ async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, reques
 # ---------------------------------------------------------------------------
 
 @app.post("/api/publish/{job_id}/{clip_index}")
-async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishRequest, request: Request):
+async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishRequest, request: Request, user: AuthUser = Depends(get_current_user)):
     """Upload a clip to Zernio and create a post on the requested platforms.
 
     If req.compose_first is True, the clip is freshly composed (Smart Cut →
@@ -1047,6 +1319,7 @@ async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishReques
     enforce_rate_limit(request, "publish", capacity=30, refill_per_sec=30 / 60)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
 
     # require_file=False: the base clip may be absent when a composed file
     # exists on disk — publish_clip_flow resolves the actual upload path.
@@ -1058,6 +1331,52 @@ async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishReques
         job_id=job_id, clip_index=clip_index, resolved=resolved,
         req=req.model_dump(), zernio_cfg=zernio_cfg,
     )
+
+
+# ---------------------------------------------------------------------------
+# Published Performance Analytics & Feedback Loop endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/analytics/summary")
+async def get_analytics_summary_endpoint():
+    """Return aggregated stats, top-performing clips, and platform breakdowns."""
+    from clippyme.domain.analytics_service import get_analytics_summary
+    return await asyncio.to_thread(get_analytics_summary)
+
+
+@app.post("/api/analytics/sync")
+async def sync_analytics_endpoint(request: Request):
+    """Sync live metrics from Zernio Analytics API."""
+    require_trusted_config_request(request)
+    from clippyme.domain.analytics_service import sync_zernio_analytics
+    return await asyncio.to_thread(sync_zernio_analytics)
+
+
+@app.post("/api/analytics/track")
+async def track_analytics_endpoint(payload: dict, request: Request):
+    """Record or update performance metrics for a specific clip."""
+    require_trusted_config_request(request)
+    clip_id = payload.get("clip_id")
+    metrics = payload.get("metrics") or {}
+    if not clip_id:
+        raise HTTPException(status_code=400, detail="clip_id is required")
+    from clippyme.domain.analytics_service import update_clip_metrics
+    updated = await asyncio.to_thread(update_clip_metrics, clip_id, metrics)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Clip not found in analytics registry")
+    return {"success": True, "clip": updated}
+
+
+@app.get("/api/analytics/insights")
+async def get_analytics_insights_endpoint():
+    """Return active learned performance rules and recommendations."""
+    from clippyme.domain.performance_feedback import analyze_performance_patterns, get_learned_patterns_prompt
+    patterns = await asyncio.to_thread(analyze_performance_patterns)
+    prompt_snippet = await asyncio.to_thread(get_learned_patterns_prompt)
+    return {
+        "patterns": patterns,
+        "prompt_snippet": prompt_snippet,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1129,6 +1448,45 @@ async def live_monitor_status(request: Request, monitor_id: Optional[str] = None
     """One monitor's status (``?monitor_id=``) or ``{"monitors": [...]}`` for all."""
     require_trusted_config_request(request)
     return live_monitor.status(monitor_id)
+
+
+@app.get("/api/live-monitor/{monitor_id}/pending-clips")
+async def live_monitor_pending_clips(monitor_id: str, request: Request):
+    """List pending preview clips awaiting review/approval for a monitor."""
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "livemonitor", capacity=20, refill_per_sec=20 / 60)
+    return {"pending_clips": live_monitor.get_pending_clips(monitor_id)}
+
+
+@app.post("/api/live-monitor/{monitor_id}/publish-clip/{clip_id}")
+async def live_monitor_publish_pending_clip(monitor_id: str, clip_id: str, request: Request):
+    """Approve and publish an individual previewed clip with optional overrides."""
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
+    overrides = None
+    try:
+        body = await request.body()
+        if body:
+            overrides = await request.json()
+    except Exception:
+        pass
+    return await live_monitor.publish_pending_clip(monitor_id, clip_id, overrides)
+
+
+@app.delete("/api/live-monitor/{monitor_id}/pending-clip/{clip_id}")
+async def live_monitor_dismiss_pending_clip(monitor_id: str, clip_id: str, request: Request):
+    """Dismiss/reject a pending preview clip, cleaning up on-disk files."""
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "livemonitor", capacity=20, refill_per_sec=20 / 60)
+    return live_monitor.dismiss_pending_clip(monitor_id, clip_id)
+
+
+@app.post("/api/live-monitor/{monitor_id}/publish-all")
+async def live_monitor_publish_all(monitor_id: str, request: Request):
+    """Approve and schedule publish for all pending clips of a monitor."""
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
+    return await live_monitor.publish_all_pending(monitor_id)
 
 
 @app.post("/api/history/{job_id}/restore")
