@@ -33,6 +33,10 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
     if not api_key:
         raise ValidationError("Zernio API key not configured")
 
+    from clippyme.domain.job_artifacts import is_clip_verified_published
+    if is_clip_verified_published(resolved.clip_info):
+        raise ClippyMeError("Clip already published", status_code=409)
+
     from clippyme.domain.clip_resolve import composed_clip_basename
     job_dir = resolved.job_dir
     base_clip = resolved.clip_path

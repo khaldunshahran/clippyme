@@ -1576,7 +1576,8 @@ class LiveMonitor:
         job_id = entry["job_id"]
         clip = entry["clip"]
         video_url = clip.get("video_url") or ""
-        clip_path = os.path.join(self._output_dir, job_id, os.path.basename(video_url))
+        from clippyme.domain.url_utils import filename_from_video_url
+        clip_path = os.path.join(self._output_dir, job_id, filename_from_video_url(video_url))
         # Dedupe on the BASE clip path (stable across compose/consolidate).
         if clip_path in self._published:
             return

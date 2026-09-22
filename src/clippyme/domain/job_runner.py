@@ -228,7 +228,13 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
                 )
                 log_thread.start()
 
+                import time
+                wait_start = time.time()
                 while process.poll() is None:
+                    if time.time() - wait_start > 7200:
+                        process.kill()
+                        jobs[job_id]["logs"].append("Process timed out after 2 hours.")
+                        break
                     await asyncio.sleep(2)
                     await _refresh(job_id, output_dir, process)
 
@@ -279,7 +285,8 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
                     break
 
                 # Exit 2 is deterministic validation/preflight rejection.
-                retryable = returncode != 2 and attempt < max_attempts
+                # Exit 137 is OOM, do not retry.
+                retryable = returncode not in (2, 137) and attempt < max_attempts
                 if retryable:
                     delay = min(30, 2 ** (attempt - 1))
                     jobs[job_id]["logs"].append(

@@ -106,7 +106,7 @@ MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "16384"))
 # (jobs older than 1 hour vanished on the next cleanup tick, meaning
 # every docker restart + 5 min wait blew away yesterday's work).
 # Override via env: JOB_RETENTION_SECONDS (0 disables auto-purge).
-JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", str(30 * 86400)))
+JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", str(86400)))
 
 # Application State
 job_queue = asyncio.Queue(maxsize=50)
