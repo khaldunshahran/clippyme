@@ -250,6 +250,92 @@ def _band_change_fraction(before, after, band: tuple) -> float:
     return float(np.mean(np.abs(ga - gb) > _SUB_CHANGE_THRESHOLD))
 
 
+def _first_speech_onset(transcript, clip_start=0.0, clip_end=None):
+    """Earliest word start in a transcript dict, in clip-relative seconds.
+
+    Returns None when the transcript carries no usable word timestamps
+    (the timing check then fails open with a warning instead of blocking).
+    """
+    best = None
+    segments = (transcript or {}).get("segments") or []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        for w in seg.get("words") or []:
+            if not isinstance(w, dict):
+                continue
+            try:
+                s = float(w.get("start"))
+                e = float(w.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if clip_start and e <= clip_start:
+                continue
+            if clip_end is not None and s >= clip_end:
+                continue
+            rel = s - (clip_start or 0.0)
+            if best is None or rel < best:
+                best = rel
+    return best
+
+
+# Caption timing QA: first caption event vs first speech onset. The user's
+# defect-B report bundled a timing complaint with the doubled captions, and
+# the pixel check alone cannot catch captions shifted seconds off the speech.
+#
+# The quality target is ~0.5s: a confident drift beyond half a second is
+# CRITICAL; anything past the advisory bound gets a loud warning.
+_SUB_TIMING_WARN_S = 0.35
+_SUB_TIMING_CRITICAL_S = 0.5
+
+
+def _measure_audio_onset(video_path: str):
+    """First audible-sound onset in a video file, in seconds.
+
+    Runs ffmpeg ``silencedetect`` over the audio stream and returns the end
+    of the leading silence (i.e. when sound first starts). Returns 0.0 when
+    audio is present from the very first sample.
+
+    Returns None when the onset cannot be measured confidently: ffmpeg is
+    missing, the file has no audio stream, the whole track is silence, or
+    the probe fails. Callers must fail OPEN on None (loud warning, never a
+    block) — an unmeasurable onset is an infra gap, not evidence of bad
+    timing.
+    """
+    import re
+    import shutil
+    import subprocess
+
+    if not video_path or not os.path.isfile(video_path):
+        return None
+    if shutil.which("ffmpeg") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", video_path,
+             "-af", "silencedetect=noise=-35dB:d=0.25",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    log = proc.stderr or ""
+    # First silence_end marks the end of the leading silence -> sound onset.
+    m = re.search(r"silence_end:\s*([0-9.]+)", log)
+    if m:
+        try:
+            return max(0.0, float(m.group(1)))
+        except ValueError:
+            return None
+    # No silence_end at all: either audio runs from t=0 (first marker would
+    # be silence_start) or there is no measurable audio. Treat "audio from
+    # the start" as onset 0.0 only when a silence_start exists later (i.e.
+    # sound was actually detected); otherwise inconclusive.
+    if re.search(r"silence_start:", log):
+        return 0.0
+    return None
+
+
 def check_subtitles_burned(
     sub_path: str,
     before_video: str,
@@ -257,10 +343,13 @@ def check_subtitles_burned(
     *,
     position: str = "bottom",
     num_samples: int = 3,
+    transcript: dict = None,
+    clip_start: float = 0.0,
+    clip_end: float = None,
 ) -> dict:
     """Validate that captions were actually burned into the video pixels.
 
-    Two layers, matching the Phase 1C spec:
+    Three layers, matching the Phase 1C spec:
 
     1. **File check** — the ``.ass``/``.srt`` sent to the burn must exist,
        be non-empty, and carry at least ``MIN_SUBTITLE_EVENTS`` dialogue
@@ -272,6 +361,14 @@ def check_subtitles_burned(
        that changed significantly. Burned karaoke text flips pixels hard;
        a silently failed burn only re-encodes, which changes ~nothing.
        Median change fraction below ``_SUB_CHANGE_MIN`` is CRITICAL.
+    3. **Timing check** — the first Dialogue event must start within about
+       half a second of the first speech onset (clip relative). Speech
+       onset is measured from the composed clip's actual audio via ffmpeg
+       ``silencedetect``, falling back to the first word onset in
+       ``transcript``. A pixel-visible but seconds-shifted burn is
+       mistimed, which the first two layers cannot see. When neither an
+       audio onset nor word timestamps can be measured, this layer fails
+       OPEN with a loud warning instead of blocking.
 
     Returns the same ``{"ok", "critical", "issues", "warnings"}`` shape as
     :func:`evaluate_clip_qa`, plus a ``"detail"`` dict with the measured
@@ -351,6 +448,49 @@ def check_subtitles_burned(
         result = _verdict(False, True)
         result["detail"] = detail
         return result
+
+    # Layer 3: caption TIMING vs speech onset. Layers 1-2 only prove the
+    # captions are visible; a burn shifted seconds off the speech sails
+    # through them. Compare the first Dialogue event's start against the
+    # speech onset (clip-relative). Onset is measured from the ACTUAL AUDIO
+    # of the composed clip via ffmpeg silencedetect, with the transcript's
+    # first word as fallback. Fails open with a loud warning when neither
+    # can be measured confidently — an unmeasurable onset is an infra gap,
+    # not evidence of mistimed captions.
+    onset = _measure_audio_onset(after_video)
+    onset_source = "audio"
+    if onset is None:
+        onset = _first_speech_onset(transcript, clip_start, clip_end)
+        onset_source = "transcript"
+    if onset is None:
+        warnings.append(
+            "caption timing check inconclusive: no measurable audio onset "
+            "and no word timestamps in transcript — skipped, not blocked"
+        )
+    else:
+        first_event_start = min(e[0] for e in events)
+        drift = abs(first_event_start - onset)
+        detail["timing_drift_s"] = round(drift, 3)
+        detail["timing_onset_source"] = onset_source
+        detail["first_caption_s"] = round(first_event_start, 3)
+        detail["first_speech_onset_s"] = round(onset, 3)
+        if drift > _SUB_TIMING_CRITICAL_S:
+            issues.append(
+                f"caption timing drift: first caption at {first_event_start:.2f}s "
+                f"but first speech at {onset:.2f}s ({onset_source} onset; "
+                f"drift {drift:.2f}s > {_SUB_TIMING_CRITICAL_S:.1f}s) — "
+                "captions are mistimed relative to the audio"
+            )
+            result = _verdict(False, True)
+            result["detail"] = detail
+            return result
+        if drift > _SUB_TIMING_WARN_S:
+            warnings.append(
+                f"caption timing drift {drift:.2f}s exceeds "
+                f"{_SUB_TIMING_WARN_S:.2f}s advisory bound "
+                f"(first caption {first_event_start:.2f}s, "
+                f"first speech {onset:.2f}s via {onset_source})"
+            )
 
     result = _verdict(True, False)
     result["detail"] = detail

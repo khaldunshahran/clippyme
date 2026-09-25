@@ -13,7 +13,7 @@ import subprocess
 from typing import Optional
 
 from clippyme.domain.clip_locks import clip_lock
-from clippyme.domain.errors import ValidationError
+from clippyme.domain.errors import ValidationError, ClippyMeError
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +154,19 @@ async def _verify_subtitles_burned(
     after_video: str,
     clip_index: int,
     position: str = "bottom",
+    transcript: dict = None,
+    clip_start: float = 0.0,
+    clip_end: float = None,
 ) -> None:
     """Phase 1C: run check_subtitles_burned() right after a caption burn.
 
     Raises ClippyMeError on a critical finding (missing/empty caption file,
-    or no visible captions in the pixels) so a silently failed burn can never
-    ship. Pixel-sampling warnings stay advisory.
+    no visible captions in the pixels, or captions mistimed vs the speech)
+    so a silently failed burn can never ship. Pixel-sampling warnings stay
+    advisory. ``transcript``/``clip_start``/``clip_end`` feed the
+    caption-timing check (first caption vs first speech onset); pass None
+    when unknown and the timing check fails open with a warning instead of
+    blocking the compose.
     """
     from clippyme.domain.clip_qa import check_subtitles_burned
     from clippyme.domain.errors import ClippyMeError
@@ -170,6 +177,9 @@ async def _verify_subtitles_burned(
         before_video,
         after_video,
         position=position,
+        transcript=transcript,
+        clip_start=clip_start,
+        clip_end=clip_end,
     )
     if report["warnings"]:
         logger.warning(
@@ -410,6 +420,11 @@ async def _apply_subtitles(
     clip_start = clip_info.get("start", 0)
     clip_end = clip_info.get("end", 0)
     sub_mode = subtitle_params.get("mode", "karaoke")
+    # The transcript/timing actually used for the subtitle file: the job
+    # transcript by default, the on-the-fly clip transcript when the job one
+    # has no words (its times are clip-relative, hence start 0.0). Feeds the
+    # caption-timing QA in _verify_subtitles_burned.
+    sub_transcript, sub_clip_start, sub_clip_end = transcript, clip_start, clip_end
     sub_offset_y = subtitle_params.get("offset_y", 0)
     band_top = _letterbox_caption_band_top(
         current_input, clip_info, subtitle_params, banner_active)
@@ -475,6 +490,8 @@ async def _apply_subtitles(
                                 subtitle_params, clip_info, metadata),
                         ),
                     )
+                    if success:
+                        sub_transcript, sub_clip_start, sub_clip_end = clip_transcript, 0.0, clip_dur
             except Exception as _ot_exc:
                 logger.warning("compose: on-the-fly transcription failed for clip %d: %s", clip_index, _ot_exc)
 
@@ -506,6 +523,9 @@ async def _apply_subtitles(
             sub_output,
             clip_index,
             position=subtitle_params.get("position", "bottom"),
+            transcript=sub_transcript,
+            clip_start=sub_clip_start,
+            clip_end=sub_clip_end,
         )
     else:
         srt_path = os.path.join(job_dir, f"composed_subs_{clip_index}.srt")
@@ -524,6 +544,8 @@ async def _apply_subtitles(
                     success = await asyncio.to_thread(
                         generate_srt, clip_transcript, 0.0, clip_dur, srt_path
                     )
+                    if success:
+                        sub_transcript, sub_clip_start, sub_clip_end = clip_transcript, 0.0, clip_dur
             except Exception as _ot_exc:
                 logger.warning("compose: on-the-fly transcription failed for clip %d: %s", clip_index, _ot_exc)
 
@@ -556,6 +578,9 @@ async def _apply_subtitles(
             sub_output,
             clip_index,
             position=subtitle_params.get("position", "bottom"),
+            transcript=sub_transcript,
+            clip_start=sub_clip_start,
+            clip_end=sub_clip_end,
         )
     return sub_output
 
@@ -635,6 +660,20 @@ async def _compose_layers_impl(
     drop_ranges=None,
     music_bed: Optional[str] = None,
 ) -> str:
+    # Idempotency guard (doubled-caption fix): never compose onto one of this
+    # clip's own compose outputs. resolve_clip(..., for_compose=True) already
+    # excludes them at the endpoint layer, but any caller can pass a path
+    # directly - burning a subtitle layer onto a file that already has one
+    # produces the same caption twice (often at different sizes when the
+    # params changed between runs).
+    _base_name = os.path.basename(base_clip or "")
+    if _base_name.lower().startswith("composed_") and _base_name.lower().endswith(".mp4"):
+        raise ClippyMeError(
+            f"Refusing to compose onto already-composed file {_base_name!r}: "
+            "composing a subtitle layer onto burned-in captions would duplicate them. "
+            "Compose from the clean base clip instead.",
+            status_code=409,
+        )
     active = {k: v for k, v in toggles.items() if v}
     # The banner can be enabled via its own params.enabled (frontend convention)
     # without a toggles entry — fold it in so the no-active short-circuit and the

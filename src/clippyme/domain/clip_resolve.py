@@ -68,14 +68,32 @@ def composed_clip_basename(clip_info: dict, clip_index: int) -> str:
     return f"composed_clip_{clip_index + 1}.mp4"
 
 
+def _is_composed_basename(basename: str) -> bool:
+    """True for filenames produced by the compose pipeline itself.
+
+    Composing ONTO one of these burns a second caption layer over the
+    already burned-in one — the doubled-caption defect — so compose callers
+    must never use them as the base clip.
+    """
+    name = basename.lower()
+    return name.startswith("composed_") and name.endswith(".mp4")
+
+
 def resolve_clip(job_id: str, clip_index: int, output_root: str,
-                 *, require_file: bool = True) -> ResolvedClip:
+                 *, require_file: bool = True, for_compose: bool = False) -> ResolvedClip:
     """Resolve a job's clip to its metadata + on-disk path.
 
     Raises ``NotFoundError`` (→ 404) when the job dir, metadata, clip index or
     — with ``require_file=True`` — the rendered mp4 is missing. Callers that
     can proceed without the base file (transcript/edit-ai read only metadata;
     publish may fall back to a composed file) pass ``require_file=False``.
+
+    ``for_compose=True`` marks a composition input: composed files
+    (``composed_*.mp4``) are then EXCLUDED from the on-disk fallback chain
+    and a composed file is never returned, because composing onto one burns
+    a second caption layer over the first (the doubled-caption defect).
+    When only a composed file exists, ``NotFoundError`` is raised instead of
+    silently returning it.
     """
     job_dir = os.path.join(output_root, job_id)
     if not os.path.isdir(job_dir):
@@ -106,6 +124,10 @@ def resolve_clip(job_id: str, clip_index: int, output_root: str,
             os.path.join(job_dir, f"reframe_{clip_filename}"),
         ]
         for cand in candidates:
+            if for_compose and _is_composed_basename(os.path.basename(cand)):
+                # Compose input must be the clean base clip: a composed file
+                # already carries burned-in layers (double-burn defect).
+                continue
             if os.path.isfile(cand):
                 clip_path = cand
                 break
@@ -113,6 +135,8 @@ def resolve_clip(job_id: str, clip_index: int, output_root: str,
             if os.path.isdir(job_dir):
                 suffix = f"_clip_{clip_index + 1}.mp4"
                 for entry in sorted(os.listdir(job_dir)):
+                    if for_compose and _is_composed_basename(entry):
+                        continue
                     if entry.endswith(suffix):
                         cand = os.path.join(job_dir, entry)
                         if os.path.isfile(cand):
@@ -121,6 +145,15 @@ def resolve_clip(job_id: str, clip_index: int, output_root: str,
 
     if require_file and not os.path.exists(clip_path):
         raise NotFoundError(f"Clip file not found: {clip_filename}")
+
+    if for_compose and _is_composed_basename(os.path.basename(clip_path)):
+        # Covers the primary path too: metadata's clip_filename itself may
+        # point at an already-composed file (dirty metadata). Refuse loudly
+        # instead of burning a second caption layer over the first.
+        raise NotFoundError(
+            f"Clean base clip missing for compose (only already-composed "
+            f"file {os.path.basename(clip_path)!r} found); refusing to "
+            "compose onto it - that would double-burn the captions")
 
     return ResolvedClip(
         metadata_path=metadata_path,

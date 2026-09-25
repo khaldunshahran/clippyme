@@ -669,6 +669,14 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
         # Word group mode: small groups of N words
         groups = _group_words_by_count(words, clip_start, words_per_group)
 
+    # Defect A fix: semantic grouping is char-count based and cannot know the
+    # rendered width (60 chars ~= 900px in Bangers, ~= 1500px in
+    # Montserrat-Black; a single long hashtag/URL can exceed the frame on its
+    # own). Re-split every event by measured pixel width so each Dialogue
+    # fits on one line inside the margins - libass then never has to wrap,
+    # and nothing can be clipped at the frame edges.
+    groups = _fit_groups_to_width(groups, style, margin_l, margin_r, pop)
+
     for group in groups:
         event_start = max(0, group[0]['start'] - clip_start)
         event_end = max(0, group[-1]['end'] - clip_start)
@@ -695,14 +703,33 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
         # Fix: \k tags shouldn't have space before them inside the line
         # Actually the space goes between words, which is correct
 
+        # Bounded auto-shrink: a single over-wide token got a per-event
+        # fontsize during the fit pass (it always stands alone in its
+        # event, since it overflows the budget at the preset size). Emit
+        # the override ahead of the karaoke/pop tags so libass renders
+        # this event smaller instead of wrapping past the margins.
+        fs_override = ""
+        if len(group) == 1 and group[0].get("_shrink_fs"):
+            fs_override = "{\\fs%d}" % int(group[0]["_shrink_fs"])
+
         ass_content += (
             f"Dialogue: 0,{format_ass_time(event_start)},{format_ass_time(event_end)},"
-            f"Viral,,0,0,0,,{line_text}\n"
+            f"Viral,,0,0,0,,{fs_override}{line_text}\n"
         )
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(ass_content)
 
+    # Width assertion: the fit pass above guarantees every event fits inside
+    # the margins; a violation means the PIL/libass metric model drifted and
+    # must be logged loudly (not raised - compose must not die on metrics).
+    ok_width, worst_px, budget_px, worst_text = verify_ass_line_widths(
+        output_path, margin_l=margin_l, margin_r=margin_r, pop=pop)
+    if not ok_width:
+        logger.warning(
+            "generate_ass_karaoke: caption event wider than frame budget: "
+            "%.0fpx > %.0fpx (preset=%s mode=%s text=%r) - may clip at frame edges",
+            worst_px, budget_px, preset, mode, worst_text[:80])
     return True
 
 
@@ -860,6 +887,283 @@ def _group_words(words, clip_start, max_chars=60, max_duration=5.0, soft_ratio=0
     if current:
         groups.append(current)
     return groups
+
+
+# ---------------------------------------------------------------------------
+# Caption width fitting (Defect A fix: edge-clipped captions)
+# ---------------------------------------------------------------------------
+# libass wraps Dialogue text at word boundaries (WrapStyle 0), but a single
+# unbreakable token (long hashtag/URL/compound word) wider than the wrap width
+# can never be wrapped and renders past the frame edges, clipped. Char-count
+# grouping cannot prevent this: the same 60 chars are ~900px in Bangers and
+# ~1500px in Montserrat-Black. So after semantic grouping we measure every
+# event with PIL against the REAL preset font (the repaired TTFs) and
+# re-split until each event fits on one line inside the margins. The word-pop
+# scale animation (POP_PEAK_SIZE) is accounted for so the bounce can never
+# push glyphs past the margins either.
+
+_ASS_PLAYRES_X = 1080
+# PIL-vs-libass metric drift + libass synthetic-bold widening safety margin.
+_WIDTH_SAFETY = 0.94
+
+_font_measure_cache = {}
+
+
+def _caption_font_path(font_name):
+    """Resolve a preset font name (e.g. 'Montserrat-Black') to a TTF path.
+
+    Prefers the merged fonts dir libass actually renders from, falls back to
+    the bundled repo fonts. Returns None when the face is unreadable (the
+    caller then skips width fitting rather than guessing blind).
+    """
+    candidates = []
+    try:
+        merged = effective_fonts_dir()
+    except Exception:
+        merged = None
+    for directory in (merged, FONTS_DIR):
+        if directory:
+            candidates.append(os.path.join(directory, font_name + ".ttf"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _measure_font(font_path, fontsize):
+    """PIL FreeType font for caption measurement, cached per (path, size)."""
+    from PIL import ImageFont  # lazy: keeps module import-light like cv2/numpy
+    key = (font_path, int(fontsize))
+    font = _font_measure_cache.get(key)
+    if font is None:
+        font = ImageFont.truetype(font_path, int(fontsize))
+        _font_measure_cache[key] = font
+    return font
+
+
+def _rendered_text(word, uppercase):
+    """The exact string libass will render for one word dict."""
+    text = _strip_ass_braces((word.get("word") or "").strip())
+    return text.upper() if uppercase else text
+
+
+def _group_width_px(words, font, uppercase):
+    """Pixel width of the joined word list exactly as rendered."""
+    text = " ".join(_rendered_text(w, uppercase) for w in words)
+    if not text.strip():
+        return 0
+    box = font.getbbox(text)
+    return box[2] - box[0]
+
+
+def _shrink_fontsize_to_fit(text, font_path, base_size, budget_px):
+    """Largest fontsize in [_SUB_FONTSIZE_MIN, base_size] that fits the budget.
+
+    Used for single over-wide tokens (long hashtags/URLs): instead of
+    hard-splitting the word, shrink just this event's font size until the
+    whole token fits on one line. Returns None when even the minimum size
+    cannot fit (caller falls back to hard-splitting) or the font is
+    unreadable.
+    """
+    try:
+        base_size = int(base_size)
+    except (TypeError, ValueError):
+        return None
+    if base_size <= _SUB_FONTSIZE_MIN or not text.strip():
+        return None
+    try:
+        full = _measure_font(font_path, base_size)
+    except Exception:
+        return None
+    box = full.getbbox(text)
+    if box[2] - box[0] <= budget_px:
+        return base_size
+    # Width scales near-linearly with size: binary-search the largest
+    # fitting size between the floor and the preset size.
+    lo, hi = _SUB_FONTSIZE_MIN, base_size
+    best = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            font = _measure_font(font_path, mid)
+        except Exception:
+            hi = mid - 1
+            continue
+        box = font.getbbox(text)
+        if box[2] - box[0] <= budget_px:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _split_word_to_fit(word, font, uppercase, budget_px):
+    """Hard-split one over-wide word into chunks that each fit the budget.
+
+    Karaoke timing is distributed proportionally by character count so the
+    total sweep duration is unchanged and libass can wrap/break between
+    chunks. Returns the original word untouched when it already fits.
+    """
+    text = _rendered_text(word, uppercase)
+    if not text:
+        return [word]
+    # Binary-search the largest char count that fits the budget.
+    lo, hi = 1, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        box = font.getbbox(text[:mid])
+        if box[2] - box[0] <= budget_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    chunk_chars = max(1, lo)
+    if chunk_chars >= len(text):
+        return [word]
+    try:
+        start = float(word["start"])
+        end = float(word["end"])
+    except (TypeError, ValueError, KeyError):
+        start, end = None, None
+    chunks = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
+    total = len(text)
+    out, pos = [], 0
+    for ch in chunks:
+        w2 = dict(word)
+        # Text is already stripped + uppercased here; the render pipeline's
+        # own .strip()/.upper() are idempotent, so downstream stays consistent.
+        w2["word"] = ch
+        if start is not None and end is not None:
+            w2["start"] = start + (end - start) * (pos / total)
+            w2["end"] = start + (end - start) * ((pos + len(ch)) / total)
+        out.append(w2)
+        pos += len(ch)
+    return out
+
+
+def _fit_groups_to_width(groups, style, margin_l, margin_r, pop):
+    """Re-split semantic word groups so every event fits on ONE rendered line.
+
+    Measurement uses PIL with the real preset TTF at the resolved fontsize,
+    so per-preset metrics (Bangers vs Montserrat-Black) and user fontsize
+    overrides are honored. When the pop animation is on, the budget shrinks
+    by the 112% peak scale so the bounce can never push glyphs past the
+    margins either. Returns a new list of groups; the input is not mutated.
+    """
+    font_path = _caption_font_path(style["font"])
+    if font_path is None:
+        logger.warning("caption width fit skipped: unreadable font %r", style.get("font"))
+        return groups
+    try:
+        font = _measure_font(font_path, style["fontsize"])
+    except Exception as exc:
+        logger.warning("caption width fit skipped: %s", exc)
+        return groups
+    budget = (_ASS_PLAYRES_X - margin_l - margin_r) * _WIDTH_SAFETY
+    if pop:
+        budget /= POP_PEAK_SIZE / 100.0
+    uppercase = bool(style.get("uppercase"))
+    base_size = style["fontsize"]
+    fitted = []
+    for group in groups:
+        # 1) Single over-wide tokens: prefer bounded auto-shrink (per-event
+        #    \fs override) over breaking the word. Hard-split stays only as
+        #    the last fallback when even the minimum fontsize cannot fit.
+        words = []
+        for w in group:
+            text = _rendered_text(w, uppercase)
+            if text and _group_width_px([w], font, uppercase) > budget:
+                shrunk = _shrink_fontsize_to_fit(text, font_path, base_size, budget)
+                if shrunk is not None and shrunk < base_size:
+                    w2 = dict(w)
+                    w2["_shrink_fs"] = shrunk
+                    words.append(w2)
+                    logger.info(
+                        "caption auto-shrink: %r to fs=%d (preset %d) to fit %.0fpx budget",
+                        text[:40], shrunk, base_size, budget)
+                    continue
+                words.extend(_split_word_to_fit(w, font, uppercase, budget))
+            else:
+                words.append(w)
+        # 2) Greedy re-split of the (chunked) word list into fitting events,
+        #    measuring the exact joined string each time (no separator math).
+        current = []
+        for w in words:
+            trial = current + [w]
+            if current and _group_width_px(trial, font, uppercase) > budget:
+                fitted.append(current)
+                current = [w]
+            else:
+                current = trial
+        if current:
+            fitted.append(current)
+    return fitted
+
+
+def verify_ass_line_widths(ass_path, margin_l=110, margin_r=110, pop=False):
+    """Width assertion for a generated karaoke ASS file.
+
+    Every Dialogue event's plain text (tags stripped, explicit \\N breaks
+    measured per physical line) must fit within PlayResX minus the margins,
+    using the same real-font PIL measurement as the fit pass. A violation is
+    REPORTED (returned), never raised: compose must not die on a metric edge
+    case, but the caller must log it loudly.
+
+    Returns ``(ok, worst_px, budget_px, worst_text)``.
+    """
+    try:
+        with open(ass_path, encoding="utf-8") as f:
+            content = f.read()
+    except OSError as exc:
+        return False, 0, 0, "unreadable: %s" % exc
+    font_name, fontsize = None, None
+    for line in content.splitlines():
+        if line.startswith("Style:"):
+            parts = line.split(",")
+            if len(parts) >= 3:
+                font_name = parts[1].strip()
+                try:
+                    fontsize = int(float(parts[2].strip()))
+                except ValueError:
+                    fontsize = None
+            break
+    if not font_name or not fontsize:
+        return False, 0, 0, "no parseable style"
+    font_path = _caption_font_path(font_name)
+    if font_path is None:
+        return False, 0, 0, "unreadable font %r" % (font_name,)
+    try:
+        font = _measure_font(font_path, fontsize)
+    except Exception as exc:
+        return False, 0, 0, str(exc)
+    budget = (_ASS_PLAYRES_X - margin_l - margin_r) * _WIDTH_SAFETY
+    if pop:
+        budget /= POP_PEAK_SIZE / 100.0
+    worst, worst_text = 0, ""
+    for line in content.splitlines():
+        if not line.startswith("Dialogue:"):
+            continue
+        fields = line.split(",", 9)
+        if len(fields) < 10:
+            continue
+        text_field = fields[9]
+        # Per-event auto-shrink: a leading {\fsNN} override (emitted for
+        # single over-wide tokens) changes the rendered size for this
+        # event, so measure with the override size, not the style size.
+        event_font = font
+        fs_match = re.search(r"\\fs(\d+)", text_field)
+        if fs_match:
+            try:
+                event_font = _measure_font(font_path, int(fs_match.group(1)))
+            except Exception:
+                event_font = font
+        plain = re.sub(r"\{[^}]*\}", "", text_field)
+        for chunk in plain.split("\\N"):
+            box = event_font.getbbox(chunk)
+            w = box[2] - box[0]
+            if w > worst:
+                worst, worst_text = w, chunk
+    return worst <= budget, worst, budget, worst_text
 
 
 def _ffmpeg_filter_escape(value: str) -> str:

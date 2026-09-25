@@ -1551,8 +1551,11 @@ class LiveMonitor:
                 raise ValueError("clip has no original_index")
             return base_path
         try:
+            # for_compose=True: the compose input must be the clean base
+            # clip, never an already-composed file (double-burn defect).
             resolved = await asyncio.to_thread(
-                resolve_clip, job_id, idx, self._output_dir, require_file=True)
+                resolve_clip, job_id, idx, self._output_dir,
+                require_file=True, for_compose=True)
             recipe = build_monitor_compose(
                 self.platform, self.cfg["channel"], clip, self.cfg.get("compose"),
                 smart_cut=bool(self.cfg.get("smart_cut")))

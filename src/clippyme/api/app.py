@@ -1288,7 +1288,10 @@ async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, reques
         raise HTTPException(status_code=400, detail="Invalid job ID")
     _verify_job_ownership(job_id, user)
 
-    resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, OUTPUT_DIR)
+    # Clean-base composition: for_compose excludes already-composed files
+    # from the on-disk fallback chain (composing onto them would double-burn
+    # captions) and refuses outright when only a composed file exists.
+    resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, OUTPUT_DIR, for_compose=True)
 
     try:
         composed_filename = await compose_layers(
