@@ -300,6 +300,9 @@ def download_video(req: DownloadRequest, request: Request = None):
             if not os.path.isfile(downloaded_file):
                 raise FileNotFoundError("yt-dlp completed without producing an MP4 file")
 
+            # Phase 1D(a): sub-720p downloads must not slip through as a log
+            # whisper — a bot-degraded source poisons the whole pipeline.
+            quality_warning = None
             try:
                 probe_cmd = [
                     "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -310,11 +313,17 @@ def download_video(req: DownloadRequest, request: Request = None):
                 if probe_output.isdigit():
                     height = int(probe_output)
                     if height < 720:
-                        logger.warning(f"downloaded at {height}p, below 720p target — likely bot-degraded client")
+                        quality_warning = (
+                            f"downloaded at {height}p, below the 720p target — "
+                            "likely a bot-degraded client; source quality is reduced"
+                        )
+                        logger.warning(quality_warning)
+                        print(f"\n\u26a0\ufe0f  QUALITY WARNING: {quality_warning}\n", flush=True)
             except Exception as probe_err:
                 logger.warning(f"Failed to probe download quality: {probe_err}")
 
-            return {"downloaded_file": downloaded_file, "sanitized_title": sanitized_title}
+            return {"downloaded_file": downloaded_file, "sanitized_title": sanitized_title,
+                    "quality_warning": quality_warning}
 
         except Exception as e:
             last_error = e

@@ -105,7 +105,11 @@ def load_zernio_config() -> dict:
     return {
         "api_key": zernio.get("api_key", ""),
         "accounts": accounts if isinstance(accounts, dict) else {},
-        "timezone": zernio.get("timezone", "Europe/Rome"),
+        # Phase 1E: default publish timezone is env-configurable
+        # (ZERNIO_DEFAULT_TZ) per campaign/deployment; the stored config
+        # value still wins when set via save_zernio_config(timezone=...).
+        "timezone": zernio.get("timezone")
+        or os.environ.get("ZERNIO_DEFAULT_TZ", "Europe/Rome"),
     }
 
 

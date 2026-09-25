@@ -218,11 +218,13 @@ def test_download_youtube_video_fallback_on_connect_error(monkeypatch, tmp_path)
     monkeypatch.setattr("clippyme.services.downloader_api.download_video", _mock_local_download)
 
     url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    out_file, title = dl.download_youtube_video(url, output_dir=str(tmp_path))
+    # Phase 1D(a): 3-tuple — (downloaded_file, sanitized_title, quality_warning)
+    out_file, title, quality_warning = dl.download_youtube_video(url, output_dir=str(tmp_path))
 
     assert fallback_called.get("url") == url
     assert title == "fallback_vid"
     assert out_file.endswith("fallback_vid.mp4")
+    assert quality_warning is None  # mock has no quality_warning key -> .get() default
 
 
 def test_download_youtube_video_propagates_microservice_error_detail(monkeypatch, tmp_path):

@@ -80,6 +80,43 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
     if not os.path.exists(upload_path):
         raise NotFoundError(f"Clip file not found: {upload_path}")
 
+    # Phase 1B (OpusClip-level upgrade): gate publish on the FINAL file that
+    # will actually be uploaded. QA used to inspect only the pre-compose
+    # render; a broken compose (truncated encode, lost audio, blank burn)
+    # could still ship. A critical finding here blocks the upload with a
+    # clear error instead of uploading a broken export. Warnings stay
+    # advisory. This runs BEFORE the Zernio upload call below and is outside
+    # its try/except, so the raise is never swallowed.
+    from clippyme.pipeline.media_qa import inspect_clip
+    try:
+        _qa_end = float((resolved.clip_info or {}).get("end", 0))
+        _qa_start = float((resolved.clip_info or {}).get("start", 0))
+        _qa_expected = _qa_end - _qa_start if _qa_end > _qa_start else None
+    except (TypeError, ValueError):
+        _qa_expected = None
+    _qa_verdict = await asyncio.to_thread(
+        inspect_clip,
+        upload_path,
+        expected_duration=_qa_expected,
+        expected_aspect=None,  # aspect is render-gated; structural checks don't need it
+        smartcut_applied=False,
+    )
+    if _qa_verdict.get("critical"):
+        _qa_detail = "; ".join(_qa_verdict.get("issues") or [])
+        logger.error(
+            "publish: final-file QA BLOCKED upload for %s/%d: %s",
+            job_id, clip_index, _qa_detail,
+        )
+        raise ClippyMeError(
+            f"Publish blocked: final clip failed QA ({_qa_detail})",
+            status_code=500,
+        )
+    if _qa_verdict.get("warnings"):
+        logger.warning(
+            "publish: final-file QA warnings for %s/%d: %s",
+            job_id, clip_index, "; ".join(_qa_verdict["warnings"]),
+        )
+
     # Resolve / generate thumbnail if requested
     thumbnail_path = req.get("thumbnail_path")
     if req.get("generate_ai_thumbnail") and not thumbnail_path:
@@ -130,7 +167,12 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
             platform_targets=req.get("platforms"),
             schedule_mode=req.get("schedule_mode"),
             scheduled_for=req.get("scheduled_for"),
-            timezone=req.get("timezone") or zernio_cfg.get("timezone") or "Europe/Rome",
+            # Phase 1E: the ultimate fallback is env-configurable
+            # (ZERNIO_DEFAULT_TZ) instead of a hardcoded Europe/Rome, so a
+            # US-oriented campaign is one env var away from correct timing.
+            # Precedence: request > zernio config store > env > Europe/Rome.
+            timezone=req.get("timezone") or zernio_cfg.get("timezone")
+            or os.environ.get("ZERNIO_DEFAULT_TZ", "Europe/Rome"),
             tiktok_settings=req.get("tiktok_settings"),
             start_date=req.get("start_date"),
             thumbnail_path=thumbnail_path,

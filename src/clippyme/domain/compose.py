@@ -103,32 +103,95 @@ def _probe_qa(path: str) -> tuple:
 async def _self_eval(
     composed_path: str, clip_info: dict, smartcut_applied: bool, clip_index: int,
 ) -> None:
-    """video-use step 7 / superpowers verification: probe the rendered output and
-    log any QA issues. Never raises — a QA miss surfaces a warning, not a 500."""
+    """video-use step 7 / superpowers verification: probe the rendered output.
+
+    Phase 1B (OpusClip-level upgrade): CRITICAL QA issues now hard-fail (raise
+    ClippyMeError, mapped to a 500 with the detail by the endpoint layer)
+    instead of only being logged — a structurally broken composed file must
+    never be handed back as a success. Signal-quality findings stay advisory
+    (warning only). A probe failure itself still never breaks compose.
+    """
     from clippyme.domain.clip_qa import evaluate_clip_qa
+    from clippyme.domain.errors import ClippyMeError
 
     try:
         dur, has_audio, size = await asyncio.to_thread(_probe_qa, composed_path)
-        try:
-            expected = float(clip_info.get("end", 0)) - float(clip_info.get("start", 0))
-        except (TypeError, ValueError):
-            expected = None
-        report = evaluate_clip_qa(
-            actual_duration=dur,
-            expected_duration=expected if expected and expected > 0 else None,
-            has_audio=has_audio,
-            size_bytes=size,
-            smartcut_applied=smartcut_applied,
-        )
-        if report["ok"]:
-            logger.info("self_eval: clip_index=%d ✓ output looks sane", clip_index)
-        else:
-            logger.warning(
-                "self_eval: clip_index=%d ⚠️ QA issues: %s",
-                clip_index, "; ".join(report["issues"]),
-            )
     except Exception as e:  # pragma: no cover — QA must never break compose
         logger.debug("self_eval skipped (probe error): %s", e)
+        return
+    try:
+        expected = float(clip_info.get("end", 0)) - float(clip_info.get("start", 0))
+    except (TypeError, ValueError):
+        expected = None
+    report = evaluate_clip_qa(
+        actual_duration=dur,
+        expected_duration=expected if expected and expected > 0 else None,
+        has_audio=has_audio,
+        size_bytes=size,
+        smartcut_applied=smartcut_applied,
+    )
+    if report["ok"]:
+        logger.info("self_eval: clip_index=%d ✓ output looks sane", clip_index)
+        return
+    detail = "; ".join(report["issues"] or report["warnings"])
+    if report["critical"]:
+        logger.error(
+            "self_eval: clip_index=%d ❌ CRITICAL QA issues: %s", clip_index, detail
+        )
+        raise ClippyMeError(
+            f"Compose QA failed (critical) for clip {clip_index}: {detail}",
+            status_code=500,
+        )
+    logger.warning(
+        "self_eval: clip_index=%d ⚠️ QA issues: %s", clip_index, detail
+    )
+
+
+async def _verify_subtitles_burned(
+    sub_path: str,
+    before_video: str,
+    after_video: str,
+    clip_index: int,
+    position: str = "bottom",
+) -> None:
+    """Phase 1C: run check_subtitles_burned() right after a caption burn.
+
+    Raises ClippyMeError on a critical finding (missing/empty caption file,
+    or no visible captions in the pixels) so a silently failed burn can never
+    ship. Pixel-sampling warnings stay advisory.
+    """
+    from clippyme.domain.clip_qa import check_subtitles_burned
+    from clippyme.domain.errors import ClippyMeError
+
+    report = await asyncio.to_thread(
+        check_subtitles_burned,
+        sub_path,
+        before_video,
+        after_video,
+        position=position,
+    )
+    if report["warnings"]:
+        logger.warning(
+            "compose: subtitle QA warnings for clip %d: %s",
+            clip_index,
+            "; ".join(report["warnings"]),
+        )
+    if report["critical"]:
+        detail = "; ".join(report["issues"])
+        logger.error(
+            "compose: subtitle QA FAILED (critical) for clip %d: %s",
+            clip_index,
+            detail,
+        )
+        raise ClippyMeError(
+            f"Subtitle QA failed (critical) for clip {clip_index}: {detail}",
+            status_code=500,
+        )
+    logger.info(
+        "compose: subtitle QA passed for clip %d (caption-band change %s)",
+        clip_index,
+        (report.get("detail") or {}).get("median_change_fraction"),
+    )
 
 
 async def _apply_smartcut(
@@ -381,6 +444,14 @@ async def _apply_subtitles(
                 pre_vf=pre_vf,
             ),
         )
+        # Phase 1C: the captions must be verifiably on the pixels.
+        await _verify_subtitles_burned(
+            ass_path,
+            current_input,
+            sub_output,
+            clip_index,
+            position=subtitle_params.get("position", "bottom"),
+        )
     else:
         srt_path = os.path.join(job_dir, f"composed_subs_{clip_index}.srt")
         intermediate_files.append(srt_path)
@@ -422,6 +493,14 @@ async def _apply_subtitles(
                 h_align=subtitle_params.get("align", "center"),
                 pre_vf=pre_vf,
             ),
+        )
+        # Phase 1C: the captions must be verifiably on the pixels.
+        await _verify_subtitles_burned(
+            srt_path,
+            current_input,
+            sub_output,
+            clip_index,
+            position=subtitle_params.get("position", "bottom"),
         )
     return sub_output
 

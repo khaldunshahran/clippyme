@@ -259,7 +259,13 @@ def _write_source_info(output_dir, info):
 
 
 def download_youtube_video(url, output_dir=".", cookies_file_path=None):
-    """Download a supported remote source by calling the downloader microservice."""
+    """Download a supported remote source by calling the downloader microservice.
+
+    Returns ``(downloaded_file, sanitized_title, quality_warning)`` —
+    ``quality_warning`` is a human-readable string when the download probed
+    below 720p (Phase 1D(a)), else None. Callers persist it on the job
+    metadata so the dashboard can badge degraded sources.
+    """
     import httpx
 
     url = validate_supported_source_url(url)
@@ -289,10 +295,13 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
             data = response.json()
             downloaded_file = data["downloaded_file"]
             sanitized_title = data["sanitized_title"]
+            quality_warning = data.get("quality_warning")
 
         step_end_time = time.time()
         print(f"✅ Video downloaded in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
-        return downloaded_file, sanitized_title
+        if quality_warning:
+            print(f"⚠️  QUALITY WARNING (persisted on job): {quality_warning}", flush=True)
+        return downloaded_file, sanitized_title, quality_warning
     except httpx.ConnectError as conn_err:
         print(f"⚠️ Downloader microservice on port 8001 not reachable ({conn_err}). Falling back to in-process download...", file=sys.stderr)
         try:
@@ -305,9 +314,12 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
             data = local_download(req)
             downloaded_file = data["downloaded_file"]
             sanitized_title = data["sanitized_title"]
+            quality_warning = data.get("quality_warning")
             step_end_time = time.time()
             print(f"✅ Video downloaded via in-process fallback in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
-            return downloaded_file, sanitized_title
+            if quality_warning:
+                print(f"⚠️  QUALITY WARNING (persisted on job): {quality_warning}", flush=True)
+            return downloaded_file, sanitized_title, quality_warning
         except Exception as fallback_err:
             print(f"❌ In-process fallback failed: {fallback_err}", file=sys.stderr)
             raise RuntimeError(f"Downloader microservice failed: {conn_err} (in-process fallback failed: {fallback_err})")

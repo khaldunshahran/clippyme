@@ -287,7 +287,10 @@ def generate_clip_metadata(
             raw_text = response.text or ""
             parsed = json.loads(raw_text)
             if isinstance(parsed, dict):
-                return _normalize_platform_dict(parsed, fallback_title=video_title)
+                # Phase 1E: tag metadata provenance for the dashboard badge.
+                normalized = _normalize_platform_dict(parsed, fallback_title=video_title)
+                normalized["metadata_quality"] = "full"
+                return normalized
         except Exception as exc:
             logger.warning("generate_clip_metadata with %s failed: %s", target_model, exc)
             last_exc = exc
@@ -296,10 +299,13 @@ def generate_clip_metadata(
     logger.error("All Gemini models failed for metadata generation: %s", last_exc)
     fallback_tags = ["#shorts", "#trending", "#viral"]
     fallback_title = video_title[:100] if video_title else "Viral Moment"
-    return _normalize_platform_dict(
+    normalized = _normalize_platform_dict(
         {"title": fallback_title, "hashtags": fallback_tags},
         fallback_title=fallback_title,
     )
+    # Phase 1E: total LLM failure -> boilerplate from the raw source title.
+    normalized["metadata_quality"] = "fallback"
+    return normalized
 
 
 def generate_all_clips_metadata(
@@ -439,6 +445,11 @@ def generate_all_clips_metadata(
             continue
 
     # Apply generated platform metadata to clips
+    # Phase 1E: metadata_quality provenance per clip — "full" when the LLM
+    # parsed this clip, "partial" when only some clips parsed and this one
+    # fell back to boilerplate, "fallback" on total LLM failure. Persisted on
+    # the clip dict so the dashboard can badge it (frontend work pending).
+    batch_total_failure = not parsed_clips_map
     for i, clip in enumerate(shorts):
         idx = i + 1
         item = parsed_clips_map.get(idx)
@@ -448,6 +459,7 @@ def generate_all_clips_metadata(
                 fallback_title=clip.get("video_title_for_youtube_short") or video_title,
                 fallback_speaker=clip.get("speaker_name") or "",
             )
+            quality = "full"
         else:
             # Fallback per-clip if batch missed this index
             fallback_title = clip.get("video_title_for_youtube_short") or f"{video_title} - Moment {idx}"
@@ -456,7 +468,9 @@ def generate_all_clips_metadata(
                 fallback_title=fallback_title,
                 fallback_speaker=clip.get("speaker_name") or "",
             )
+            quality = "fallback" if batch_total_failure else "partial"
 
+        clip["metadata_quality"] = quality
         clip["platforms"] = normalized["platforms"]
         clip["speaker_name"] = normalized["speaker_name"] or clip.get("speaker_name", "")
         clip["hashtags"] = normalized["hashtags"]

@@ -937,6 +937,18 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
     OUTPUT_WIDTH = int(OUTPUT_HEIGHT * aspect_ratio)
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
+    # Phase 1A (OpusClip-level upgrade): vertical (9:16) jobs always emit a
+    # true 1080x1920 frame instead of inheriting the source height (a 1080p
+    # source used to yield 608x1080 - 31% of the pixels of a real short). The
+    # per-frame emit resize (_resize_to_output, Lanczos on enlarge) and every
+    # frame builder take these dims as parameters, so this is a clean upscale.
+    # Square/landscape jobs keep the legacy height-inherited sizing. Downstream
+    # layers need no rescaling: subtitles are authored for 1080x1920 (PlayResX/Y
+    # in subtitles.py) and hook/logo/banner size themselves as fractions of the
+    # actual frame.
+    if abs(aspect_ratio - 9 / 16) < 1e-9:
+        OUTPUT_WIDTH, OUTPUT_HEIGHT = 1080, 1920
+        print("   \U0001F4D0 Output canvas: 1080x1920 (full-res vertical).")
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height,

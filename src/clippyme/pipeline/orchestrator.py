@@ -294,6 +294,10 @@ def _trim_head(input_video: str, output_dir: str, offset: float) -> str:
 
 def _prepare_input(args: argparse.Namespace, output_dir: str, state: RuntimeState, legacy):
     state.start("acquiring", "acquiring source media")
+    # Phase 1D(a): any download quality warning, persisted on the job
+    # metadata below. Fresh downloads overwrite it; resume/local inputs
+    # keep whatever a previous run stored.
+    download_quality_warning = state.artifact("quality_warning")
     if args.input:
         input_video = os.path.abspath(args.input)
         if not _valid_file(input_video):
@@ -309,7 +313,7 @@ def _prepare_input(args: argparse.Namespace, output_dir: str, state: RuntimeStat
             video_title = str(state.artifact("video_title") or Path(prior).stem)
             print(f"♻️ Resume: reusing downloaded source {os.path.basename(input_video)}", flush=True)
         else:
-            input_video, video_title = legacy.download_youtube_video(
+            input_video, video_title, download_quality_warning = legacy.download_youtube_video(
                 args.url,
                 output_dir,
                 args.cookies,
@@ -325,6 +329,8 @@ def _prepare_input(args: argparse.Namespace, output_dir: str, state: RuntimeStat
             "video_title": video_title,
             "source_url": args.url,
             "source_fingerprint": _source_fingerprint(input_video),
+            # Phase 1D(a): None when the source probed >= 720p.
+            "quality_warning": download_quality_warning,
         },
         detail="source media ready",
     )

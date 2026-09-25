@@ -351,7 +351,10 @@ def transcribe_video(video_path):
     downstream Gemini prompt + subtitle writer see the same ``speaker``
     field as the Deepgram path.
     """
-    provider = (os.getenv("TRANSCRIPTION_PROVIDER") or "whisper").strip().lower()
+    # Phase 1D(c): default matches the docstring above ("deepgram"). The
+    # old "whisper" fallback was a landmine: one missing env var on a
+    # fresh deploy silently flipped to local CPU Whisper.
+    provider = (os.getenv("TRANSCRIPTION_PROVIDER") or "deepgram").strip().lower()
 
     # Strip to an audio-only track once so neither backend ingests the full
     # video (see diarization.extract_audio_for_asr). Massively shrinks the
@@ -891,10 +894,14 @@ if __name__ == '__main__':
     # 1. Get Input Video
     if args.url:
         output_dir = resolve_output_dir(args.output, default=".")
-        input_video, video_title = download_youtube_video(args.url, output_dir, args.cookies)
+        # Phase 1D(a): 3-tuple — persist any download quality warning on the
+        # job metadata below so the dashboard can badge degraded sources.
+        input_video, video_title, download_quality_warning = download_youtube_video(args.url, output_dir, args.cookies)
     else:
         input_video = args.input
         video_title = os.path.splitext(os.path.basename(input_video))[0]
+        # Phase 1D(a): local inputs are never downloads - no quality warning.
+        download_quality_warning = None
         output_dir = resolve_output_dir(
             args.output,
             default=os.path.dirname(input_video) or ".",
@@ -969,6 +976,8 @@ if __name__ == '__main__':
                 # Monitor: no hallucinated/fallback clips — write empty metadata
                 # (+ exhaustion marker if Gemini ran out of models) and exit clean.
                 empty = {'shorts': [], 'transcript': transcript, 'aspect': args.aspect}
+                if download_quality_warning:
+                    empty['quality_warning'] = download_quality_warning
                 if getattr(get_viral_clips, '_last_gemini_exhausted', False):
                     empty['gemini_exhausted'] = True
                 _meta = os.path.join(output_dir, f"{video_title}_metadata.json")
@@ -1027,6 +1036,8 @@ if __name__ == '__main__':
             # to 9:16 and silently squashes a 1:1/16:9 job when the user flips
             # reframe mode after the run.
             clips_data['aspect'] = args.aspect
+            if download_quality_warning:
+                clips_data['quality_warning'] = download_quality_warning
             # Fold the download-time source-channel sidecar (uploader/channel/
             # webpage + suggested attribution banner) into the job metadata so
             # job_results can surface it to the dashboard. URL jobs only; a
