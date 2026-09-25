@@ -85,6 +85,11 @@ def flatten_words(transcript: dict | None) -> list[dict]:
                     flat["probability"] = _p
             except (TypeError, ValueError):
                 pass
+            # 3C: preserve the diarization speaker label so the clip render
+            # loop can slice words per clip and build speaker turns.
+            _spk = w.get("speaker")
+            if _spk:
+                flat["speaker"] = _spk
             words.append(flat)
     words.sort(key=lambda x: x["start"])
     return words

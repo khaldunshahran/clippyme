@@ -29,6 +29,11 @@ def _ensure_data_dir() -> Path:
     return target
 
 
+def _keep(new_val, old_val):
+    """Prefer the new value, but never let a ``None`` update clobber stored data."""
+    return old_val if new_val is None else new_val
+
+
 def load_analytics_data() -> Dict[str, Any]:
     """Load the analytics registry with fallback to default empty shape."""
     path = ANALYTICS_FILE_PATH
@@ -69,9 +74,17 @@ def record_published_clip(
     publish_result: Dict[str, Any],
     platforms: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
-    """Record a clip after it is published/scheduled to social platforms."""
+    """Record a clip after it is published/scheduled to social platforms.
+
+    Phase 3A: retains ``deterministic_features``, ``deterministic_score``,
+    ``viral_score`` and ``title_variants`` from ``clip_info`` so the
+    virality calibration loop can correlate features with real outcomes.
+    Updates carrying ``None`` for these fields never clobber values already
+    stored (``_keep`` pattern).
+    """
     data = load_analytics_data()
     clip_id = f"{job_id}:{clip_index}"
+    existing = data["clips"].get(clip_id, {})
 
     start = float(clip_info.get("start") or 0.0)
     end = float(clip_info.get("end") or 0.0)
@@ -105,6 +118,18 @@ def record_published_clip(
         "post_id": publish_result.get("post_id"),
         "scheduled_for": publish_result.get("scheduled_for"),
         "published_at": datetime.now(timezone.utc).isoformat(),
+        # Phase 3A: virality feedback inputs — retained from clip_info;
+        # None-valued updates never clobber already-stored values.
+        "deterministic_features": _keep(
+            clip_info.get("deterministic_features"),
+            existing.get("deterministic_features")),
+        "deterministic_score": _keep(
+            clip_info.get("deterministic_score"),
+            existing.get("deterministic_score")),
+        "viral_score": _keep(
+            clip_info.get("viral_score"), existing.get("viral_score")),
+        "title_variants": _keep(
+            clip_info.get("title_variants"), existing.get("title_variants")),
         "metrics": {
             "views": 0,
             "likes": 0,

@@ -406,38 +406,82 @@ def compute_deterministic_features(
     }
 
 
-def deterministic_score(features: Dict[str, Any]) -> int:
+#: Deterministic scoring features eligible for virality weight calibration
+#: (Phase 3A). Each key scales its named delta in ``deterministic_score``.
+SCORE_FEATURE_KEYS = [
+    "speech_rate_wpm",
+    "question_density",
+    "exclamation_density",
+    "audio_energy_variance",
+    "duration",
+]
+
+
+def deterministic_score(
+    features: Dict[str, Any],
+    weight_overrides: Optional[Dict[str, float]] = None,
+) -> int:
     """Heuristic 1-100 virality score from deterministic features (pure).
 
     Rewards: conversational speech rate (140-185 wpm), question/exclamation
     hooks, dynamic audio delivery, and the 20-45s short-form sweet spot.
     Penalises: rushed/dragging speech, flat monotone audio, sub-12s stubs.
+
+    Phase 3A: each named per-feature delta is multiplied by its override
+    (``weight_overrides.get(key, 1.0)``). ``weight_overrides=None``
+    lazy-loads the approved calibration file via
+    ``virality_calibration.get_active_weight_overrides()`` (``{}`` when no
+    approved file exists); an explicit ``{}`` reproduces the Phase-2
+    defaults exactly.
     """
+    if weight_overrides is None:
+        try:
+            from clippyme.domain.virality_calibration import (
+                get_active_weight_overrides,
+            )
+            weight_overrides = get_active_weight_overrides()
+        except Exception:  # noqa: BLE001 - calibration must never break scoring
+            weight_overrides = {}
+    w = lambda key: float(weight_overrides.get(key, 1.0))  # noqa: E731
+
+    feats = features or {}
     score = 50.0
-    wpm = features.get("speech_rate_wpm") or 0
+
+    wpm = feats.get("speech_rate_wpm") or 0
     if 140 <= wpm <= 185:
-        score += 15
+        wpm_delta = 15.0
     elif 110 <= wpm < 140 or 185 < wpm <= 220:
-        score += 6
+        wpm_delta = 6.0
     else:
-        score -= 10
-    if (features.get("question_density") or 0) >= 0.03:
-        score += 8
-    if (features.get("exclamation_density") or 0) >= 0.03:
-        score += 8
-    var = features.get("audio_energy_variance")
-    if var is not None:
-        if var >= 25:
-            score += 10
-        elif var >= 10:
-            score += 4
-        else:
-            score -= 6
-    dur = features.get("duration") or 0
+        wpm_delta = -10.0
+    score += wpm_delta * w("speech_rate_wpm")
+
+    question_delta = 8.0 if (feats.get("question_density") or 0) >= 0.03 else 0.0
+    score += question_delta * w("question_density")
+
+    exclamation_delta = 8.0 if (feats.get("exclamation_density") or 0) >= 0.03 else 0.0
+    score += exclamation_delta * w("exclamation_density")
+
+    var = feats.get("audio_energy_variance")
+    if var is None:
+        energy_delta = 0.0
+    elif var >= 25:
+        energy_delta = 10.0
+    elif var >= 10:
+        energy_delta = 4.0
+    else:
+        energy_delta = -6.0
+    score += energy_delta * w("audio_energy_variance")
+
+    dur = feats.get("duration") or 0
     if 20 <= dur <= 45:
-        score += 10
+        duration_delta = 10.0
     elif dur < 12:
-        score -= 8
+        duration_delta = -8.0
+    else:
+        duration_delta = 0.0
+    score += duration_delta * w("duration")
+
     return max(1, min(100, int(round(score))))
 
 
@@ -446,6 +490,7 @@ def cross_check_scores(
     transcript_words=None,
     media_path: Optional[str] = None,
     energy_fn=None,
+    weight_overrides: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach deterministic cross-check fields to candidate dicts.
 
@@ -456,7 +501,9 @@ def cross_check_scores(
     ``viral_score`` itself is never replaced. ``energy_fn`` is injectable
     for tests (defaults to
     ``media_probe.compute_audio_energy_variance``); a failing energy probe
-    degrades to transcript-only features.
+    degrades to transcript-only features. ``weight_overrides`` (Phase 3A)
+    is forwarded to ``deterministic_score``; ``None`` loads the approved
+    calibration file, ``{}`` keeps Phase-2 defaults.
     """
     if energy_fn is None:
         try:
@@ -483,7 +530,7 @@ def cross_check_scores(
                 var = None
         feats = compute_deterministic_features(
             c, transcript_words, audio_energy_variance=var)
-        det = deterministic_score(feats)
+        det = deterministic_score(feats, weight_overrides)
         try:
             llm = int(c.get("viral_score"))
         except (TypeError, ValueError):
@@ -517,6 +564,7 @@ def validate_and_dedupe(
     drop_generic: bool = False,
     transcript_words=None,
     media_path: Optional[str] = None,
+    weight_overrides: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Pydantic-validate then remove overlapping clips.
 
@@ -610,8 +658,10 @@ def validate_and_dedupe(
     dumped = [c.model_dump() for c in kept]
     # 2F: deterministic cross-check — flag (and down-rank, never silently
     # replace) LLM scores that disagree with transcript/audio features.
+    # Phase 3A: approved virality weight overrides flow through here.
     return cross_check_scores(
-        dumped, transcript_words=transcript_words, media_path=media_path)
+        dumped, transcript_words=transcript_words, media_path=media_path,
+        weight_overrides=weight_overrides)
 
 
 def _truncate_words(text: str, n: int = 10) -> str:

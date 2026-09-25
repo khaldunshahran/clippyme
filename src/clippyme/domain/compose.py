@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import subprocess
+from typing import Optional
 
 from clippyme.domain.clip_locks import clip_lock
 from clippyme.domain.errors import ValidationError
@@ -594,6 +595,7 @@ async def compose_layers(
     grade_params: dict = None,
     banner_params: dict = None,
     drop_ranges=None,
+    music_bed: Optional[str] = None,
 ) -> str:
     """Run the active layer pipeline. Returns the final composed filename (basename).
 
@@ -613,6 +615,7 @@ async def compose_layers(
             hook_params=hook_params, subtitle_params=subtitle_params,
             logo_params=logo_params, grade_params=grade_params,
             banner_params=banner_params, drop_ranges=drop_ranges,
+            music_bed=music_bed,
         )
 
 
@@ -630,6 +633,7 @@ async def _compose_layers_impl(
     grade_params: dict = None,
     banner_params: dict = None,
     drop_ranges=None,
+    music_bed: Optional[str] = None,
 ) -> str:
     active = {k: v for k, v in toggles.items() if v}
     # The banner can be enabled via its own params.enabled (frontend convention)
@@ -643,7 +647,9 @@ async def _compose_layers_impl(
         len((hook_params or {}).get("text", "") or ""),
         (subtitle_params or {}).get("mode", "karaoke"),
     )
-    if not active:
+    # 3B: a music bed counts as active work — an audio-only call must still
+    # run the mix pass below, not take the base-clip shortcut.
+    if not active and not music_bed:
         logger.info("compose_layers: no active toggles → returning base clip unmodified")
         return os.path.basename(base_clip)
 
@@ -813,6 +819,28 @@ async def _compose_layers_impl(
             )
             layers_applied.append("banner")
             logger.info("compose_layers: ✓ banner → %s", os.path.basename(current_input))
+
+        # Phase 3B: optional music bed — mixed AFTER every visual layer (the
+        # dialogue track is the composed output so far) and BEFORE atomic
+        # promotion. The bed is ducked under speech, then the final file is
+        # normalized to -14 LUFS. Runs in a worker thread (blocking ffmpeg).
+        if music_bed:
+            from clippyme.domain import music_bed as music_bed_mod
+            _music_tmp = os.path.join(
+                job_dir, f".clip_{clip_index}_music_tmp.mp4")
+            intermediate_files.append(_music_tmp)
+            await asyncio.to_thread(
+                music_bed_mod.mix_music_ducked,
+                current_input, music_bed, _music_tmp,
+            )
+            await asyncio.to_thread(
+                music_bed_mod.normalize_final_loudness, _music_tmp, -14.0)
+            current_input = _music_tmp
+            layers_applied.append("music_bed")
+            logger.info(
+                "compose_layers: ✓ music_bed → %s",
+                os.path.basename(current_input),
+            )
 
         # Atomic final write: copy to a .tmp sibling first, then os.replace into
         # place. This guarantees the composed file is never absent between the

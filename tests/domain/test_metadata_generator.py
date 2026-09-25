@@ -76,3 +76,31 @@ def test_generate_clip_metadata_missing_key():
 def test_generate_all_clips_metadata_missing_job(tmp_path):
     with pytest.raises(NotFoundError):
         generate_all_clips_metadata("non-existent-job-id", str(tmp_path))
+
+
+# --- Phase 3D: title_variants normalization (appended) -------------------------
+
+def test_normalize_platform_dict_stores_three_title_variants():
+    from clippyme.domain.metadata_generator import _normalize_platform_dict
+    payload = {
+        "title": "Main title",
+        "alternate_titles": ["Alt one", "Alt two", "Alt one"],  # dup + 3
+    }
+    out = _normalize_platform_dict(payload, "Main title", {}, 0, 30)
+    assert out["title"] == "Main title"
+    assert out["title_variants"] == ["Main title", "Alt one", "Alt two"]
+    assert out["title_variant_source"] == "llm"
+
+
+def test_normalize_platform_dict_variants_fallback():
+    from clippyme.domain.metadata_generator import _normalize_platform_dict
+    out = _normalize_platform_dict({"title": "Solo"}, "Solo", {}, 0, 30)
+    assert out["title_variants"] == ["Solo"]
+    assert out["title_variant_source"] == "fallback"
+
+
+def test_normalize_platform_dict_variant_a_is_main_title():
+    from clippyme.domain.metadata_generator import _normalize_platform_dict
+    out = _normalize_platform_dict(
+        {"title": "Other", "alternate_titles": ["X"]}, "Main title", {}, 0, 30)
+    assert out["title_variants"][0] == "Main title"

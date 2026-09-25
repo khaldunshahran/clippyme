@@ -1220,11 +1220,38 @@ if __name__ == '__main__':
                 # zoom rides inside the master encode (zoom_end) — see
                 # process_video_to_vertical; the old apply_subtle_zoom pass
                 # only runs as its internal fallback.
+                # Phase 3C: multi-speaker layout. Slice the diarized words
+                # to this clip, let the layout selector decide, and — only
+                # for speaker_switch — build diarization turns relative to
+                # the clip start (offset=-start) for the reframe guide.
+                # Everything guarded: any failure falls back to the legacy
+                # single-speaker path (speaker_turns=None).
+                speaker_turns = None
+                try:
+                    from clippyme.pipeline.layouts.speaker_switch import (
+                        select_multi_speaker_layout,
+                        speaker_turns_from_words,
+                    )
+                    clip_words = [
+                        w for w in (_words or [])
+                        if w.get("end", 0) > start and w.get("start", 0) < end
+                    ]
+                    layout = select_multi_speaker_layout(clip_words).get("layout")
+                    if layout == "speaker_switch":
+                        speaker_turns = speaker_turns_from_words(
+                            clip_words, offset=-start)
+                        print(f"   🎙️  multi-speaker layout: speaker_switch "
+                              f"({len(speaker_turns)} turns)")
+                except Exception as exc:  # noqa: BLE001 - advisory only
+                    print(f"   ⚠️  speaker layout detection failed ({exc}); "
+                          f"using single-speaker path")
+                    speaker_turns = None
                 success = process_video_to_vertical(
                     clip_source_path, clip_final_path,
                     reframe_mode=args.reframe_mode,
                     zoom_end=None if args.no_zoom else 1.05,
-                    aspect_ratio=aspect_ratio, letterbox_zoom=letterbox_zoom)
+                    aspect_ratio=aspect_ratio, letterbox_zoom=letterbox_zoom,
+                    speaker_turns=speaker_turns)
 
                 if success:
                     normalize_audio(clip_final_path)

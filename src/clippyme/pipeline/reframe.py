@@ -823,7 +823,8 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
 def process_video_to_vertical(input_video, final_output_video, reframe_mode='auto',
                               zoom_end=None, aspect_ratio: float = 9 / 16,
                               letterbox_zoom: float = 0.0,
-                              punch_times=None):
+                              punch_times=None,
+                              speaker_turns=None):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
 
@@ -845,6 +846,13 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
     aspect_ratio: output width/height ratio (9/16 vertical default; 1.0 and
     16/9 for square/landscape jobs). Passed explicitly by main.py per job —
     this replaced the old ``reframe.ASPECT_RATIO`` module global.
+
+    speaker_turns: Phase 3C — optional list of ``{"speaker", "start", "end"}``
+    dicts (clip-relative seconds, from diarization word labels). When
+    provided, a DiarizationGuide steers the active-speaker tracker in the
+    default single-pass loop; None (default) keeps legacy lip-motion
+    tracking. The opt-in _render_global_smooth path always uses legacy
+    tracking.
     """
     # 'object' is the legacy name for the FrameShift face-first 'subject' mode —
     # normalize once here so the rest of this function only ever sees 'subject'.
@@ -924,6 +932,18 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
     if _reconciled_fps != fps:
         print(f"   ⏱️  fps reconciled: detector={fps:.4f} → cv2 reader={_reconciled_fps:.4f}")
     fps = _reconciled_fps
+
+    # Phase 3C: diarization guide for multi-speaker clips. Built AFTER fps
+    # reconciliation so turn times map to the exact frame numbers the loop
+    # below will see. Guarded: any failure → None → legacy tracking.
+    speaker_guide = None
+    if speaker_turns:
+        try:
+            from clippyme.pipeline.layouts.speaker_switch import DiarizationGuide
+            speaker_guide = DiarizationGuide(speaker_turns, fps)
+        except Exception as exc:  # noqa: BLE001 - guide is advisory only
+            print(f"   ⚠️  DiarizationGuide unavailable ({exc}); using legacy tracking")
+            speaker_guide = None
 
     if not scenes:
         print("   ❌ No scenes were detected. Using full video as one scene.")
@@ -1184,7 +1204,7 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
                             candidates = detection_smoother.smooth(candidates, frame_number)
                             for cand in candidates:
                                 cand['mar'] = compute_mouth_aspect_ratio(frame, cand['box'])
-                            target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
+                            target_box = speaker_tracker.get_target(candidates, frame_number, original_width, guide=speaker_guide)
                             if target_box:
                                 cameraman.update_target(target_box)
                             elif current_strategy == 'TRACK':

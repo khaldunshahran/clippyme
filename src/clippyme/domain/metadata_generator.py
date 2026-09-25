@@ -63,6 +63,7 @@ Emit ONLY valid JSON:
 {{
   "speaker_name": "<Identified speaker name or role (e.g. 'John Kiriakou' or 'Former CIA Officer')>",
   "title": "<High-CTR YouTube Shorts title, max 100 chars>",
+  "alternate_titles": ["<Distinct alternate title 1, max 100 chars>", "<Distinct alternate title 2, max 100 chars>"],
   "hashtags": ["#shorts", "#trending", "#topic1", "#topic2"],
   "caption": "<Universal fallback caption with hook and tags>",
   "platforms": {{
@@ -122,6 +123,7 @@ Emit ONLY valid JSON:
       "clip_index": 1,
       "speaker_name": "<Speaker name or role>",
       "title": "<High-converting title, max 100 chars>",
+      "alternate_titles": ["<Distinct alternate title 1, max 100 chars>", "<Distinct alternate title 2, max 100 chars>"],
       "hashtags": ["#shorts", "#trending", "#topic1", "#topic2"],
       "caption": "<Universal fallback caption>",
       "platforms": {{
@@ -161,9 +163,20 @@ def _clean_tags(tags: Any, default_tag: str = "#shorts") -> List[str]:
 def _normalize_platform_dict(
     parsed: Dict[str, Any],
     fallback_title: str,
+    clip: Optional[Dict[str, Any]] = None,
+    start: float = 0,
+    end: float = 0,
     fallback_speaker: str = "",
 ) -> Dict[str, Any]:
-    """Normalize and validate platform captions from Gemini response."""
+    """Normalize and validate platform captions from Gemini response.
+
+    Phase 3D: also builds ``title_variants`` — up to 3 deduplicated titles
+    with the caller-supplied main title (``fallback_title``) forced to
+    index 0 (variant A, the control) — plus ``title_variant_source``
+    (``"llm"`` when the model supplied alternates, ``"fallback"``
+    otherwise). ``clip``/``start``/``end`` are accepted for provenance
+    context (variant attribution downstream).
+    """
     speaker = (parsed.get("speaker_name") or fallback_speaker or "").strip()
     title = (parsed.get("title") or fallback_title or "Viral Moment").strip()[:100]
     hashtags = _clean_tags(parsed.get("hashtags"), "#shorts")
@@ -205,9 +218,23 @@ def _normalize_platform_dict(
 
     universal_caption = (parsed.get("caption") or tiktok_caption or yt_desc).strip()
 
+    # Phase 3D: title variants for A/B testing. The caller-supplied main
+    # title is forced to index 0 (variant A = the control = today's
+    # behaviour); the model's alternates follow, deduplicated, capped at 3.
+    main_variant = (fallback_title or title or "Viral Moment").strip()[:100]
+    title_variants = [main_variant]
+    for alt in (parsed.get("alternate_titles") or []):
+        alt = (alt or "").strip()[:100]
+        if alt and alt not in title_variants:
+            title_variants.append(alt)
+    title_variants = title_variants[:3]
+    title_variant_source = "llm" if len(title_variants) > 1 else "fallback"
+
     return {
         "speaker_name": speaker,
         "title": title,
+        "title_variants": title_variants,
+        "title_variant_source": title_variant_source,
         "hashtags": hashtags,
         "caption": universal_caption,
         "platforms": {
@@ -288,7 +315,11 @@ def generate_clip_metadata(
             parsed = json.loads(raw_text)
             if isinstance(parsed, dict):
                 # Phase 1E: tag metadata provenance for the dashboard badge.
-                normalized = _normalize_platform_dict(parsed, fallback_title=video_title)
+                # Phase 3D: main title resolved first so variant A == the
+                # title actually shipped.
+                main_title = (parsed.get("title") or video_title or "").strip()
+                normalized = _normalize_platform_dict(
+                    parsed, main_title or video_title, None, start, end)
                 normalized["metadata_quality"] = "full"
                 return normalized
         except Exception as exc:
@@ -301,7 +332,7 @@ def generate_clip_metadata(
     fallback_title = video_title[:100] if video_title else "Viral Moment"
     normalized = _normalize_platform_dict(
         {"title": fallback_title, "hashtags": fallback_tags},
-        fallback_title=fallback_title,
+        fallback_title, None, start, end,
     )
     # Phase 1E: total LLM failure -> boilerplate from the raw source title.
     normalized["metadata_quality"] = "fallback"
@@ -454,9 +485,19 @@ def generate_all_clips_metadata(
         idx = i + 1
         item = parsed_clips_map.get(idx)
         if item:
+            # Phase 3D: main title resolved first so variant A == the title
+            # actually shipped; variants + provenance persisted on the clip.
+            main_title = (
+                item.get("title")
+                or clip.get("video_title_for_youtube_short")
+                or video_title
+            )
             normalized = _normalize_platform_dict(
                 item,
-                fallback_title=clip.get("video_title_for_youtube_short") or video_title,
+                main_title,
+                clip,
+                clip.get("start", 0),
+                clip.get("end", 0),
                 fallback_speaker=clip.get("speaker_name") or "",
             )
             quality = "full"
@@ -465,12 +506,17 @@ def generate_all_clips_metadata(
             fallback_title = clip.get("video_title_for_youtube_short") or f"{video_title} - Moment {idx}"
             normalized = _normalize_platform_dict(
                 {"title": fallback_title},
-                fallback_title=fallback_title,
+                fallback_title,
+                clip,
+                clip.get("start", 0),
+                clip.get("end", 0),
                 fallback_speaker=clip.get("speaker_name") or "",
             )
             quality = "fallback" if batch_total_failure else "partial"
 
         clip["metadata_quality"] = quality
+        clip["title_variants"] = normalized["title_variants"]
+        clip["title_variant_source"] = normalized["title_variant_source"]
         clip["platforms"] = normalized["platforms"]
         clip["speaker_name"] = normalized["speaker_name"] or clip.get("speaker_name", "")
         clip["hashtags"] = normalized["hashtags"]

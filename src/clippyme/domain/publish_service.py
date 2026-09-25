@@ -155,6 +155,25 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
                 logger.warning("publish: AI thumbnail generation failed: %s", exc)
                 thumbnail_path = None
 
+    # Phase 3D: A/B title testing (default off). When the request carries no
+    # explicit title and the experiment is enabled, resolve the variant to
+    # ship deterministically from the clip's stored title_variants. Guarded:
+    # the experiment must never break publishing.
+    ab_assignment = None
+    try:
+        from clippyme.domain.title_ab_testing import (
+            ab_testing_enabled, resolve_title_for_post)
+        if not req.get("title") and ab_testing_enabled():
+            ab_key = (f"{job_id}:{clip_index}:{req.get('platforms')}:"
+                      f"{req.get('scheduled_for') or 'now'}")
+            ab_assignment = resolve_title_for_post(
+                resolved.clip_info, assignment_key=ab_key)
+            logger.info("publish: A/B title variant %s for %s/%d",
+                        ab_assignment.get("variant"), job_id, clip_index)
+    except Exception as exc:  # noqa: BLE001 - experiment is advisory only
+        logger.warning("publish: A/B title resolution failed: %s", exc)
+        ab_assignment = None
+
     # Run the publish in a worker thread (presign + PUT + create are blocking)
     from clippyme.integrations.social_publisher import publish_clip, ZernioError
     try:
@@ -162,7 +181,8 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
             publish_clip,
             api_key=api_key,
             clip_path=upload_path,
-            title=req.get("title") or resolved.clip_info.get("title", "")[:100] or f"Clip {clip_index + 1}",
+            title=req.get("title") or (ab_assignment or {}).get("title")
+            or resolved.clip_info.get("title", "")[:100] or f"Clip {clip_index + 1}",
             caption=req.get("caption") or "",
             platform_targets=req.get("platforms"),
             schedule_mode=req.get("schedule_mode"),
@@ -227,6 +247,22 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
             result,
             req.get("platforms"),
         )
+        # Phase 3D: attribute the shipped A/B title variant to the analytics
+        # record (best-effort; never fails the publish response).
+        if ab_assignment and ab_assignment.get("enabled"):
+            try:
+                from clippyme.domain.title_ab_testing import (
+                    record_title_variant_assignment)
+                await asyncio.to_thread(
+                    record_title_variant_assignment,
+                    job_id,
+                    clip_index,
+                    result.get("post_id"),
+                    ab_assignment,
+                    platform=(req.get("platforms") or [None])[0],
+                )
+            except Exception as e:
+                logger.warning("publish: A/B attribution failed: %s", e)
     except Exception as e:
         logger.warning("publish: failed to persist publish record for %s/%d: %s", job_id, clip_index, e)
 

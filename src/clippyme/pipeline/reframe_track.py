@@ -373,7 +373,10 @@ class SpeakerTracker:
         variance = sum((sample - mean) ** 2 for sample in history) / len(history)
         return min(variance * 200.0, 3.0)
 
-    def get_target(self, face_candidates, frame_number, width):
+    def get_target(self, face_candidates, frame_number, width, guide=None):
+        # ``guide`` (Phase 3C) is an optional DiarizationGuide: diarization
+        # turns steer the framing, the visual tracker just maps labels to
+        # face ids. ``guide=None`` keeps the exact legacy behaviour below.
         # Prune expired identities before matching. Otherwise long
         # streams accumulate an ever-growing candidate list.
         self.known_faces = [
@@ -441,6 +444,46 @@ class SpeakerTracker:
         challenger = ranked[0]
         challenger_score = self.speaker_scores.get(challenger["id"], 0.0)
         active = next((item for item in current if item["id"] == self.active_speaker_id), None)
+
+        if guide is not None:
+            # Feed ONE evidence point per frame: the face with the strongest
+            # mouth motion THAT frame. This is the frame-to-frame mar
+            # variance on the _mouth_motion scale (x200, capped at 3.0) —
+            # deliberately NOT the 25-frame smoothed _mouth_motion, which
+            # reacts so slowly that a brief laugh burst would dominate the
+            # evidence long after it ends. The guide filters the point by
+            # the active diarization turn itself.
+            def _frame_motion(face_id):
+                hist = self.mar_history.get(face_id, [])
+                if len(hist) < 2:
+                    return 0.0
+                delta = hist[-1] - hist[-2]
+                return min(delta * delta * 50.0, 3.0)
+
+            strongest = max(
+                current, key=lambda item: _frame_motion(item["id"]))
+            strongest_motion = _frame_motion(strongest["id"])
+            if strongest_motion >= 1.0:
+                try:
+                    guide.observe(
+                        strongest["id"], strongest_motion, frame_number)
+                except Exception:
+                    pass
+
+            # Diarization steers before any visual heuristic: while the guide
+            # has a confident hint for a VISIBLE face, it is authoritative —
+            # frame that face every frame (no group box, no visual
+            # cooldown). Short turns never steer (guide hysteresis), and a
+            # None hint falls through to the legacy path below.
+            hint = guide.suggest(frame_number)
+            if hint is not None:
+                hinted = next((item for item in current if item["id"] == hint), None)
+                if hinted is not None:
+                    self.active_speaker_id = hint
+                    self.last_switch_frame = frame_number
+                    self.locked_counter = 0
+                    return hinted["box"]
+
         active_score = self.speaker_scores.get(self.active_speaker_id, 0.0)
 
         # Ambiguous dialogue/reaction: keep both prominent faces centred. It is
