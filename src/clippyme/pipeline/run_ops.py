@@ -6,6 +6,7 @@ Only stdlib + ``domain.encode`` here.
 """
 import os
 import re
+import subprocess
 
 from clippyme.domain.encode import x264_video_args
 
@@ -100,28 +101,90 @@ def build_vfr_normalization_command(input_video: str, dest: str) -> list[str]:
     ]
 
 
+def _keyframe_at_or_before(path: str, t: float) -> float | None:
+    """Timestamp of the nearest video keyframe at/before ``t`` (None if unknown).
+
+    Fast ffprobe pass that only inspects keyframes (``-skip_frame nokey``);
+    uses ``best_effort_timestamp_time`` because ``pkt_pts_time`` is empty on
+    some mp4s. Used to build a frame-accurate hybrid cut: input-seek to the
+    keyframe (fast), then decode forward the small residual with an output
+    ``-ss`` (accurate).
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-skip_frame", "nokey",
+                "-select_streams", "v:0",
+                "-show_entries", "frame=best_effort_timestamp_time",
+                "-of", "csv=p=0",
+                path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    best: float | None = None
+    for line in proc.stdout.splitlines():
+        try:
+            ts = float(line.strip().rstrip(","))
+        except ValueError:
+            continue
+        if ts <= t + 1e-3 and (best is None or ts > best):
+            best = ts
+            if ts >= t - 1e-3:
+                break  # keyframes are ordered; can't do better
+    return best
+
+
 def build_cut_command(input_video: str, start: float, end: float, dest: str) -> list[str]:
     """ffmpeg argv for cutting the 16:9 source slice of one clip.
 
-    ``-ss`` BEFORE ``-i`` uses fast input seek (jump to the keyframe before
-    ``start``, decode forward to the exact time). ``-pix_fmt yuv420p`` +
-    ``-vsync cfr`` guarantee the persisted slice is universally decodable and
-    constant-frame-rate, so the downstream reframe render (raw frames at a
-    fixed ``-r``) can't drift against audio even if the original download was
-    VFR. Shared x264 settings (CRF 18 / medium): this slice feeds every later
-    generation, so it must not be the weak link.
+    Frame-accurate hybrid cut: ``-ss`` BEFORE ``-i`` jumps (fast) to the
+    keyframe at/before ``start`` (found via a quick ffprobe keyframe scan),
+    then a second ``-ss`` AFTER ``-i`` decodes forward the small residual so
+    the slice begins at the exact requested frame. The slice is re-encoded,
+    never stream-copied: with ``-c:v copy`` the output would begin at the
+    keyframe instead of ``start``, and every downstream timestamp —
+    subtitles (``word_time - clip_start``), Smart Cut ranges, compose —
+    would shift early by the keyframe gap (this broke subtitle sync in
+    Sep 2026). ``-pix_fmt yuv420p`` + ``-vsync cfr`` guarantee the persisted
+    slice is universally decodable and constant-frame-rate, so the downstream
+    reframe render (raw frames at a fixed ``-r``) cannot drift against audio
+    even if the original download was VFR. Shared x264 settings
+    (CRF 18 / medium): this slice feeds every later generation, so it must
+    not be the weak link.
+
+    When the keyframe probe fails (e.g. ffprobe missing in a test env), falls
+    back to a plain accurate cut: input ``-ss`` to ``start`` + re-encode,
+    which still decodes forward to the exact frame, just without the fast
+    keyframe pre-seek.
     """
-    clip_duration = float(end) - float(start)
-    return [
-        'ffmpeg', '-y',
-        '-ss', f'{float(start):.3f}',
-        '-i', input_video,
-        '-t', f'{clip_duration:.3f}',
-        '-c:v', 'copy',
-        '-c:a', 'copy',
-        '-avoid_negative_ts', 'make_zero',
+    start = float(start)
+    clip_duration = float(end) - start
+    keyframe = _keyframe_at_or_before(input_video, start)
+    argv: list[str] = [
+        "ffmpeg", "-y",
+        "-ss", f"{keyframe:.3f}" if keyframe is not None else f"{start:.3f}",
+        "-i", input_video,
+    ]
+    if keyframe is not None and start - keyframe > 1e-3:
+        # Output seek: decode forward from the keyframe to the exact frame.
+        argv += ["-ss", f"{start - keyframe:.3f}"]
+    argv += [
+        "-t", f"{clip_duration:.3f}",
+        *x264_video_args(faststart=False),
+        "-vsync", "cfr",
+        "-c:a", "aac",
+        "-avoid_negative_ts", "make_zero",
         dest,
     ]
+    return argv
 
 
 _CLIP_SUFFIX_RE = re.compile(r"_clip_\d+\.mp4$", re.IGNORECASE)
