@@ -332,11 +332,191 @@ def consolidate_narrative_continuations(
     return merged
 
 
+# --- 2F deterministic score cross-check -----------------------------------
+# The LLM's viral_score is a self-assessment with no grounding. These pure
+# helpers compute an independent heuristic score from the transcript (and,
+# when a media path is available, the clip's audio energy) so a confident
+# but flat clip can't sail through on LLM vibes alone. A disagreement above
+# SCORE_DISAGREEMENT_THRESHOLD flags the candidate for review and down-ranks
+# it in sort order — the LLM score itself is never silently replaced.
+
+SCORE_DISAGREEMENT_THRESHOLD = 25
+SCORE_REVIEW_RANK_PENALTY = 10
+
+
+def _norm_word(w: Dict[str, Any]):
+    """Read a transcript word in either {word,start,end} or {w,s,e} shape."""
+    if not isinstance(w, dict):
+        return None, None, None
+    text = w.get("word", w.get("w"))
+    start = w.get("start", w.get("s"))
+    end = w.get("end", w.get("e"))
+    try:
+        s = float(start) if start is not None else None
+        e = float(end) if end is not None else None
+    except (TypeError, ValueError):
+        return None, None, None
+    return text, s, e
+
+
+def _overlap_words(transcript_words, start: float, end: float) -> List[Dict[str, Any]]:
+    out = []
+    for w in transcript_words or []:
+        text, s, e = _norm_word(w)
+        if s is None or e is None:
+            continue
+        if e > start and s < end:
+            out.append({"word": text, "start": s, "end": e})
+    return out
+
+
+def compute_deterministic_features(
+    candidate: Dict[str, Any],
+    transcript_words=None,
+    audio_energy_variance: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Deterministic virality features for one clip candidate (pure).
+
+    - speech_rate_wpm: words overlapping [start, end] per minute
+    - question/exclamation_density: ? and ! per overlapping word
+    - audio_energy_variance: per-window dBFS variance when provided
+    """
+    try:
+        start = float(candidate.get("start", 0) or 0)
+        end = float(candidate.get("end", 0) or 0)
+    except (TypeError, ValueError):
+        start, end = 0.0, 0.0
+    dur = max(0.1, end - start)
+    words = _overlap_words(transcript_words, start, end)
+    n = len(words)
+    text = " ".join(str(w.get("word") or "") for w in words)
+    var = None
+    if audio_energy_variance is not None:
+        try:
+            var = float(audio_energy_variance)
+        except (TypeError, ValueError):
+            var = None
+    return {
+        "word_count": n,
+        "duration": round(dur, 2),
+        "speech_rate_wpm": round((n / dur) * 60.0, 1),
+        "question_density": round(text.count("?") / max(1, n), 4),
+        "exclamation_density": round(text.count("!") / max(1, n), 4),
+        "audio_energy_variance": round(var, 3) if var is not None else None,
+    }
+
+
+def deterministic_score(features: Dict[str, Any]) -> int:
+    """Heuristic 1-100 virality score from deterministic features (pure).
+
+    Rewards: conversational speech rate (140-185 wpm), question/exclamation
+    hooks, dynamic audio delivery, and the 20-45s short-form sweet spot.
+    Penalises: rushed/dragging speech, flat monotone audio, sub-12s stubs.
+    """
+    score = 50.0
+    wpm = features.get("speech_rate_wpm") or 0
+    if 140 <= wpm <= 185:
+        score += 15
+    elif 110 <= wpm < 140 or 185 < wpm <= 220:
+        score += 6
+    else:
+        score -= 10
+    if (features.get("question_density") or 0) >= 0.03:
+        score += 8
+    if (features.get("exclamation_density") or 0) >= 0.03:
+        score += 8
+    var = features.get("audio_energy_variance")
+    if var is not None:
+        if var >= 25:
+            score += 10
+        elif var >= 10:
+            score += 4
+        else:
+            score -= 6
+    dur = features.get("duration") or 0
+    if 20 <= dur <= 45:
+        score += 10
+    elif dur < 12:
+        score -= 8
+    return max(1, min(100, int(round(score))))
+
+
+def cross_check_scores(
+    candidates: List[Dict[str, Any]],
+    transcript_words=None,
+    media_path: Optional[str] = None,
+    energy_fn=None,
+) -> List[Dict[str, Any]]:
+    """Attach deterministic cross-check fields to candidate dicts.
+
+    Each candidate gains ``deterministic_features``, ``deterministic_score``,
+    ``score_disagreement`` (|LLM - deterministic|) and
+    ``score_review_required``. Flagged candidates are down-ranked by
+    ``SCORE_REVIEW_RANK_PENALTY`` in sort order only — the LLM
+    ``viral_score`` itself is never replaced. ``energy_fn`` is injectable
+    for tests (defaults to
+    ``media_probe.compute_audio_energy_variance``); a failing energy probe
+    degrades to transcript-only features.
+    """
+    if energy_fn is None:
+        try:
+            from clippyme.pipeline.media_probe import compute_audio_energy_variance
+            energy_fn = compute_audio_energy_variance
+        except Exception:  # noqa: BLE001 - import must never break scoring
+            energy_fn = lambda *a, **k: None  # noqa: E731
+
+    out = []
+    for c in candidates:
+        if not isinstance(c, dict):
+            out.append(c)
+            continue
+        try:
+            c_start = float(c.get("start", 0) or 0)
+            c_end = float(c.get("end", 0) or 0)
+        except (TypeError, ValueError):
+            c_start, c_end = 0.0, 0.0
+        var = None
+        if media_path:
+            try:
+                var = energy_fn(media_path, c_start, c_end)
+            except Exception:  # noqa: BLE001 - degrade to transcript-only
+                var = None
+        feats = compute_deterministic_features(
+            c, transcript_words, audio_energy_variance=var)
+        det = deterministic_score(feats)
+        try:
+            llm = int(c.get("viral_score"))
+        except (TypeError, ValueError):
+            llm = det
+        disagreement = abs(llm - det)
+        review = disagreement > SCORE_DISAGREEMENT_THRESHOLD
+        c = dict(c)
+        c["deterministic_features"] = feats
+        c["deterministic_score"] = det
+        c["score_disagreement"] = disagreement
+        c["score_review_required"] = bool(review)
+        if review:
+            logger.info(
+                "cross_check_scores: clip %.1f-%.1fs LLM=%d deterministic=%d "
+                "disagreement=%d > %d — flagged for review (down-ranked, score kept)",
+                c_start, c_end, llm, det, disagreement,
+                SCORE_DISAGREEMENT_THRESHOLD,
+            )
+        out.append(c)
+    out.sort(key=lambda c: -(
+        (c.get("viral_score") or 0)
+        - (SCORE_REVIEW_RANK_PENALTY if isinstance(c, dict) and c.get("score_review_required") else 0)
+    ))
+    return out
+
+
 def validate_and_dedupe(
     data: Dict[str, Any],
     video_duration: Optional[float] = None,
     overlap_threshold: float = 0.7,
     drop_generic: bool = False,
+    transcript_words=None,
+    media_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Pydantic-validate then remove overlapping clips.
 
@@ -344,6 +524,12 @@ def validate_and_dedupe(
     its intersection-over-union with any already-kept clip exceeds
     ``overlap_threshold`` it's dropped. When ``video_duration`` is
     given, clips whose ``end`` exceeds it are also dropped.
+
+    ``transcript_words`` / ``media_path`` (both optional, 2F): feed the
+    deterministic score cross-check — candidates whose LLM viral_score
+    disagrees with the deterministic heuristic by more than
+    ``SCORE_DISAGREEMENT_THRESHOLD`` are flagged (``score_review_required``)
+    and down-ranked; the LLM score itself is never replaced.
 
     Raises
     ------
@@ -421,7 +607,11 @@ def validate_and_dedupe(
         if not overlaps:
             kept.append(clip)
 
-    return [c.model_dump() for c in kept]
+    dumped = [c.model_dump() for c in kept]
+    # 2F: deterministic cross-check — flag (and down-rank, never silently
+    # replace) LLM scores that disagree with transcript/audio features.
+    return cross_check_scores(
+        dumped, transcript_words=transcript_words, media_path=media_path)
 
 
 def _truncate_words(text: str, n: int = 10) -> str:
@@ -529,6 +719,10 @@ __all__ = [
     "ParseResult",
     "parse_gemini_response",
     "validate_and_dedupe",
+    "compute_deterministic_features",
+    "deterministic_score",
+    "cross_check_scores",
+    "SCORE_DISAGREEMENT_THRESHOLD",
     "backfill_hook_text",
     "drop_wordless_clips",
 ]

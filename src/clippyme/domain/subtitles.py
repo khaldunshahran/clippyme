@@ -479,13 +479,36 @@ def ass_alignment_and_margins(vpos, align):
     return base, _SUB_MARGIN_EDGE, _SUB_MARGIN_EDGE
 
 
+def _normalize_keyword(s):
+    """2D: lowercase + strip punctuation for keyword matching."""
+    return "".join(
+        ch for ch in str(s).lower() if ch.isalnum() or ch.isspace()).strip()
+
+
+def _normalize_keywords(keywords):
+    """2D: normalize a keyword list to a set; None/empty -> None (legacy path).
+
+    Accepts a list/tuple/set of strings, or a comma-separated string.
+    """
+    if not keywords:
+        return None
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in keywords.split(",")]
+    try:
+        out = {_normalize_keyword(k) for k in keywords}
+    except TypeError:
+        return None
+    out.discard("")
+    return out or None
+
+
 def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
                          preset="classic_white", mode="word_group",
                          words_per_group=3, uppercase=True,
                          font_name=None, font_color=None, highlight_color=None,
                          font_size=None, outline_width=None, position="bottom",
                          offset_y=0, outline_color=None, align="center",
-                         band_top=None):
+                         band_top=None, animate=None, keywords=None):
     """
     Generate an ASS subtitle file with karaoke word-by-word highlighting.
     Uses \\k tags so the current word snaps from secondary (base) to primary (highlight) color.
@@ -500,6 +523,12 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
         uppercase: convert text to uppercase
         font_name/font_color/highlight_color/font_size/outline_width: overrides for preset
         position: 'top', 'center', 'bottom'
+        animate: None (default, static karaoke) or "pop" - per-word
+            \\t + \\fscx/\\fscy scale pop (100->112->100 over the word).
+            A preset may also carry an "animate" flag; the explicit kwarg wins.
+        keywords: None (default) or a list of words held in the highlight
+            colour for their whole event (2D). Matching is case- and
+            punctuation-insensitive. No keywords -> output unchanged.
     """
     # Resolve preset
     style = SUBTITLE_PRESETS.get(preset, SUBTITLE_PRESETS["classic_white"]).copy()
@@ -594,6 +623,13 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
     if not words:
         return False
 
+    # 2A word-pop: enabled by the explicit kwarg or a preset-level flag.
+    # Existing presets carry no "animate" key, so their output is unchanged.
+    _animate_mode = animate if animate is not None else style.get("animate")
+    pop = isinstance(_animate_mode, str) and _animate_mode.strip().lower() == "pop"
+    # 2D: keyword set for highlight-hold; None keeps the legacy path.
+    kw_set = _normalize_keywords(keywords)
+
     # Colors: primary = highlight (what word becomes), secondary = base (what word starts as)
     primary_colour = hex_to_ass_color(style["highlight_color"], 1.0)
     secondary_colour = hex_to_ass_color(style["text_color"], 1.0)
@@ -643,7 +679,17 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
             text = _strip_ass_braces(w['word'].strip())
             if style["uppercase"]:
                 text = text.upper()
-            karaoke_parts.append(f"{{\\k{duration_cs}}}{text}")
+            prefix = ""
+            if pop:
+                prefix = _pop_transform(w, clip_start, event_start)
+            if kw_set and _normalize_keyword(w['word']) in kw_set:
+                # 2D keyword: hold the highlight colour for the whole event by
+                # painting the karaoke sweep's secondary side highlight too,
+                # then restoring the base colour for the following words.
+                karaoke_parts.append(
+                    f"{prefix}{{\\k{duration_cs}}}{{\\2c{primary_colour}&}}{text}{{\\2c{secondary_colour}&}}")
+            else:
+                karaoke_parts.append(f"{prefix}{{\\k{duration_cs}}}{text}")
 
         line_text = " ".join(karaoke_parts)
         # Fix: \k tags shouldn't have space before them inside the line
@@ -698,6 +744,44 @@ _SUB_CONNECTORS = {
     "und", "aber", "oder", "weil", "dass", "welche", "wo", "wann", "während",
     "wenn", "obwohl", "als",
 }
+
+
+# --- 2A word-pop animation ------------------------------------------------
+# OpusClip-style per-word bounce: each spoken word scales 100 -> POP_PEAK_SIZE
+# -> 100 over its own duration via core-ASS \\t + \\fscx/\\fscy transforms
+# (libass renders \\t natively). Times are ms relative to the event start.
+# The peak lands at 40% of the word so the pop reads as snappy, not wobbly;
+# the peak size is deliberately modest (12%) - bigger overshoots wobble.
+POP_PEAK_SIZE = 112
+POP_PEAK_AT = 0.4
+
+
+def _pop_transform(w, clip_start, event_start):
+    """Build the ``\\t`` scale-pop override block for one karaoke word.
+
+    Returns "" when the word has no usable duration (degenerate timing can
+    otherwise emit a zero-length \\t, which some renderers treat as a jump).
+    """
+    try:
+        ws = float(w["start"]) - clip_start - event_start
+        we = float(w["end"]) - clip_start - event_start
+    except (TypeError, ValueError, KeyError):
+        return ""
+    if we <= ws:
+        return ""
+    ws_ms = int(round(ws * 1000))
+    we_ms = int(round(we * 1000))
+    wpk_ms = ws_ms + int(round((we_ms - ws_ms) * POP_PEAK_AT))
+    parts = []
+    if wpk_ms > ws_ms:
+        parts.append(
+            f"\\t({ws_ms},{wpk_ms},\\fscx{POP_PEAK_SIZE}\\fscy{POP_PEAK_SIZE})"
+        )
+    if we_ms > wpk_ms:
+        parts.append(f"\\t({wpk_ms},{we_ms},\\fscx100\\fscy100)")
+    if not parts:
+        return ""
+    return "{" + "".join(parts) + "}"
 
 
 def _word_text(w):

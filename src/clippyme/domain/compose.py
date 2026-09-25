@@ -228,6 +228,36 @@ async def _apply_smartcut(
     return sc_output or current_input
 
 
+async def _hook_text_fallback(metadata, clip_info) -> str:
+    """2C: slice the clip's transcript words and ask Gemini for a hook line.
+
+    Pure glue — ``hooks.generate_hook_text`` does the LLM call (in a thread)
+    and returns the hard fallback "You need to see this" if Gemini fails.
+    Returns "" only when there are no transcript words to work from.
+    """
+    try:
+        from clippyme.domain.hooks import generate_hook_text
+
+        transcript = (metadata or {}).get("transcript", {}) or {}
+        start = float((clip_info or {}).get("start", 0) or 0)
+        end = float((clip_info or {}).get("end", 0) or 0)
+        words = []
+        for seg in transcript.get("segments", []) or []:
+            for w in seg.get("words", []) or []:
+                ws, we = w.get("start"), w.get("end")
+                if ws is None or we is None:
+                    continue
+                if we > start and ws < end and w.get("word"):
+                    words.append(str(w["word"]))
+        text = " ".join(words).strip()
+        if not text:
+            return ""
+        return await asyncio.to_thread(generate_hook_text, text[:1500])
+    except Exception as exc:  # noqa: BLE001 - fallback must never break compose
+        logger.warning("compose_layers: hook LLM fallback failed: %s", exc)
+        return ""
+
+
 async def _apply_hook(
     current_input: str,
     job_dir: str,
@@ -256,7 +286,7 @@ async def _apply_hook(
     # actually set so create_hook_image's defaults fill the rest.
     _style_keys = ("text_color", "bg_enabled", "bg_color", "bg_opacity",
                    "corner_radius", "outline_color", "outline_width", "font", "shadow",
-                   "animate")
+                   "animate", "kinetic")
     style = {k: hook_params[k] for k in _style_keys if k in hook_params}
     logo = None
     if logo_params is not None:
@@ -344,6 +374,24 @@ def _letterbox_caption_band_top(video_path, clip_info, subtitle_params, banner_a
     return letterbox_band_bottom(width, height) + CAPTION_BAND_PAD
 
 
+def _resolve_subtitle_keywords(subtitle_params, clip_info, metadata):
+    """2D: keyword list for ASS keyword coloring.
+
+    Precedence: explicit subtitle_params["keywords"], then clip_info /
+    metadata fields ("keywords", "emphasis_keywords", "highlight_words")
+    when present. Returns None when nothing is set (legacy output).
+    """
+    kw = (subtitle_params or {}).get("keywords")
+    if kw:
+        return kw
+    for src in (clip_info or {}, metadata or {}):
+        for key in ("keywords", "emphasis_keywords", "highlight_words"):
+            val = src.get(key)
+            if val:
+                return val
+    return None
+
+
 async def _apply_subtitles(
     current_input: str,
     job_dir: str,
@@ -388,6 +436,9 @@ async def _apply_subtitles(
                 outline_color=subtitle_params.get("outline_color"),
                 align=subtitle_params.get("align", "center"),
                 band_top=band_top,
+                animate=subtitle_params.get("animate"),
+                keywords=_resolve_subtitle_keywords(
+                    subtitle_params, clip_info, metadata),
             ),
         )
         if not success:
@@ -418,6 +469,9 @@ async def _apply_subtitles(
                             outline_color=subtitle_params.get("outline_color"),
                             align=subtitle_params.get("align", "center"),
                             band_top=band_top,
+                            animate=subtitle_params.get("animate"),
+                            keywords=_resolve_subtitle_keywords(
+                                subtitle_params, clip_info, metadata),
                         ),
                     )
             except Exception as _ot_exc:
@@ -685,12 +739,23 @@ async def _compose_layers_impl(
             hook_text = hook_text.strip()
         hook_active = bool(active.get("hook"))
         if hook_active and not hook_text:
-            logger.warning(
-                "compose_layers: hook toggle ON but text is empty — "
-                "skipping hook layer. Ensure PublishModal / ResultCard "
-                "sends a non-empty hook_params.text.",
-            )
-            hook_active = False
+            # 2C: never render a blank hook card — generate one from the
+            # clip transcript via the Gemini fallback (hard fallback line
+            # if Gemini is unavailable). Only skip if even that fails.
+            hook_text = await _hook_text_fallback(metadata, clip_info)
+            if hook_text:
+                logger.info(
+                    "compose_layers: hook toggle ON but text was empty — "
+                    "using generated hook %r.",
+                    hook_text,
+                )
+                hook_params = {**(hook_params or {}), "text": hook_text}
+            else:
+                logger.warning(
+                    "compose_layers: hook toggle ON but no hook text and "
+                    "no transcript to generate one from — skipping hook layer.",
+                )
+                hook_active = False
         logo_active = bool(active.get("logo"))
         if logo_active and not os.path.exists(LOGO_PATH):
             logger.warning(

@@ -441,6 +441,8 @@ def render_highlight_reel_sync(
                     position=sub_opts.get("position", "bottom"),
                     offset_y=sub_opts.get("offset_y", 0),
                     align=sub_opts.get("align", "center"),
+                    animate=sub_opts.get("animate"),
+                    keywords=sub_opts.get("keywords"),
                 )
                 subbed_temp = os.path.join(job_dir, f"temp_hl_subbed_{final_id}.mp4")
                 burn_subtitles(

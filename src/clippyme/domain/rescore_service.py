@@ -109,7 +109,7 @@ A complete story arc that resolves its premise with a punchline achieves far hig
 
 Analyze the following {len(clip_payload)} extracted video clips.
 For EACH clip, evaluate its viral performance and provide:
-- viral_score: Integer between 65 and 99 based on hook strength, emotional intensity, narrative completeness, controversy/curiosity, and shareability.
+- viral_score: Integer between 1 and 100 based on hook strength, emotional intensity, narrative completeness, controversy/curiosity, and shareability.
 - viral_reason: A sharp, persuasive 1-2 sentence explanation of why this moment captures viewer retention and drives comments/shares. Highlight narrative setup, payoff, and story completeness.
 - video_title_for_youtube_short: A high-CTR viral YouTube Short title with curiosity hook (under 60 characters).
 - hook: The opening punchline or tension-building hook in the first 3 seconds of the clip.
@@ -147,12 +147,33 @@ Respond with ONLY a JSON object matching this schema:
 
     rescored_map = {item.get("clip_index"): item for item in parse_result.data.get("clips", [])}
 
+    # 2F: deterministic cross-check fields (transcript-only here; the
+    # rescore path has no media slice handy). Never replaces the LLM score.
+    from clippyme.pipeline.gemini_parser import (
+        compute_deterministic_features, deterministic_score,
+        SCORE_DISAGREEMENT_THRESHOLD,
+    )
+    _seg_words = []
+    for _s in segments:
+        _seg_words.extend(_s.get("words", []) or [])
+
     # Update metadata shorts
     for i, clip in enumerate(shorts):
         idx = i + 1
         ai_data = rescored_map.get(idx)
         if ai_data:
-            clip["viral_score"] = int(ai_data.get("viral_score", 85))
+            try:
+                _raw_score = int(ai_data.get("viral_score", 85))
+            except (TypeError, ValueError):
+                _raw_score = 85
+            clip["viral_score"] = max(1, min(100, _raw_score))
+            _feats = compute_deterministic_features(clip, _seg_words)
+            _det = deterministic_score(_feats)
+            _dis = abs(int(clip["viral_score"]) - _det)
+            clip["deterministic_features"] = _feats
+            clip["deterministic_score"] = _det
+            clip["score_disagreement"] = _dis
+            clip["score_review_required"] = bool(_dis > SCORE_DISAGREEMENT_THRESHOLD)
             clip["viral_reason"] = str(ai_data.get("viral_reason", "")).strip()
             if ai_data.get("video_title_for_youtube_short"):
                 clip["video_title_for_youtube_short"] = str(ai_data["video_title_for_youtube_short"]).strip()

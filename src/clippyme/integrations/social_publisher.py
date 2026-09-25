@@ -309,6 +309,38 @@ class SmartScheduler:
     slot_windows: dict[int, list[tuple[int, int]]] = field(default_factory=lambda: dict(DEFAULT_SLOT_WINDOWS))
     min_gap_seconds: int = MIN_GAP_BETWEEN_POSTS_SECONDS
     rng: random.Random = field(default_factory=random.Random)
+    # 2E audience-aware scheduling (all optional — API-compatible):
+    # when set and the caller left slot_windows at its default, the windows
+    # are derived from per-hour analytics (exact account match first,
+    # platform-level fallback; thin history -> conservative per-platform
+    # local windows). An explicitly passed slot_windows always wins.
+    platform: Optional[str] = None
+    account_id: Optional[str] = None
+    analytics_history: Optional[list] = None
+    # IANA name (or tzinfo) used to interpret history timestamps as local
+    # audience hours; None keeps each record's own tz.
+    history_tz: Optional[str] = None
+
+    def __post_init__(self):
+        if (self.platform or self.analytics_history) and self.slot_windows == dict(DEFAULT_SLOT_WINDOWS):
+            try:
+                from clippyme.integrations.audience_schedule import slot_windows_for
+                tz = self.history_tz
+                if isinstance(tz, str) and tz.strip():
+                    try:
+                        tz = _load_timezone(tz)
+                    except ValueError:
+                        tz = None
+                learned = slot_windows_for(
+                    platform=self.platform,
+                    account=self.account_id,
+                    history=self.analytics_history,
+                    tz=tz,
+                )
+            except Exception:
+                learned = None
+            if learned:
+                self.slot_windows = learned
 
     def _windows_for(self, weekday: int) -> list[tuple[int, int]]:
         return self.slot_windows.get(weekday, self.slot_windows[0])
@@ -382,6 +414,32 @@ class SmartScheduler:
         # one minute keeps the result strictly in the future even when the
         # scheduler was built with min_gap_seconds=0.
         return now + timedelta(seconds=max(self.min_gap_seconds, 60))
+
+
+def _audience_aware_scheduler(platform_targets, tz=None) -> "SmartScheduler":
+    """2E: default scheduler seeded from the primary target's platform/account
+    plus local analytics history. Falls back to the legacy scheduler when
+    nothing audience-specific is known."""
+    platform = account_id = None
+    try:
+        first = (platform_targets or [None])[0] or {}
+        if isinstance(first, dict):
+            platform = first.get("platform")
+            account_id = first.get("accountId") or first.get("account_id")
+    except Exception:
+        pass
+    history = None
+    try:
+        from clippyme.integrations.audience_schedule import load_analytics_history
+        history = load_analytics_history()
+    except Exception:
+        history = None
+    try:
+        return SmartScheduler(
+            platform=platform, account_id=account_id,
+            analytics_history=history or None, history_tz=tz)
+    except Exception:
+        return SmartScheduler()
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +545,7 @@ def publish_clip(
         # Pick a slot today (or tomorrow if it's late), or honour an
         # explicit start_date from the caller (batch publish UI lets the
         # user pick the day the schedule should begin).
-        sched = scheduler or SmartScheduler()
+        sched = scheduler or _audience_aware_scheduler(platform_targets, target_timezone)
         now = datetime.now(target_timezone)
         if start_date:
             try:

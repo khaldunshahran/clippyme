@@ -24,6 +24,11 @@ DEFAULT_POST_PAD = 0.08  # 80ms after the last kept word
 # the transcript is probably misaligned for that moment — keep the raw edge
 # rather than yank the clip somewhere the LLM did not intend.
 DEFAULT_MAX_SNAP = 0.6
+# 2B: when the anchor word a clip edge snaps to has a *known* confidence
+# below the quality floor, its timing is untrusted — pad wider so the
+# word is never clipped. Unknown confidence keeps the normal pads.
+LOW_CONFIDENCE_PRE_PAD = 0.15
+LOW_CONFIDENCE_POST_PAD = 0.25
 
 
 # video-use Hard Rule 3: a 30ms audio fade at every segment boundary kills the
@@ -71,7 +76,16 @@ def flatten_words(transcript: dict | None) -> list[dict]:
                 continue
             if e < s:
                 continue
-            words.append({"start": s, "end": e, "word": w.get("word", "")})
+            flat = {"start": s, "end": e, "word": w.get("word", "")}
+            # 2B: preserve word confidence as optional — downstream
+            # (snap pads, QA) reads it via .get("probability").
+            try:
+                _p = float(w.get("probability"))
+                if _p == _p:  # drop NaN
+                    flat["probability"] = _p
+            except (TypeError, ValueError):
+                pass
+            words.append(flat)
     words.sort(key=lambda x: x["start"])
     return words
 
@@ -86,6 +100,37 @@ def _nearest_boundary(target: float, boundaries: Iterable[float], max_snap: floa
             best_dist = d
             best = b
     return best
+
+
+def _nearest_word(target: float, words: list[dict], key: str, max_snap: float):
+    """Return the word whose ``key`` boundary is nearest to `target` (within
+    `max_snap`), else None. 2B: lets the snap use the *anchor word's*
+    confidence for edge padding."""
+    best = None
+    best_dist = max_snap
+    for w in words:
+        try:
+            b = float(w[key])
+        except (TypeError, ValueError, KeyError):
+            continue
+        d = abs(b - target)
+        if d <= best_dist:
+            best_dist = d
+            best = w
+    return best
+
+
+def _pad_for_confidence(prob, normal_pad: float, low_pad: float) -> float:
+    """2B: pad for an anchor word's confidence — unknown keeps the normal
+    pad, known-below-floor widens (never below an explicit override)."""
+    try:
+        p = float(prob)
+    except (TypeError, ValueError):
+        return normal_pad
+    from clippyme.pipeline.transcript_quality import TRANSCRIPT_QUALITY_FLOOR
+    if 0.0 <= p < TRANSCRIPT_QUALITY_FLOOR:
+        return max(normal_pad, low_pad)
+    return normal_pad
 
 
 def snap_clip_to_words(
@@ -118,13 +163,21 @@ def snap_clip_to_words(
         return start, end
 
     new_start, new_end = start, end
+    start_anchor_prob = None
+    end_anchor_prob = None
     if words:
-        snap_start = _nearest_boundary(start, (w["start"] for w in words), max_snap)
-        if snap_start is not None:
-            new_start = snap_start
-        snap_end = _nearest_boundary(end, (w["end"] for w in words), max_snap)
-        if snap_end is not None:
-            new_end = snap_end
+        w0 = _nearest_word(start, words, "start", max_snap)
+        if w0 is not None:
+            new_start = w0["start"]
+            start_anchor_prob = w0.get("probability")
+        w1 = _nearest_word(end, words, "end", max_snap)
+        if w1 is not None:
+            new_end = w1["end"]
+            end_anchor_prob = w1.get("probability")
+
+    # 2B: low-confidence anchors get wider pads; unknown keeps the default.
+    pre_pad = _pad_for_confidence(start_anchor_prob, pre_pad, LOW_CONFIDENCE_PRE_PAD)
+    post_pad = _pad_for_confidence(end_anchor_prob, post_pad, LOW_CONFIDENCE_POST_PAD)
 
     new_start = max(0.0, new_start - pre_pad)
     new_end = new_end + post_pad

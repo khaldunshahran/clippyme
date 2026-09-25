@@ -334,8 +334,8 @@ def _transcribe_whisper_chunked(model, audio_path: str, language: str | None, ch
     return all_segments, detected_lang
 
 
-def transcribe_video(video_path):
-    """Dispatch to the configured transcription provider.
+def _transcribe_video_once(video_path):
+    """Dispatch to the configured transcription provider (single attempt).
 
     Provider is selected via the ``TRANSCRIPTION_PROVIDER`` env var:
       - "deepgram" (default) → Deepgram Nova-3 REST API (requires DEEPGRAM_API_KEY)
@@ -518,6 +518,94 @@ def transcribe_video(video_path):
                 except OSError:
                     pass
 
+# --- 2B transcript quality gate -------------------------------------------------
+# Wraps _transcribe_video_once: after the primary transcript, assess mean word
+# confidence; if "low", retry ONCE with a secondary provider and keep the
+# better result; if still low, the transcript is annotated (never silently
+# trusted). Cached transcripts are assessed on load via
+# ensure_transcript_quality (annotated, not retried).
+
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _provider_override(provider):
+    """Temporarily force TRANSCRIPTION_PROVIDER for one transcription attempt."""
+    key = "TRANSCRIPTION_PROVIDER"
+    prev = os.environ.get(key)
+    os.environ[key] = provider
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prev
+
+
+def ensure_transcript_quality(transcript):
+    """Assess (+ annotate) a transcript dict — also used for cached loads."""
+    from clippyme.pipeline.transcript_quality import annotate_transcript_quality
+    return annotate_transcript_quality(transcript)
+
+
+def transcribe_video(video_path):
+    """Dispatch to the configured transcription provider, with a confidence gate.
+
+    Provider selection, audio-only extraction, isolation pre-pass and the
+    cloud->local fallback chain live in ``_transcribe_video_once`` (single
+    attempt). This wrapper adds the 2B quality gate: a primary transcript
+    whose known-mean word confidence is below ``TRANSCRIPT_QUALITY_FLOOR``
+    triggers exactly one retry with a secondary provider; the better result
+    is kept and always annotated with ``transcript_quality`` /
+    ``transcript_confidence`` metadata.
+    """
+    from clippyme.pipeline.transcript_quality import (
+        assess_transcript_quality, annotate_transcript_quality,
+        pick_better_transcript, secondary_provider_for,
+        TRANSCRIPT_QUALITY_FLOOR,
+    )
+    _log = logging.getLogger("clippyme")
+
+    primary = _transcribe_video_once(video_path)
+    quality = assess_transcript_quality(primary)
+    if quality["quality"] != "low":
+        return annotate_transcript_quality(primary, quality)
+
+    mean = quality["mean_confidence"]
+    provider = (os.getenv("TRANSCRIPTION_PROVIDER") or "deepgram").strip().lower()
+    secondary = secondary_provider_for(provider)
+    if not secondary:
+        _log.warning(
+            "transcribe_video: transcript confidence %.2f < %.2f but no secondary "
+            "provider available — flagging as low quality",
+            mean, TRANSCRIPT_QUALITY_FLOOR)
+        print(f"\u26a0\ufe0f Transcript confidence {mean:.2f} is low — flagged; "
+              "no secondary provider to retry with.")
+        return annotate_transcript_quality(primary, quality)
+
+    _log.warning(
+        "transcribe_video: primary transcript confidence %.2f < %.2f — "
+        "retrying once with %s", mean, TRANSCRIPT_QUALITY_FLOOR, secondary)
+    print(f"\u26a0\ufe0f Low transcript confidence ({mean:.2f}) — "
+          f"retrying once with {secondary}...")
+    try:
+        with _provider_override(secondary):
+            alt = _transcribe_video_once(video_path)
+    except Exception as exc:  # noqa: BLE001 — keep the primary on retry failure
+        _log.warning("transcribe_video: secondary transcription (%s) failed: %s",
+                     secondary, exc)
+        return annotate_transcript_quality(primary, quality)
+    alt_quality = assess_transcript_quality(alt)
+    best, best_q = pick_better_transcript(primary, quality, alt, alt_quality)
+    _alt_mean = alt_quality["mean_confidence"]
+    _log.info(
+        "transcribe_video: quality retry done — primary %.2f vs %s %.2f; kept %s",
+        mean, secondary, _alt_mean if _alt_mean is not None else -1.0,
+        "secondary" if best is alt else "primary")
+    return annotate_transcript_quality(best, best_q)
+
+
 def get_viral_clips(
     transcript_result,
     video_duration,
@@ -529,6 +617,7 @@ def get_viral_clips(
     clip_type=None,
     duration_mode=None,
     audience_intel=None,
+    media_path=None,
 ):
     print("🤖  Analyzing with Gemini...")
     get_viral_clips._last_gemini_exhausted = False
@@ -658,6 +747,8 @@ def get_viral_clips(
                 video_duration=video_duration,
                 overlap_threshold=0.7,
                 drop_generic=True,
+                transcript_words=words,
+                media_path=media_path,
             )
         except ValidationError as e:
             print(f"❌ Pydantic validation failed: {e}")
@@ -921,7 +1012,8 @@ if __name__ == '__main__':
         # 3. Transcribe (with cache for URL-based jobs)
         cached = _load_cached_transcript(args.url) if args.url else None
         if cached:
-            transcript = cached
+            # 2B: cached transcripts are assessed too (annotated, not retried)
+            transcript = ensure_transcript_quality(cached)
         else:
             transcript = transcribe_video(input_video)
             if args.url:
@@ -957,6 +1049,7 @@ if __name__ == '__main__':
             clip_type=args.clip_type,
             duration_mode=getattr(args, "duration_mode", None),
             audience_intel=audience_intel,
+            media_path=input_video,
         )
 
         # Smarter no-AI fallback: when Gemini is unavailable (no key) or its
@@ -975,7 +1068,8 @@ if __name__ == '__main__':
             if not should_use_fallback(args.monitor):
                 # Monitor: no hallucinated/fallback clips — write empty metadata
                 # (+ exhaustion marker if Gemini ran out of models) and exit clean.
-                empty = {'shorts': [], 'transcript': transcript, 'aspect': args.aspect}
+                empty = {'shorts': [], 'transcript': transcript, 'aspect': args.aspect,
+                         'transcript_quality': (transcript or {}).get('transcript_quality', 'unknown')}
                 if download_quality_warning:
                     empty['quality_warning'] = download_quality_warning
                 if getattr(get_viral_clips, '_last_gemini_exhausted', False):
@@ -996,6 +1090,7 @@ if __name__ == '__main__':
             
             # Save metadata
             clips_data['transcript'] = transcript # Save full transcript for subtitles
+            clips_data['transcript_quality'] = (transcript or {}).get('transcript_quality', 'unknown')
             # Annotate each clip with the reframe mode used for the initial
             # render so the dashboard can render the correct per-clip state
             # without guessing (the /api/reframe endpoint updates this

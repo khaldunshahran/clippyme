@@ -822,7 +822,8 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
 
 def process_video_to_vertical(input_video, final_output_video, reframe_mode='auto',
                               zoom_end=None, aspect_ratio: float = 9 / 16,
-                              letterbox_zoom: float = 0.0):
+                              letterbox_zoom: float = 0.0,
+                              punch_times=None):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
 
@@ -835,6 +836,11 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
     letterbox_zoom: only meaningful for reframe_mode='disabled' — 0.0 keeps the
     whole frame between the black bars, 0.05–0.15 crops that fraction off the
     width for a fixed zoom (see reframe_ops.letterbox_plan).
+
+    punch_times: 2D punch-ins — optional list of clip-relative seconds
+        where a subtle local zoom pulse (peaking at 1.12x) is added on top
+        of the Ken Burns drift. None (default) auto-detects high-energy
+        audio peaks when the zoom fold is active; pass [] to disable.
 
     aspect_ratio: output width/height ratio (9/16 vertical default; 1.0 and
     16/9 for square/landscape jobs). Passed explicitly by main.py per job —
@@ -1005,8 +1011,26 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
     zoom_vf_args = []
     if zoom_end and float(zoom_end) > 1.0 and _probe_total_frames > 0:
         zpf = (float(zoom_end) - 1.0) / _probe_total_frames
+        # 2D punch-ins: optional local zoom pulses on high-energy peaks.
+        # punch_times=None auto-detects from the input audio; [] disables.
+        # Pulses fold into this same zoompan — no extra encode, no tracking
+        # changes; drift stays <=1.05 and pulses peak at <=1.12.
+        _punches = punch_times
+        if _punches is None:
+            try:
+                from clippyme.pipeline.media_probe import detect_energy_peaks
+                _punches = detect_energy_peaks(input_video)
+            except Exception:
+                _punches = []
+        try:
+            from clippyme.pipeline.media_probe import punch_zoom_suffix
+            _punch_suffix = punch_zoom_suffix(fps, _punches)
+        except Exception:
+            _punch_suffix = ""
+        if _punch_suffix:
+            print(f"   punch-ins: {len(_punches) if _punches else 0} pulse(s) folded into the zoom")
         zoom_vf_args = ['-vf', (
-            f"zoompan=z='1+{zpf:.8f}*on'"
+            f"zoompan=z='1+{zpf:.8f}*on{_punch_suffix}'"
             f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
             f":d=1:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:fps={fps}"
         )]

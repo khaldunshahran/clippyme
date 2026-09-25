@@ -2,6 +2,7 @@ import contextlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.request
@@ -166,6 +167,54 @@ def has_emoji(text):
 _HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
+def generate_hook_text(transcript_text, api_key=None, model=None):
+    """2C: LLM fallback hook line generated from a clip's transcript.
+
+    Called when ``clip.viral_hook_text`` is empty so the pipeline never
+    renders a blank hook card. Reuses the existing Gemini model-fallback
+    helper (``pipeline.gemini_request`` is import-light: json/time only, so
+    no import cycle). Returns a <=8-word scroll-stopping line; on total LLM
+    failure returns the hard fallback "You need to see this" (the same
+    ultimate fallback as ``gemini_parser.backfill_hook_text``).
+    """
+    transcript_text = (transcript_text or "").strip()
+    if not transcript_text:
+        return "You need to see this"
+    try:
+        from google import genai  # lazy: keeps hooks.py import-light for tests
+        from clippyme.pipeline.gemini_request import (
+            build_model_chain, generate_with_model_fallback,
+        )
+        from clippyme.storage.config_store import load_persistent_config
+        cfg = load_persistent_config()
+        key = api_key or cfg.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise RuntimeError("no Gemini API key configured")
+        prompt = (
+            "You write scroll-stopping overlay hooks for TikTok/Reels/YouTube Shorts.\n"
+            "Read the clip transcript below and write ONE hook line: 3-8 words, "
+            "same language as the transcript.\n"
+            "Rules: curiosity gap, bold claim, or question. NOT a quote from the "
+            "transcript, NOT the speaker's first words. No hashtags, no emojis, "
+            "no quotation marks around it. Output ONLY the hook line.\n"
+            "Transcript:\n"
+            f"{transcript_text[:1500]}"
+        )
+        client = genai.Client(api_key=key)
+        chain = build_model_chain(
+            model or cfg.get("GEMINI_MODEL") or "gemini-3.5-flash-lite")
+        response, _model_used = generate_with_model_fallback(
+            client, prompt, chain, max_attempts=2, log_fn=logger.info)
+        hook = (response.text or "").strip().strip('"').strip("'").strip()
+        words = hook.split()
+        if not words:
+            raise RuntimeError("empty hook from Gemini")
+        return " ".join(words[:8])
+    except Exception as exc:  # noqa: BLE001 - fallback must never break compose
+        logger.warning("generate_hook_text: Gemini fallback failed (%s)", exc)
+        return "You need to see this"
+
+
 def _hex_to_rgba(hex_str, alpha=255, default=(0, 0, 0)):
     """#RRGGBB → (r, g, b, alpha), with a safe fallback."""
     if isinstance(hex_str, str) and _HEX_RE.match(hex_str):
@@ -212,6 +261,7 @@ HOOK_STYLE_DEFAULTS = {
     "font": "Anton-Regular",
     "shadow": None,
     "animate": False,
+    "kinetic": False,
 }
 
 
@@ -239,8 +289,14 @@ def _split_overlong_word(draw, word, font, max_width, stroke_width):
 
 
 def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
-                      font_scale=1.0, style=None):
-    """Render a hook text overlay PNG (transparent canvas)."""
+                      font_scale=1.0, style=None, reveal_words=None):
+    """Render a hook text overlay PNG (transparent canvas).
+
+    ``reveal_words`` (2C kinetic path): when an int, only the first N words
+    are drawn (layout is still computed from the FULL text so the card box
+    never resizes between frames) and the newest revealed word pops at
+    1.18x. ``None`` keeps the exact legacy single-shot render.
+    """
     s = {**HOOK_STYLE_DEFAULTS, **(style or {})}
     bg_enabled = bool(s["bg_enabled"])
     bg_opacity = max(0.0, min(1.0, float(s["bg_opacity"])))
@@ -273,9 +329,11 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
     max_text_width = max(1, target_width - (2 * padding_x))
 
     lines = []
+    line_words = []  # parallel word lists, for the 2C reveal draw path
     for paragraph in str(text or "").split("\n"):
         if not paragraph.strip():
             lines.append("")
+            line_words.append([])
             continue
         current_line = []
         words = []
@@ -288,12 +346,15 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
             else:
                 if current_line:
                     lines.append(" ".join(current_line))
+                    line_words.append(list(current_line))
                 current_line = [word]
         if current_line:
             lines.append(" ".join(current_line))
+            line_words.append(list(current_line))
 
     if not lines:
         lines = [""]
+        line_words = [[]]
 
     max_line_width = 0
     text_heights = []
@@ -315,6 +376,30 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
     canvas_h = box_height + 2 * margin
     img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
 
+    # 2C: per-word x positions for the reveal draw (centred exactly like the
+    # full-line draw above, so revealed words never shift between frames).
+    _space_w = _text_width(draw, " ", font, outline_w)
+    _line_word_xs = []
+    for _li, _line in enumerate(lines):
+        _xs = []
+        if _line:
+            _bbox = draw.textbbox((0, 0), _line, font=font, stroke_width=outline_w)
+            _x = margin + (box_width - (_bbox[2] - _bbox[0])) // 2
+            for _wd in line_words[_li]:
+                _xs.append(_x)
+                _x += _text_width(draw, _wd, font, outline_w) + _space_w
+        _line_word_xs.append(_xs)
+
+    _reveal = reveal_words is not None
+    _words_flat = [wd for _lws in line_words for wd in _lws]
+    _n_reveal = len(_words_flat) if not _reveal else max(0, min(int(reveal_words), len(_words_flat)))
+
+    def _revealed_upto(line_idx):
+        # global word index of the last revealed word on this line, or -1
+        count_before = sum(len(line_words[j]) for j in range(line_idx))
+        last = _n_reveal - 1 - count_before
+        return last
+
     if shadow:
         shadow_offset = (4, 4)
         shadow_draw = ImageDraw.Draw(img)
@@ -327,15 +412,28 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
             cy = margin + padding_y - 2
             for i, line in enumerate(lines):
                 if line:
-                    lw = _text_width(shadow_draw, line, font, outline_w)
-                    lx = margin + (box_width - lw) // 2
-                    shadow_draw.text(
-                        (lx + shadow_offset[0], cy + shadow_offset[1]),
-                        line,
-                        font=font,
-                        fill=(0, 0, 0, 150),
-                        stroke_width=outline_w,
-                    )
+                    if not _reveal:
+                        lw = _text_width(shadow_draw, line, font, outline_w)
+                        lx = margin + (box_width - lw) // 2
+                        shadow_draw.text(
+                            (lx + shadow_offset[0], cy + shadow_offset[1]),
+                            line,
+                            font=font,
+                            fill=(0, 0, 0, 150),
+                            stroke_width=outline_w,
+                        )
+                    else:
+                        _last = _revealed_upto(i)
+                        for _wi, _wd in enumerate(line_words[i]):
+                            if _wi > _last:
+                                break
+                            shadow_draw.text(
+                                (_line_word_xs[i][_wi] + shadow_offset[0], cy + shadow_offset[1]),
+                                _wd,
+                                font=font,
+                                fill=(0, 0, 0, 150),
+                                stroke_width=outline_w,
+                            )
                 cy += text_heights[i] + line_spacing
         img = img.filter(ImageFilter.GaussianBlur(5))
 
@@ -354,29 +452,119 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
         except Exception:
             emoji_font = None
 
+    # 2C kinetic reveal draw: revealed words only, newest word pops at 1.18x.
+    _pop_font = None
+    _pop_scale = 1.18
+    if _reveal:
+        try:
+            _pop_font = ImageFont.truetype(font_path, max(8, int(font_size * _pop_scale)))
+        except Exception:
+            try:
+                _pop_font = ImageFont.truetype(FONT_PATH, max(8, int(font_size * _pop_scale)))
+            except Exception:
+                _pop_font = font
+
     current_y = margin + padding_y - 2
     for i, line in enumerate(lines):
         if not line:
             current_y += font_size + line_spacing
             continue
-        render_font = emoji_font if emoji_font and has_emoji(line) else font
-        bbox = draw_final.textbbox((0, 0), line, font=render_font)
-        line_w = bbox[2] - bbox[0]
-        x = margin + (box_width - line_w) // 2
+        if not _reveal:
+            render_font = emoji_font if emoji_font and has_emoji(line) else font
+            bbox = draw_final.textbbox((0, 0), line, font=render_font)
+            line_w = bbox[2] - bbox[0]
+            x = margin + (box_width - line_w) // 2
 
-        if render_font is emoji_font:
-            draw_final.text((x, current_y), line, font=render_font, embedded_color=True)
-        elif outline_w > 0:
-            draw_final.text(
-                (x, current_y), line, font=render_font, fill=text_rgba,
-                stroke_width=outline_w, stroke_fill=outline_rgba)
+            if render_font is emoji_font:
+                draw_final.text((x, current_y), line, font=render_font, embedded_color=True)
+            elif outline_w > 0:
+                draw_final.text(
+                    (x, current_y), line, font=render_font, fill=text_rgba,
+                    stroke_width=outline_w, stroke_fill=outline_rgba)
+            else:
+                draw_final.text((x, current_y), line, font=render_font, fill=text_rgba)
         else:
-            draw_final.text((x, current_y), line, font=render_font, fill=text_rgba)
+            _last = _revealed_upto(i)
+            for _wi, _wd in enumerate(line_words[i]):
+                if _wi > _last:
+                    break
+                _is_newest = (_wi == _last)  # last revealed word on this line == newest globally
+                _wfont = emoji_font if (emoji_font and has_emoji(_wd)) else font
+                _wx = _line_word_xs[i][_wi]
+                if _is_newest and _pop_font is not None:
+                    # pop: draw bigger, centred on the word's original centre
+                    _wbbox = draw_final.textbbox((0, 0), _wd, font=_wfont, stroke_width=outline_w)
+                    _ww = _wbbox[2] - _wbbox[0]
+                    _pbbox = draw_final.textbbox((0, 0), _wd, font=_pop_font, stroke_width=outline_w)
+                    _pw = _pbbox[2] - _pbbox[0]
+                    _px = _wx + (_ww - _pw) / 2
+                    _py = current_y - (int(font_size * _pop_scale) - font_size) // 2
+                    if outline_w > 0:
+                        draw_final.text((_px, _py), _wd, font=_pop_font, fill=text_rgba,
+                                        stroke_width=outline_w, stroke_fill=outline_rgba)
+                    else:
+                        draw_final.text((_px, _py), _wd, font=_pop_font, fill=text_rgba)
+                elif outline_w > 0:
+                    draw_final.text((_wx, current_y), _wd, font=_wfont, fill=text_rgba,
+                                    stroke_width=outline_w, stroke_fill=outline_rgba)
+                else:
+                    draw_final.text((_wx, current_y), _wd, font=_wfont, fill=text_rgba)
 
         current_y += text_heights[i] + line_spacing
 
     img.save(output_image_path)
     return output_image_path, canvas_w, canvas_h
+
+
+# --- 2C kinetic hook reveal -------------------------------------------------
+# Word-by-word reveal: a PIL frame sequence (one stage per word, newest word
+# popping) fed to ffmpeg as an image-sequence overlay input. This composes
+# with the existing hook overlay path: the card PNG becomes a short overlay
+# video with alpha, overlaid with the same x/y/enable math.
+
+KINETIC_FPS = 12
+KINETIC_WORD_INTERVAL = 0.28  # seconds each revealed stage stays on screen
+KINETIC_HOLD_SEC = 1.0        # full-card hold after the last word
+
+
+def render_hook_reveal_frames(text, target_width, frames_dir, style=None,
+                              font_scale=1.0, fps=KINETIC_FPS,
+                              word_interval=KINETIC_WORD_INTERVAL,
+                              hold_sec=KINETIC_HOLD_SEC):
+    """Render the kinetic reveal frame sequence for a hook card.
+
+    Returns ``(frame_pattern, fps, total_frames)`` where ``frame_pattern`` is
+    an ffmpeg image-sequence pattern like ``.../hook_%03d.png``. Layout is
+    computed from the full text once, so the card box never resizes; frame i
+    reveals words[0..i] with the newest word popped, then the full card holds.
+    """
+    import shutil
+
+    words = str(text or "").split()
+    n = len(words)
+    os.makedirs(frames_dir, exist_ok=True)
+    pattern = os.path.join(frames_dir, "hook_%03d.png")
+    repeat = max(1, int(round(word_interval * fps)))
+    idx = 0
+    if n == 0:
+        create_hook_image(text, target_width, pattern % 1,
+                          font_scale=font_scale, style=style)
+        return pattern, fps, 1
+    for i in range(1, n + 1):
+        stage_path = os.path.join(frames_dir, f"hook_stage_{i:03d}.png")
+        create_hook_image(text, target_width, stage_path,
+                          font_scale=font_scale, style=style, reveal_words=i)
+        for _ in range(repeat):
+            idx += 1
+            shutil.copyfile(stage_path, pattern % idx)
+    full_path = os.path.join(frames_dir, "hook_full.png")
+    create_hook_image(text, target_width, full_path,
+                      font_scale=font_scale, style=style)
+    n_hold = max(1, int(round(hold_sec * fps)))
+    for _ in range(n_hold):
+        idx += 1
+        shutil.copyfile(full_path, pattern % idx)
+    return pattern, fps, idx
 
 
 def _enable_suffix(enable_end):
@@ -416,8 +604,15 @@ def build_hook_logo_filter(hook_x, hook_y, logo_chain, logo_x, logo_y,
 
 
 def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0,
-                      offset_y=0, style=None, logo=None, hook_duration=None):
-    """Overlay a text hook box, optionally with the brand logo, onto a video."""
+                      offset_y=0, style=None, logo=None, hook_duration=None,
+                      kinetic_reveal=False, transcript_text=None):
+    """Overlay a text hook box, optionally with the brand logo, onto a video.
+
+    ``kinetic_reveal`` (or style ``{"kinetic": True}``): 2C word-by-word
+    reveal overlay — a PIL frame sequence fed as an image-sequence input.
+    ``transcript_text``: when ``text`` is blank, the clip transcript used
+    for the LLM hook fallback — a blank card is never rendered.
+    """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video {video_path} not found")
 
@@ -433,17 +628,43 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         video_width, video_height = 1080, 1920
 
     target_box_width = int(video_width * 0.9)
-    # PID + basename was not unique inside one backend process: two concurrent
-    # jobs commonly both render `clip_1.mp4` and could overwrite/delete each
-    # other's hook PNG. mkstemp provides an exclusive path for every render.
-    fd, hook_filename = tempfile.mkstemp(prefix="clippyme-hook-", suffix=".png")
-    os.close(fd)
+
+    # 2C: never render a blank hook card — LLM fallback from the clip
+    # transcript, else the hard fallback line.
+    text = (text or "").strip()
+    if not text:
+        if transcript_text:
+            text = generate_hook_text(transcript_text)
+        if not text:
+            text = "You need to see this"
+        logger.info("add_hook_to_video: empty hook text — using fallback %r", text)
+
+    kinetic = bool(kinetic_reveal) or bool((style or {}).get("kinetic", False))
+
+    hook_tmpdir = None
+    if kinetic:
+        # 2C kinetic reveal: frame sequence (layout constant across frames).
+        hook_tmpdir = tempfile.mkdtemp(prefix="clippyme-hook-frames-")
+        hook_pattern, _kfps, _nframes = render_hook_reveal_frames(
+            text, target_box_width, hook_tmpdir, style=style, font_scale=font_scale)
+        with Image.open(hook_pattern % 1) as _fim:
+            box_w, box_h = _fim.size
+        hook_filename = hook_pattern  # image-sequence input pattern
+    else:
+        # PID + basename was not unique inside one backend process: two concurrent
+        # jobs commonly both render `clip_1.mp4` and could overwrite/delete each
+        # other's hook PNG. mkstemp provides an exclusive path for every render.
+        fd, hook_filename = tempfile.mkstemp(prefix="clippyme-hook-", suffix=".png")
+        os.close(fd)
 
     try:
-        img_path, box_w, box_h = create_hook_image(
-            text, target_box_width, hook_filename,
-            font_scale=font_scale, style=style,
-        )
+        if kinetic:
+            img_path = hook_filename  # image-sequence pattern
+        else:
+            img_path, box_w, box_h = create_hook_image(
+                text, target_box_width, hook_filename,
+                font_scale=font_scale, style=style,
+            )
 
         overlay_x = (video_width - box_w) // 2
         position_norm = "center" if position == "middle" else position
@@ -458,6 +679,8 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         overlay_y = max(0, min(overlay_y, video_height - box_h))
 
         animate = bool((style or {}).get("animate", False))
+        if kinetic:
+            animate = False  # 2C: the reveal IS the animation
         extra_inputs = []
         if logo and logo.get("path") and os.path.exists(logo["path"]):
             from clippyme.domain.logo import DEFAULT_POSITION, logo_filter_chain
@@ -482,12 +705,16 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         # overlay would repeat it forever — the hook never appeared at all. Loop
         # the image so fade has frames to work on, and let -shortest end the
         # output with the (finite) video instead of the (infinite) image.
-        loop_input = ["-loop", "1"] if animate else []
-        shortest = ["-shortest"] if animate else []
+        if kinetic:
+            hook_inputs = ["-framerate", str(KINETIC_FPS), "-i", img_path]
+        else:
+            loop_input = ["-loop", "1"] if animate else []
+            hook_inputs = [*loop_input, "-i", img_path]
+        shortest = ["-shortest"] if (animate and not kinetic) else []
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", video_path,
-            *loop_input, "-i", img_path,
+            *hook_inputs,
             *extra_inputs,
             "-filter_complex", filter_complex,
             "-c:a", "copy",
@@ -512,5 +739,8 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         logger.error("❌ FFmpeg Error: %s", e.stderr.decode() if e.stderr else "Unknown")
         raise
     finally:
-        with contextlib.suppress(OSError):
-            os.remove(hook_filename)
+        if hook_tmpdir:
+            shutil.rmtree(hook_tmpdir, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                os.remove(hook_filename)

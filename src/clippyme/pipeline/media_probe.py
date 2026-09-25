@@ -248,6 +248,217 @@ def parse_silencedetect(stderr_text: str) -> list[tuple[float, float]]:
     return intervals
 
 
+def _decode_db_levels(
+    media_path: str,
+    start: float,
+    duration: float,
+    window_sec: float = 0.25,
+    timeout: int = 120,
+) -> "tuple[list[float] | None, list[float] | None]":
+    """Decode mono 8 kHz PCM and return (per-window dBFS levels, window times).
+
+    Shared 2D/2F helper: ``compute_audio_energy_variance`` and
+    ``detect_energy_peaks`` both build on this. Returns (None, None) when
+    ffmpeg/numpy is missing, the slice has no audio, or the slice is
+    degenerate. Never raises.
+    """
+    try:
+        start_f, dur_f = float(start), float(duration)
+    except (TypeError, ValueError):
+        return None, None
+    if not media_path or dur_f <= 0 or dur_f > 600:
+        return None, None
+    try:
+        import numpy as np
+    except ImportError:
+        return None, None
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-v", "error",
+             "-ss", f"{start_f:.3f}", "-t", f"{dur_f:.3f}",
+             "-i", media_path, "-map", "0:a", "-ac", "1", "-ar", "8000",
+             "-f", "f32le", "-"],
+            capture_output=True, timeout=timeout,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None, None
+    raw = result.stdout or b""
+    if len(raw) < 8000:  # < 1s of audio at 8kHz f32 mono
+        return None, None
+    samples = np.frombuffer(raw, dtype=np.float32)
+    win = max(1, int(8000 * window_sec))
+    n_win = len(samples) // win
+    if n_win < 1:
+        return None, None
+    levels = []
+    for i in range(n_win):
+        chunk = samples[i * win:(i + 1) * win]
+        rms = float(np.sqrt(np.mean(chunk * chunk)))
+        levels.append(20.0 * float(np.log10(rms + 1e-9)))
+    times = [start_f + i * window_sec for i in range(n_win)]
+    return levels, times
+
+
+def compute_audio_energy_variance(
+    media_path: str,
+    start: float,
+    end: float,
+    window_sec: float = 0.5,
+    timeout: int = 120,
+) -> float | None:
+    """Per-window RMS energy variance (dBFS) over ``[start, end]``.
+
+    2F deterministic feature: decodes mono 8 kHz PCM for the slice via
+    ffmpeg and returns the variance of per-window dBFS levels — high
+    variance = dynamic delivery (loud/soft contrast), low = flat monotone.
+    Returns None when ffmpeg/numpy is missing, the slice has no audio, or
+    the slice is degenerate. Never raises — the caller simply treats the
+    energy feature as unknown.
+    """
+    try:
+        start_f, end_f = float(start), float(end)
+    except (TypeError, ValueError):
+        return None
+    dur = end_f - start_f
+    if not media_path or dur <= 0 or dur > 600:
+        return None
+    levels, _ = _decode_db_levels(
+        media_path, start_f, dur, window_sec=window_sec, timeout=timeout)
+    if not levels or len(levels) < 2:
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    var = float(np.var(levels))
+    if not np.isfinite(var):
+        return None
+    return var
+
+
+# 2D punch-in tuning: local zoom pulses on high-energy peaks. Amplitude is
+# chosen so drift (<=1.05) + pulse peaks at <=1.12; sigma gives a ~1.5 s
+# smooth bump. Peaks are capped and spaced so clips stay calm.
+PUNCH_IN_AMPLITUDE = 0.07
+PUNCH_IN_SIGMA = 0.6
+PUNCH_IN_MAX = 3
+PUNCH_IN_MIN_SPACING = 2.0
+PUNCH_IN_THRESHOLD_DB = 6.0
+
+
+def pick_energy_peaks(
+    levels,
+    times,
+    min_spacing: float = PUNCH_IN_MIN_SPACING,
+    max_peaks: int = PUNCH_IN_MAX,
+    threshold_db: float = PUNCH_IN_THRESHOLD_DB,
+) -> list:
+    """Pure non-max-suppressed peak picker over a (time, dBFS) series.
+
+    A peak is a local maximum at least ``threshold_db`` above the series
+    median. Candidates are taken greedily by height while enforcing
+    ``min_spacing`` between chosen peaks; at most ``max_peaks`` are kept.
+    Returns peak times ascending. Never raises on junk input.
+    """
+    try:
+        pairs = [(float(t), float(db)) for t, db in zip(times, levels)]
+    except (TypeError, ValueError):
+        return []
+    n = len(pairs)
+    if n == 0:
+        return []
+    try:
+        med = sorted(db for _, db in pairs)[n // 2]
+        floor = med + float(threshold_db)
+        spacing = float(min_spacing)
+        cap = max(0, int(max_peaks))
+    except (TypeError, ValueError):
+        return []
+    cands = []
+    for i, (t, db) in enumerate(pairs):
+        if db < floor:
+            continue
+        prev_ok = i == 0 or pairs[i - 1][1] <= db
+        next_ok = i == n - 1 or pairs[i + 1][1] <= db
+        if prev_ok and next_ok:
+            cands.append((db, t))
+    cands.sort(key=lambda c: -c[0])  # tallest first
+    chosen = []
+    for db, t in cands:
+        if all(abs(t - ct) >= spacing for _, ct in chosen):
+            chosen.append((db, t))
+            if len(chosen) >= cap:
+                break
+    return sorted(t for _, t in chosen)
+
+
+def detect_energy_peaks(
+    media_path: str,
+    start: float = 0.0,
+    duration: float | None = None,
+    timeout: int = 120,
+    **kwargs,
+) -> list:
+    """High-energy moments in a media file for 2D punch-in zooms.
+
+    Decodes the (optionally ``[start, start+duration]``) audio and returns
+    up to ``PUNCH_IN_MAX`` peak times (seconds, media-relative), spaced
+    apart, sorted ascending. Never raises — ``[]`` on any failure so the
+    caller simply renders without punch-ins.
+    """
+    try:
+        dur = None if duration is None else float(duration)
+    except (TypeError, ValueError):
+        return []
+    if duration is None:
+        try:
+            dur = float(probe_duration(media_path) or 0)
+        except Exception:
+            return []
+    try:
+        levels, times = _decode_db_levels(
+            media_path, float(start), dur, window_sec=0.25, timeout=timeout)
+    except Exception:
+        return []
+    if not levels:
+        return []
+    try:
+        return pick_energy_peaks(levels, times, **kwargs)
+    except Exception:
+        return []
+
+
+def punch_zoom_suffix(
+    fps,
+    punch_times,
+    amplitude: float = PUNCH_IN_AMPLITUDE,
+    sigma: float = PUNCH_IN_SIGMA,
+) -> str:
+    """Pure: ffmpeg zoompan ``z``-expression suffix for punch-in pulses.
+
+    Each pulse is a Gaussian bump ``+a*exp(-pow((on/fps-t)/s,2))`` peaking at
+    ``t`` seconds. At most ``PUNCH_IN_MAX`` pulses; invalid times skipped.
+    Returns "" when there is nothing to add (legacy expression preserved).
+    """
+    try:
+        fps_f = float(fps)
+        if fps_f <= 0:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    parts = []
+    for pt in (punch_times or [])[:PUNCH_IN_MAX]:
+        try:
+            t = float(pt)
+        except (TypeError, ValueError):
+            continue
+        if t < 0:
+            continue
+        parts.append(
+            f"+{float(amplitude)}*exp(-pow((on/{fps_f}-{t:.2f})/{float(sigma)},2))")
+    return "".join(parts)
+
+
 def detect_silences(
     media_path: str,
     noise_db: float = -30.0,

@@ -392,7 +392,7 @@ def _load_or_transcribe(args, input_video: str, state: RuntimeState, legacy):
         transcript = _load_json(transcript_path)
         if transcript and isinstance(transcript.get("segments"), list):
             print("♻️ Resume: reusing transcript checkpoint", flush=True)
-            return transcript
+            return legacy.ensure_transcript_quality(transcript)
 
     state.start("transcribing", "transcribing speech")
     # A trimmed source has its own timeline, so it needs its own cache slot —
@@ -401,6 +401,7 @@ def _load_or_transcribe(args, input_video: str, state: RuntimeState, legacy):
     transcript = legacy._load_cached_transcript(cache_key) if cache_key else None
     if transcript:
         print("♻️ Reusing shared URL transcript cache", flush=True)
+        transcript = legacy.ensure_transcript_quality(transcript)
     else:
         transcript = legacy.transcribe_video(input_video)
         if cache_key:
@@ -468,6 +469,7 @@ def _load_or_analyze(
             clip_type=args.clip_type,
             duration_mode=getattr(args, "duration_mode", None),
             audience_intel=audience_intel,
+            media_path=input_video,
         )
         if not clips_data or "shorts" not in clips_data:
             if should_use_fallback(args.monitor):
@@ -485,6 +487,7 @@ def _load_or_analyze(
                 clips_data = _whole_video_fallback(video_title, duration)
 
     clips_data["transcript"] = transcript
+    clips_data["transcript_quality"] = (transcript or {}).get("transcript_quality", "unknown")
     clips_data["aspect"] = args.aspect
     shorts = clips_data.get("shorts") or []
     max_clips = _max_clips_from_env()
