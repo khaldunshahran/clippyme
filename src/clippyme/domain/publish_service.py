@@ -19,6 +19,26 @@ from clippyme.domain.job_artifacts import record_clip_publish
 
 logger = logging.getLogger("clippyme")
 
+# Cap concurrent composes: subtitle-burning is CPU-heavy and a batch publish
+# fires one task per clip. Without this, 19 clips thrash the 4-core ARM box.
+COMPOSE_SEMAPHORE = asyncio.Semaphore(2)
+
+
+def _composed_is_fresh(composed_path: str, base_clip: str | None) -> bool:
+    """True when a composed file exists and is newer than the base clip.
+
+    Lets publish reuse the dashboard's compose output instead of re-rendering
+    the same clip. Delete the composed file to force a recompose.
+    """
+    try:
+        if not composed_path or not os.path.exists(composed_path):
+            return False
+        if base_clip and os.path.exists(base_clip):
+            return os.path.getmtime(composed_path) >= os.path.getmtime(base_clip)
+        return True
+    except OSError:
+        return False
+
 
 async def publish_clip_flow(*, job_id: str, clip_index: int,
                             resolved: ResolvedClip, req: dict,
@@ -53,27 +73,45 @@ async def publish_clip_flow(*, job_id: str, clip_index: int,
     )
 
     if req.get("compose_first") and toggles:
-        try:
-            composed_filename = await compose_layers(
-                base_clip=base_clip,
-                job_dir=job_dir,
-                clip_index=clip_index,
-                metadata=resolved.metadata,
-                clip_info=resolved.clip_info,
-                toggles=toggles,
-                hook_params=req.get("hook_params") or {},
-                subtitle_params=req.get("subtitle_params") or {},
-                logo_params=req.get("logo_params") or {},
-                grade_params=req.get("grade_params") or {},
-                banner_params=req.get("banner_params") or {},
-                drop_ranges=req.get("drop_ranges"),
+        if _composed_is_fresh(composed_path, base_clip):
+            logger.info(
+                "publish: reusing fresh composed file for %s/%d: %s",
+                job_id, clip_index, os.path.basename(composed_path),
             )
-            upload_path = os.path.join(job_dir, composed_filename)
-        except ClippyMeError:
-            raise
-        except Exception as e:
-            logger.error("publish: compose_layers failed for %s/%d: %s", job_id, clip_index, e)
-            raise ClippyMeError(f"Compose before publish failed: {e}", status_code=500)
+            upload_path = composed_path
+        else:
+            try:
+                # Compose must start from the CLEAN base clip: re-resolve with
+                # for_compose=True so an already-composed file is never used as
+                # the subtitle-burn input (double-burn defect). The endpoint
+                # resolved with require_file=False for the upload-path logic;
+                # here the real base file must exist.
+                from clippyme.domain.clip_resolve import resolve_clip
+                strict = await asyncio.to_thread(
+                    resolve_clip, job_id, clip_index,
+                    os.path.dirname(job_dir),
+                    require_file=True, for_compose=True)
+                async with COMPOSE_SEMAPHORE:
+                    composed_filename = await compose_layers(
+                        base_clip=strict.clip_path,
+                        job_dir=job_dir,
+                        clip_index=clip_index,
+                        metadata=strict.metadata,
+                        clip_info=strict.clip_info,
+                        toggles=toggles,
+                        hook_params=req.get("hook_params") or {},
+                        subtitle_params=req.get("subtitle_params") or {},
+                        logo_params=req.get("logo_params") or {},
+                        grade_params=req.get("grade_params") or {},
+                        banner_params=req.get("banner_params") or {},
+                        drop_ranges=req.get("drop_ranges"),
+                    )
+                upload_path = os.path.join(job_dir, composed_filename)
+            except ClippyMeError:
+                raise
+            except Exception as e:
+                logger.error("publish: compose_layers failed for %s/%d: %s", job_id, clip_index, e)
+                raise ClippyMeError(f"Compose before publish failed: {e}", status_code=500)
     elif os.path.exists(composed_path):
         upload_path = composed_path
 

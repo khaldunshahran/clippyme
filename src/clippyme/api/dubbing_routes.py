@@ -3,9 +3,11 @@ import asyncio
 import logging
 import os
 from typing import Optional
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
+from clippyme.api.auth import AuthUser, get_current_user
+from clippyme.api.security import enforce_rate_limit
 from clippyme.domain.clip_locks import clip_lock
 from clippyme.domain.clip_resolve import resolve_clip
 from clippyme.domain.errors import ValidationError, ClippyMeError
@@ -36,21 +38,33 @@ async def dub_clip(
     job_id: str,
     clip_index: int,
     body: DubbingRequest,
+    request: Request,
     x_elevenlabs_key: Optional[str] = Header(None, alias="x-elevenlabs-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
-    """Dub a single clip into a target language. Outputs dubbed_<lang>_<clip_name>.mp4."""
+    """Dub a single clip into a target language. Outputs dubbed_<lang>_<clip_name>.mp4.
+
+    Dubbing is billed per minute by ElevenLabs. Callers must bring their own API
+    key (BYOK); the server key is never spent on behalf of non-admin callers.
+    """
+    # Dubbing is billed per minute — keep the bucket small.
+    enforce_rate_limit(request, "dubbing", capacity=10, refill_per_sec=10 / 60)
+
     resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, output_root=OUTPUT_DIR)
 
     cfg = load_persistent_config()
-    api_key = (
-        body.elevenlabs_api_key
-        or x_elevenlabs_key
-        or cfg.get("ELEVENLABS_API_KEY")
-        or os.getenv("ELEVENLABS_API_KEY")
-    )
+    user_key = body.elevenlabs_api_key or x_elevenlabs_key
+    server_key = cfg.get("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
+    # The server key is NEVER spent on behalf of non-admin callers.
+    api_key = user_key or (server_key if user.is_admin else None)
     if not api_key:
-        raise ValidationError(
-            "ElevenLabs API key is required for dubbing. Provide it in settings or request body."
+        if user.is_admin:
+            raise ValidationError(
+                "ElevenLabs API key is required for dubbing. Provide it in settings or request body."
+            )
+        raise HTTPException(
+            status_code=402,
+            detail="ElevenLabs API key required: dubbing is billed per minute, so a personal API key is required (bring your own key).",
         )
 
     target_lang = body.target_language.lower().strip()

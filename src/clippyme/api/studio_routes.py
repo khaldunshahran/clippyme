@@ -3,8 +3,12 @@ import asyncio
 import logging
 import os
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
+
+from clippyme.api.auth import AuthUser, get_current_user
+from clippyme.api.security import enforce_rate_limit
+from clippyme.domain.quota_service import check_user_quota
 
 from clippyme.domain.errors import ValidationError, ClippyMeError
 from clippyme.studio.youtube_studio import (
@@ -46,9 +50,16 @@ class ThumbnailRequest(BaseModel):
 @router.post("/api/studio/titles")
 async def get_viral_titles(
     body: TitlesRequest,
+    request: Request,
     x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Generate 10 viral YouTube title suggestions from transcript text."""
+    enforce_rate_limit(request, "studio", capacity=30, refill_per_sec=30/60)
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
+
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -77,9 +88,16 @@ async def get_viral_titles(
 @router.post("/api/studio/titles/refine")
 async def refine_titles_endpoint(
     body: RefineTitlesRequest,
+    request: Request,
     x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Refine titles via chat instruction."""
+    enforce_rate_limit(request, "studio", capacity=30, refill_per_sec=30/60)
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
+
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -105,9 +123,16 @@ async def refine_titles_endpoint(
 @router.post("/api/studio/chapters")
 async def generate_chapters_endpoint(
     body: ChaptersRequest,
+    request: Request,
     x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Generate timestamped chapters and SEO description from transcript segments."""
+    enforce_rate_limit(request, "studio", capacity=30, refill_per_sec=30/60)
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
+
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -131,9 +156,16 @@ async def generate_chapters_endpoint(
 @router.post("/api/studio/thumbnail")
 async def generate_thumbnail_endpoint(
     body: ThumbnailRequest,
+    request: Request,
     x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Generate an AI YouTube thumbnail or social cover."""
+    enforce_rate_limit(request, "studio", capacity=30, refill_per_sec=30/60)
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
+
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:

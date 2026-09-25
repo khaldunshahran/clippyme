@@ -3,10 +3,13 @@ import asyncio
 import logging
 import os
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from clippyme.domain.errors import ValidationError, NotFoundError, ClippyMeError
+from clippyme.api.auth import AuthUser, get_current_user
+from clippyme.api.security import enforce_rate_limit
+from clippyme.domain.quota_service import check_user_quota
 from clippyme.domain.highlight_service import (
     plan_highlights_sync,
     render_highlight_reel_sync,
@@ -79,9 +82,15 @@ class HighlightRenderRequest(BaseModel):
 async def plan_highlights(
     job_id: str,
     body: HighlightPlanRequest,
+    request: Request,
     x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Stage 1: Generate an AI narrative timeline plan for a highlight reel."""
+    enforce_rate_limit(request, "highlights", capacity=30, refill_per_sec=30 / 60)
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -114,9 +123,15 @@ async def plan_highlights(
 async def render_highlight_reel(
     job_id: str,
     body: HighlightRenderRequest,
+    request: Request,
     x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Stage 2: Full multi-layer rendering of a highlight reel with aspect ratio sizing."""
+    enforce_rate_limit(request, "highlights", capacity=30, refill_per_sec=30 / 60)
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
@@ -154,9 +169,15 @@ async def render_highlight_reel(
 async def generate_all_highlights(
     job_id: str,
     body: HighlightGenerateAllRequest,
+    request: Request,
     x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Analyze video and automatically generate multi-tier highlight reels (<60s, ~120s, 180s-720s)."""
+    enforce_rate_limit(request, "highlights", capacity=30, refill_per_sec=30 / 60)
+    allowed, reason = check_user_quota(user)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=reason)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
@@ -190,8 +211,11 @@ async def apply_edit_highlight(
     job_id: str,
     highlight_id: str,
     body: HighlightApplyEditRequest,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
 ):
     """Reprocess a specific highlight reel with updated edit parameters (reframe, subtitles, grade, hook, trim)."""
+    enforce_rate_limit(request, "highlights", capacity=30, refill_per_sec=30 / 60)
     try:
         return await asyncio.to_thread(
             reprocess_highlight_reel_sync,
@@ -210,21 +234,34 @@ async def apply_edit_highlight(
 
 
 @router.get("/api/highlights/{job_id}")
-async def get_highlights(job_id: str):
+async def get_highlights(
+    job_id: str,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
     """List all generated highlight reels for a job."""
+    enforce_rate_limit(request, "highlights", capacity=30, refill_per_sec=30 / 60)
     try:
         _, data = await asyncio.to_thread(load_or_create_job_metadata, job_id, OUTPUT_DIR)
         return {"highlights": data.get("highlights", [])}
     except (NotFoundError, FileNotFoundError):
         raise NotFoundError(f"Job metadata not found for {job_id}")
+    except ClippyMeError:
+        raise
     except Exception as e:
         logger.exception("Failed to load highlights")
         raise ClippyMeError(f"Failed to load highlights: {e}", status_code=500)
 
 
 @router.delete("/api/highlights/{job_id}/{filename}")
-async def delete_highlight(job_id: str, filename: str):
+async def delete_highlight(
+    job_id: str,
+    filename: str,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
     """Delete a generated highlight reel."""
+    enforce_rate_limit(request, "highlights", capacity=30, refill_per_sec=30 / 60)
     try:
         return await asyncio.to_thread(
             delete_highlight_reel_sync,
@@ -232,6 +269,8 @@ async def delete_highlight(job_id: str, filename: str):
             filename=filename,
             output_root=OUTPUT_DIR,
         )
+    except ClippyMeError:
+        raise
     except Exception as e:
         logger.exception("Failed to delete highlight")
         raise ClippyMeError(f"Failed to delete highlight: {e}", status_code=500)

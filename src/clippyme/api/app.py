@@ -48,6 +48,12 @@ from clippyme.domain.job_journal import JOURNAL_FILENAME, make_journal_writer, r
 from clippyme.domain.job_runner import make_run_job
 from clippyme.domain.job_submission import QueueFullError, submit_job
 from clippyme.domain.publish_service import publish_clip_flow
+from clippyme.domain.publish_tasks import (
+    get_publish_task,
+    is_valid_task_id,
+    submit_publish_task,
+)
+from clippyme.domain.job_artifacts import is_clip_verified_published
 from clippyme.api.schemas import (
     BatchRequest,
     ComposeRequest,
@@ -137,6 +143,12 @@ live_monitor = LiveMonitorRegistry(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # S4: fail closed — SaaS mode must never serve with auth misconfigured.
+    _saas_mode = os.environ.get("AUTH_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    if _saas_mode and not os.environ.get("SUPABASE_JWT_SECRET", "").strip():
+        logger.error("REFUSING TO SERVE: AUTH_ENABLED=1 but SUPABASE_JWT_SECRET is not configured.")
+        raise RuntimeError("Refusing to serve: AUTH_ENABLED=1 requires SUPABASE_JWT_SECRET to be set.")
+
     # Recover journalled jobs from the previous server life BEFORE the
     # dispatcher starts: queued jobs are re-enqueued, interrupted ones are
     # marked failed (or restored as completed when their result is on disk).
@@ -1305,14 +1317,20 @@ async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, reques
 # Publish (Zernio) endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/api/publish/{job_id}/{clip_index}")
+@app.post("/api/publish/{job_id}/{clip_index}", status_code=202)
 async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishRequest, request: Request, user: AuthUser = Depends(get_current_user)):
-    """Upload a clip to Zernio and create a post on the requested platforms.
+    """Queue a clip publish to Zernio (async).
 
-    If req.compose_first is True, the clip is freshly composed (Smart Cut →
-    Hook → Subtitles) using req.toggles before upload — same flow as
-    /api/compose. Otherwise we look for an existing composed_clip_{i}.mp4
-    on disk and fall back to the base clip.
+    Returns 202 immediately with a ``task_id`` — the compose + upload run in
+    a background task because the dashboard sits behind Cloudflare (100 s
+    origin timeout -> HTTP 524 on long synchronous requests). Poll
+    ``GET /api/publish/status/{task_id}`` for the outcome.
+
+    If req.compose_first is True, the clip is composed (Smart Cut → Hook →
+    Subtitles) using req.toggles before upload — same flow as /api/compose —
+    unless a fresh composed file already exists on disk, in which case it is
+    reused. Otherwise we look for an existing composed_clip_{i}.mp4 on disk
+    and fall back to the base clip.
     """
     require_trusted_config_request(request)
     # Throttle uploads so a runaway "publish all" can't exhaust Zernio quota.
@@ -1327,10 +1345,50 @@ async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishReques
         resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
 
     zernio_cfg = await asyncio.to_thread(load_zernio_config)
-    return await publish_clip_flow(
-        job_id=job_id, clip_index=clip_index, resolved=resolved,
-        req=req.model_dump(), zernio_cfg=zernio_cfg,
+    if not (zernio_cfg or {}).get("api_key"):
+        raise HTTPException(status_code=400, detail="Zernio API key not configured")
+    # Fail fast on duplicates so we never queue a doomed task.
+    if is_clip_verified_published(resolved.clip_info):
+        raise HTTPException(status_code=409, detail="Clip already published")
+
+    req_dict = req.model_dump()
+    task_id = submit_publish_task(
+        lambda: publish_clip_flow(
+            job_id=job_id, clip_index=clip_index, resolved=resolved,
+            req=req_dict, zernio_cfg=zernio_cfg,
+        ),
+        job_id=job_id,
+        clip_index=clip_index,
     )
+    return {"status": "accepted", "task_id": task_id, "job_id": job_id, "clip_index": clip_index}
+
+
+@app.get("/api/publish/status/{task_id}")
+async def publish_status_endpoint(task_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Return the state of a background publish task.
+
+    ``state`` is one of: queued | running | done | error.
+    On ``done``, ``result`` carries the publish result; on ``error``,
+    ``error`` carries the message and ``error_status`` the HTTP status the
+    synchronous endpoint would have returned.
+    """
+    require_trusted_config_request(request)
+    if not is_valid_task_id(task_id):
+        raise HTTPException(status_code=400, detail="Invalid task ID")
+    task = get_publish_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Publish task not found or expired")
+    _verify_job_ownership(task["job_id"], user)
+    return {
+        "task_id": task["task_id"],
+        "job_id": task["job_id"],
+        "clip_index": task["clip_index"],
+        "state": task["state"],
+        "result": task["result"],
+        "error": task["error"],
+        "error_status": task["error_status"],
+        "updated_at": task["updated_at"],
+    }
 
 
 # ---------------------------------------------------------------------------

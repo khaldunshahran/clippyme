@@ -28,10 +28,46 @@ from clippyme.domain.highlights_ops import (
     build_highlight_video_filter,
 )
 from clippyme.domain.job_artifacts import load_job_metadata, save_job_metadata
+from clippyme.domain.history_service import is_valid_job_id
 from clippyme.domain.subtitles import generate_ass_karaoke, burn_subtitles
 from clippyme.storage.config_store import load_persistent_config
 
 logger = logging.getLogger("clippyme.highlights")
+
+
+def _validated_job_dir(job_id: str, output_root: str) -> str:
+    """Return the absolute job directory for ``job_id``, enforcing the trust boundary.
+
+    NOTE: the highlight router never receives the app's in-memory jobs dict,
+    so UUIDv4 validation + absolute-path containment is the equivalent
+    enforcement at the trust boundary (per the S1 deviation note).
+
+    Raises :class:`ValidationError` when ``job_id`` is not a strict UUIDv4
+    or when the resolved path escapes ``output_root`` (path traversal).
+    """
+    if not is_valid_job_id(job_id):
+        raise ValidationError("Invalid job ID")
+    root = os.path.abspath(output_root)
+    job_dir = os.path.abspath(os.path.join(root, job_id))
+    if os.path.commonpath([root, job_dir]) != root:
+        raise ValidationError("Invalid job ID")
+    return job_dir
+
+
+def _validated_filename(filename: str) -> str:
+    """Return ``filename`` when it is a plain filename (no separators/traversal).
+
+    Raises :class:`ValidationError` when the value contains path separators
+    ("/" or "\\"), parent-directory references (".."), or otherwise differs
+    from its basename.
+    """
+    if not isinstance(filename, str) or not filename:
+        raise ValidationError("Invalid filename")
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise ValidationError("Invalid filename")
+    if filename != os.path.basename(filename):
+        raise ValidationError("Invalid filename")
+    return filename
 
 
 def _find_source_video_path(job_dir: str, job_data: Optional[dict] = None) -> str:
@@ -176,7 +212,7 @@ def _extract_transcript_words_from_job(job_data: dict, job_dir: str) -> List[Dic
 
 def load_or_create_job_metadata(job_id: str, output_root: str = "output") -> Tuple[str, dict]:
     """Load job metadata, or synthesize a clean metadata dictionary if *_metadata.json hasn't been generated yet."""
-    job_dir = os.path.join(output_root, job_id)
+    job_dir = _validated_job_dir(job_id, output_root)
     if not os.path.isdir(job_dir):
         raise NotFoundError(f"Job directory not found: {job_dir}")
 
@@ -241,7 +277,7 @@ def plan_highlights_sync(
     model_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Stage 1: Query Gemini to plan a highlight reel timeline without rendering."""
-    job_dir = os.path.join(output_root, job_id)
+    job_dir = _validated_job_dir(job_id, output_root)
     _, data = load_or_create_job_metadata(job_id, output_root)
 
     words = _extract_transcript_words_from_job(data, job_dir)
@@ -321,7 +357,7 @@ def render_highlight_reel_sync(
     save_metadata: bool = True,
 ) -> Dict[str, Any]:
     """Stage 2: Full multi-layer rendering of the highlight reel with aspect ratio sizing, fast seeking, subtitles, hook, and logo."""
-    job_dir = os.path.join(output_root, job_id)
+    job_dir = _validated_job_dir(job_id, output_root)
 
     with job_metadata_lock(job_dir):
         metadata_path, data = load_or_create_job_metadata(job_id, output_root)
@@ -573,12 +609,12 @@ def render_highlight_reel_sync(
 
 def delete_highlight_reel_sync(job_id: str, filename: str, output_root: str = "output") -> Dict[str, Any]:
     """Delete a generated highlight reel from disk and job metadata with thread safety."""
-    job_dir = os.path.join(output_root, job_id)
+    job_dir = _validated_job_dir(job_id, output_root)
 
     with job_metadata_lock(job_dir):
         metadata_path, data = load_or_create_job_metadata(job_id, output_root)
 
-        safe_filename = os.path.basename(filename)
+        safe_filename = os.path.basename(_validated_filename(filename))
         file_path = os.path.join(job_dir, safe_filename)
         if os.path.exists(file_path):
             try:
@@ -610,7 +646,7 @@ def generate_multi_tier_highlights_sync(
     model_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Analyze full video and generate all duration tier packages (<60s, ~120s, 180s-720s) with atomic metadata locking."""
-    job_dir = os.path.join(output_root, job_id)
+    job_dir = _validated_job_dir(job_id, output_root)
 
     with job_metadata_lock(job_dir):
         metadata_path, data = load_or_create_job_metadata(job_id, output_root)
@@ -717,7 +753,7 @@ def reprocess_highlight_reel_sync(
     output_root: str = "output",
 ) -> Dict[str, Any]:
     """Reprocess an existing highlight reel with updated edit parameters (reframe, subtitles, grade, hook, logo, trim)."""
-    job_dir = os.path.join(output_root, job_id)
+    job_dir = _validated_job_dir(job_id, output_root)
 
     with job_metadata_lock(job_dir):
         metadata_path, data = load_or_create_job_metadata(job_id, output_root)
@@ -785,7 +821,7 @@ def reprocess_highlight_reel_sync(
 
         # Clean old file if different
         if old_filename and old_filename != new_highlight.get("filename"):
-            old_path = os.path.join(job_dir, old_filename)
+            old_path = os.path.join(job_dir, _validated_filename(old_filename))
             if os.path.exists(old_path):
                 try:
                     os.remove(old_path)

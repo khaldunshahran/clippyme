@@ -8,11 +8,13 @@ import logging
 import os
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, HttpUrl
 
 from clippyme.api.auth import AuthUser, get_current_user
+from clippyme.api.security import ALLOWED_ORIGINS
 from clippyme.domain.quota_service import (
     create_stripe_checkout,
     get_user_usage,
@@ -22,6 +24,37 @@ from clippyme.domain.quota_service import (
 
 logger = logging.getLogger("clippyme")
 router = APIRouter(prefix="/api/billing", tags=["billing"])
+
+
+def _redirect_host_allowlist() -> set:
+    hosts = set()
+    for origin in ALLOWED_ORIGINS:
+        try:
+            h = urlparse(origin).hostname
+            if h:
+                hosts.add(h.lower())
+        except Exception:
+            pass
+    app_url = os.environ.get("APP_URL", "").strip()
+    if app_url:
+        try:
+            h = urlparse(app_url).hostname
+            if h:
+                hosts.add(h.lower())
+        except Exception:
+            pass
+    return hosts
+
+
+def _validate_checkout_redirect(url: str, name: str) -> None:
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid {name}: malformed URL")
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme not in ("http", "https") or not host or host not in _redirect_host_allowlist()
+            or parsed.username or parsed.password):
+        raise HTTPException(status_code=400, detail=f"Invalid {name}: redirect URL is not an allowed app URL")
 
 
 class CheckoutRequest(BaseModel):
@@ -41,6 +74,10 @@ async def create_checkout(
     user: AuthUser = Depends(get_current_user),
 ):
     """Create a Stripe checkout session for upgrading to Pro."""
+    # S5: Stripe redirect allowlist — validate redirect URLs BEFORE any
+    # billing checks so an attacker can't bounce victims to an evil domain.
+    _validate_checkout_redirect(req.success_url, "success_url")
+    _validate_checkout_redirect(req.cancel_url, "cancel_url")
     if not is_billing_enabled():
         raise HTTPException(
             status_code=400,
