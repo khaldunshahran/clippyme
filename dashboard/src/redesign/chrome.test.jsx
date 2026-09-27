@@ -1,70 +1,89 @@
-import { cleanup, render, screen, fireEvent } from '@testing-library/react';
-import { afterEach, expect, test, vi } from 'vitest';
-import { TopNav, Hero } from './chrome';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { expect, test, vi } from 'vitest';
+import { SidebarNav, MobileNav, MoreSheet, NotFoundPage, NAV_GROUPS, GROW_TABS } from './chrome';
 
-afterEach(() => cleanup());
-
-test('TopNav renders both desktop and mobile navigation with all 5 tabs', () => {
-  const setTab = vi.fn();
-  render(<TopNav tab="create" setTab={setTab} busy={false} />);
-
-  // Desktop navigation exists with aria-label
-  const primaryNav = screen.getByRole('navigation', { name: /primary navigation/i });
-  expect(primaryNav).toBeInTheDocument();
-
-  // Mobile navigation exists with aria-label
-  const mobileNav = screen.getByRole('navigation', { name: /mobile navigation/i });
-  expect(mobileNav).toBeInTheDocument();
-
-  // Both contain all 8 tabs
-  const desktopButtons = primaryNav.querySelectorAll('button');
-  expect(desktopButtons).toHaveLength(8);
-  const activeDesktopTab = primaryNav.querySelector('button[aria-current="page"]');
-  expect(activeDesktopTab).toBeInTheDocument();
-
-  // Check mobile tabs
-  const mobileButtons = mobileNav.querySelectorAll('button');
-  expect(mobileButtons).toHaveLength(8);
-
-  // Active tab in mobile nav has aria-current="page" and active class
-  const activeMobileTab = mobileNav.querySelector('button[aria-current="page"]');
-  expect(activeMobileTab).toHaveTextContent(/create/i);
-  expect(activeMobileTab.className).toContain('active');
-
-  // Clicking a mobile tab calls setTab
-  const settingsBtn = Array.from(mobileButtons).find((b) => /settings/i.test(b.textContent));
-  expect(settingsBtn).toBeDefined();
-  fireEvent.click(settingsBtn);
-  expect(setTab).toHaveBeenCalledWith('settings');
+test('sidebar renders the grouped SaaS navigation', () => {
+  render(<SidebarNav tab="home" goTab={() => {}} />);
+  // Ungrouped primaries
+  for (const label of ['Home', 'Create', 'Clips']) {
+    expect(screen.getByRole('button', { name: label })).toBeTruthy();
+  }
+  // Grow group
+  for (const label of ['Trend Radar', 'Channels', 'Analytics', 'Live Monitor']) {
+    expect(screen.getByRole('button', { name: label })).toBeTruthy();
+  }
+  // Library group + settings
+  for (const label of ['History', 'Highlights', 'Settings']) {
+    expect(screen.getByRole('button', { name: label })).toBeTruthy();
+  }
 });
 
-test('Hero renders title, gradient, and eyebrow', () => {
-  render(<Hero eyebrow="Welcome" line1="Create viral" grad="Shorts" sub="Subtitle text" />);
-  expect(screen.getByText('Welcome')).toBeInTheDocument();
-  expect(screen.getByText(/Create viral/)).toBeInTheDocument();
-  expect(screen.getByText('Shorts')).toBeInTheDocument();
-  expect(screen.getByText('Subtitle text')).toBeInTheDocument();
+test('sidebar marks the active tab with aria-current', () => {
+  render(<SidebarNav tab="analytics" goTab={() => {}} />);
+  expect(screen.getByRole('button', { name: 'Analytics' }).getAttribute('aria-current')).toBe('page');
+  expect(screen.getByRole('button', { name: 'Home' }).getAttribute('aria-current')).toBeNull();
 });
 
-test('TopNav renders Sign in button when logged out and triggers onSignIn', () => {
+test('sidebar navigates and offers sign-in / view-website', () => {
+  const goTab = vi.fn();
+  const onOpenSite = vi.fn();
   const onSignIn = vi.fn();
-  render(<TopNav tab="create" setTab={vi.fn()} busy={false} user={null} onSignIn={onSignIn} />);
-
-  const signInBtn = screen.getByRole('button', { name: /sign in/i });
-  expect(signInBtn).toBeInTheDocument();
-  fireEvent.click(signInBtn);
-  expect(onSignIn).toHaveBeenCalledTimes(1);
+  render(<SidebarNav tab="home" goTab={goTab} onOpenSite={onOpenSite} onSignIn={onSignIn} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Clips' }));
+  expect(goTab).toHaveBeenCalledWith('clips');
+  fireEvent.click(screen.getByRole('button', { name: 'View website' }));
+  expect(onOpenSite).toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+  expect(onSignIn).toHaveBeenCalled();
 });
 
-test('TopNav renders user avatar and sign out button when logged in', () => {
-  const onSignOut = vi.fn();
-  const user = { email: 'alex@example.com' };
-  render(<TopNav tab="create" setTab={vi.fn()} busy={false} user={user} onSignOut={onSignOut} />);
-
-  expect(screen.getByText('AL')).toBeInTheDocument();
-  const userBtn = screen.getByRole('button', { name: /user account/i });
-  expect(userBtn).toBeInTheDocument();
-  fireEvent.click(userBtn);
-  expect(onSignOut).toHaveBeenCalledTimes(1);
+test('mobile nav has five primaries; Grow routes to trends, More opens the sheet', () => {
+  const goTab = vi.fn();
+  const onMore = vi.fn();
+  render(<MobileNav tab="home" goTab={goTab} onMore={onMore} />);
+  for (const label of ['Home', 'Create', 'Clips', 'Grow']) {
+    expect(screen.getByRole('button', { name: label })).toBeTruthy();
+  }
+  const moreBtn = screen.getByRole('button', { name: 'More destinations' });
+  expect(moreBtn).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Grow' }));
+  expect(goTab).toHaveBeenCalledWith('trends');
+  fireEvent.click(moreBtn);
+  expect(onMore).toHaveBeenCalled();
 });
 
+test('mobile nav marks a grow tab active on the Grow item', () => {
+  render(<MobileNav tab="channels" goTab={() => {}} onMore={() => {}} />);
+  expect(screen.getByRole('button', { name: 'Grow' }).getAttribute('aria-current')).toBe('page');
+});
+
+test('more sheet exposes every destination and closes', () => {
+  const goTab = vi.fn();
+  const onClose = vi.fn();
+  render(<MoreSheet tab="home" goTab={goTab} onClose={onClose} />);
+  const allIds = NAV_GROUPS.flatMap((g) => g.items.map((i) => i.label));
+  for (const label of [...allIds, 'Settings']) {
+    expect(screen.getByRole('button', { name: label })).toBeTruthy();
+  }
+  fireEvent.click(screen.getByRole('button', { name: 'Highlights' }));
+  expect(goTab).toHaveBeenCalledWith('highlights');
+  expect(onClose).toHaveBeenCalled();
+  fireEvent.keyDown(window, { key: 'Escape' });
+  expect(onClose).toHaveBeenCalledTimes(2);
+});
+
+test('404 page offers working ways back', () => {
+  const onHome = vi.fn();
+  const onCreate = vi.fn();
+  render(<NotFoundPage onHome={onHome} onCreate={onCreate} />);
+  expect(screen.getByText('This page got clipped.')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Back to Home' }));
+  expect(onHome).toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Create a clip' }));
+  expect(onCreate).toHaveBeenCalled();
+});
+
+test('grow tab set covers the sidebar grow group', () => {
+  const growIds = NAV_GROUPS.find((g) => g.label === 'Grow').items.map((i) => i.id);
+  expect([...GROW_TABS].sort()).toEqual([...growIds].sort());
+});

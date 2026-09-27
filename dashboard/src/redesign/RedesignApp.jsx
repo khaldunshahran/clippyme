@@ -5,8 +5,11 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import './tokens.css';
 import './app.css';
+import './phaseA.css';
 import { Icon, Btn } from './primitives';
-import { TopNav } from './chrome';
+import { SidebarNav, MobileNav, MoreSheet, NotFoundPage } from './chrome';
+import { LandingPage } from './LandingPage';
+import { Home } from './Home';
 import { CreateView } from './create';
 import { ProcessingView } from './processing';
 import { ResultsView } from './results';
@@ -53,7 +56,7 @@ const DEFAULT_OPTS = {
   preset: 'viral',
 };
 
-const CONFETTI_COLORS = ['#E6428D', '#9850C3', '#675ADD', '#0A81D9', '#02C5BF', '#F7BC59'];
+const CONFETTI_COLORS = ['#BB5A3C', '#7A4F63', '#C99A44', '#6E7F5C', '#9B4126', '#A57B33'];
 
 function Confetti() {
   const pieces = useMemo(() => Array.from({ length: 90 }, (_, i) => ({
@@ -123,8 +126,26 @@ export default function RedesignApp() {
 
   const [tab, setTab] = useState(() => {
     const t = restoredSession?.activeTab;
-    return (t === 'ai-shorts' || t === 'studio') ? 'create' : (t || 'create');
+    return (t === 'ai-shorts' || t === 'studio') ? 'create' : (t || 'home');
   });
+  // Public landing gate: first visit sees the marketing site; entering the app
+  // (or a restored in-progress session) goes straight to the studio.
+  const [enteredApp, setEnteredApp] = useState(() => {
+    if (restoredSession?.jobId || restoredSession?.status === 'processing') return true;
+    try { return localStorage.getItem('nugget_entered_app') === '1'; } catch { return false; }
+  });
+  const [showMore, setShowMore] = useState(false);
+  const enterApp = useCallback((withAuth) => {
+    try { localStorage.setItem('nugget_entered_app', '1'); } catch { /* */ }
+    setEnteredApp(true);
+    if (withAuth && isAuthEnabled() && !user) setShowAuthModal(true);
+  }, [user]);
+
+  const TAB_TITLES = { home: 'Home', create: 'Create', clips: 'Clips', trends: 'Trend Radar', channels: 'Channels', analytics: 'Analytics', live: 'Live Monitor', history: 'History', highlights: 'Highlights', settings: 'Settings' };
+  const KNOWN_TABS = new Set(Object.keys(TAB_TITLES));
+  useEffect(() => {
+    document.title = enteredApp ? `Nugget — ${TAB_TITLES[tab] || 'Studio'}` : 'Nugget — Find the moment worth keeping';
+  }, [enteredApp, tab]);
   const [jobId, setJobId] = useState(restoredSession?.jobId || null);
   const [status, setStatus] = useState(restoredSession?.status || 'idle'); // idle | processing | complete | error
   const [results, setResults] = useState(restoredSession?.results || null);
@@ -609,40 +630,93 @@ export default function RedesignApp() {
     runBulk(plan, activeJobId, activeUpdateState);
   };
 
+  if (!enteredApp) {
+    return (
+      <div>
+        <LandingPage onStart={() => enterApp(true)} onSignIn={() => enterApp(true)} />
+        {showAuthModal && (
+          <AuthModal
+            isOpen={showAuthModal}
+            onClose={() => setShowAuthModal(false)}
+            onSuccess={(data) => {
+              setUser(data?.user || null);
+              pushToast('success', 'Signed in successfully');
+            }}
+          />
+        )}
+        <Toasts items={toasts} onDismiss={dismissToast} />
+      </div>
+    );
+  }
+
   return (
-    <div>
-      <TopNav
+    <div className="app-shell">
+      <SidebarNav
         tab={tab}
-        setTab={goTab}
+        goTab={goTab}
         busy={status === 'processing'}
         user={user}
         onSignIn={() => setShowAuthModal(true)}
         onSignOut={handleSignOut}
+        onOpenSite={() => setEnteredApp(false)}
       />
+      <div className="app-main">
       {confetti && <Confetti />}
 
       {status === 'processing' && tab !== 'create' && (
         <div
           role="button"
           tabIndex={0}
-          style={{
-            background: 'linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%)',
-            color: '#ffffff',
-            padding: '10px 24px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            fontSize: '13px',
-            fontWeight: '600',
-            cursor: 'pointer',
-          }}
+          className="active-job-banner"
           onClick={() => { setViewingHistory(false); setHistoryJob(null); setTab('create'); }}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { setViewingHistory(false); setHistoryJob(null); setTab('create'); } }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#4ade80', boxShadow: '0 0 8px #4ade80' }} />
-            <span>⚡ Active Job Running in Background: {processingMedia?.type === 'url' ? processingMedia.payload : (processingMedia?.payload?.name || 'Processing video…')}</span>
+          <div className="ajb-left">
+            <span className="ajb-dot" aria-hidden="true" />
+            <span>Your clips are rendering in the background{processingMedia ? `: ${processingMedia?.type === 'url' ? processingMedia.payload : (processingMedia?.payload?.name || 'video')}` : ''}</span>
           </div>
-          <span style={{ textDecoration: 'underline', opacity: 0.9 }}>Return to Live Progress →</span>
+          <span className="ajb-cta">Return to live progress →</span>
+        </div>
+      )}
+
+      {tab === 'home' && (
+        <Home
+          user={user}
+          history={history}
+          clips={clips}
+          clipStates={clipStates}
+          status={status}
+          processingMedia={processingMedia}
+          goTab={goTab}
+          onContinueJob={() => { setViewingHistory(false); setHistoryJob(null); goTab('create'); }}
+          onResumeHistoryJob={(job) => { openHistoryJob(job); goTab('history'); }}
+        />
+      )}
+
+      {tab === 'clips' && status === 'complete' && clips.length > 0 && (
+        <ResultsView clips={clips} jobId={jobId} preselections={preselections}
+          clipStates={clipStates} onUpdateClipState={updateClipStateT} onBack={() => goTab('home')}
+          onPublish={openPublish} onPublishAll={openPublish} onEdit={(c, i) => setEditClip({ clip: c, idx: i })}
+          onApplyToAll={applyClipToAll} onEditSelected={(targets) => setBulkEdit({ targets })}
+          pushToast={pushToast} />
+      )}
+      {tab === 'clips' && !(status === 'complete' && clips.length > 0) && (
+        <div className="hm">
+          <div className="hm-greet-row">
+            <div className="hm-greet">
+              <h1>Clips</h1>
+              <p>Every keeper, ready to publish.</p>
+            </div>
+            <div className="hm-actions">
+              <Btn variant="primary" icon="plus" onClick={() => goTab('create')}>New clip</Btn>
+            </div>
+          </div>
+          <div className="empty">
+            <div className="empty-ic"><Icon n="scissors" /></div>
+            <h3>No clips yet</h3>
+            <p>Paste a link or upload a video and Nugget will cut the moments worth keeping.</p>
+            <Btn variant="primary" icon="plus" onClick={() => goTab('create')}>Create your first clip</Btn>
+          </div>
         </div>
       )}
 
@@ -723,6 +797,10 @@ export default function RedesignApp() {
       {tab === 'highlights' && <HighlightsStudioView apiKey={apiKey} onToast={(t) => pushToast(t.type, t.message)} />}
       {tab === 'settings' && <SettingsView apiKey={apiKey} onApiKey={setApiKey} cookiesConfigured={cookiesConfigured} onCookiesChange={setCookiesConfigured} pushToast={pushToast} />}
 
+      {!KNOWN_TABS.has(tab) && (
+        <NotFoundPage onHome={() => goTab('home')} onCreate={() => goTab('create')} />
+      )}
+
       {publishClips && (
         <PublishModal clips={publishClips} jobId={viewingHistory && historyJob ? historyJob.jobId : jobId}
           clipStates={viewingHistory && historyJob ? histClipStates : clipStates}
@@ -783,6 +861,19 @@ export default function RedesignApp() {
       )}
 
       <Toasts items={toasts} onDismiss={dismissToast} />
+      </div>
+      <MobileNav tab={tab} goTab={goTab} onMore={() => setShowMore(true)} />
+      {showMore && (
+        <MoreSheet
+          tab={tab}
+          goTab={goTab}
+          onClose={() => setShowMore(false)}
+          user={user}
+          onSignIn={() => setShowAuthModal(true)}
+          onSignOut={handleSignOut}
+          onOpenSite={() => setEnteredApp(false)}
+        />
+      )}
     </div>
   );
 }

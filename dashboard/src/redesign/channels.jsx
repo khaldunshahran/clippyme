@@ -151,10 +151,10 @@ function ChannelModal({
               <div
                 style={{
                   background: 'rgba(235, 87, 87, 0.12)',
-                  border: '1px solid var(--danger, #eb5757)',
+                  border: '1px solid var(--danger)',
                   borderRadius: 8,
                   padding: '10px 12px',
-                  color: 'var(--danger, #eb5757)',
+                  color: 'var(--danger)',
                   fontSize: '0.85rem',
                 }}
               >
@@ -530,8 +530,8 @@ export function ChannelsView({
                     <h3 style={{ fontSize: '1.2rem', fontWeight: 700, margin: '0 0 4px', color: 'var(--ink)' }}>
                       {ch.name}
                     </h3>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.82rem', color: 'var(--accent, #02C5BF)' }}>
-                      <Social n={ch.banner_platform || 'youtube'} size={14} color="var(--accent, #02C5BF)" />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.82rem', color: 'var(--accent, #6E7F5C)' }}>
+                      <Social n={ch.banner_platform || 'youtube'} size={14} color="var(--accent, #6E7F5C)" />
                       <span style={{ fontWeight: 600 }}>{bannerHandle}</span>
                     </div>
                   </div>

@@ -1315,7 +1315,7 @@ export function HighlightsStudioView({ apiKey = '', onToast }) {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
             <div>
               <h2 style={{ fontSize: '20px', fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Icon n="film" style={{ color: 'var(--brand-teal, #02C5BF)' }} />
+                <Icon n="film" style={{ color: 'var(--brand-teal, #6E7F5C)' }} />
                 Generated Highlight Packages ({highlights.length})
               </h2>
               <span style={{ fontSize: '13px', color: 'var(--fg-3)' }}>

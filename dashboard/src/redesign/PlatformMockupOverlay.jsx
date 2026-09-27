@@ -78,7 +78,7 @@ export function PlatformMockupOverlay({
               <span
                 style={{
                   fontSize: '9px',
-                  background: 'rgba(2,197,191,0.25)',
+                  background: 'rgba(110, 127, 92,0.25)',
                   color: '#fff',
                   padding: '1px 5px',
                   borderRadius: 8,
@@ -195,9 +195,9 @@ export function PlatformCaptionSection({
                 type="button"
                 onClick={() => onChangePlatform(p.id)}
                 style={{
-                  border: '1px solid ' + (active ? 'var(--brand-teal, #02c5bf)' : 'transparent'),
-                  background: active ? 'rgba(2,197,191,0.12)' : 'transparent',
-                  color: active ? 'var(--brand-teal, #02c5bf)' : 'var(--fg-3, #777)',
+                  border: '1px solid ' + (active ? 'var(--brand-teal, #6E7F5C)' : 'transparent'),
+                  background: active ? 'rgba(110, 127, 92,0.12)' : 'transparent',
+                  color: active ? 'var(--brand-teal, #6E7F5C)' : 'var(--fg-3, #777)',
                   fontSize: '11px',
                   fontWeight: active ? 700 : 500,
                   padding: '2px 7px',
@@ -225,8 +225,8 @@ export function PlatformCaptionSection({
               fontWeight: 600,
               padding: '2px 7px',
               borderRadius: 6,
-              border: '1px solid ' + (showMockup ? 'var(--brand-teal, #02c5bf)' : 'var(--border, rgba(51,46,38,0.1))'),
-              background: showMockup ? 'var(--brand-teal, #02c5bf)' : 'transparent',
+              border: '1px solid ' + (showMockup ? 'var(--brand-teal, #6E7F5C)' : 'var(--border, rgba(51,46,38,0.1))'),
+              background: showMockup ? 'var(--brand-teal, #6E7F5C)' : 'transparent',
               color: showMockup ? '#fff' : 'var(--fg-2, #555)',
               cursor: 'pointer',
             }}
@@ -261,7 +261,7 @@ export function PlatformCaptionSection({
 
       {/* Speaker Badge if available */}
       {speaker && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: '11px', color: 'var(--brand-teal, #02c5bf)', fontWeight: 600 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: '11px', color: 'var(--brand-teal, #6E7F5C)', fontWeight: 600 }}>
           <span>🗣️</span>
           <span>{speaker}</span>
         </div>

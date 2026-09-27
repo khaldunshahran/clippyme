@@ -63,7 +63,7 @@ function TrendCard({
             background: 'var(--surface-deep, rgba(0,0,0,0.15))',
             borderRadius: 10,
             padding: '10px 12px',
-            borderLeft: '3px solid var(--accent, #02C5BF)',
+            borderLeft: '3px solid var(--accent, #6E7F5C)',
             fontSize: '0.85rem',
             lineHeight: 1.45,
             color: 'var(--ink-dim)',
@@ -168,7 +168,7 @@ function TrendCard({
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--ink-dim)', fontWeight: 600 }}>
-          <Icon n="tv" style={{ width: 14, height: 14, color: 'var(--accent, #02C5BF)' }} />
+          <Icon n="tv" style={{ width: 14, height: 14, color: 'var(--accent, #6E7F5C)' }} />
           <span>Target Channel:</span>
         </div>
         {channels.length > 0 ? (

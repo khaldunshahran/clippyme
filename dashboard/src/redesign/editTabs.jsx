@@ -245,7 +245,7 @@ export function DubbingTab({ jobId, clipIndex, onDubSuccess }) {
           {busy ? 'Dubbing…' : 'Start Dubbing'}
         </Btn>
       </div>
-      {msg && <div className="eo-d" style={{ color: msg.startsWith('❌') ? '#ef4444' : '#10b981', marginTop: 8 }}>{msg}</div>}
+      {msg && <div className="eo-d" style={{ color: msg.startsWith('❌') ? '#BB5A3C' : '#6E7F5C', marginTop: 8 }}>{msg}</div>}
       {dubbedUrl && (
         <div style={{ marginTop: 12 }}>
           <a href={dubbedUrl} download className="btn sm" target="_blank" rel="noreferrer">

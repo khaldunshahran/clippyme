@@ -723,8 +723,8 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .pubrow.done {
-  border-color: rgba(2, 197, 191, 0.35);
-  background: rgba(2, 197, 191, 0.04);
+  border-color: rgba(110, 127, 92, 0.35);
+  background: rgba(110, 127, 92, 0.04);
 }
 
 .pubrow .pthumb {
@@ -817,7 +817,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .pubrow .pstat.done {
-  color: #02c5bf;
+  color: #6E7F5C;
 }
 
 .pubrow .pstat.wait {
@@ -839,8 +839,8 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .pubrow.done .pcheck {
-  background: rgba(2, 197, 191, 0.15);
-  color: #02c5bf;
+  background: rgba(110, 127, 92, 0.15);
+  color: #6E7F5C;
   box-shadow: 2px 2px 6px var(--shadow-r);
 }
 
@@ -3104,7 +3104,7 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
   padding: 16px;
   border-radius: 20px;
   background: var(--surface-deep);
-  border: 1.5px solid rgba(2, 197, 191, 0.25);
+  border: 1.5px solid rgba(110, 127, 92, 0.25);
   animation: clayModalIn 0.2s ease both;
 }
 

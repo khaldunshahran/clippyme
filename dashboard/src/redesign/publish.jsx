@@ -37,7 +37,7 @@ function PubRow({ clip, idx, st, plats }) {
         <div className="pplats">
           {tasks.map((p) => (
             <div className="pp" key={p}>
-              <Social n={PLAT[p].icon} color={done ? '02C5BF' : '7E7E8F'} size={13} />
+              <Social n={PLAT[p].icon} color={done ? '6E7F5C' : '7E7E8F'} size={13} />
               <div className="ptrack"><i className={p} style={{ width: done ? '100%' : status === 'uploading' ? '70%' : status === 'processing' ? '85%' : '0%', transition: 'width .4s' }}></i></div>
             </div>
           ))}
@@ -414,7 +414,7 @@ export function PublishModal({
                             padding: '4px 10px',
                             borderRadius: '16px',
                             border: '1.5px solid ' + (activeClipIdx === i ? 'var(--brand-teal)' : 'rgba(51,46,38,0.1)'),
-                            background: activeClipIdx === i ? 'rgba(2,197,191,0.12)' : 'var(--surface-deep)',
+                            background: activeClipIdx === i ? 'rgba(110, 127, 92,0.12)' : 'var(--surface-deep)',
                             color: activeClipIdx === i ? 'var(--brand-teal)' : 'var(--ink)',
                             fontSize: '11.5px',
                             fontWeight: activeClipIdx === i ? 700 : 500,
@@ -465,7 +465,7 @@ export function PublishModal({
                                 padding: '3px 6px',
                                 borderRadius: 6,
                                 border: '1px solid ' + (mockupPlat === pm.id ? 'var(--brand-teal)' : 'rgba(51,46,38,0.1)'),
-                                background: mockupPlat === pm.id ? 'rgba(2,197,191,0.15)' : 'transparent',
+                                background: mockupPlat === pm.id ? 'rgba(110, 127, 92,0.15)' : 'transparent',
                                 color: mockupPlat === pm.id ? 'var(--brand-teal)' : 'var(--fg-3)',
                                 fontSize: '10.5px',
                                 fontWeight: 600,
@@ -587,7 +587,7 @@ export function PublishModal({
                               display: 'inline-flex',
                               alignItems: 'center',
                               gap: '6px',
-                              border: '1px solid var(--brand-teal-dim, rgba(2,197,191,0.2))',
+                              border: '1px solid var(--brand-teal-dim, rgba(110, 127, 92,0.2))',
                               borderRadius: '6px',
                               cursor: 'pointer',
                               background: 'transparent',
@@ -614,7 +614,7 @@ export function PublishModal({
                           <span className="field-label" style={{ margin: 0 }}>Video Title</span>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             {speakerName && (
-                              <span style={{ fontSize: '11px', color: 'var(--brand-teal)', background: 'rgba(2,197,191,0.1)', padding: '2px 7px', borderRadius: '10px', fontWeight: 600 }}>
+                              <span style={{ fontSize: '11px', color: 'var(--brand-teal)', background: 'rgba(110, 127, 92,0.1)', padding: '2px 7px', borderRadius: '10px', fontWeight: 600 }}>
                                 🗣️ {speakerName}
                               </span>
                             )}
@@ -682,7 +682,7 @@ export function PublishModal({
                                 padding: '3px 8px',
                                 borderRadius: 6,
                                 border: '1px solid ' + (captionPlat === pm.id ? 'var(--brand-teal)' : 'rgba(51,46,38,0.1)'),
-                                background: captionPlat === pm.id ? 'rgba(2,197,191,0.15)' : 'transparent',
+                                background: captionPlat === pm.id ? 'rgba(110, 127, 92,0.15)' : 'transparent',
                                 color: captionPlat === pm.id ? 'var(--brand-teal)' : 'var(--fg-3)',
                                 fontSize: '11px',
                                 fontWeight: 600,
@@ -724,7 +724,7 @@ export function PublishModal({
                                   onClick={() => toggleTag(tag)}
                                   style={{
                                     border: '1px solid ' + (active ? 'var(--brand-teal)' : 'var(--border)'),
-                                    background: active ? 'rgba(2,197,191,0.15)' : 'var(--surface-deep)',
+                                    background: active ? 'rgba(110, 127, 92,0.15)' : 'var(--surface-deep)',
                                     color: active ? 'var(--brand-teal)' : 'var(--fg-2)',
                                     padding: '3px 8px',
                                     borderRadius: '12px',
@@ -798,7 +798,7 @@ export function PublishModal({
                                   onClick={() => setAspectRatio(r.id)}
                                   style={{
                                     border: '1px solid ' + (aspectRatio === r.id ? 'var(--brand-teal)' : 'var(--border)'),
-                                    background: aspectRatio === r.id ? 'rgba(2,197,191,0.15)' : 'transparent',
+                                    background: aspectRatio === r.id ? 'rgba(110, 127, 92,0.15)' : 'transparent',
                                     color: aspectRatio === r.id ? 'var(--brand-teal)' : 'var(--fg-2)',
                                     padding: '2px 8px',
                                     borderRadius: '6px',

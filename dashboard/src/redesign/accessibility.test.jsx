@@ -1,7 +1,7 @@
 import { cleanup, render } from '@testing-library/react'
 import axe from 'axe-core'
 import { afterEach, expect, test, vi } from 'vitest'
-import { TopNav, Hero } from './chrome'
+import { SidebarNav, MobileNav, Hero } from './chrome'
 import { ProcessingView } from './processing'
 import { Btn, Panel, Segmented, Stepper, Switch } from './primitives'
 import { ResultsView } from './results'
@@ -21,10 +21,11 @@ async function expectAccessible(container) {
 afterEach(() => cleanup())
 
 test('shared navigation and controls expose an accessible DOM', async () => {
-  const setTab = vi.fn()
+  const goTab = vi.fn()
   const { container } = render(
     <>
-      <TopNav tab="create" setTab={setTab} busy={false} />
+      <SidebarNav tab="create" goTab={goTab} busy={false} />
+      <MobileNav tab="create" goTab={goTab} onMore={vi.fn()} />
       <main>
         <Hero eyebrow="Create" line1="Turn video into clips" sub="Accessible controls" />
         <Panel title="Options" sub="Configure the job">

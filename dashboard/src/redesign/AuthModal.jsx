@@ -85,10 +85,10 @@ export function AuthModal({ isOpen, onClose, onSuccess }) {
               <div
                 style={{
                   background: 'rgba(235, 87, 87, 0.12)',
-                  border: '1px solid var(--danger, #eb5757)',
+                  border: '1px solid var(--danger)',
                   borderRadius: 8,
                   padding: '10px 12px',
-                  color: 'var(--danger, #eb5757)',
+                  color: 'var(--danger)',
                   fontSize: 13,
                   display: 'flex',
                   alignItems: 'center',
@@ -103,11 +103,11 @@ export function AuthModal({ isOpen, onClose, onSuccess }) {
             {info && (
               <div
                 style={{
-                  background: 'rgba(2, 197, 191, 0.12)',
-                  border: '1px solid var(--brand-teal, #02C5BF)',
+                  background: 'rgba(110, 127, 92, 0.12)',
+                  border: '1px solid var(--brand-teal, #6E7F5C)',
                   borderRadius: 8,
                   padding: '10px 12px',
-                  color: 'var(--brand-teal, #02C5BF)',
+                  color: 'var(--brand-teal, #6E7F5C)',
                   fontSize: 13,
                   display: 'flex',
                   alignItems: 'center',
@@ -167,7 +167,7 @@ export function AuthModal({ isOpen, onClose, onSuccess }) {
                     style={{
                       background: 'none',
                       border: 'none',
-                      color: 'var(--brand-teal, #02C5BF)',
+                      color: 'var(--brand-teal, #6E7F5C)',
                       cursor: 'pointer',
                       fontWeight: 600,
                       padding: 0,
@@ -189,7 +189,7 @@ export function AuthModal({ isOpen, onClose, onSuccess }) {
                     style={{
                       background: 'none',
                       border: 'none',
-                      color: 'var(--brand-teal, #02C5BF)',
+                      color: 'var(--brand-teal, #6E7F5C)',
                       cursor: 'pointer',
                       fontWeight: 600,
                       padding: 0,
