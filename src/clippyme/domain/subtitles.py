@@ -334,6 +334,30 @@ SUBTITLE_PRESETS = {
         "uppercase": True,
         "fontsize": 43,
     },
+    "gold_standard": {
+        "font": "Montserrat-ExtraBold",
+        "text_color": "#FFFFFF",
+        "highlight_color": "#FFC93C",
+        "outline_color": "#000000",
+        "outline_width": 4,
+        "border_style": 1,
+        "shadow": 0,
+        "margin_v": 350,
+        "uppercase": True,
+        "fontsize": 40,
+    },
+    "clay_plum": {
+        "font": "Poppins-Black",
+        "text_color": "#FFFFFF",
+        "highlight_color": "#E8A0B4",
+        "outline_color": "#000000",
+        "outline_width": 4,
+        "border_style": 1,
+        "shadow": 0,
+        "margin_v": 350,
+        "uppercase": True,
+        "fontsize": 40,
+    },
 }
 
 # Bundled TTF fonts live at repo-root `fonts/` and are also mounted by

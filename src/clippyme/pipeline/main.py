@@ -791,6 +791,21 @@ def get_viral_clips(
         # strategy (no drift between live runs and restored jobs).
         backfill_hook_text(clips, words)
 
+        # Product guarantee: transformative Shorts must stay under 60s.
+        # Gemini sometimes returns longer ranges despite the prompt cap —
+        # hard-clamp here so no clip can exceed max_duration (default 59s).
+        _cap = max_duration if max_duration else 59.0
+        for c in clips:
+            try:
+                dur = float(c.end) - float(c.start)
+            except (TypeError, ValueError):
+                continue
+            if dur > _cap:
+                old_end = c.end
+                c.end = float(c.start) + _cap
+                print(f"✂️  Clip capped to {_cap:.0f}s "
+                      f"({dur:.1f}s → {_cap:.1f}s, end {old_end} → {c.end:.2f})")
+
         print(f"✅ {len(clips)} clips passed validation + dedupe")
         result_json = {"shorts": clips}
         if cost_analysis:
@@ -802,7 +817,7 @@ def get_viral_clips(
         return None
 
 
-def build_texttiling_fallback(transcript_result, video_title):
+def build_texttiling_fallback(transcript_result, video_title, max_duration=None, max_clips=None):
     """No-AI fallback: topic-segment the transcript into clips via lexical TextTiling.
 
     Returns a ``{"shorts": [...]}`` dict shaped like ``get_viral_clips`` output so
@@ -810,6 +825,10 @@ def build_texttiling_fallback(transcript_result, video_title):
     the transcript can't be usefully segmented (caller then renders whole-video).
     Clips carry ``viral_score=0`` and an explicit ``viral_reason`` so the UI shows
     they are heuristic, not AI-judged. See docs/clipsai-analysis.md.
+
+    Product guarantees (same as the Gemini path): every clip is hard-clamped to
+    ``max_duration`` (default 59s — transformative Shorts must stay under 60s)
+    and the list is truncated to ``max_clips`` when set.
     """
     try:
         segments = (transcript_result or {}).get('segments') or []
@@ -817,18 +836,33 @@ def build_texttiling_fallback(transcript_result, video_title):
         if not topic_clips:
             return None
         print(f"🧩 Gemini unavailable — lexical TextTiling found {len(topic_clips)} topic clips.")
+        _cap = float(max_duration) if max_duration else 59.0
         shorts = []
         for i, tc in enumerate(topic_clips):
             snippet = (tc.get('text') or '').strip()
+            start = float(tc['start'])
+            end = float(tc['end'])
+            if end - start > _cap:
+                old_end = end
+                end = start + _cap
+                print(f"✂️  Fallback clip capped to {_cap:.0f}s "
+                      f"({(old_end - start):.1f}s → {_cap:.1f}s)")
+            if end <= start:
+                continue
             shorts.append({
-                'start': float(tc['start']),
-                'end': float(tc['end']),
+                'start': start,
+                'end': end,
                 'video_title_for_youtube_short': f"{video_title} — part {i + 1}",
                 'tiktok_caption': snippet[:150],
                 'viral_score': 0,
                 'viral_reason': "Topic-segmented fallback (no AI scoring — Gemini was unavailable).",
                 'hook': '',
             })
+        if max_clips and max_clips > 0 and len(shorts) > max_clips:
+            print(f"✂️  Fallback clips truncated: {len(shorts)} → {max_clips} (max_clips).")
+            shorts = shorts[:max_clips]
+        if not shorts:
+            return None
         return {"shorts": shorts}
     except Exception as e:  # noqa: BLE001 — fallback must never break the pipeline
         print(f"⚠️  TextTiling fallback failed ({e}); will render whole video instead.")
@@ -1062,7 +1096,11 @@ if __name__ == '__main__':
         # docs/clipsai-analysis.md.)
         if not clips_data or 'shorts' not in clips_data:
             if should_use_fallback(args.monitor):
-                clips_data = build_texttiling_fallback(transcript, video_title)
+                clips_data = build_texttiling_fallback(
+                    transcript, video_title,
+                    max_duration=args.max_duration,
+                    max_clips=args.max_clips,
+                )
 
         if not clips_data or not clips_data.get('shorts'):
             if not should_use_fallback(args.monitor):

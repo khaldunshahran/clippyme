@@ -675,6 +675,29 @@ async def _compose_layers_impl(
             status_code=409,
         )
     active = {k: v for k, v in toggles.items() if v}
+    # Pre-burned caption detection: if the SOURCE already has creator-burned
+    # captions, Nugget's karaoke will stack on top (double captions). This is
+    # advisory — the user may still want the clip — but it goes in the log
+    # so the dashboard can surface a warning.
+    if active.get("subtitles"):
+        try:
+            from clippyme.domain.preburn_detect import detect_preburned_captions
+            _pb = await asyncio.to_thread(
+                detect_preburned_captions,
+                base_clip,
+                (metadata or {}).get("transcript"),
+                clip_start=0.0,
+                clip_end=float(clip_info.get("end", 60)) - float(clip_info.get("start", 0)),
+            )
+            if _pb.get("likely"):
+                logger.warning(
+                    "compose: source appears to have creator-burned captions "
+                    "(%s). Nugget's captions will stack on top — consider a "
+                    "cleaner source or disabling subtitles.",
+                    _pb.get("detail"),
+                )
+        except Exception as exc:
+            logger.debug("compose: preburn detection skipped (%s)", exc)
     # The banner can be enabled via its own params.enabled (frontend convention)
     # without a toggles entry — fold it in so the no-active short-circuit and the
     # downstream active.get('banner') check both see it.
