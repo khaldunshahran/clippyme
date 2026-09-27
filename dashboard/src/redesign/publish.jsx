@@ -6,7 +6,7 @@ import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Icon, Social, Btn, Switch, PlatPill, PLATFORMS, Badge, Segmented } from './primitives';
 import { LazyVideo } from './LazyVideo';
-import { clipVideoSrc, publishClip, getZernio, generateClipMetadata } from './realApi';
+import { clipVideoSrc, publishClip, pollPublishTask, getZernio, generateClipMetadata } from './realApi';
 import { seedToggles, seedHookParams, seedSubtitleParams, seedLogoParams, seedBannerParams } from '../lib/seedClipParams';
 import { localDatePlus } from '../lib/scheduleDates';
 import { useModalA11y } from './useModalA11y';
@@ -38,13 +38,13 @@ function PubRow({ clip, idx, st, plats }) {
           {tasks.map((p) => (
             <div className="pp" key={p}>
               <Social n={PLAT[p].icon} color={done ? '02C5BF' : '7E7E8F'} size={13} />
-              <div className="ptrack"><i className={p} style={{ width: done ? '100%' : status === 'uploading' ? '70%' : '0%', transition: 'width .4s' }}></i></div>
+              <div className="ptrack"><i className={p} style={{ width: done ? '100%' : status === 'uploading' ? '70%' : status === 'processing' ? '85%' : '0%', transition: 'width .4s' }}></i></div>
             </div>
           ))}
-          <span className={'pstat' + (done ? ' done' : status === 'uploading' ? '' : ' wait')}
+          <span className={'pstat' + (done ? ' done' : status === 'uploading' || status === 'processing' ? '' : ' wait')}
             style={error ? { color: 'var(--danger)' } : undefined}
             title={error && errMsg ? errMsg : undefined}>
-            {error ? (errMsg ? `failed: ${errMsg.slice(0, 60)}` : 'failed') : done ? 'live' : status === 'uploading' ? 'uploading' : 'queued'}
+            {error ? (errMsg ? `failed: ${errMsg.slice(0, 60)}` : 'failed') : done ? 'live' : status === 'uploading' ? 'uploading' : status === 'processing' ? 'processing…' : 'queued'}
           </span>
         </div>
       </div>
@@ -311,13 +311,41 @@ export function PublishModal({
 
         if (typeof onCustomPublish === 'function') {
           await onCustomPublish(clip, body);
-        } else {
-          await publishClip(jobId, apiIdx, body);
+          setProgress((p) => ({ ...p, [idx]: { state: 'done' } }));
+          onPublished?.(idx);
+          return true;
         }
-
-        setProgress((p) => ({ ...p, [idx]: { state: 'done' } }));
-        onPublished?.(idx);
-        return true;
+        // Async backend: POST returns 202 + task_id immediately; the compose +
+        // upload runs in the background. Poll until the task itself is done —
+        // marking it done on 202 alone would lie about the publish state.
+        let accepted;
+        try {
+          accepted = await publishClip(jobId, apiIdx, body);
+        } catch (e) {
+          if (e?.status === 409) {
+            // Already published previously — the desired end state holds.
+            setProgress((p) => ({ ...p, [idx]: { state: 'done' } }));
+            onPublished?.(idx);
+            return true;
+          }
+          throw e;
+        }
+        const taskId = accepted?.task_id;
+        if (!taskId) {
+          setProgress((p) => ({ ...p, [idx]: { state: 'done' } }));
+          onPublished?.(idx);
+          return true;
+        }
+        setProgress((p) => ({ ...p, [idx]: { state: 'processing' } }));
+        const final = await pollPublishTask(taskId, { intervalMs: 3000, timeoutMs: 600000 });
+        if (!mountedRef.current) return false;
+        if (final.state === 'done') {
+          setProgress((p) => ({ ...p, [idx]: { state: 'done' } }));
+          onPublished?.(idx);
+          return true;
+        }
+        setProgress((p) => ({ ...p, [idx]: { state: 'error', error: final.error || 'Publish failed in background' } }));
+        return false;
       } catch (e) {
         setProgress((p) => ({ ...p, [idx]: { state: 'error', error: e?.message || 'Publish failed' } }));
         return false;
@@ -350,7 +378,7 @@ export function PublishModal({
         <div className="modal-head">
           <div>
             <h3 id="publish-modal-title">{title}</h3>
-            {stage === 'uploading' && <div className="mh-sub">uploading concurrently · daily-limit checks server-side</div>}
+            {stage === 'uploading' && <div className="mh-sub">publishing runs in the background — each clip stays live here until it finishes</div>}
             {stage === 'setup' && (
               <div className="mh-sub">
                 {all ? `Batch review (${clips.length} clips)` : 'Preview, AI metadata & schedule'}

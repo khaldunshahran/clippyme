@@ -187,7 +187,38 @@ export async function publishClip(jobId, index, body) {
     e.status = res.status;
     throw e;
   }
-  return res.json().catch(() => ({}));
+  return res.json().catch(() => ({})); // { status: 'accepted', task_id } — compose+upload run in background
+}
+
+export async function getPublishTaskStatus(taskId) {
+  const res = await apiFetch(getApiUrl(`/api/publish/status/${taskId}`));
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json(); // { task_id, state: queued|running|done|error, result, error, error_status }
+}
+
+// Poll a background publish task until it reaches a terminal state.
+// The backend composes + uploads asynchronously (POST returns 202 immediately),
+// so the UI must not mark a clip done until the task itself reports done.
+// Resolves with the final status snapshot; throws on timeout or transport errors.
+export async function pollPublishTask(taskId, { intervalMs = 3000, timeoutMs = 600000, onState } = {}) {
+  const start = Date.now();
+  for (;;) {
+    const snap = await getPublishTaskStatus(taskId);
+    if (onState) { try { onState(snap); } catch { /* UI callbacks must never break polling */ } }
+    if (snap.state === 'done' || snap.state === 'error') return snap;
+    if (Date.now() - start > timeoutMs) {
+      const e = new Error('Timed out waiting for the publish to finish — it may still be processing in the background.');
+      e.status = 'timeout';
+      e.taskId = taskId;
+      throw e;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
 }
 
 export async function generateClipMetadata(jobId, index, instruction = '') {
