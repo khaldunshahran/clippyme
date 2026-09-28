@@ -791,10 +791,11 @@ def get_viral_clips(
         # strategy (no drift between live runs and restored jobs).
         backfill_hook_text(clips, words)
 
-        # Product guarantee: transformative Shorts must stay under 60s.
-        # Gemini sometimes returns longer ranges despite the prompt cap —
-        # hard-clamp here so no clip can exceed max_duration (default 59s).
-        _cap = max_duration if max_duration else 59.0
+        # Product guarantee: duration serves the story — the AI cuts at natural
+        # story boundaries (multi-tier mix: punchy 20-45s, mid 60-120s, extended
+        # 120-180s). This is only a backstop so no clip can exceed max_duration
+        # (default 180s / 3 min) no matter what the model returns.
+        _cap = max_duration if max_duration else 180.0
         for c in clips:
             try:
                 dur = float(c.end) - float(c.start)
@@ -827,8 +828,8 @@ def build_texttiling_fallback(transcript_result, video_title, max_duration=None,
     they are heuristic, not AI-judged. See docs/clipsai-analysis.md.
 
     Product guarantees (same as the Gemini path): every clip is hard-clamped to
-    ``max_duration`` (default 59s — transformative Shorts must stay under 60s)
-    and the list is truncated to ``max_clips`` when set.
+    ``max_duration`` (default 180s / 3 min — duration serves the story, this is
+    only a backstop) and the list is truncated to ``max_clips`` when set.
     """
     try:
         segments = (transcript_result or {}).get('segments') or []
@@ -836,7 +837,7 @@ def build_texttiling_fallback(transcript_result, video_title, max_duration=None,
         if not topic_clips:
             return None
         print(f"🧩 Gemini unavailable — lexical TextTiling found {len(topic_clips)} topic clips.")
-        _cap = float(max_duration) if max_duration else 59.0
+        _cap = float(max_duration) if max_duration else 180.0
         shorts = []
         for i, tc in enumerate(topic_clips):
             snippet = (tc.get('text') or '').strip()

@@ -282,7 +282,7 @@ Output schema:
       "video_title_for_youtube_short": "<max 100 chars, engagement-first bait per TITLE & CAPTION COPY — stakes/speculation/comment trigger, grounded in the clip, never a flat summary>",
       "viral_hook_text": "<REQUIRED, 3-8 words, scroll-stopping overlay copy — NOT a transcript quote. Use curiosity gap, POV, counter-claim, question, number, or warning pattern. Same language as transcript.>",
       "speaker_name": "<Identified speaker name or prominent subject in this moment if detectable from dialogue or context (e.g. 'John Kiriakou', 'Judge Napolitano', or empty if unknown)>",
-      "duration_tier": "<REQUIRED: 'short' (20-45s) | 'mid' (60-180s) | 'extended' (180-300s)>",
+      "duration_tier": "<REQUIRED: 'short' (20-45s) | 'mid' (60-120s) | 'extended' (120-180s)>",
       "target_platforms": ["#tiktok", "#youtube_shorts", "#instagram_reels"],
       "hashtags": ["#shorts", "#topicTag1", "#topicTag2", "#topicTag3", "#trending"],
       "video_description": "<Rich complete YouTube Shorts description with hook, speaker attribution, key takeaway, and hashtags>"
@@ -424,8 +424,8 @@ def build_viral_prompt(
 
     if is_multi_tier:
         min_dur = 15.0
-        # Allow extended social clips up to 300s (5m), bounded by actual video duration
-        max_dur = min(float(video_duration or 300.0), 300.0)
+        # Allow extended social clips up to 180s (3m), bounded by actual video duration
+        max_dur = min(float(video_duration or 180.0), 180.0)
         if max_dur < 30.0:
             max_dur = max(min_dur + 10.0, float(video_duration or 30.0))
         duration_descriptor = f"15s–{max_dur:.0f}s (Dynamic Multi-Tier Portfolio Mix)"
@@ -435,7 +435,7 @@ def build_viral_prompt(
             "Do NOT output clips of uniform duration. Top platforms (like OpusClip) succeed by letting the story content dictate the length. Curate a diversified portfolio distributed across:\n"
             "1. TIER 1 - SHORTS / REELS (20s – 45s) [DEFAULT — aim here first]: Fast-paced, instant hook in first 0-3s, quick punchy payoff. The highest-retention short-form length; most clips should land in this tier. Perfect for rapid-scroll YouTube Shorts / IG Reels.\n"
             "2. TIER 2 - MID-LENGTH SOCIAL (60s – 120s / 1m – 2m): Complete narrative arc, escalating argument, or storytelling anecdote with thorough setup and payoff. Crucial for high-retention TikTok watch time and Reels.\n"
-            "3. TIER 3 - EXTENDED DEEP DIVE (120s – 300s / 2m – 5m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
+            "3. TIER 3 - EXTENDED DEEP DIVE (120s – 180s / 2m – 3m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
             "Bias the mix toward TIER 1 (20–45s) as the default — reach for TIER 2/3 only when the story arc genuinely needs more room. "
             "Every clip in your response MUST designate its 'duration_tier' ('short', 'mid', or 'extended') and list recommended 'target_platforms'."
         )
