@@ -126,8 +126,13 @@ def is_trusted_client_host(client_host: Optional[str]) -> bool:
 def require_trusted_config_request(request: Request) -> None:
     """Protect config + state-changing endpoints from cross-site browser access.
 
-    Three layers, checked in order:
+    Four layers, checked in order:
 
+    0. Verified Supabase JWT — the public SaaS frontend authenticates with a
+       Supabase session token (``Authorization: Bearer <jwt>``); when the JWT
+       gate middleware has verified it, the request is trusted regardless of
+       fetch metadata. This is the deliberate public path — everything below
+       is the unchanged local-first path.
     1. ``Sec-Fetch-Site`` — a *forbidden* request header set by the browser and
        not writable from JavaScript. Any value of ``cross-site`` / ``same-site``
        means a different origin initiated the request, so we reject outright.
@@ -138,6 +143,9 @@ def require_trusted_config_request(request: Request) -> None:
     3. Private/loopback client IP — only reached for non-browser clients (curl,
        CLI scripts) that send neither ``Sec-Fetch-Site`` nor ``Origin``.
     """
+    if request_supabase_user(request):
+        return
+
     sec_fetch_site = request.headers.get("sec-fetch-site")
     if sec_fetch_site in ("cross-site", "same-site"):
         raise HTTPException(status_code=403, detail="Cross-site requests are not allowed.")
@@ -163,6 +171,97 @@ def require_trusted_config_request(request: Request) -> None:
         return
 
     raise HTTPException(status_code=403, detail="Config access requires a trusted local origin.")
+
+
+# --- Supabase JWT authentication (public SaaS frontend) ---------------------
+# Lets the public Cloudflare Pages frontend call the laptop backend through
+# the Cloudflare Tunnel. The frontend signs in with Supabase (Google OAuth)
+# and sends the session JWT as ``Authorization: Bearer <jwt>`` on every
+# /api request (see dashboard/src/lib/supabaseClient.js -> apiToken.js).
+# A *valid* JWT (HS256, signed with the project's JWT secret, unexpired)
+# marks the request trusted, bypassing the Sec-Fetch-Site cross-site
+# rejection in require_trusted_config_request. Without a valid JWT the
+# local-first behaviour is completely unchanged.
+#
+# The secret NEVER lives in code or chat: it is read from the
+# SUPABASE_JWT_SECRET env var, or from data/supabase_jwt_secret.txt
+# (one line, no trailing newline issues — we strip whitespace).
+
+
+def supabase_jwt_secret() -> Optional[str]:
+    """The Supabase project JWT secret, or None when SaaS auth is off.
+
+    Env var wins (containers); otherwise data/supabase_jwt_secret.txt
+    relative to the working directory (laptop: C:\\nugget) or the repo root.
+    Read per call (not cached at import) so a secret rotation takes effect
+    without a restart and tests can swap it freely.
+    """
+    env_value = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
+    if env_value:
+        return env_value
+    candidates = [
+        os.path.join(os.getcwd(), "data", "supabase_jwt_secret.txt"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "supabase_jwt_secret.txt"),
+    ]
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+            if value:
+                return value
+        except OSError:
+            continue
+    return None
+
+
+def verify_supabase_jwt(token: str) -> Optional[Dict]:
+    """Verify a Supabase session JWT. Returns its claims, or None.
+
+    Strict: HS256 only (Supabase signs with the JWT secret), signature must
+    verify, token must not be expired, and it must carry a subject (the
+    Supabase user id). Any failure — bad signature, wrong algorithm, expired,
+    missing secret — returns None (fail closed: the request falls back to the
+    normal local-trust path instead of being trusted).
+    """
+    token = (token or "").strip()
+    if not token:
+        return None
+    secret = supabase_jwt_secret()
+    if not secret:
+        return None
+    try:
+        import jwt as pyjwt
+    except ImportError:
+        return None
+    try:
+        claims = pyjwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            # Signature + expiry + subject are the trust decision. We do NOT
+            # verify `aud`: Supabase mints aud="authenticated" and the claim
+            # carries no security weight here — anyone holding the project
+            # secret (the only way to forge a signature) already wins.
+            options={"require": ["exp", "sub"], "verify_aud": False},
+            leeway=30,
+        )
+    except Exception:
+        return None
+    if not isinstance(claims, dict) or not claims.get("sub"):
+        return None
+    return claims
+
+
+def request_supabase_user(request: Request) -> Optional[str]:
+    """The verified Supabase user id for this request, or None.
+
+    Set by the JWT gate middleware in app.py; the dependency below reads it.
+    Defensive about ``request.state``: unit-test doubles may not provide it.
+    """
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    return getattr(state, "supabase_user", None)
 
 
 # --- optional API token (deliberate LAN deployments) ------------------------
@@ -275,8 +374,13 @@ def enforce_rate_limit(request: Request, bucket: str, capacity: float, refill_pe
     """
     if os.environ.get("RATE_LIMIT_ENABLED", "1") != "1":
         return
-    client_host = client_ip(request) or "unknown"
-    if not _rate_limit_allow((bucket, client_host), capacity, refill_per_sec, time.monotonic()):
+    # Behind the Cloudflare Tunnel every public client arrives via cloudflared
+    # on loopback, so IP-keying would put ALL SaaS users in one shared bucket
+    # and they'd 429 each other. Verified JWT users get their own per-user
+    # bucket; everyone else keeps the existing IP-keyed behaviour.
+    jwt_user = request_supabase_user(request)
+    client_key = f"jwt:{jwt_user}" if jwt_user else (client_ip(request) or "unknown")
+    if not _rate_limit_allow((bucket, client_key), capacity, refill_per_sec, time.monotonic()):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded. Please slow down and retry shortly.",

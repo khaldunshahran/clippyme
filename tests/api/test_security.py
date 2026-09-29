@@ -304,3 +304,87 @@ def test_enforce_rate_limit_disabled_via_env(monkeypatch):
     # Never raises when disabled, regardless of how many calls.
     for _ in range(50):
         security.enforce_rate_limit(req, "process", capacity=1, refill_per_sec=0.0)
+
+
+# --- Supabase JWT authentication (public SaaS path) -------------------------
+
+def _mint_jwt(secret, sub="user-123", exp_offset=3600, algorithm="HS256"):
+    import time as _time
+    import jwt as _pyjwt
+    now = int(_time.time())
+    return _pyjwt.encode(
+        {"sub": sub, "aud": "authenticated", "role": "authenticated",
+         "iat": now, "exp": now + exp_offset},
+        secret, algorithm=algorithm,
+    )
+
+
+def test_verify_supabase_jwt_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "test-secret-abc")
+    token = _mint_jwt("test-secret-abc")
+    claims = security.verify_supabase_jwt(token)
+    assert claims and claims["sub"] == "user-123"
+
+
+def test_verify_supabase_jwt_rejects_wrong_secret(monkeypatch):
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "correct-secret")
+    token = _mint_jwt("wrong-secret")
+    assert security.verify_supabase_jwt(token) is None
+
+
+def test_verify_supabase_jwt_rejects_expired(monkeypatch):
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "test-secret-abc")
+    token = _mint_jwt("test-secret-abc", exp_offset=-120)
+    assert security.verify_supabase_jwt(token) is None
+
+
+def test_verify_supabase_jwt_rejects_wrong_algorithm(monkeypatch):
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "test-secret-abc")
+    token = _mint_jwt("test-secret-abc", algorithm="HS384")
+    assert security.verify_supabase_jwt(token) is None
+
+
+def test_verify_supabase_jwt_reads_secret_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("SUPABASE_JWT_SECRET", raising=False)
+    secret_file = tmp_path / "data" / "supabase_jwt_secret.txt"
+    secret_file.parent.mkdir(parents=True)
+    secret_file.write_text("file-secret-xyz\n")
+    monkeypatch.chdir(tmp_path)
+    token = _mint_jwt("file-secret-xyz")
+    claims = security.verify_supabase_jwt(token)
+    assert claims and claims["sub"] == "user-123"
+
+
+def test_verify_supabase_jwt_none_without_secret(monkeypatch, tmp_path):
+    monkeypatch.delenv("SUPABASE_JWT_SECRET", raising=False)
+    monkeypatch.chdir(tmp_path)  # empty dir: no secret file
+    assert security.verify_supabase_jwt(_mint_jwt("whatever")) is None
+
+
+def test_trusted_request_allows_verified_jwt_user(monkeypatch):
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "test-secret-abc")
+    req = _FakeRequest(sec_fetch_site="cross-site", client_host="8.8.8.8")
+    req.state = type("S", (), {"supabase_user": "user-123"})()
+    # Would 403 on sec-fetch-site alone; the verified JWT bypasses it.
+    security.require_trusted_config_request(req)
+
+
+def test_trusted_request_still_rejects_cross_site_without_jwt():
+    req = _FakeRequest(sec_fetch_site="cross-site", client_host="8.8.8.8")
+    with pytest.raises(HTTPException):
+        security.require_trusted_config_request(req)
+
+
+def test_rate_limit_keys_jwt_users_separately(monkeypatch):
+    monkeypatch.setenv("RATE_LIMIT_ENABLED", "1")
+    security._rate_state.clear()
+    req_a = _FakeRequest(client_host="127.0.0.1")
+    req_a.state = type("S", (), {"supabase_user": "user-a"})()
+    req_b = _FakeRequest(client_host="127.0.0.1")
+    req_b.state = type("S", (), {"supabase_user": "user-b"})()
+    # capacity=1, no refill: user A exhausts only their own bucket.
+    security.enforce_rate_limit(req_a, "process", capacity=1, refill_per_sec=0.0)
+    with pytest.raises(HTTPException):
+        security.enforce_rate_limit(req_a, "process", capacity=1, refill_per_sec=0.0)
+    # user B (same socket IP) is unaffected.
+    security.enforce_rate_limit(req_b, "process", capacity=1, refill_per_sec=0.0)

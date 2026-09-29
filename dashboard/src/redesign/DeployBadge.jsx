@@ -2,6 +2,7 @@
 // sidebar footer so the build on screen is always verifiable. Falls back to
 // a subtle "dev" when the deploy env vars aren't set (local dev).
 import { Icon } from './icon';
+import { API_BASE_URL } from '../config';
 
 function deployInfo() {
   const short = (import.meta.env.VITE_DEPLOY_SHA || '').trim();
@@ -16,11 +17,12 @@ function deployInfo() {
 
 export function DeployBadge() {
   const info = deployInfo();
+  const apiBase = (API_BASE_URL || '').trim() || 'local (same origin)';
   const detail = info
-    ? [`Full SHA: ${info.full}`, info.time && `Committed: ${info.time}`, info.subject && `“${info.subject}”`]
+    ? [`Full SHA: ${info.full}`, info.time && `Committed: ${info.time}`, info.subject && `“${info.subject}”`, `API: ${apiBase}`]
         .filter(Boolean)
         .join('\n')
-    : 'Local development build — no deploy SHA set.';
+    : `Local development build — no deploy SHA set.\nAPI: ${apiBase}`;
   return (
     <button
       type="button"

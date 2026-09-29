@@ -72,6 +72,7 @@ from clippyme.api.security import (
     enforce_api_token,
     enforce_rate_limit,
     require_trusted_config_request,
+    verify_supabase_jwt,
 )
 from clippyme.storage.config_store import (
     load_persistent_config,
@@ -271,6 +272,26 @@ async def _api_token_gate(request: Request, call_next):
             enforce_api_token(request)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _supabase_jwt_gate(request: Request, call_next):
+    """Verify the Supabase session JWT on /api requests (public SaaS path).
+
+    The public frontend sends ``Authorization: Bearer <supabase_jwt>`` (see
+    dashboard/src/lib/supabaseClient.js). When the token verifies against the
+    project JWT secret, the request is stamped with the user id and
+    require_trusted_config_request + enforce_rate_limit honour it. An invalid
+    or absent token is NOT an error here — the request simply continues down
+    the normal local-trust path (fail safe, local-first unchanged).
+    """
+    if request.url.path.startswith("/api/") and request.method != "OPTIONS":
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            claims = verify_supabase_jwt(auth[7:].strip())
+            if claims:
+                request.state.supabase_user = claims["sub"]
     return await call_next(request)
 
 
