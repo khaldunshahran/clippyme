@@ -118,11 +118,16 @@ export default function RedesignApp() {
   const [showAuthModal, setShowAuthModal] = useState(false);
 
   useEffect(() => {
-    // Recover the session when returning from Google/ OAuth sign-in.
-    handleOAuthRedirect();
+    // Subscribe first: handleOAuthRedirect() notifies subscribers synchronously
+    // when it recovers a session, so the subscription must exist before it runs.
     const unsub = onAuthStateChange((_event, session) => {
       setUser(session?.user || null);
     });
+    // Recover the session when returning from Google / OAuth sign-in, and make
+    // sure React state reflects it even if the notification was missed.
+    if (handleOAuthRedirect()) {
+      setUser(getCurrentUser());
+    }
     return unsub;
   }, []);
 

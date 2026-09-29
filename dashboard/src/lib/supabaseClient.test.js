@@ -1,5 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { clearSession, getCurrentUser, handleOAuthRedirect } from './supabaseClient';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  clearSession,
+  getCurrentUser,
+  handleOAuthRedirect,
+  onAuthStateChange,
+} from './supabaseClient';
 
 function fakeJwt(payload) {
   const b64url = (obj) =>
@@ -41,5 +46,24 @@ describe('handleOAuthRedirect', () => {
     window.location.hash = '#access_token=not-a-jwt';
     expect(handleOAuthRedirect()).toBe(true); // session saved, user null
     expect(getCurrentUser()).toBeNull();
+  });
+
+  it('notifies subscribers synchronously so a pre-registered listener sees the sign-in', () => {
+    // Regression: the app subscribes to auth changes BEFORE calling
+    // handleOAuthRedirect(), and relies on the SIGNED_IN notification to update
+    // its user state. If the notification were async, the sidebar would keep
+    // showing "Sign in" after a successful Google login.
+    const seen = [];
+    const unsub = onAuthStateChange((event, session) => {
+      seen.push([event, session?.user?.id]);
+    });
+    try {
+      const token = fakeJwt({ sub: 'user-456', email: 'h@example.com' });
+      window.location.hash = `#access_token=${token}&token_type=bearer&expires_in=3600`;
+      expect(handleOAuthRedirect()).toBe(true);
+      expect(seen).toEqual([['SIGNED_IN', 'user-456']]);
+    } finally {
+      unsub();
+    }
   });
 });
