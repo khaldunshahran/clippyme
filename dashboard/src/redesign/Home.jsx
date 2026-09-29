@@ -1,5 +1,6 @@
 import { Icon, Social } from './icon';
 import { Btn, Badge } from './primitives';
+import { WhatsNew } from './WhatsNew';
 
 /* ------------------------------------------------------------------
    Home — the logged-in dashboard for Nugget.
@@ -224,6 +225,8 @@ export function Home(props) {
   /* ---------------- render ---------------- */
   return (
     <div className="hm">
+      <WhatsNew />
+
       {/* 1. Greeting + quick actions */}
       <div className="hm-greet-row">
         <div className="hm-greet">

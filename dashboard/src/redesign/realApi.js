@@ -601,6 +601,13 @@ export function optsToPreselections(opts) {
     banner: opts.banner
       ? { enabled: true, platform: opts.bannerPlatform || 'kick', handle: opts.bannerHandle || '', y_pct: opts.bannerYPct ?? 0.85 }
       : false,
+    // Lower-thirds overlay spec (compose-time layer). Burn-in isn't supported
+    // by the backend yet — persisted here only so the design travels with the
+    // recipe and applies once rendering support lands. Deliberately NOT
+    // forwarded to the compose call (exportClip builds an explicit body).
+    lower_thirds: opts.lowerThirdOn
+      ? { enabled: true, ...(opts.lowerThird || {}) }
+      : false,
   };
 }
 

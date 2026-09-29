@@ -5,19 +5,23 @@ import { Hero } from './chrome';
 import { PIPE } from './data';
 import { clipVideoSrc, fmtDuration } from './realApi';
 import { latestRuntimeTelemetry, formatEta, formatMetric } from '../lib/runtimeTelemetry';
+import { computeJobProgress, JOB_STEP_BASELINE } from '../lib/jobProgress';
 
+// STEP_INFO keeps the legacy per-step index for anything that still wants it;
+// the live pct/phase math now lives in lib/jobProgress.computeJobProgress so
+// the sidebar progress chip reports identical numbers.
 const STEP_INFO = {
-  queued: { pct: 5, idx: 0 },
-  acquiring: { pct: 12, idx: 0 },
-  downloading: { pct: 18, idx: 0 },
-  preflight: { pct: 22, idx: 0 },
-  transcribing: { pct: 38, idx: 1 },
-  analyzing: { pct: 58, idx: 2 },
-  cutting: { pct: 68, idx: 3 },
-  reframing: { pct: 82, idx: 3 },
-  quality: { pct: 93, idx: 4 },
-  finalizing: { pct: 97, idx: 4 },
-  processing: { pct: 80, idx: 3 },
+  queued: { pct: JOB_STEP_BASELINE.queued, idx: 0 },
+  acquiring: { pct: JOB_STEP_BASELINE.acquiring, idx: 0 },
+  downloading: { pct: JOB_STEP_BASELINE.downloading, idx: 0 },
+  preflight: { pct: JOB_STEP_BASELINE.preflight, idx: 0 },
+  transcribing: { pct: JOB_STEP_BASELINE.transcribing, idx: 1 },
+  analyzing: { pct: JOB_STEP_BASELINE.analyzing, idx: 2 },
+  cutting: { pct: JOB_STEP_BASELINE.cutting, idx: 3 },
+  reframing: { pct: JOB_STEP_BASELINE.reframing, idx: 3 },
+  quality: { pct: JOB_STEP_BASELINE.quality, idx: 4 },
+  finalizing: { pct: JOB_STEP_BASELINE.finalizing, idx: 4 },
+  processing: { pct: JOB_STEP_BASELINE.processing, idx: 3 },
 };
 
 function MiniClip({ clip }) {
@@ -124,40 +128,13 @@ export function ProcessingView({
     [logs]
   );
   const failed = status === 'error';
-  const effectiveStep = runtime?.stage || step;
-  const info = STEP_INFO[effectiveStep] || STEP_INFO.queued;
-  const reportedProgress = Number(runtime?.progress);
-  const dlPct = Number(runtime?.download_percent);
-  const isAcquiring = effectiveStep === 'acquiring' || effectiveStep === 'downloading';
-  const pct = failed
-    ? 100
-    : isAcquiring && Number.isFinite(dlPct) && dlPct > 0
-    ? Math.min(18, Math.max(2, Math.round(dlPct * 0.18)))
-    : Number.isFinite(reportedProgress)
-    ? Math.min(100, Math.max(0, reportedProgress))
-    : Math.min(96, info.pct + Math.min(18, clips.length * 3));
+  // Shared with the sidebar live-progress chip (lib/jobProgress) so both
+  // surfaces report the same percent and phase.
+  const { pct, phase } = useMemo(
+    () => computeJobProgress({ logs, step, clipsCount: clips.length, status, paused }),
+    [logs, step, clips.length, status, paused]
+  );
   const sourceLabel = media?.type === 'url' ? media.payload : (media?.payload?.name || media?.payload || 'your video');
-  const words = {
-    queued: 'queued',
-    acquiring: 'fetching',
-    downloading: 'fetching',
-    preflight: 'checking capacity',
-    transcribing: 'transcribing',
-    analyzing: 'scoring',
-    cutting: 'cutting',
-    reframing: 'rendering',
-    quality: 'verifying',
-    finalizing: 'finalizing',
-    processing: 'rendering',
-    completed: 'complete',
-  };
-  const phase = failed
-    ? 'failed'
-    : paused
-    ? 'paused'
-    : isAcquiring && Number.isFinite(dlPct) && dlPct > 0
-    ? `downloading ${dlPct}%`
-    : (words[effectiveStep] || (clips.length > 0 ? 'rendering' : 'working'));
 
   return (
     <main className="container fade-in">

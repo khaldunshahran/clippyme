@@ -7,6 +7,7 @@ import { HookStyleControls, HookPreview } from './hookStyle';
 import { SubtitleControls } from './subtitleControls';
 import { LogoControls, GradeControls } from './layerControls';
 import { BannerControls } from './bannerControls';
+import { LowerThirdControls, LOWER_THIRD_DEFAULT } from './lowerThirdControls';
 import { validateCreateOptions } from '../lib/createValidation';
 
 function PresetCards({ presets, active, defaultId, onPick, onSetDefault, onDelete, onSaveCurrent }) {
@@ -262,11 +263,27 @@ function BannerConfig({ opts, set }) {
   );
 }
 
+// Lower thirds (broadcast name tags / location titles). The spec object is
+// stored whole on opts.lowerThird and persists with the recipe; the toggle
+// is opts.lowerThirdOn. Burn-in is backend work that doesn't exist yet — the
+// controls component carries the honest note.
+function LowerThirdConfig({ opts, set }) {
+  return (
+    <div className="cfg-drawer fade-in">
+      <LowerThirdControls
+        value={opts.lowerThird || LOWER_THIRD_DEFAULT}
+        onChange={(spec) => set({ lowerThird: spec })}
+      />
+    </div>
+  );
+}
+
 function OptionsPanel({ opts, set, ready, onCreate, error }) {
   const [subCfg, setSubCfg] = useState(false);
   const [hookCfg, setHookCfg] = useState(false);
   const [logoCfg, setLogoCfg] = useState(false);
   const [bannerCfg, setBannerCfg] = useState(false);
+  const [lowerThirdCfg, setLowerThirdCfg] = useState(false);
 
   return (
     <div className="recipe-panel">
@@ -606,6 +623,17 @@ function OptionsPanel({ opts, set, ready, onCreate, error }) {
           configActive={bannerCfg}
         />
         {opts.banner && bannerCfg && <BannerConfig opts={opts} set={set} />}
+
+        <OptRow
+          icon="megaphone"
+          label="Lower thirds"
+          desc="Broadcast name tags & location titles"
+          on={opts.lowerThirdOn}
+          set={(v) => set({ lowerThirdOn: v })}
+          onConfig={() => setLowerThirdCfg(!lowerThirdCfg)}
+          configActive={lowerThirdCfg}
+        />
+        {opts.lowerThirdOn && lowerThirdCfg && <LowerThirdConfig opts={opts} set={set} />}
 
         <div className="row opt">
           <div className="row-left">

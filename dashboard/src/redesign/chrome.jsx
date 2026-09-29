@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Icon } from './icon';
+import { SidebarProgress } from './SidebarProgress';
+import { DeployBadge } from './DeployBadge';
 
 export const NAV_GROUPS = [
   {
@@ -22,6 +24,9 @@ export const NAV_GROUPS = [
   {
     label: 'Library',
     items: [
+      { id: 'projects', label: 'Projects', icon: 'clapperboard' },
+      { id: 'favorites', label: 'Favorites', icon: 'heart' },
+      { id: 'collections', label: 'Collections', icon: 'folder' },
       { id: 'history', label: 'History', icon: 'clock' },
       { id: 'highlights', label: 'Highlights', icon: 'star' },
     ],
@@ -51,7 +56,7 @@ function NavItem({ item, active, onGo, badge }) {
   );
 }
 
-export function SidebarNav({ tab, goTab, user, onSignIn, onSignOut, onOpenSite, busy }) {
+export function SidebarNav({ tab, goTab, user, onSignIn, onSignOut, onOpenSite, busy, job }) {
   const go = (id) => {
     goTab(id);
     if (typeof window !== 'undefined' && window.scrollTo) window.scrollTo({ top: 0 });
@@ -81,7 +86,19 @@ export function SidebarNav({ tab, goTab, user, onSignIn, onSignOut, onOpenSite, 
         </div>
       ))}
 
+      {/* Live generation progress — only renders while a job is active. */}
+      <SidebarProgress
+        status={job?.status}
+        step={job?.step}
+        logs={job?.logs}
+        clipsCount={job?.clipsCount}
+        media={job?.media}
+        paused={job?.paused}
+        onOpen={() => go('create')}
+      />
+
       <div className="sb-footer">
+        <DeployBadge />
         <NavItem item={SETTINGS_TAB} active={tab === 'settings'} onGo={go} />
         {onOpenSite && (
           <button type="button" className="sb-site-link" onClick={onOpenSite}>

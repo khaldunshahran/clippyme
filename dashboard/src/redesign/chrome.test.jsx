@@ -13,7 +13,7 @@ test('sidebar renders the grouped SaaS navigation', () => {
     expect(screen.getByRole('button', { name: label })).toBeTruthy();
   }
   // Library group + settings
-  for (const label of ['History', 'Highlights', 'Settings']) {
+  for (const label of ['Projects', 'Favorites', 'Collections', 'History', 'Highlights', 'Settings']) {
     expect(screen.getByRole('button', { name: label })).toBeTruthy();
   }
 });

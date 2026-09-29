@@ -16,6 +16,9 @@ export function seedToggles(preselections) {
         logo: !!preselections?.logo,
         grade: !!(preselections?.grade && preselections.grade.preset && preselections.grade.preset !== 'none'),
         banner: !!(preselections?.banner && preselections.banner.enabled),
+        // Lower thirds: enabled in the recipe, but the backend can't burn the
+        // layer yet — kept as a toggle so the UI state round-trips honestly.
+        lowerThirds: !!(preselections?.lower_thirds && preselections.lower_thirds.enabled),
     };
 }
 
@@ -48,6 +51,35 @@ export function seedLogoParams(preselections) {
     return {
         position: logo?.position || 'top-right',
         size: logo?.size || 'M',
+    };
+}
+
+// Lower-thirds overlay spec (broadcast name tags / location titles). Mirrors
+// the { preset, lines, style, startSec, endSec } shape the Create recipe
+// persists. The backend can't burn this layer yet, so the spec travels with
+// the options and waits for rendering support.
+const LOWER_THIRD_PRESETS = new Set(['name_slide', 'location_fade', 'minimal_bar', 'bold_block', 'news_tone', 'elegant_rule']);
+const LOWER_THIRD_ACCENTS = new Set(['rust', 'gold', 'sage', 'plum', 'ink']);
+
+export function seedLowerThirdParams(preselections) {
+    const lt = preselections?.lower_thirds || {};
+    const start = Math.max(0, Number(lt.startSec) || 0);
+    let end = Number(lt.endSec) || 0;
+    if (!(end > start)) end = start + 1;
+    return {
+        enabled: lt.enabled !== false && !!preselections?.lower_thirds,
+        preset: LOWER_THIRD_PRESETS.has(lt.preset) ? lt.preset : 'name_slide',
+        lines: {
+            name: String(lt.lines?.name ?? 'Alex Rivera').slice(0, 60),
+            title: String(lt.lines?.title ?? 'Founder, Brightline Studio').slice(0, 80),
+        },
+        style: {
+            font: lt.style?.font || 'Montserrat-Black',
+            accent: LOWER_THIRD_ACCENTS.has(lt.style?.accent) ? lt.style.accent : 'rust',
+            align: lt.style?.align === 'center' ? 'center' : 'left',
+        },
+        startSec: Math.round(start * 10) / 10,
+        endSec: Math.round(end * 10) / 10,
     };
 }
 

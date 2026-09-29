@@ -2,6 +2,7 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import {
   seedToggles, seedGradeParams, seedLogoParams, seedHookParams, seedSubtitleParams, seedBannerParams,
+  seedLowerThirdParams,
 } from './seedClipParams.js';
 
 // seedClipParams is the single seam that keeps the Create pre-selection panel,
@@ -12,6 +13,7 @@ import {
 test('seedToggles defaults everything off', () => {
   assert.deepEqual(seedToggles(undefined), {
     smartcut: false, hook: false, subtitles: false, logo: false, grade: false, banner: false,
+    lowerThirds: false,
   });
 });
 
@@ -109,4 +111,34 @@ test('seedSubtitleParams uses canonical snake_case font_size (not fontSize)', ()
   const out = seedSubtitleParams({ subtitles: { font_size: 40 } });
   assert.equal(out.font_size, 40);
   assert.equal('fontSize' in out, false);
+});
+
+test('seedLowerThirdParams normalizes the overlay spec', () => {
+  const seeded = seedLowerThirdParams({
+    lower_thirds: {
+      enabled: true, preset: 'bold_block',
+      lines: { name: 'Jane', title: 'Berlin' },
+      style: { font: 'Anton-Regular', accent: 'gold', align: 'center' },
+      startSec: 1, endSec: 6,
+    },
+  });
+  assert.deepEqual(seeded, {
+    enabled: true, preset: 'bold_block',
+    lines: { name: 'Jane', title: 'Berlin' },
+    style: { font: 'Anton-Regular', accent: 'gold', align: 'center' },
+    startSec: 1, endSec: 6,
+  });
+});
+
+test('seedLowerThirdParams degrades honestly without a pre-selection', () => {
+  const seeded = seedLowerThirdParams(undefined);
+  assert.equal(seeded.enabled, false);
+  assert.equal(seeded.preset, 'name_slide');
+  assert.ok(seeded.endSec > seeded.startSec);
+});
+
+test('seedToggles turns lowerThirds on only when the spec is enabled', () => {
+  assert.equal(seedToggles({ lower_thirds: { enabled: true, preset: 'name_slide' } }).lowerThirds, true);
+  assert.equal(seedToggles({ lower_thirds: { enabled: false } }).lowerThirds, false);
+  assert.equal(seedToggles({}).lowerThirds, false);
 });

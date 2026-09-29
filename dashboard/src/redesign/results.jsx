@@ -3,6 +3,8 @@ import { Icon, Btn, Badge, RingGauge, PebbleWaveform } from './primitives';
 import { LazyVideo } from './LazyVideo';
 import { clipPreviewSrc, fmtDuration, downloadClip, exportClip } from './realApi';
 import { PlatformMockupOverlay, PlatformCaptionSection } from './PlatformMockupOverlay';
+import { FavoriteButton, CollectionMenu } from './collections';
+import { clipRefFromClip, isFavorite } from '../lib/collections';
 
 const REFRAME_ICON = { auto: 'crop', subject: 'scan-face', object: 'scan-face', disabled: 'square' };
 const REFRAME_LABEL = { auto: 'Auto', subject: 'Subject', object: 'Subject', disabled: 'Off' };
@@ -27,6 +29,9 @@ const ClipCard = memo(function ClipCard({
   selectMode,
   onPublish,
   pushToast,
+  collectionsStore,
+  onToggleFavorite,
+  onUpdateCollections,
 }) {
   const [downloading, setDownloading] = useState(false);
   const [activePlatform, setActivePlatform] = useState('tiktok');
@@ -241,6 +246,21 @@ const ClipCard = memo(function ClipCard({
       {/* Actions */}
       {!selectMode && (
         <div className="clip-foot">
+          {collectionsStore && onToggleFavorite && (
+            <FavoriteButton
+              active={isFavorite(collectionsStore, clipRefFromClip(jobId, clip, index).key)}
+              onToggle={() => onToggleFavorite(clipRefFromClip(jobId, clip, index))}
+              title={title}
+            />
+          )}
+          {collectionsStore && onUpdateCollections && (
+            <CollectionMenu
+              clipRef={clipRefFromClip(jobId, clip, index)}
+              store={collectionsStore}
+              onStoreChange={onUpdateCollections}
+              title={title}
+            />
+          )}
           <button
             type="button"
             className="mini"
@@ -315,6 +335,9 @@ export function ResultsView({
   onEditSelected,
   embedded,
   pushToast,
+  collectionsStore,
+  onToggleFavorite,
+  onUpdateCollections,
 }) {
   const [selectMode, setSelectMode] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -456,6 +479,9 @@ export function ResultsView({
               onEdit={onEdit}
               onApplyToAll={onApplyToAll}
               pushToast={pushToast}
+              collectionsStore={collectionsStore}
+              onToggleFavorite={onToggleFavorite}
+              onUpdateCollections={onUpdateCollections}
             />
           ))}
         </div>

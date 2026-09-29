@@ -22,6 +22,12 @@ import { ChannelsView } from './channels';
 import { AnalyticsView } from './analyticsView';
 import { EditClipModal } from './captions';
 import { AuthModal } from './AuthModal';
+import { ProjectsView, deriveProjects, projectOpenJob } from './projects';
+import { FavoritesView, CollectionsView } from './collections';
+import {
+  loadCollections, saveCollections, toggleFavorite,
+  createCollection, renameCollection, deleteCollection,
+} from '../lib/collections';
 import { getCurrentUser, handleOAuthRedirect, isAuthEnabled, onAuthStateChange, signOut } from '../lib/supabaseClient';
 import { optsToPreselections, restoreJob, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig, generateAllClipMetadata } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
@@ -148,11 +154,11 @@ export default function RedesignApp() {
     if (withAuth && isAuthEnabled() && !user) setShowAuthModal(true);
   }, [user]);
 
-  const TAB_TITLES = { home: 'Home', create: 'Create', clips: 'Clips', trends: 'Trend Radar', channels: 'Channels', analytics: 'Analytics', live: 'Live Monitor', history: 'History', highlights: 'Highlights', settings: 'Settings' };
-  const KNOWN_TABS = new Set(Object.keys(TAB_TITLES));
+  const TAB_TITLES = useMemo(() => ({ home: 'Home', create: 'Create', clips: 'Clips', projects: 'Projects', favorites: 'Favorites', collections: 'Collections', trends: 'Trend Radar', channels: 'Channels', analytics: 'Analytics', live: 'Live Monitor', history: 'History', highlights: 'Highlights', settings: 'Settings' }), []);
+  const KNOWN_TABS = useMemo(() => new Set(Object.keys(TAB_TITLES)), [TAB_TITLES]);
   useEffect(() => {
     document.title = enteredApp ? `Nugget — ${TAB_TITLES[tab] || 'Studio'}` : 'Nugget — Find the moment worth keeping';
-  }, [enteredApp, tab]);
+  }, [enteredApp, tab, TAB_TITLES]);
   const [jobId, setJobId] = useState(restoredSession?.jobId || null);
   const [status, setStatus] = useState(restoredSession?.status || 'idle'); // idle | processing | complete | error
   const [results, setResults] = useState(restoredSession?.results || null);
@@ -204,7 +210,22 @@ export default function RedesignApp() {
   const [availableJobIds, setAvailableJobIds] = useState(null);
 
   const { history, saveToHistory, deleteFromHistory, clearHistory } = useHistory();
-  const { cookiesConfigured, setCookiesConfigured } = useBackendStatus();
+  const { cookiesConfigured, setCookiesConfigured, reachable: backendReachable } = useBackendStatus();
+
+  // Collections (favorites + custom) — localStorage, keyed by signed-in user
+  // id with an anonymous fallback. Available to everyone, no paywall.
+  const collectionsUserId = user?.id || null;
+  const [collectionsStore, setCollectionsStore] = useState(() => loadCollections(collectionsUserId));
+  useEffect(() => {
+    setCollectionsStore(loadCollections(collectionsUserId));
+  }, [collectionsUserId]);
+  const updateCollectionsStore = useCallback((updater) => {
+    setCollectionsStore((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      saveCollections(collectionsUserId, next);
+      return next;
+    });
+  }, [collectionsUserId]);
   const { states: clipStates, updateClip: updateClipState } = useClipStates(jobId);
   const { states: histClipStates, updateClip: updateHistClipState } = useClipStates(historyJob?.jobId);
 
@@ -666,6 +687,7 @@ export default function RedesignApp() {
         onSignIn={() => setShowAuthModal(true)}
         onSignOut={handleSignOut}
         onOpenSite={() => setEnteredApp(false)}
+        job={{ status, step: currentStep, logs, clipsCount: clips.length, media: processingMedia, paused }}
       />
       <div className="app-main">
       {confetti && <Confetti />}
@@ -705,6 +727,9 @@ export default function RedesignApp() {
           clipStates={clipStates} onUpdateClipState={updateClipStateT} onBack={() => goTab('home')}
           onPublish={openPublish} onPublishAll={openPublish} onEdit={(c, i) => setEditClip({ clip: c, idx: i })}
           onApplyToAll={applyClipToAll} onEditSelected={(targets) => setBulkEdit({ targets })}
+          collectionsStore={collectionsStore}
+          onToggleFavorite={(ref) => updateCollectionsStore((s) => toggleFavorite(s, ref))}
+          onUpdateCollections={updateCollectionsStore}
           pushToast={pushToast} />
       )}
       {tab === 'clips' && !(status === 'complete' && clips.length > 0) && (
@@ -781,6 +806,44 @@ export default function RedesignApp() {
 
       {tab === 'live' && <LiveMonitorView pushToast={pushToast} />}
 
+      {tab === 'projects' && (
+        <ProjectsView
+          projects={deriveProjects(history)}
+          backendReachable={backendReachable}
+          onSelect={(p) => { const job = projectOpenJob(p); if (job) openHistoryJob(job); }}
+          onDelete={(p) => {
+            (p.jobs || []).forEach((j) => deleteFromHistory(j.jobId));
+            pushToast('info', 'Project deleted');
+          }}
+        />
+      )}
+
+      {tab === 'favorites' && (
+        <FavoritesView
+          store={collectionsStore}
+          onOpenClip={(ref) => {
+            const entry = history.find((h) => h.jobId === ref.jobId);
+            if (entry) openHistoryJob(entry);
+            else pushToast('error', 'The source job is no longer available');
+          }}
+          onToggleFav={(ref) => updateCollectionsStore((s) => toggleFavorite(s, ref))}
+        />
+      )}
+
+      {tab === 'collections' && (
+        <CollectionsView
+          store={collectionsStore}
+          onOpenClip={(ref) => {
+            const entry = history.find((h) => h.jobId === ref.jobId);
+            if (entry) openHistoryJob(entry);
+            else pushToast('error', 'The source job is no longer available');
+          }}
+          onCreate={(name) => updateCollectionsStore((s) => createCollection(s, name).store)}
+          onRename={(id, name) => updateCollectionsStore((s) => renameCollection(s, id, name))}
+          onDelete={(id) => { updateCollectionsStore((s) => deleteCollection(s, id)); pushToast('info', 'Collection deleted'); }}
+        />
+      )}
+
       {tab === 'history' && !viewingHistory && (
         <HistoryView history={history} availableIds={availableJobIds}
           onOpen={openHistoryJob}
@@ -797,6 +860,9 @@ export default function RedesignApp() {
             onPublish={openPublish} onPublishAll={openPublish} onEdit={(c, i) => setEditClip({ clip: c, idx: i })}
             onApplyToAll={applyClipToAll}
             onEditSelected={(targets) => setBulkEdit({ targets })}
+            collectionsStore={collectionsStore}
+            onToggleFavorite={(ref) => updateCollectionsStore((s) => toggleFavorite(s, ref))}
+            onUpdateCollections={updateCollectionsStore}
             pushToast={pushToast} />
         </div>
       )}

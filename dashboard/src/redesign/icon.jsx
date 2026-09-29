@@ -10,7 +10,7 @@ import {
   Download, Send, TrendingUp, Play, CheckSquare, X, AudioLines, CalendarClock,
   CalendarCheck, PartyPopper, Loader, Trash2, ChevronRight, Eye, EyeOff, KeyRound,
   Rss, Cookie, Info, Star, RefreshCw, Stamp, Image,  Baseline, Copy, CheckCheck, Palette, Tv,
-  BarChart3,
+  BarChart3, Heart, Folder, FolderPlus, Pencil, Megaphone, Clapperboard, GitCommit,
 } from 'lucide-react';
 
 const MAP = {
@@ -28,7 +28,8 @@ const MAP = {
   rss: Rss, cookie: Cookie, 'circle-check': CircleCheck, 'triangle-alert': TriangleAlert,
   info: Info, star: Star, 'refresh-cw': RefreshCw, stamp: Stamp, image: Image,
   baseline: Baseline, copy: Copy, 'check-check': CheckCheck, palette: Palette, tv: Tv,
-  'bar-chart': BarChart3,
+  'bar-chart': BarChart3, heart: Heart, folder: Folder, 'folder-plus': FolderPlus,
+  pencil: Pencil, megaphone: Megaphone, clapperboard: Clapperboard, 'git-commit': GitCommit,
 };
 
 export function Icon({ n, cls, style }) {
