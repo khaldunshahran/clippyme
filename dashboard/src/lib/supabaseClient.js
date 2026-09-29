@@ -225,3 +225,78 @@ export async function signOut() {
   }
   clearSession();
 }
+
+/**
+ * Replace the stored session's user object (e.g. after user_metadata changed
+ * server-side) WITHOUT emitting auth events — subscribers already know about
+ * this session; this just keeps the cached copy fresh.
+ */
+export function updateStoredUser(user) {
+  try {
+    const raw = storage()?.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return;
+    const session = JSON.parse(raw);
+    session.user = { ...(session.user || {}), ...(user || {}) };
+    storage()?.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // Storage quota or privacy mode error
+  }
+}
+
+/**
+ * Fetch the fresh user record (including user_metadata) from Supabase Auth.
+ * Throws when there is no session or the request fails.
+ */
+export async function fetchAuthUser() {
+  if (!isAuthEnabled()) {
+    throw new Error('Supabase Auth is not configured.');
+  }
+  const session = getSession();
+  if (!session?.access_token) {
+    throw new Error('Not signed in.');
+  }
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.msg || data.error_description || data.message || 'Failed to fetch user');
+  }
+  updateStoredUser(data.user || data);
+  return data.user || data;
+}
+
+/**
+ * Merge `data` into the signed-in user's user_metadata via Supabase Auth.
+ * Only the user themself (via their access token) can read/write their own
+ * metadata — this is the per-account key vault's server side.
+ * Returns the updated user record.
+ */
+export async function updateAuthUserData(data) {
+  if (!isAuthEnabled()) {
+    throw new Error('Supabase Auth is not configured.');
+  }
+  const session = getSession();
+  if (!session?.access_token) {
+    throw new Error('Not signed in.');
+  }
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({ data }),
+  });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(payload.msg || payload.error_description || payload.message || 'Failed to save');
+  }
+  const user = payload.user || payload;
+  updateStoredUser(user);
+  return user;
+}

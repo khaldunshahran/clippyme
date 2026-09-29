@@ -29,6 +29,7 @@ import {
   createCollection, renameCollection, deleteCollection,
 } from '../lib/collections';
 import { getCurrentUser, handleOAuthRedirect, isAuthEnabled, onAuthStateChange, signOut } from '../lib/supabaseClient';
+import { getVaultKey, setVaultKey, syncVaultOnSignIn } from '../lib/keyVault';
 import { optsToPreselections, restoreJob, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig, generateAllClipMetadata } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
@@ -111,28 +112,46 @@ function loadSavedCreateOpts() {
 
 export default function RedesignApp() {
   const restoredSession = useMemo(() => loadPersistedSession(), []);
-  // The Gemini key is persisted in localStorage in cleartext. This is an
-  // accepted tradeoff for the single-user self-host model (no server-side
-  // session store, key never leaves the browser except as the X-Gemini-Key
-  // header to the same-origin backend). Any same-origin XSS would expose it —
-  // the production CSP in vite.config.js (no inline/eval scripts) is the
-  // mitigation. If multi-user is ever added, move this to a short-lived
-  // server-issued token or sessionStorage.
-  const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  // The Gemini key lives in the per-account key vault (lib/keyVault.js): when
+  // signed in it's stored in the user's own Supabase auth metadata, so it
+  // follows the account across deploys, devices, and browsers; localStorage
+  // is the read cache and the full store when signed out. The key never
+  // leaves the browser except as the X-Gemini-Key header to the backend.
+  // Any same-origin XSS would expose it — the production CSP in
+  // vite.config.js (no inline/eval scripts) is the mitigation.
+  const [apiKey, setApiKey] = useState(() => getVaultKey('gemini'));
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [user, setUser] = useState(() => getCurrentUser());
   const [showAuthModal, setShowAuthModal] = useState(false);
+
+  // Pull the per-account key vault into the local cache after sign-in, then
+  // adopt the vault's Gemini key into state when it differs from what's shown.
+  const pullVaultKeys = useCallback(() => {
+    syncVaultOnSignIn()
+      .then(() => {
+        setApiKey((prev) => {
+          const v = getVaultKey('gemini');
+          return v === prev ? prev : v;
+        });
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     // Subscribe first: handleOAuthRedirect() notifies subscribers synchronously
     // when it recovers a session, so the subscription must exist before it runs.
     const unsub = onAuthStateChange((_event, session) => {
       setUser(session?.user || null);
+      if (_event === 'SIGNED_IN' && session?.user) pullVaultKeys();
     });
     // Recover the session when returning from Google / OAuth sign-in, and make
     // sure React state reflects it even if the notification was missed.
     if (handleOAuthRedirect()) {
       setUser(getCurrentUser());
+      // (SIGNED_IN fired synchronously above, which already pulled the vault.)
+    } else if (getCurrentUser()) {
+      // Returning session, no redirect: pull the per-account key vault once.
+      pullVaultKeys();
     }
     return unsub;
   }, []);
@@ -244,7 +263,9 @@ export default function RedesignApp() {
     updateClipState(idx, patch);
   };
 
-  useEffect(() => { if (apiKey) localStorage.setItem('gemini_key', apiKey); }, [apiKey]);
+  // Every keystroke updates the local cache immediately; the vault debounces
+  // the push to the per-account server copy (no-op when signed out).
+  useEffect(() => { setVaultKey('gemini', apiKey); }, [apiKey]);
   // Refresh and reconcile the on-disk backend job set whenever the History tab opens or on load,
   // so any job completed on disk (even via CLI, API or across refreshes) appears in History.
   useEffect(() => {

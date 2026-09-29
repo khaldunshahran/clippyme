@@ -330,7 +330,7 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
       <Hero eyebrow="Settings" line1="Keys & connections." sub="Everything is stored locally. Your keys never leave your machine." />
 
       <Panel title="API keys" sub="Required for transcription & moment detection" icon="key-round" style={{ marginBottom: 18 }}>
-        <KeyRow icon="sparkles" name="Gemini" desc="Viral-moment detection" value={gemini} present={present.gemini}
+        <KeyRow icon="sparkles" name="Gemini" desc="Viral-moment detection · synced to your account when signed in" value={gemini} present={present.gemini}
           onChange={(v) => { setGemini(v); onApiKey?.(v); }} onSave={() => saveKeys({ GEMINI_API_KEY: gemini })}
           onClear={() => { setGemini(''); onApiKey?.(''); saveKeys({ GEMINI_API_KEY: '' }); }} placeholder="AIza…" />
         <KeyRow icon="audio-lines" name="Deepgram" desc="Nova-3 transcription" value={deepgram} present={present.deepgram}
