@@ -388,32 +388,46 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     }
     try {
       let accounts = null;
+      let keyOwner = '';
       try {
         // Discovery runs against the *saved* key, so persist a freshly-typed
         // one to the backend first — otherwise it 400s "API key not configured".
         if (typed) await saveZernio({ api_key: typed, accounts: accts });
         ({ accounts } = await discoverZernioAccounts());
       } catch {
-        const res = await fetch('https://zernio.com/api/v1/accounts', {
-          headers: { 'Authorization': `Bearer ${key}` },
-        });
+        // Laptop unreachable — validate the key, then list accounts directly.
+        const auth = { 'Authorization': `Bearer ${key}` };
+        const vres = await fetch('https://zernio.com/api/v1/auth/verify', { headers: auth });
+        const vdata = await vres.json().catch(() => ({}));
+        if (!vres.ok || vdata.valid === false) {
+          pushToast?.('error', 'This Zernio API key looks invalid — copy a fresh one from zernio.com → dashboard → API keys');
+          return;
+        }
+        if (vdata.email) keyOwner = ` (key belongs to ${vdata.email})`;
+        const res = await fetch('https://zernio.com/api/v1/accounts?includeOverLimit=true', { headers: auth });
         if (!res.ok) throw new Error(`Zernio responded HTTP ${res.status}`);
         const data = await res.json();
         accounts = Array.isArray(data) ? data : (data.accounts || []);
       }
+      const list = accounts || [];
       const next = { ...accts };
-      (accounts || []).forEach((a) => {
+      // Prefer healthy accounts when a platform appears more than once.
+      const ordered = [...list].sort((a, b) => (b.isActive === false) - (a.isActive === false));
+      ordered.forEach((a) => {
         const p = (a.platform || '').toLowerCase();
         const id = a._id || a.id;
-        if (p.includes('tiktok')) next.tiktok = id;
-        else if (p.includes('insta')) next.instagram = id;
-        else if (p.includes('you')) next.youtube = id;
-        else if (p.includes('face') || p.includes('fb')) next.facebook = id;
+        if (!id) return;
+        if (p.includes('tiktok')) next.tiktok = next.tiktok || id;
+        else if (p.includes('insta')) next.instagram = next.instagram || id;
+        else if (p.includes('you')) next.youtube = next.youtube || id;
+        else if (p.includes('face') || p.includes('fb')) next.facebook = next.facebook || id;
       });
       setAccts(next);
       setVaultKey('zernio_accounts', JSON.stringify(next));
-      if ((accounts || []).length) pushToast?.('success', `Discovered ${accounts.length} accounts`);
-      else pushToast?.('warn', 'No connected accounts found in your Zernio account');
+      const filled = [next.tiktok, next.instagram, next.youtube, next.facebook].filter(Boolean).length;
+      if (!list.length) pushToast?.('warn', `Zernio returned no connected accounts for this key${keyOwner} — the accounts must be connected under that same Zernio login`);
+      else if (filled) pushToast?.('success', `Discovered ${list.length} accounts — filled ${filled} platform slot${filled === 1 ? '' : 's'}`);
+      else pushToast?.('warn', `Found ${list.length} account${list.length === 1 ? '' : 's'}, but none were TikTok / Instagram / YouTube / Facebook`);
     } catch { pushToast?.('error', 'Discover failed. Check the API key.'); }
   };
 

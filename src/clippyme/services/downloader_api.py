@@ -199,16 +199,21 @@ def download_video(req: DownloadRequest, request: Request = None):
             ("web_safari", True, False),   # safari + cookies, NO po token
             ("default", True, True),       # cookies + po token (only if bgutil server running)
             ("web_safari", True, True),
+            ("web_embedded", True, False), # embedded player + cookies — slips past the web bot check
             ("default", False, False),
+            ("web_embedded", False, False),# embedded player, no cookies — proven 720p bot-check bypass
             ("web_safari", False, False),
             ("default", False, True),
+            ("web_embedded", False, True),
             ("web_safari", False, True),
         ]
     else:
         attempts = [
             ("default", False, False),
+            ("web_embedded", False, False),# embedded player — proven 720p bot-check bypass
             ("web_safari", False, False),
             ("default", False, True),
+            ("web_embedded", False, True),
             ("web_safari", False, True),
         ]
     attempts.extend([
