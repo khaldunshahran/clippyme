@@ -14,6 +14,7 @@ import {
 } from './realApi';
 import { SUB_FONTS } from './data';
 import { getApiToken, setApiToken } from '../lib/apiToken';
+import { getVaultKey, clearVaultKey } from '../lib/keyVault';
 import { relTime } from '../lib/relTime';
 import { triggerStorageCleanup, getStorageBreakdown } from '../lib/api';
 
@@ -125,6 +126,9 @@ function KeyRow({ icon, name, desc, value, onChange, onSave, onClear, placeholde
 
 export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesChange, pushToast }) {
   const [gemini, setGemini] = useState(apiKey || '');
+  // The account vault can pull a key in after this view mounts (sign-in); keep
+  // the field in sync so a pulled key appears without a reload.
+  useEffect(() => { setGemini(apiKey || ''); }, [apiKey]);
   const [deepgram, setDeepgram] = useState('');
   const [elevenlabs, setElevenlabs] = useState('');
   const [hf, setHf] = useState('');
@@ -175,7 +179,8 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     finally { setLoadingModels(false); }
   };
 
-  // Source of truth for "is this key set" is always the backend's response,
+  // Source of truth for "is this key set" is the backend's response for most keys;
+  // Gemini also counts the account vault (what generation requests actually use),
   // never the (optimistic) input text — refetched after every save/clear so
   // the badge can't drift from what's actually persisted.
   const refreshConfig = async () => {
@@ -187,6 +192,33 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     });
     if (c.TRANSCRIPTION_PROVIDER) setProvider(c.TRANSCRIPTION_PROVIDER);
     if (c.GEMINI_MODEL) setModel(c.GEMINI_MODEL);
+  };
+
+  // Gemini's primary store is the per-account vault (local copy), which is what
+  // generation requests actually use via the X-Gemini-Key header. The backend
+  // copy is opportunistic — the laptop backend isn't reachable from the public
+  // site, so its failure must never look like the key wasn't saved.
+  const saveGeminiKey = async (value) => {
+    onApiKey?.(value); // vault write (local now, account sync debounced)
+    try {
+      await saveConfig({ GEMINI_API_KEY: value });
+      pushToast?.('success', 'Saved');
+    } catch {
+      if (getVaultKey('gemini')) {
+        pushToast?.('warn', 'Saved to your account — backend unreachable, but the key works');
+      } else {
+        pushToast?.('error', 'Save failed');
+      }
+    }
+    await refreshConfig();
+  };
+  const clearGeminiKey = async () => {
+    setGemini('');
+    onApiKey?.('');
+    clearVaultKey('gemini');
+    try { await saveConfig({ GEMINI_API_KEY: '' }); } catch { /* vault clear already done */ }
+    pushToast?.('success', 'Cleared');
+    await refreshConfig();
   };
 
   useEffect(() => {
@@ -327,12 +359,12 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
 
   return (
     <div className="container narrow fade-in">
-      <Hero eyebrow="Settings" line1="Keys & connections." sub="Everything is stored locally. Your keys never leave your machine." />
+      <Hero eyebrow="Settings" line1="Keys & connections." sub="Keys live in your browser — and sync to your account when you're signed in." />
 
       <Panel title="API keys" sub="Required for transcription & moment detection" icon="key-round" style={{ marginBottom: 18 }}>
-        <KeyRow icon="sparkles" name="Gemini" desc="Viral-moment detection · synced to your account when signed in" value={gemini} present={present.gemini}
-          onChange={(v) => { setGemini(v); onApiKey?.(v); }} onSave={() => saveKeys({ GEMINI_API_KEY: gemini })}
-          onClear={() => { setGemini(''); onApiKey?.(''); saveKeys({ GEMINI_API_KEY: '' }); }} placeholder="AIza…" />
+        <KeyRow icon="sparkles" name="Gemini" desc="Viral-moment detection · synced to your account when signed in" value={gemini} present={present.gemini || !!gemini}
+          onChange={(v) => { setGemini(v); onApiKey?.(v); }} onSave={() => saveGeminiKey(gemini)}
+          onClear={clearGeminiKey} placeholder="AIza…" />
         <KeyRow icon="audio-lines" name="Deepgram" desc="Nova-3 transcription" value={deepgram} present={present.deepgram}
           onChange={setDeepgram} onSave={() => saveKeys({ DEEPGRAM_API_KEY: deepgram })}
           onClear={() => { setDeepgram(''); saveKeys({ DEEPGRAM_API_KEY: '' }); }} placeholder="dg_…" />

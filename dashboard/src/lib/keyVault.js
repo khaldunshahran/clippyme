@@ -61,6 +61,11 @@ const PUSH_DEBOUNCE_MS = 800;
 const pushTimers = {};
 const lastPushed = {}; // name -> value last confirmed on the server
 
+// Becomes true after the first successful vault sync. Until we've seen the
+// server state we must not push — otherwise a fresh browser (empty cache)
+// could push a blank over a key that only exists on the server.
+let serverKnown = false;
+
 function serverKeysFromSession() {
   const user = getSession()?.user;
   const meta = user?.user_metadata?.[VAULT_META_KEY];
@@ -68,7 +73,7 @@ function serverKeysFromSession() {
 }
 
 async function pushToServer(name, value) {
-  if (!isAuthEnabled() || !getSession()?.access_token) return;
+  if (!isAuthEnabled() || !getSession()?.access_token || !serverKnown) return;
   if (lastPushed[name] === value) return; // already there — skip
   try {
     const current = { ...serverKeysFromSession() };
@@ -123,6 +128,7 @@ export async function syncVaultOnSignIn() {
     const user = await fetchAuthUser();
     const meta = user?.user_metadata?.[VAULT_META_KEY];
     if (meta && typeof meta === 'object') serverKeys = meta;
+    serverKnown = true; // we've now seen the server state — pushes are safe
   } catch {
     return; // offline — stay on the local cache
   }

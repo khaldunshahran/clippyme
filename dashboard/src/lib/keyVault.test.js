@@ -25,6 +25,14 @@ function signedOut() {
   sb.getSession.mockReturnValue(null);
 }
 
+// Mirrors the app: RedesignApp always pulls the vault on sign-in before the
+// user can type, which marks the server state as known and enables pushes.
+async function signInAndSync(serverKeys = {}) {
+  signedIn(serverKeys);
+  sb.fetchAuthUser.mockResolvedValue({ id: 'u1', user_metadata: { [META]: serverKeys } });
+  await vault.syncVaultOnSignIn();
+}
+
 beforeEach(async () => {
   vi.resetModules();
   localStorage.clear();
@@ -61,7 +69,7 @@ describe('keyVault (signed out)', () => {
 
 describe('keyVault (signed in)', () => {
   it('pushes the key to user_metadata, merging existing vault keys', async () => {
-    signedIn({ gemini: 'old', other: 'keep-me' });
+    await signInAndSync({ gemini: 'old', other: 'keep-me' });
     vault.setVaultKey('gemini', 'AIza-new');
     // Not pushed synchronously (debounced)…
     expect(sb.updateAuthUserData).not.toHaveBeenCalled();
@@ -73,13 +81,8 @@ describe('keyVault (signed in)', () => {
   });
 
   it('skips the server push when the value is unchanged', async () => {
-    signedIn({ gemini: 'AIza-same' });
-    sb.fetchAuthUser.mockResolvedValue({
-      id: 'u1',
-      user_metadata: { [META]: { gemini: 'AIza-same' } },
-    });
+    await signInAndSync({ gemini: 'AIza-same' });
     localStorage.setItem('gemini_key', 'AIza-same');
-    await vault.syncVaultOnSignIn(); // marks lastPushed
     expect(sb.updateAuthUserData).not.toHaveBeenCalled();
     vault.setVaultKey('gemini', 'AIza-same');
     await vault.__flushVaultPushes();
@@ -87,18 +90,31 @@ describe('keyVault (signed in)', () => {
   });
 
   it('pushes removals so clearing propagates to the account', async () => {
-    signedIn({ gemini: 'AIza-gone' });
+    await signInAndSync({ gemini: 'AIza-gone' });
     vault.clearVaultKey('gemini');
     await vault.__flushVaultPushes();
     expect(sb.updateAuthUserData).toHaveBeenCalledWith({ [META]: {} });
   });
 
   it('never throws when the server push fails (local cache still wins)', async () => {
-    signedIn({});
+    await signInAndSync({});
     sb.updateAuthUserData.mockRejectedValue(new Error('offline'));
     expect(() => vault.setVaultKey('gemini', 'AIza-offline')).not.toThrow();
     await vault.__flushVaultPushes();
     expect(vault.getVaultKey('gemini')).toBe('AIza-offline');
+  });
+
+  it('does not push before the first sync — a blank cache must never wipe the server', async () => {
+    signedIn({ gemini: 'AIza-server' }); // server has a key…
+    // …but the app hasn't synced yet (slow network), cache is empty:
+    vault.setVaultKey('gemini', '');
+    await vault.__flushVaultPushes();
+    expect(sb.updateAuthUserData).not.toHaveBeenCalled();
+    // Once sync runs, the server key is pulled down, not wiped.
+    sb.fetchAuthUser.mockResolvedValue({ id: 'u1', user_metadata: { [META]: { gemini: 'AIza-server' } } });
+    await vault.syncVaultOnSignIn();
+    expect(vault.getVaultKey('gemini')).toBe('AIza-server');
+    expect(sb.updateAuthUserData).not.toHaveBeenCalled();
   });
 });
 

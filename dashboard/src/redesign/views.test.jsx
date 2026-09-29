@@ -5,6 +5,7 @@
 import { test, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { SettingsView, HistoryView } from './views.jsx';
+import * as vault from '../lib/keyVault';
 
 const getConfig = vi.fn();
 const saveConfig = vi.fn();
@@ -35,6 +36,7 @@ const SET_CONFIG = { ...EMPTY_CONFIG, GEMINI_API_KEY: 'AIza...xyz1' };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
   saveConfig.mockResolvedValue({ success: true });
 });
 
@@ -45,15 +47,45 @@ function mount(pushToast = vi.fn()) {
 
 const geminiRow = () => screen.getByLabelText('Gemini').closest('.keyrow');
 
-test('badge reflects backend state, not input text typed before any save', async () => {
+test('gemini badge reflects the account vault — typing a key shows set even when the backend is down', async () => {
   getConfig.mockResolvedValue(EMPTY_CONFIG);
   mount();
   await waitFor(() => expect(within(geminiRow()).getByText('empty')).toBeInTheDocument());
 
-  // Typing into the field (no blur/save yet) must not flip the badge.
+  // Typing writes the vault (local copy) on every keystroke, so the key IS
+  // available for generation — the badge says so even if the backend is down.
   fireEvent.change(screen.getByLabelText('Gemini'), { target: { value: 'AIzaSomeKey' } });
+  expect(within(geminiRow()).getByText('set')).toBeInTheDocument();
+});
+
+test('gemini save with an unreachable backend reports the vault save, never "Save failed"', async () => {
+  getConfig.mockResolvedValue(EMPTY_CONFIG);
+  saveConfig.mockRejectedValue(new Error('backend unreachable'));
+  const pushToast = vi.fn();
+  render(<SettingsView pushToast={pushToast} onApiKey={(v) => vault.setVaultKey('gemini', v)} />);
+  await waitFor(() => expect(within(geminiRow()).getByText('empty')).toBeInTheDocument());
+
+  const input = screen.getByLabelText('Gemini');
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: 'AIzaSomeKey' } });
+  fireEvent.blur(input);
+
+  await waitFor(() => expect(pushToast).toHaveBeenCalledWith('warn', expect.stringContaining('Saved to your account')));
+  expect(pushToast).not.toHaveBeenCalledWith('error', expect.anything());
+  expect(vault.getVaultKey('gemini')).toBe('AIzaSomeKey');
+  expect(within(geminiRow()).getByText('set')).toBeInTheDocument();
+});
+
+test('clearing the gemini key clears the vault too', async () => {
+  getConfig.mockResolvedValue(EMPTY_CONFIG);
+  vault.setVaultKey('gemini', 'AIzaSomeKey');
+  const pushToast = vi.fn();
+  render(<SettingsView pushToast={pushToast} apiKey="AIzaSomeKey" onApiKey={(v) => vault.setVaultKey('gemini', v)} />);
+  await waitFor(() => expect(within(geminiRow()).getByText('set')).toBeInTheDocument());
+
+  fireEvent.click(within(geminiRow()).getByRole('button', { name: /clear/i }));
+  await waitFor(() => expect(vault.getVaultKey('gemini')).toBe(''));
   expect(within(geminiRow()).getByText('empty')).toBeInTheDocument();
-  expect(within(geminiRow()).queryByText('set')).toBeNull();
 });
 
 test('save triggers a refetch and the badge updates from the backend response', async () => {
