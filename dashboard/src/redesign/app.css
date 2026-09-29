@@ -382,6 +382,9 @@ h1, h2, h3, h4, h5, h6 {
 .hero h1 em, .hero h1 .grad {
   font-style: normal;
   color: var(--rust-deep);
+  /* The accent line is a second hero line by design — inline flow let it
+     collide with the first line ("in.Viral") at some widths. */
+  display: block;
 }
 
 .hero p.lede, .hero p {
