@@ -5,6 +5,7 @@ import * as supabaseClient from '../lib/supabaseClient';
 
 vi.mock('../lib/supabaseClient', () => ({
   signInWithPassword: vi.fn(),
+  signInWithOAuth: vi.fn(),
   signUp: vi.fn(),
 }));
 
@@ -80,5 +81,13 @@ describe('AuthModal', () => {
     await waitFor(() => {
       expect(screen.getByText('Invalid login credentials')).toBeInTheDocument();
     });
+  });
+
+  it('starts Google sign-in when the Google button is clicked', () => {
+    render(<AuthModal isOpen={true} onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /continue with google/i }));
+
+    expect(supabaseClient.signInWithOAuth).toHaveBeenCalledWith('google');
   });
 });

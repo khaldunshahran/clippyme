@@ -22,7 +22,7 @@ import { ChannelsView } from './channels';
 import { AnalyticsView } from './analyticsView';
 import { EditClipModal } from './captions';
 import { AuthModal } from './AuthModal';
-import { getCurrentUser, isAuthEnabled, onAuthStateChange, signOut } from '../lib/supabaseClient';
+import { getCurrentUser, handleOAuthRedirect, isAuthEnabled, onAuthStateChange, signOut } from '../lib/supabaseClient';
 import { optsToPreselections, restoreJob, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig, generateAllClipMetadata } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
@@ -118,6 +118,8 @@ export default function RedesignApp() {
   const [showAuthModal, setShowAuthModal] = useState(false);
 
   useEffect(() => {
+    // Recover the session when returning from Google/ OAuth sign-in.
+    handleOAuthRedirect();
     const unsub = onAuthStateChange((_event, session) => {
       setUser(session?.user || null);
     });

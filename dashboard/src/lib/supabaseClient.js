@@ -142,6 +142,69 @@ export async function signInWithPassword({ email, password }) {
 }
 
 /**
+ * Start an OAuth sign-in flow (e.g. 'google') via Supabase Auth.
+ * Redirects the browser to the provider; Supabase redirects back to this app.
+ */
+export function signInWithOAuth(provider) {
+  if (!isAuthEnabled()) {
+    throw new Error('Supabase Auth is not configured. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
+  }
+  const redirectTo = window.location.origin + window.location.pathname;
+  const url =
+    `${SUPABASE_URL}/auth/v1/authorize?provider=${encodeURIComponent(provider)}` +
+    `&redirect_to=${encodeURIComponent(redirectTo)}`;
+  window.location.href = url;
+}
+
+/**
+ * Decode the user identity embedded in a Supabase JWT access token.
+ * Synchronous so the OAuth redirect can restore the session on first paint.
+ */
+function userFromAccessToken(accessToken) {
+  try {
+    const payload = JSON.parse(
+      atob(accessToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))
+    );
+    return {
+      id: payload.sub,
+      email: payload.email,
+      user_metadata: payload.user_metadata || {},
+      app_metadata: payload.app_metadata || {},
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Handle the OAuth redirect back from Supabase: parses the URL fragment
+ * (#access_token=...) into a session and stores it. Cleans the tokens out of
+ * the address bar. Returns true when a session was recovered from the URL.
+ */
+export function handleOAuthRedirect() {
+  try {
+    const hash = window.location.hash || '';
+    if (!hash.includes('access_token=')) return false;
+    const params = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+    const accessToken = params.get('access_token');
+    if (!accessToken) return false;
+    const expiresIn = parseInt(params.get('expires_in') || '3600', 10);
+    saveSession({
+      access_token: accessToken,
+      refresh_token: params.get('refresh_token') || '',
+      token_type: params.get('token_type') || 'bearer',
+      expires_in: expiresIn,
+      expires_at: Math.floor(Date.now() / 1000) + expiresIn,
+      user: userFromAccessToken(accessToken),
+    });
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Sign out and clear stored session tokens.
  */
 export async function signOut() {
