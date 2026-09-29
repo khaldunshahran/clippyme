@@ -79,17 +79,17 @@ export const SUBTITLE_PRESETS = [
   { id: 'fire_impact', label: 'Fire', hi: '#FF4444', style: { color: '#fff', fontFamily: 'Impact,sans-serif', textShadow: '0 0 3px #f44,-1px -1px 0 #000,1px 1px 0 #000', letterSpacing: '.03em' } },
 ];
 
-// Instagram-Stories-style hook text defaults. Keys match the backend
-// create_hook_image `style` dict (domain/hooks.py:HOOK_STYLE_DEFAULTS).
-// Default look = bannerless white Anton with a thin black outline (the
-// bannerless path also auto-adds a soft drop shadow for legibility). Users can
-// still re-enable the banner / pick any colour or font per clip.
+// Viral short-form hook text defaults: white rounded bubble with black
+// text, pinned top-center for the full clip (the OpusClip viral style).
+// Keys match the backend create_hook_image `style` dict
+// (domain/hooks.py:HOOK_STYLE_DEFAULTS). Users can still switch back to the
+// bannerless white-on-video look per clip via the style editor.
 export const HOOK_STYLE_DEFAULT = {
-  bg_enabled: false,
+  bg_enabled: true,
   bg_color: '#FFFFFF',
   bg_opacity: 0.94,
-  text_color: '#FFFFFF',
-  outline_width: 4,
+  text_color: '#000000',
+  outline_width: 0,
   outline_color: '#000000',
   font: 'Anton-Regular',
   animate: false,

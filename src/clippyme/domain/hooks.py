@@ -251,13 +251,16 @@ def _resolve_hook_font_path(font_name):
 # Instagram-Stories-style defaults: bannerless white Anton with a thin black
 # outline (the bannerless path auto-adds a soft drop shadow for legibility).
 HOOK_STYLE_DEFAULTS = {
-    "text_color": "#FFFFFF",
-    "bg_enabled": False,
+    # Viral default look (OpusClip-style): white rounded bubble, black text,
+    # persistent top overlay. Users can still switch back to the bannerless
+    # white-on-video look per clip via bg_enabled=false.
+    "text_color": "#000000",
+    "bg_enabled": True,
     "bg_color": "#FFFFFF",
     "bg_opacity": 0.94,
     "corner_radius": 20,
     "outline_color": "#000000",
-    "outline_width": 4,
+    "outline_width": 0,
     "font": "Anton-Regular",
     "shadow": None,
     "animate": False,

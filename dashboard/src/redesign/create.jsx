@@ -480,7 +480,7 @@ function OptionsPanel({ opts, set, ready, onCreate, error }) {
             </div>
             <div className="row-text">
               <div className="title">Reframe</div>
-              <div className="desc">Auto face-track · Subject FrameShift crop · Off letterbox</div>
+              <div className="desc">Auto face-track · Subject FrameShift crop · Letterbox on black</div>
             </div>
           </div>
           <div className="row-control">
@@ -490,7 +490,7 @@ function OptionsPanel({ opts, set, ready, onCreate, error }) {
               options={[
                 { id: 'auto', label: 'Auto' },
                 { id: 'subject', label: 'Subject' },
-                { id: 'disabled', label: 'Off' },
+                { id: 'disabled', label: 'Letterbox' },
               ]}
             />
           </div>

@@ -201,9 +201,9 @@ def test_hook_without_text_still_applies_logo_standalone(tmp_path, monkeypatch):
     assert calls["logo"] == 1
 
 
-# --- _apply_hook duration: first-4s window, except letterbox reframe -------
+# --- _apply_hook duration: persistent for the full clip (viral style) -------
 
-def test_apply_hook_duration_by_reframe_mode(tmp_path, monkeypatch):
+def test_apply_hook_duration_persistent(tmp_path, monkeypatch):
     captured = []
 
     def fake_add_hook_to_video(video_path, text, output_path, position,
@@ -219,15 +219,10 @@ def test_apply_hook_duration_by_reframe_mode(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"in")
 
-    for reframe_mode, expected in (
-        ("disabled", None),
-        ("auto", 4),
-        ("subject", 4),
-        ("object", 4),
-        (None, 4),
-    ):
+    for reframe_mode in ("disabled", "auto", "subject", "object", None):
         asyncio.run(compose._apply_hook(
             str(clip), str(tmp_path), 0, {"text": "hi"}, [],
             reframe_mode=reframe_mode,
         ))
-    assert captured == [None, 4, 4, 4, 4]
+    assert captured == [None, None, None, None, None], \
+        "hook must persist for the full clip in every reframe mode"

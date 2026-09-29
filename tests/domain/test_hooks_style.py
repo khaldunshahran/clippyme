@@ -1,4 +1,4 @@
-"""Hook text styling: hex parsing + Instagram-Stories-style render (Pillow)."""
+"""Hook text styling: hex parsing + viral white-bubble hook render (Pillow)."""
 import os
 import tempfile
 
@@ -18,11 +18,11 @@ def test_hex_to_rgba_bad_falls_back():
 
 
 def test_hook_style_defaults_match_frontend():
-    # Bannerless white Anton with a thin black outline — kept in sync with the
+    # Viral white-bubble style (OpusClip look) — kept in sync with the
     # frontend HOOK_STYLE_DEFAULT (dashboard/src/redesign/data.js).
-    assert HOOK_STYLE_DEFAULTS["bg_enabled"] is False
-    assert HOOK_STYLE_DEFAULTS["text_color"] == "#FFFFFF"
-    assert HOOK_STYLE_DEFAULTS["outline_width"] == 4
+    assert HOOK_STYLE_DEFAULTS["bg_enabled"] is True
+    assert HOOK_STYLE_DEFAULTS["text_color"] == "#000000"
+    assert HOOK_STYLE_DEFAULTS["outline_width"] == 0
     assert HOOK_STYLE_DEFAULTS["outline_color"] == "#000000"
     assert HOOK_STYLE_DEFAULTS["font"] == "Anton-Regular"
 

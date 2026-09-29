@@ -282,11 +282,12 @@ async def _apply_hook(
     composited in the SAME encode (hook below, logo topmost — identical
     z-order to the sequential Hook → Logo passes, one generation cheaper).
 
-    The hook is visible for the first 4s of the clip only, EXCEPT when
-    ``reframe_mode`` is the literal 'disabled' (letterbox) — full clip then."""
+    The hook stays visible for the FULL clip duration (the viral
+    short-form style) — persistence beats a 4s teaser for scroll-stopping."""
+
     from clippyme.domain.hooks import add_hook_to_video
 
-    hook_duration = None if reframe_mode == "disabled" else 4
+    hook_duration = None  # None = persistent for the whole clip
 
     hook_output = os.path.join(job_dir, f"composed_hook_{clip_index}.mp4")
     intermediate_files.append(hook_output)
