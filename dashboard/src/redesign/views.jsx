@@ -129,11 +129,11 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
   // The account vault can pull a key in after this view mounts (sign-in); keep
   // the field in sync so a pulled key appears without a reload.
   useEffect(() => { setGemini(apiKey || ''); }, [apiKey]);
-  const [deepgram, setDeepgram] = useState('');
-  const [elevenlabs, setElevenlabs] = useState('');
-  const [hf, setHf] = useState('');
-  const [twitchId, setTwitchId] = useState('');
-  const [twitchSecret, setTwitchSecret] = useState('');
+  const [deepgram, setDeepgram] = useState(() => getVaultKey('deepgram'));
+  const [elevenlabs, setElevenlabs] = useState(() => getVaultKey('elevenlabs'));
+  const [hf, setHf] = useState(() => getVaultKey('hf'));
+  const [twitchId, setTwitchId] = useState(() => getVaultKey('twitch_id'));
+  const [twitchSecret, setTwitchSecret] = useState(() => getVaultKey('twitch_secret'));
   const [apiToken, setApiTokenState] = useState(() => getApiToken());
   const [present, setPresent] = useState({});
   const [zernio, setZernioState] = useState(null);
@@ -186,11 +186,20 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     finally { setLoadingModels(false); }
   };
 
-  // Source of truth for "is this key set" is the backend's response for most keys;
-  // Gemini also counts the account vault (what generation requests actually use),
-  // never the (optimistic) input text — refetched after every save/clear so
-  // the badge can't drift from what's actually persisted.
-  const refreshConfig = async () => {
+  // Vault-backed provider keys: [vault name, backend config key].
+  const VAULT_KEY_PAIRS = [
+    ['deepgram', 'DEEPGRAM_API_KEY'],
+    ['elevenlabs', 'ELEVENLABS_API_KEY'],
+    ['hf', 'HF_TOKEN'],
+    ['twitch_id', 'TWITCH_CLIENT_ID'],
+    ['twitch_secret', 'TWITCH_CLIENT_SECRET'],
+  ];
+
+  // Source of truth for "is this key set" is the account vault first (what the
+  // UI actually uses), then the backend's response — never the (optimistic)
+  // input text. Refetched after every save/clear so the badge can't drift from
+  // what's actually persisted.
+  const refreshConfig = async (adopt = true) => {
     const c = await getConfig();
     if (!c) { pushToast?.('warn', 'Could not refresh key status'); return; }
     setPresent({
@@ -199,6 +208,18 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     });
     if (c.TRANSCRIPTION_PROVIDER) setProvider(c.TRANSCRIPTION_PROVIDER);
     if (c.GEMINI_MODEL) setModel(c.GEMINI_MODEL);
+    if (adopt) {
+      // Keys saved to the account vault while the laptop was unreachable get
+      // pushed up now that the backend answers. Backend wins on conflict.
+      const missing = {};
+      for (const [vn, ck] of VAULT_KEY_PAIRS) {
+        const vv = getVaultKey(vn);
+        if (vv && !c[ck]) missing[ck] = vv;
+      }
+      if (Object.keys(missing).length) {
+        saveConfig(missing).then(() => refreshConfig(false)).catch(() => {});
+      }
+    }
   };
 
   // Gemini's primary store is the per-account vault (local copy), which is what
@@ -226,6 +247,23 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     try { await saveConfig({ GEMINI_API_KEY: '' }); } catch { /* vault clear already done */ }
     pushToast?.('success', 'Cleared');
     await refreshConfig();
+  };
+
+  // Every third-party key follows the Gemini pattern: the per-account vault is
+  // the primary store, the laptop backend copy is opportunistic — the backend
+  // isn't reachable from the public site, so its failure must never lose the key.
+  const saveProviderKey = async (vaultName, configKey, value, label) => {
+    const v = (value || '').trim();
+    setVaultKey(vaultName, v); // '' clears
+    try {
+      await saveConfig({ [configKey]: v });
+      pushToast?.('success', v ? `${label} saved` : `${label} cleared`);
+    } catch {
+      pushToast?.('warn', v
+        ? `${label} kept in your account — syncs to the laptop when it reconnects`
+        : `${label} cleared in your account — laptop copy clears when it reconnects`);
+    }
+    await refreshConfig().catch(() => {});
   };
 
   useEffect(() => {
@@ -336,12 +374,33 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     }
   };
 
+  // Zernio account discovery. Prefers the laptop backend (it validates the key
+  // and stores it server-side); when the laptop is unreachable, asks Zernio
+  // directly from the browser with the vault key — Zernio's API allows CORS.
   const discover = async () => {
+    const typed = zKey.trim();
+    const key = typed || getVaultKey('zernio');
+    if (!key) { pushToast?.('error', 'Paste your Zernio API key first'); return; }
+    if (typed) {
+      setVaultKey('zernio', typed); // vault first — the key is safe whatever happens next
+      setZVaultKey(typed);
+      setZKey('');
+    }
     try {
-      // Discovery runs against the *saved* key, so persist a freshly-typed one
-      // first — otherwise the backend 400s with "API key not configured".
-      if (zKey.trim()) { await saveZernio({ api_key: zKey.trim(), accounts: accts }); setZKey(''); }
-      const { accounts } = await discoverZernioAccounts();
+      let accounts = null;
+      try {
+        // Discovery runs against the *saved* key, so persist a freshly-typed
+        // one to the backend first — otherwise it 400s "API key not configured".
+        if (typed) await saveZernio({ api_key: typed, accounts: accts });
+        ({ accounts } = await discoverZernioAccounts());
+      } catch {
+        const res = await fetch('https://zernio.com/api/v1/accounts', {
+          headers: { 'Authorization': `Bearer ${key}` },
+        });
+        if (!res.ok) throw new Error(`Zernio responded HTTP ${res.status}`);
+        const data = await res.json();
+        accounts = Array.isArray(data) ? data : (data.accounts || []);
+      }
       const next = { ...accts };
       (accounts || []).forEach((a) => {
         const p = (a.platform || '').toLowerCase();
@@ -352,7 +411,9 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
         else if (p.includes('face') || p.includes('fb')) next.facebook = id;
       });
       setAccts(next);
-      pushToast?.('success', `Discovered ${(accounts || []).length} accounts`);
+      setVaultKey('zernio_accounts', JSON.stringify(next));
+      if ((accounts || []).length) pushToast?.('success', `Discovered ${accounts.length} accounts`);
+      else pushToast?.('warn', 'No connected accounts found in your Zernio account');
     } catch { pushToast?.('error', 'Discover failed. Check the API key.'); }
   };
 
@@ -399,21 +460,21 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
         <KeyRow icon="sparkles" name="Gemini" desc="Viral-moment detection · synced to your account when signed in" value={gemini} present={present.gemini || !!gemini}
           onChange={(v) => { setGemini(v); onApiKey?.(v); }} onSave={() => saveGeminiKey(gemini)}
           onClear={clearGeminiKey} placeholder="AIza…" />
-        <KeyRow icon="audio-lines" name="Deepgram" desc="Nova-3 transcription" value={deepgram} present={present.deepgram}
-          onChange={setDeepgram} onSave={() => saveKeys({ DEEPGRAM_API_KEY: deepgram })}
-          onClear={() => { setDeepgram(''); saveKeys({ DEEPGRAM_API_KEY: '' }); }} placeholder="dg_…" />
-        <KeyRow icon="audio-lines" name="ElevenLabs" desc="Scribe transcription · audio-event tags · AI Dubbing" value={elevenlabs} present={present.elevenlabs}
-          onChange={setElevenlabs} onSave={() => saveKeys({ ELEVENLABS_API_KEY: elevenlabs })}
-          onClear={() => { setElevenlabs(''); saveKeys({ ELEVENLABS_API_KEY: '' }); }} placeholder="sk_…" />
-        <KeyRow icon="scan-face" name="Hugging Face token" desc="Speaker diarization models" value={hf} present={present.hf}
-          onChange={setHf} onSave={() => saveKeys({ HF_TOKEN: hf })}
-          onClear={() => { setHf(''); saveKeys({ HF_TOKEN: '' }); }} placeholder="hf_…" />
-        <KeyRow icon="rss" name="Twitch client ID" desc="Live Monitor: Twitch channel detection" value={twitchId} present={present.twitchId}
-          onChange={setTwitchId} onSave={() => saveKeys({ TWITCH_CLIENT_ID: twitchId })}
-          onClear={() => { setTwitchId(''); saveKeys({ TWITCH_CLIENT_ID: '' }); }} placeholder="Helix app client id" />
-        <KeyRow icon="rss" name="Twitch client secret" desc="Live Monitor: Twitch channel detection" value={twitchSecret} present={present.twitchSecret}
-          onChange={setTwitchSecret} onSave={() => saveKeys({ TWITCH_CLIENT_SECRET: twitchSecret })}
-          onClear={() => { setTwitchSecret(''); saveKeys({ TWITCH_CLIENT_SECRET: '' }); }} placeholder="Helix app client secret" />
+        <KeyRow icon="audio-lines" name="Deepgram" desc="Nova-3 transcription · synced to your account when signed in" value={deepgram} present={present.deepgram || !!getVaultKey('deepgram')}
+          onChange={setDeepgram} onSave={() => saveProviderKey('deepgram', 'DEEPGRAM_API_KEY', deepgram, 'Deepgram')}
+          onClear={() => { setDeepgram(''); saveProviderKey('deepgram', 'DEEPGRAM_API_KEY', '', 'Deepgram'); }} placeholder="dg_…" />
+        <KeyRow icon="audio-lines" name="ElevenLabs" desc="Scribe transcription · audio-event tags · AI Dubbing · synced to your account when signed in" value={elevenlabs} present={present.elevenlabs || !!getVaultKey('elevenlabs')}
+          onChange={setElevenlabs} onSave={() => saveProviderKey('elevenlabs', 'ELEVENLABS_API_KEY', elevenlabs, 'ElevenLabs')}
+          onClear={() => { setElevenlabs(''); saveProviderKey('elevenlabs', 'ELEVENLABS_API_KEY', '', 'ElevenLabs'); }} placeholder="sk_…" />
+        <KeyRow icon="scan-face" name="Hugging Face token" desc="Speaker diarization models · synced to your account when signed in" value={hf} present={present.hf || !!getVaultKey('hf')}
+          onChange={setHf} onSave={() => saveProviderKey('hf', 'HF_TOKEN', hf, 'Hugging Face token')}
+          onClear={() => { setHf(''); saveProviderKey('hf', 'HF_TOKEN', '', 'Hugging Face token'); }} placeholder="hf_…" />
+        <KeyRow icon="rss" name="Twitch client ID" desc="Live Monitor: Twitch channel detection · synced to your account when signed in" value={twitchId} present={present.twitchId || !!getVaultKey('twitch_id')}
+          onChange={setTwitchId} onSave={() => saveProviderKey('twitch_id', 'TWITCH_CLIENT_ID', twitchId, 'Twitch client ID')}
+          onClear={() => { setTwitchId(''); saveProviderKey('twitch_id', 'TWITCH_CLIENT_ID', '', 'Twitch client ID'); }} placeholder="Helix app client id" />
+        <KeyRow icon="rss" name="Twitch client secret" desc="Live Monitor: Twitch channel detection · synced to your account when signed in" value={twitchSecret} present={present.twitchSecret || !!getVaultKey('twitch_secret')}
+          onChange={setTwitchSecret} onSave={() => saveProviderKey('twitch_secret', 'TWITCH_CLIENT_SECRET', twitchSecret, 'Twitch client secret')}
+          onClear={() => { setTwitchSecret(''); saveProviderKey('twitch_secret', 'TWITCH_CLIENT_SECRET', '', 'Twitch client secret'); }} placeholder="Helix app client secret" />
         <KeyRow icon="key-round" name="API token" desc="Only for LAN deploys with CLIPPYME_API_TOKEN set — stored in this browser, sent as X-API-Token" value={apiToken} present={!!getApiToken()}
           onChange={setApiTokenState} onSave={() => { setApiToken(apiToken); pushToast?.('success', apiToken.trim() ? 'API token saved' : 'API token cleared'); }} placeholder="Shared secret (leave empty + Save to clear)" />
         <div className="opt" style={{ borderBottom: 0 }}>
