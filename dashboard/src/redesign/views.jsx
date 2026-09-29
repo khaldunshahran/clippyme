@@ -14,7 +14,7 @@ import {
 } from './realApi';
 import { SUB_FONTS } from './data';
 import { getApiToken, setApiToken } from '../lib/apiToken';
-import { getVaultKey, clearVaultKey } from '../lib/keyVault';
+import { getVaultKey, setVaultKey, clearVaultKey } from '../lib/keyVault';
 import { relTime } from '../lib/relTime';
 import { triggerStorageCleanup, getStorageBreakdown } from '../lib/api';
 
@@ -138,7 +138,14 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
   const [present, setPresent] = useState({});
   const [zernio, setZernioState] = useState(null);
   const [zKey, setZKey] = useState('');
-  const [accts, setAccts] = useState({ tiktok: '', instagram: '', youtube: '' });
+  const [accts, setAccts] = useState(() => {
+    try { return { tiktok: '', instagram: '', youtube: '', ...JSON.parse(getVaultKey('zernio_accounts') || '{}') }; }
+    catch { return { tiktok: '', instagram: '', youtube: '' }; }
+  });
+  // Zernio's primary store is the per-account vault (same pattern as the
+  // Gemini key): the laptop backend copy is opportunistic — unreachable from
+  // the public site, so its failure must never lose the key.
+  const [zVaultKey, setZVaultKey] = useState(() => getVaultKey('zernio'));
   const [cookies, setCookies] = useState(!!cookiesConfigured);
   const [logoOn, setLogoOn] = useState(false);
   const [fonts, setFonts] = useState([]);
@@ -223,7 +230,18 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
 
   useEffect(() => {
     refreshConfig().then(loadModels);
-    getZernio().then((z) => { setZernioState(z); if (z.accounts) setAccts({ tiktok: '', instagram: '', youtube: '', facebook: '', ...z.accounts }); }).catch(() => {});
+    getZernio().then((z) => {
+      setZernioState(z);
+      if (z.accounts) setAccts({ tiktok: '', instagram: '', youtube: '', facebook: '', ...z.accounts });
+      // The key may have been saved to the account vault while the laptop was
+      // unreachable — push it up now that the backend answers.
+      const vk = getVaultKey('zernio');
+      if (!z.configured && vk) {
+        let va = {};
+        try { va = JSON.parse(getVaultKey('zernio_accounts') || '{}'); } catch { /* keep {} */ }
+        saveZernio({ api_key: vk, accounts: va }).then(setZernioState).catch(() => {});
+      }
+    }).catch(() => {});
     getWatchdog().then((w) => {
       if (w) {
         setWatchdogState(w);
@@ -292,14 +310,30 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
     catch { pushToast?.('error', 'Save failed'); }
   };
 
+  // The Zernio key's primary store is the per-account vault (same pattern as
+  // the Gemini key). The laptop backend copy is opportunistic — unreachable
+  // from the public site, so its failure must never lose the key.
   const saveZernioCfg = async () => {
+    const key = zKey.trim();
+    if (key) {
+      setVaultKey('zernio', key);
+      setZVaultKey(key);
+    }
+    setVaultKey('zernio_accounts', JSON.stringify(accts));
     try {
       const payload = { accounts: accts };
-      if (zKey.trim()) payload.api_key = zKey.trim();
+      if (key) payload.api_key = key;
       const z = await saveZernio(payload);
       setZernioState(z); setZKey('');
       pushToast?.('success', 'Zernio saved');
-    } catch { pushToast?.('error', 'Zernio save failed'); }
+    } catch {
+      if (key || getVaultKey('zernio')) {
+        setZKey('');
+        pushToast?.('warn', 'Saved to your account — syncs to the laptop when it reconnects');
+      } else {
+        pushToast?.('error', 'Zernio save failed');
+      }
+    }
   };
 
   const discover = async () => {
@@ -419,13 +453,17 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
             <div className="zico"><Icon n="rss" /></div>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div className="kt">Zernio</div>
-              <div className="kd">{zernio?.configured ? `Connected${zernio.api_key_masked ? ' · ' + zernio.api_key_masked : ''}` : 'Add your API key + account IDs to schedule posts'}</div>
+              <div className="kd">{zernio?.configured ? `Connected${zernio.api_key_masked ? ' · ' + zernio.api_key_masked : ''}` : zVaultKey ? 'Key saved in your account · syncs to the laptop when it reconnects' : 'Add your API key + account IDs to schedule posts'}</div>
             </div>
-            {zernio?.configured && <span className="conn"><Icon n="circle-check" />Connected</span>}
+            {zernio?.configured
+              ? <span className="conn"><Icon n="circle-check" />Connected</span>
+              : zVaultKey
+                ? <span className="miss"><Icon n="check" />Key saved</span>
+                : null}
           </div>
           <input className="key-input" style={{ width: '100%' }} type="password" value={zKey}
             aria-label="Zernio API key"
-            placeholder={zernio?.configured ? 'Replace API key (optional)' : 'Zernio API key (sk_…)'} onChange={(e) => setZKey(e.target.value)} />
+            placeholder={(zernio?.configured || zVaultKey) ? 'Replace API key (optional)' : 'Zernio API key (sk_…)'} onChange={(e) => setZKey(e.target.value)} />
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 8 }}>
             {['tiktok', 'instagram', 'youtube', 'facebook'].map((p) => (
               <input key={p} className="key-input" style={{ width: '100%', fontFamily: 'var(--font-sans)' }}
