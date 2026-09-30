@@ -75,6 +75,7 @@ from clippyme.api.security import (
     enforce_api_token,
     enforce_rate_limit,
     require_trusted_config_request,
+    supabase_jwt_secret,
     verify_supabase_jwt,
 )
 from clippyme.storage.config_store import (
@@ -275,10 +276,12 @@ live_monitor = LiveMonitorRegistry(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # S4: fail closed — SaaS mode must never serve with auth misconfigured.
+    # supabase_jwt_secret() covers both the env var and the file-backed
+    # secret (data/supabase_jwt_secret.txt); either one satisfies the gate.
     _saas_mode = os.environ.get("AUTH_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-    if _saas_mode and not os.environ.get("SUPABASE_JWT_SECRET", "").strip():
-        logger.error("REFUSING TO SERVE: AUTH_ENABLED=1 but SUPABASE_JWT_SECRET is not configured.")
-        raise RuntimeError("Refusing to serve: AUTH_ENABLED=1 requires SUPABASE_JWT_SECRET to be set.")
+    if _saas_mode and not supabase_jwt_secret():
+        logger.error("REFUSING TO SERVE: AUTH_ENABLED=1 but no Supabase JWT secret is configured (SUPABASE_JWT_SECRET env or data/supabase_jwt_secret.txt).")
+        raise RuntimeError("Refusing to serve: AUTH_ENABLED=1 requires a Supabase JWT secret.")
 
     # Recover journalled jobs from the previous server life BEFORE the
     # dispatcher starts: queued jobs are re-enqueued, interrupted ones are
