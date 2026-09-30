@@ -12,6 +12,24 @@ import path from 'path'
 // Remote origins the app genuinely loads: Google Fonts (tokens.css @import →
 // stylesheet from fonts.googleapis.com, font files from fonts.gstatic.com)
 // and the simpleicons CDN used for the TikTok/Instagram/YouTube marks.
+//
+// connect-src MUST allow the API and Supabase origins: the app talks to the
+// backend (VITE_API_URL) and Supabase Auth (VITE_SUPABASE_URL) via fetch.
+// A bare `connect-src 'self'` blocks those requests in the browser and every
+// call fails with a bare "Failed to fetch" TypeError — while OAuth logins
+// still work because they use top-level redirects, not fetch. Read the
+// origins from the build environment so the policy always matches the
+// deployed configuration; fail the build if they are missing.
+const API_ORIGIN = (process.env.VITE_API_URL || '').replace(/\/+$/, '');
+const SUPABASE_ORIGIN = (process.env.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || '';
+if (!API_ORIGIN || !SUPABASE_ORIGIN || !SUPABASE_ANON_KEY) {
+  throw new Error(
+    'Vite build requires VITE_API_URL, VITE_SUPABASE_URL and ' +
+    'VITE_SUPABASE_ANON_KEY to be set — they are baked into the bundle ' +
+    'and into the Content-Security-Policy. Refusing to build without them.'
+  );
+}
 const CSP = [
   "default-src 'self'",
   "script-src 'self'",
@@ -19,7 +37,7 @@ const CSP = [
   "img-src 'self' data: blob: https://cdn.simpleicons.org",
   "media-src 'self' blob:",
   "font-src 'self' data: https://fonts.gstatic.com",
-  "connect-src 'self'",
+  `connect-src 'self' ${API_ORIGIN} ${SUPABASE_ORIGIN}`,
   "base-uri 'self'",
   "form-action 'self'",
   "frame-ancestors 'none'",
