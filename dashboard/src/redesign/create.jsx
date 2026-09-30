@@ -278,7 +278,7 @@ function LowerThirdConfig({ opts, set }) {
   );
 }
 
-function OptionsPanel({ opts, set, ready, onCreate, error }) {
+function OptionsPanel({ opts, set, ready, onCreate, submitting, error }) {
   const [subCfg, setSubCfg] = useState(false);
   const [hookCfg, setHookCfg] = useState(false);
   const [logoCfg, setLogoCfg] = useState(false);
@@ -657,12 +657,12 @@ function OptionsPanel({ opts, set, ready, onCreate, error }) {
       </div>
 
       {/* Integrated Synthesis Action Footer */}
-      <SummaryBar opts={opts} ready={ready} onCreate={onCreate} error={error} />
+      <SummaryBar opts={opts} ready={ready} onCreate={onCreate} submitting={submitting} error={error} />
     </div>
   );
 }
 
-function SummaryBar({ opts, ready, onCreate, error }) {
+function SummaryBar({ opts, ready, onCreate, submitting, error }) {
   const durationLabel =
     opts.durationMode === 'all'
       ? '🌐 mix duration'
@@ -724,15 +724,15 @@ function SummaryBar({ opts, ready, onCreate, error }) {
         )}
       </div>
       <div className="rf-right s-right">
-        <Btn variant="grad" size="lg" icon="wand-sparkles" onClick={onCreate} disabled={!ready}>
-          Create clips
+        <Btn variant="grad" size="lg" icon="wand-sparkles" onClick={onCreate} disabled={!ready || submitting}>
+          {submitting ? 'Creating…' : 'Create clips'}
         </Btn>
       </div>
     </div>
   );
 }
 
-export function CreateView({ opts, set, onPickPreset, onCreate, presets, defaultId, onSetDefault, onDelete, onSaveCurrent }) {
+export function CreateView({ opts, set, onPickPreset, onCreate, submitting, presets, defaultId, onSetDefault, onDelete, onSaveCurrent }) {
   const validation = validateCreateOptions(opts);
   const ready = validation.valid;
 
@@ -760,7 +760,7 @@ export function CreateView({ opts, set, onPickPreset, onCreate, presets, default
             onSaveCurrent={onSaveCurrent}
           />
         </div>
-        <OptionsPanel opts={opts} set={set} ready={ready} onCreate={onCreate} error={validation.firstError} />
+        <OptionsPanel opts={opts} set={set} ready={ready} onCreate={onCreate} submitting={submitting} error={validation.firstError} />
       </div>
     </div>
   );

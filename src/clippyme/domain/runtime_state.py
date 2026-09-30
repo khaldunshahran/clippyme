@@ -24,6 +24,14 @@ from typing import Any
 
 RUNTIME_FILENAME = ".clippyme_runtime.json"
 CHECKPOINT_DIRNAME = ".clippyme_checkpoint"
+# Download progress lives in its OWN file, not inside .clippyme_runtime.json.
+# The downloader microservice (:8001) is a separate process from the
+# orchestrator; both wrote the runtime file via read-modify-write, so a
+# progress save could clobber a stage transition written concurrently
+# (threading.RLock only guards threads, not processes). A single-writer
+# sidecar file eliminates the race: only the downloader writes it,
+# readers merge it over the runtime state on load.
+DOWNLOAD_PROGRESS_FILENAME = ".clippyme_download_progress.json"
 SCHEMA_VERSION = 1
 
 STAGE_ORDER = (
@@ -66,6 +74,41 @@ def _lock_for(path: str) -> threading.RLock:
 
 def runtime_path(output_dir: str) -> str:
     return os.path.join(output_dir, RUNTIME_FILENAME)
+
+
+def download_progress_path(output_dir: str) -> str:
+    return os.path.join(output_dir, DOWNLOAD_PROGRESS_FILENAME)
+
+
+def write_download_progress(output_dir: str, payload: dict[str, Any]) -> None:
+    """Atomically replace the download-progress sidecar.
+
+    Single-writer (the downloader): blind write, no read-modify-write, so
+    concurrent orchestrator saves of the runtime file cannot interleave.
+    Failures are swallowed — progress is best-effort telemetry.
+    """
+    try:
+        _atomic_json(download_progress_path(output_dir), dict(payload))
+    except OSError:
+        pass
+
+
+def read_download_progress(output_dir: str) -> dict[str, Any]:
+    """Best-effort read of the download-progress sidecar; {} when absent."""
+    try:
+        with open(download_progress_path(output_dir), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+def clear_download_progress(output_dir: str) -> None:
+    """Remove a stale progress sidecar (fresh download / terminal state)."""
+    try:
+        os.unlink(download_progress_path(output_dir))
+    except OSError:
+        pass
 
 
 def checkpoint_dir(output_dir: str) -> str:
@@ -139,7 +182,13 @@ def _atomic_json(path: str, payload: dict[str, Any]) -> None:
 
 
 def load_runtime_state(output_dir: str) -> dict[str, Any] | None:
-    """Return a defensive copy of the persisted runtime state, or ``None``."""
+    """Return a defensive copy of the persisted runtime state, or ``None``.
+
+    The download-progress sidecar (written by the downloader microservice,
+    a separate process) is merged over the runtime file's own download keys
+    so readers always see the freshest progress without a cross-process
+    read-modify-write race on the runtime file itself.
+    """
     path = runtime_path(output_dir)
     try:
         with _lock_for(path):
@@ -147,6 +196,11 @@ def load_runtime_state(output_dir: str) -> dict[str, Any] | None:
                 data = json.load(handle)
         if not isinstance(data, dict) or data.get("schema") != SCHEMA_VERSION:
             return None
+        progress = read_download_progress(output_dir)
+        if progress:
+            for key in ("download_percent", "download_speed", "download_eta", "download_bytes"):
+                if progress.get(key) is not None:
+                    data[key] = progress[key]
         return deepcopy(data)
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
         return None

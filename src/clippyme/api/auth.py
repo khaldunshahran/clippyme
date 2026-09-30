@@ -97,11 +97,16 @@ def is_auth_enabled() -> bool:
     """Whether multi-tenant authentication is enforced.
 
     Defaults to False for backward-compatible local self-hosting.
-    Set AUTH_ENABLED=1 or SUPABASE_JWT_SECRET to enable.
+    Set AUTH_ENABLED=1, SUPABASE_JWT_SECRET, or place the secret in
+    data/supabase_jwt_secret.txt to enable. The file source matters:
+    production keeps the secret in the file, not the environment, so
+    checking only the env var would silently run as default_user admin.
     """
     if os.environ.get("AUTH_ENABLED", "0") in ("1", "true", "yes", "on"):
         return True
-    return bool(os.environ.get("SUPABASE_JWT_SECRET", "").strip())
+    # Local import: keep security.py import-clean of auth.py.
+    from clippyme.api.security import supabase_jwt_secret
+    return bool(supabase_jwt_secret())
 
 
 def configured_admin_secret() -> Optional[str]:
@@ -121,10 +126,22 @@ def extract_bearer_token(request: Request) -> Optional[str]:
 def get_current_user(request: Request) -> AuthUser:
     """FastAPI dependency to extract and validate the current authenticated user.
 
-    In development / single-tenant mode (AUTH_ENABLED=0), unauthenticated requests
-    receive a default local admin user. In multi-tenant mode (AUTH_ENABLED=1),
-    valid Supabase JWT authentication is strictly required.
+    Identity resolution order:
+    1. Admin-secret header / LAN API token -> local admin (unchanged).
+    2. Middleware-verified Supabase JWT (``request.state.supabase_claims``) ->
+       per-user identity. This is the primary path for the public site: the
+       JWT gate in app.py already verified the signature/expiry with the
+       env-or-file secret, so we reuse those claims instead of verifying
+       twice. Admin rights come only from the ADMIN_EMAIL allow-list.
+    3. Manual Bearer verification (fallback when the middleware did not run
+       or PyJWT is unavailable) — now uses the same env-or-file secret as
+       the middleware instead of env-only.
+    4. Unauthenticated -> default local admin when auth is not enabled
+       (backward-compatible single-tenant behavior, unchanged).
     """
+    # Local import: keep security.py import-clean of auth.py.
+    from clippyme.api.security import request_supabase_claims, supabase_jwt_secret
+
     admin_secret = configured_admin_secret()
     req_admin_secret = request.headers.get("x-admin-secret", "").strip()
     if admin_secret and req_admin_secret and hmac.compare_digest(admin_secret, req_admin_secret):
@@ -140,7 +157,23 @@ def get_current_user(request: Request) -> AuthUser:
             return AuthUser(id="admin", email="lan_admin@clippyme.internal", role="admin", is_admin=True)
 
     token = extract_bearer_token(request)
-    jwt_secret = os.environ.get("SUPABASE_JWT_SECRET", "").strip() or None
+
+    # 2. Prefer the middleware-verified identity (single verifier, single
+    #    secret source). Without this, every signed-in user fell through to
+    #    the default admin below and all jobs were shared.
+    verified_claims = request_supabase_claims(request)
+    if verified_claims and verified_claims.get("sub"):
+        email = verified_claims.get("email")
+        admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+        is_admin = bool(email and admin_email and email.lower() == admin_email)
+        return AuthUser(
+            id=str(verified_claims["sub"]),
+            email=email,
+            role=str(verified_claims.get("role", "authenticated")),
+            is_admin=is_admin,
+        )
+
+    jwt_secret = supabase_jwt_secret() or "" or None
 
     if not token:
         if not is_auth_enabled():

@@ -61,6 +61,14 @@ export function useJobPolling({
         schedule(typeof document !== 'undefined' && document.hidden ? 10000 : BASE_DELAY);
       } catch (error) {
         if (disposed || error?.name === 'AbortError') return;
+        // The job is gone from the server (e.g. wiped by a backend restart) —
+        // polling it forever can never succeed. Terminal, with a message.
+        if (error?.status === 404) {
+          return terminal(
+            callbacks.current.onFailed,
+            'Job not found on server — it may have been removed after a backend restart.',
+          );
+        }
         consecutiveErrors += 1;
         if (consecutiveErrors >= 3 && !disconnectedAnnounced) {
           disconnectedAnnounced = true;

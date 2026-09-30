@@ -2,9 +2,13 @@
 // Communicates with Supabase Auth REST endpoints with zero external dependencies.
 // Synchronizes the current session JWT with setAuthToken in apiToken.js.
 
-import { setAuthToken } from './apiToken.js';
+import { setAuthToken, setTokenRefresher } from './apiToken.js';
 
 const SESSION_STORAGE_KEY = 'clippyme_auth_session';
+
+// Refresh the access token this far ahead of its expiry so long-lived tabs
+// never send a token that dies mid-request.
+const REFRESH_SKEW_SECONDS = 120;
 
 const SUPABASE_URL = (import.meta.env?.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_ANON_KEY = import.meta.env?.VITE_SUPABASE_ANON_KEY || '';
@@ -203,6 +207,93 @@ export function handleOAuthRedirect() {
     return false;
   }
 }
+
+/**
+ * Read the stored session WITHOUT the expiry wipe that getSession() applies.
+ * Refresh needs the refresh_token even when the access token already expired;
+ * getSession() would have destroyed it.
+ */
+function getStoredSessionRaw() {
+  try {
+    const raw = storage()?.getItem(SESSION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Single-flight guard: a 401 storm (or N concurrent apiFetch calls) triggers
+// exactly one refresh request, and every waiter shares its result.
+let refreshPromise = null;
+
+/**
+ * Exchange the stored refresh_token for a fresh session via
+ * `grant_type=refresh_token`. Updates localStorage AND `clippyme_auth_token`
+ * (via saveSession) on success. Returns the new access token, or null when
+ * there is nothing to refresh with. When the refresh token itself is dead,
+ * the session is cleared (SIGNED_OUT → the app prompts re-sign-in).
+ */
+export async function refreshAccessToken() {
+  if (!isAuthEnabled()) return null;
+  const refreshToken = getStoredSessionRaw()?.refresh_token || null;
+  if (!refreshToken) return null;
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error_description || data.msg || data.message || 'Token refresh failed');
+      }
+      if (!data.access_token) {
+        throw new Error('Token refresh returned no access token');
+      }
+      saveSession(data);
+      return data.access_token;
+    })().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  try {
+    return await refreshPromise;
+  } catch {
+    // Refresh token rejected/expired — the session is unrecoverable.
+    clearSession();
+    return null;
+  }
+}
+
+/**
+ * Proactive refresh: renew the access token when it expires within
+ * REFRESH_SKEW_SECONDS. Returns a usable access token, or the best token
+ * available when no refresh is possible (the 401 path handles the rest).
+ * Cheap no-op when the session is healthy — safe to call before requests.
+ */
+export async function ensureFreshAccessToken() {
+  if (!isAuthEnabled()) return null;
+  const raw = getStoredSessionRaw();
+  if (!raw?.refresh_token) return getSession()?.access_token || null;
+  const accessToken = raw.access_token || null;
+  const expMs = raw.expires_at ? raw.expires_at * 1000 : 0;
+  const needsRefresh = !accessToken || !expMs || expMs - Date.now() < REFRESH_SKEW_SECONDS * 1000;
+  if (!needsRefresh) return accessToken;
+  const fresh = await refreshAccessToken();
+  return fresh || accessToken;
+}
+
+// Register the refresh implementation with apiFetch's global 401 path:
+// force=false → proactive pre-request refresh; force=true → unconditional
+// refresh after a 401.
+setTokenRefresher(async ({ force } = {}) => {
+  if (force) return refreshAccessToken();
+  return ensureFreshAccessToken();
+});
 
 /**
  * Sign out and clear stored session tokens.

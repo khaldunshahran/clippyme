@@ -231,9 +231,20 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
                 import time
                 wait_start = time.time()
                 while process.poll() is None:
-                    if time.time() - wait_start > 7200:
-                        process.kill()
-                        jobs[job_id]["logs"].append("Process timed out after 2 hours.")
+                    # The 2h clock measures ACTIVE time only: while paused the
+                    # deadline is pushed forward so a long pause can never
+                    # trigger a "timeout" kill (pause must mean pause).
+                    if jobs[job_id].get("status") == "paused":
+                        wait_start = time.time()
+                    elif time.time() - wait_start > 7200:
+                        # Kill the whole tree (ffmpeg/yt-dlp children too) —
+                        # process.kill() alone orphans them on Windows and
+                        # they keep burning GPU/RAM after the retry starts.
+                        await _stop_process_tree(job_id, process)
+                        jobs[job_id]["logs"].append(
+                            "Process timed out after 2 hours of active time; "
+                            "terminated the full process tree."
+                        )
                         break
                     await asyncio.sleep(2)
                     await _refresh(job_id, output_dir, process)
@@ -286,7 +297,28 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
 
                 # Exit 2 is deterministic validation/preflight rejection.
                 # Exit 137 is OOM, do not retry.
-                retryable = returncode not in (2, 137) and attempt < max_attempts
+                # CUDA OOM inside the orchestrator surfaces as exit 1 with an
+                # OutOfMemoryError in the logs — retrying just re-OOMs the
+                # same 4GB VRAM, so treat it as non-retryable too.
+                log_tail = "\n".join(
+                    str(line) for line in jobs[job_id].get("logs", [])[-200:]
+                ).lower()
+                cuda_oom = (
+                    "cuda out of memory" in log_tail
+                    or "outofmemoryerror" in log_tail.replace(" ", "")
+                    or "out of memory" in log_tail and "cuda" in log_tail
+                )
+                retryable = (
+                    returncode not in (2, 137)
+                    and not cuda_oom
+                    and attempt < max_attempts
+                )
+                if cuda_oom:
+                    jobs[job_id]["logs"].append(
+                        "GPU out of memory (CUDA OOM) — not retrying. Free VRAM "
+                        "by closing other jobs or lowering MAX_CONCURRENT_JOBS, "
+                        "then press Retry."
+                    )
                 if retryable:
                     delay = min(30, 2 ** (attempt - 1))
                     jobs[job_id]["logs"].append(
@@ -300,11 +332,12 @@ def make_run_job(*, jobs: dict, output_root: str, on_change=None):
                     continue
 
                 jobs[job_id]["status"] = "failed"
-                reason = (
-                    "non-retryable input/preflight error"
-                    if returncode == 2
-                    else "retry limit reached"
-                )
+                if cuda_oom:
+                    reason = "GPU out of memory (not retried)"
+                elif returncode == 2:
+                    reason = "non-retryable input/preflight error"
+                else:
+                    reason = "retry limit reached"
                 fail_msg = f"Process failed with exit code {returncode} ({reason})."
                 jobs[job_id]["logs"].append(fail_msg)
                 try:

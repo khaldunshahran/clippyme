@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 // Vitest runs with a jsdom environment, so window.location.origin is real —
 // the old plain-Node `globalThis.window` stub is gone.
-import { optsToPreselections, clipVideoSrc, clipPreviewSrc, fmtDuration, exportClip } from './realApi.js';
+import { optsToPreselections, clipVideoSrc, clipPreviewSrc, fmtDuration, exportClip, getConfig, saveConfig, getModels, configPresence } from './realApi.js';
 
 // --- optsToPreselections: the Create-tab → backend translation layer --------
 
@@ -128,4 +128,114 @@ test('exportClip composes against clip.original_index, not the array position', 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// --- H1/M3: getConfig never throws -------------------------------------------
+// null means "unknown / unreachable" — callers must not mistake it for "no
+// keys configured".
+
+function stubFetch(impl) {
+  const original = globalThis.fetch;
+  globalThis.fetch = impl;
+  return () => { globalThis.fetch = original; };
+}
+
+test('getConfig returns null on network failure instead of throwing', async () => {
+  const restore = stubFetch(() => Promise.reject(new TypeError('Failed to fetch')));
+  try {
+    assert.equal(await getConfig(), null);
+  } finally { restore(); }
+});
+
+test('getConfig returns null on HTTP error status', async () => {
+  const restore = stubFetch(() => Promise.resolve({ ok: false, status: 403 }));
+  try {
+    assert.equal(await getConfig(), null);
+  } finally { restore(); }
+});
+
+test('getConfig returns null when the body is not valid JSON', async () => {
+  const restore = stubFetch(() => Promise.resolve({
+    ok: true,
+    json: () => Promise.reject(new Error('Unexpected token <')),
+  }));
+  try {
+    assert.equal(await getConfig(), null);
+  } finally { restore(); }
+});
+
+test('getConfig returns the parsed body on success', async () => {
+  const body = { server_has_gemini: true, has_hf_token: false };
+  const restore = stubFetch(() => Promise.resolve({ ok: true, json: () => Promise.resolve(body) }));
+  try {
+    assert.deepEqual(await getConfig(), body);
+  } finally { restore(); }
+});
+
+// --- configPresence: the boolean contract -------------------------------------
+
+test('configPresence reads the new has_* flags', () => {
+  const p = configPresence({
+    server_has_gemini: true, has_hf_token: true, has_deepgram_key: false,
+    has_elevenlabs_key: false, TWITCH_CLIENT_ID: 'abc', has_twitch_secret: true,
+  });
+  assert.equal(p.gemini, true);
+  assert.equal(p.hf, true);
+  assert.equal(p.deepgram, false);
+  assert.equal(p.elevenlabs, false);
+  assert.equal(p.twitchId, true);
+  assert.equal(p.twitchSecret, true);
+});
+
+test('configPresence accepts the legacy UPPER_CASE aliases', () => {
+  // Old shape: GEMINI_API_KEY carried the key string itself.
+  assert.equal(configPresence({ GEMINI_API_KEY: 'AIza...' }).gemini, true);
+  assert.equal(configPresence({ GEMINI_API_KEY: '' }).gemini, false);
+  // New shape: the aliases are booleans.
+  assert.equal(configPresence({ GEMINI_API_KEY: true }).gemini, true);
+  assert.equal(configPresence({ server_has_gemini: false, GEMINI_API_KEY: true }).gemini, false);
+});
+
+test('configPresence is all-false on empty/undefined config', () => {
+  const p = configPresence({});
+  assert.deepEqual(p, { gemini: false, hf: false, deepgram: false, elevenlabs: false, twitchId: false, twitchSecret: false });
+  assert.equal(configPresence(undefined).gemini, false);
+  assert.equal(configPresence(null).hf, false);
+});
+
+// --- L1: saveConfig surfaces the server's error detail ------------------------
+
+test('saveConfig throws the server detail instead of a generic message', async () => {
+  const restore = stubFetch(() => Promise.resolve({
+    ok: false, status: 422,
+    json: () => Promise.resolve({ detail: 'HF_TOKEN looks invalid' }),
+  }));
+  try {
+    await assert.rejects(saveConfig({ HF_TOKEN: 'x' }), /HF_TOKEN looks invalid/);
+  } finally { restore(); }
+});
+
+test('saveConfig falls back to the status when the server gives no detail', async () => {
+  const restore = stubFetch(() => Promise.resolve({
+    ok: false, status: 500, json: () => Promise.resolve({}),
+  }));
+  try {
+    await assert.rejects(saveConfig({}), /500/);
+  } finally { restore(); }
+});
+
+// --- M5: getModels omits X-Gemini-Key when empty --------------------------------
+
+test('getModels omits the X-Gemini-Key header when the key is empty', async () => {
+  let captured;
+  const restore = stubFetch((url, init) => {
+    captured = init;
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ models: [] }) });
+  });
+  try {
+    await getModels('');
+    assert.ok(!('X-Gemini-Key' in (captured?.headers || {})), 'header must be omitted, not empty');
+    await getModels('  k  ');
+    assert.equal(captured.headers['X-Gemini-Key'], 'k');
+  } finally { restore(); }
 });

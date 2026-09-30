@@ -40,6 +40,33 @@ async def _terminate_job_process(job_id: str, proc) -> None:
         raise ConflictError("Could not stop the running process; output was left untouched")
 
 
+async def _cancel_microservice_download(job_id: str) -> None:
+    """Best-effort: tell the downloader microservice to abort a download for this job.
+
+    The microservice runs yt-dlp in its own process; killing the orchestrator
+    tree does NOT stop it, so without this a cancelled job's download keeps
+    running to completion (wasted bandwidth/disk, orphaned file).
+    """
+    import urllib.request
+
+    body = ("{\"job_id\": \"%s\"}" % job_id).encode("utf-8")
+    req = urllib.request.Request(
+        "http://127.0.0.1:8001/download/cancel",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    def _post() -> None:
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                logger.info("Downloader cancel for job %s: %s", job_id, resp.status)
+        except Exception as exc:
+            # Microservice down or no download in flight — not fatal.
+            logger.info("Downloader cancel for job %s skipped: %s", job_id, exc)
+
+    await asyncio.to_thread(_post)
+
+
 async def cancel_job_action(job_id: str, job: dict) -> dict:
     """Hard cancel: stop the process tree and delete all output."""
     if not job_control.can_cancel(job["status"]):
@@ -55,6 +82,10 @@ async def cancel_job_action(job_id: str, job: dict) -> dict:
     # Publish the terminal intent before signalling the tree so the worker's
     # poll loop cannot race the kill and overwrite the transition as "failed".
     job["status"] = "cancelled"
+    # Stop the microservice download first: otherwise yt-dlp keeps writing
+    # into the output dir while we rmtree it below (PermissionError on
+    # Windows) and the finished file is orphaned.
+    await _cancel_microservice_download(job_id)
     try:
         await _terminate_job_process(job_id, proc)
     except Exception:
@@ -106,6 +137,9 @@ async def stop_job_action(job_id: str, job: dict) -> dict:
         )
     job["status"] = "stopped"
 
+    # Same as cancel: abort any in-flight microservice download so yt-dlp
+    # doesn't keep writing after the tree is gone.
+    await _cancel_microservice_download(job_id)
     try:
         await _terminate_job_process(job_id, proc)
     except Exception:

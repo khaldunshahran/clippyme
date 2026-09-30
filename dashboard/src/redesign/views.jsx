@@ -11,6 +11,7 @@ import {
   getWatchdog, saveWatchdog, testWatchdogAlert,
   listFonts, uploadFont, deleteFont, logoStatus, uploadLogo, deleteLogo,
   researchProduct, generateUgcScripts, fetchViralTitles, refineViralTitles, generateThumbnail,
+  configPresence,
 } from './realApi';
 import { SUB_FONTS } from './data';
 import { getApiToken, setApiToken } from '../lib/apiToken';
@@ -202,9 +203,10 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
   const refreshConfig = async (adopt = true) => {
     const c = await getConfig();
     if (!c) { pushToast?.('warn', 'Could not refresh key status'); return; }
+    const p = configPresence(c);
     setPresent({
-      gemini: !!c.GEMINI_API_KEY, hf: !!c.HF_TOKEN, deepgram: !!c.DEEPGRAM_API_KEY, elevenlabs: !!c.ELEVENLABS_API_KEY,
-      twitchId: !!c.TWITCH_CLIENT_ID, twitchSecret: !!c.TWITCH_CLIENT_SECRET,
+      gemini: p.gemini, hf: p.hf, deepgram: p.deepgram, elevenlabs: p.elevenlabs,
+      twitchId: p.twitchId, twitchSecret: p.twitchSecret,
     });
     if (c.TRANSCRIPTION_PROVIDER) setProvider(c.TRANSCRIPTION_PROVIDER);
     if (c.GEMINI_MODEL) setModel(c.GEMINI_MODEL);
@@ -787,7 +789,7 @@ export function ApiKeyModal({ onClose, onGoToSettings }) {
         <div className="modal-head"><h3 id="apikey-modal-title">Add your Gemini key</h3><button className="x" onClick={onClose} aria-label="Close"><Icon n="x" /></button></div>
         <div className="modal-body">
           <p style={{ color: 'var(--fg-2)', fontSize: 14, lineHeight: 1.55 }}>
-            Nugget needs a Gemini key to score the transcript and find viral moments. It&apos;s stored locally and never leaves your machine.
+            Nugget needs a Gemini key to score the transcript and find viral moments. It&apos;s kept in your account and sent to your Nugget backend with each request — never anywhere else.
           </p>
         </div>
         <div className="modal-foot">

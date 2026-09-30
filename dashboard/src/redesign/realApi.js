@@ -280,12 +280,34 @@ export async function listBackendJobIds() {
 
 // --- config / settings ----------------------------------------------------
 
+// Normalizes the backend's secret-presence contract: the new `has_*`
+// booleans are authoritative; the legacy UPPER_CASE aliases are accepted as a
+// fallback (they are booleans under the new contract, key strings before it —
+// both are handled). Never reads key material itself.
+export function configPresence(cfg) {
+  cfg = cfg ?? {};
+  return {
+    gemini: !!(cfg.server_has_gemini ?? cfg.GEMINI_API_KEY),
+    hf: !!(cfg.has_hf_token ?? cfg.HF_TOKEN),
+    deepgram: !!(cfg.has_deepgram_key ?? cfg.DEEPGRAM_API_KEY),
+    elevenlabs: !!(cfg.has_elevenlabs_key ?? cfg.ELEVENLABS_API_KEY),
+    twitchId: !!cfg.TWITCH_CLIENT_ID,
+    // The backend no longer returns the secret value at all — only presence.
+    twitchSecret: !!(cfg.has_twitch_secret ?? cfg.TWITCH_CLIENT_SECRET),
+  };
+}
+
+// Never throws: returns null on network failure, HTTP error, AND JSON parse
+// failure (e.g. an HTML error page with status 200). null means "unknown /
+// unreachable" — callers must NOT mistake it for "no keys configured".
 export async function getConfig() {
-  const res = await apiFetch(getApiUrl('/api/config'));
-  // null (not {}) on failure — callers must not mistake "couldn't reach the
-  // backend" for "no keys configured" and wipe already-known present state.
-  if (!res.ok) return null;
-  return res.json();
+  try {
+    const res = await apiFetch(getApiUrl('/api/config'));
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
 
 export async function saveConfig(keys) {
@@ -294,12 +316,21 @@ export async function saveConfig(keys) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ keys }),
   });
-  if (!res.ok) throw new Error('Save config failed');
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = Array.isArray(err.detail)
+      ? err.detail.map((d) => `${(d.loc || []).slice(1).join('.')}: ${d.msg}`).join('; ')
+      : err.detail;
+    throw new Error(detail || `Save config failed (HTTP ${res.status})`);
+  }
   return res.json().catch(() => ({}));
 }
 
 export async function getModels(apiKey) {
-  const res = await apiFetch(getApiUrl('/api/config/models'), { headers: { 'X-Gemini-Key': apiKey } });
+  // Omit X-Gemini-Key when empty so the backend's persisted-key fallback
+  // applies (matches submitProcessJob).
+  const key = (apiKey || '').trim();
+  const res = await apiFetch(getApiUrl('/api/config/models'), key ? { headers: { 'X-Gemini-Key': key } } : {});
   if (!res.ok) return { models: [] };
   return res.json();
 }

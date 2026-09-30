@@ -56,15 +56,17 @@ class ChannelUpdateRequest(BaseModel):
 
 
 @router.get("")
-async def list_channels(user: AuthUser = Depends(get_current_user)):
+async def list_channels(request: Request, user: AuthUser = Depends(get_current_user)):
     """List all configured channel profiles."""
+    require_trusted_config_request(request)
     channels = await asyncio.to_thread(load_channels)
     return {"channels": channels, "total": len(channels)}
 
 
 @router.get("/match")
-async def match_channel(category: Optional[str] = Query(None), user: AuthUser = Depends(get_current_user)):
+async def match_channel(request: Request, category: Optional[str] = Query(None), user: AuthUser = Depends(get_current_user)):
     """Find the best-fitting channel profile for a given category/niche."""
+    require_trusted_config_request(request)
     ch = await asyncio.to_thread(match_channel_for_category, category)
     if not ch:
         raise HTTPException(status_code=404, detail="No matching channel profile found")
@@ -72,8 +74,9 @@ async def match_channel(category: Optional[str] = Query(None), user: AuthUser = 
 
 
 @router.get("/{channel_id}")
-async def get_channel_by_id(channel_id: str, user: AuthUser = Depends(get_current_user)):
+async def get_channel_by_id(channel_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Get details of a specific channel profile."""
+    require_trusted_config_request(request)
     ch = await asyncio.to_thread(get_channel, channel_id)
     if not ch:
         raise HTTPException(status_code=404, detail=f"Channel {channel_id} not found")

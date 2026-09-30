@@ -46,3 +46,15 @@ test('aborts an in-flight request on unmount', async () => {
   unmount();
   expect(signal.aborted).toBe(true);
 });
+
+test('HTTP 404 is terminal: job not found on server', async () => {
+  const err = new Error('Not Found');
+  err.status = 404;
+  pollJob.mockRejectedValue(err);
+  const { callbacks } = mount();
+  await act(async () => {});
+  expect(callbacks.onFailed).toHaveBeenCalledTimes(1);
+  expect(callbacks.onFailed).toHaveBeenCalledWith(expect.stringMatching(/not found on server/i));
+  expect(callbacks.onConnectionChange).not.toHaveBeenCalled();
+  expect(vi.getTimerCount()).toBe(0); // no more polling
+});

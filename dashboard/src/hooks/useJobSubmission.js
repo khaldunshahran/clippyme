@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { submitProcessJob, submitBatchJob } from '../lib/api';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/apiToken';
@@ -20,6 +20,10 @@ function withTaste(data) {
 export function useJobSubmission({
   apiKey,
   serverHasKey,
+  // Async () => true | false | null. Re-checks the backend's key presence on
+  // every submit attempt (fresh, not the mount-time snapshot); null means the
+  // backend was unreachable. Falls back to the `serverHasKey` prop when absent.
+  checkServerKey,
   setShowKeyModal,
   setStatus,
   setLogs,
@@ -43,52 +47,115 @@ export function useJobSubmission({
     [],
   );
 
-  const handleProcess = async (data) => {
-    if (!apiKey && !serverHasKey) {
-      setShowKeyModal(true);
-      return;
-    }
-    setStatus('processing');
-    setLogs(['Initializing engine...']);
-    setResults(null);
-    setProcessingMedia(data);
-    if (data.preselections) setPreselections(data.preselections);
+  // Double-submit guard: a second click while a submission is in flight is
+  // ignored (the button is also disabled via `submitting`), so an impatient
+  // double-click can't spawn two GPU jobs.
+  const submittingRef = useRef(false);
+  const submitControllerRef = useRef(null);
+  const [submitting, setSubmitting] = useState(false);
 
+  /** Abort the in-flight submit request, if any. */
+  const cancelSubmit = () => {
+    submitControllerRef.current?.abort();
+  };
+
+  // The key gate, evaluated fresh on every submit attempt: only show the
+  // "Add your Gemini key" modal when the backend positively reports no key.
+  // Returns true when submission may proceed.
+  const checkKeyGate = async () => {
+    if (apiKey) return true;
+    let hasKey = serverHasKey;
+    if (typeof checkServerKey === 'function') {
+      try {
+        hasKey = await checkServerKey();
+      } catch {
+        hasKey = null;
+      }
+    }
+    if (hasKey == null) {
+      // Unreachable — a retryable connection error, NOT the key modal.
+      setStatus('error');
+      setLogs((l) => [...l, 'Could not reach the backend — check your connection and try again.']);
+      return false;
+    }
+    if (!hasKey) {
+      setShowKeyModal(true);
+      return false;
+    }
+    return true;
+  };
+
+  const submitErrorMessage = (e) => {
+    if (e?.name === 'AbortError') return { status: 'idle', message: 'Submission cancelled.' };
+    // TimeoutError carries its own user-friendly message.
+    return { status: 'error', message: e?.message ? `Error: ${e.message}` : 'Error: submission failed' };
+  };
+
+  const handleProcess = async (data) => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    const controller = new AbortController();
+    submitControllerRef.current = controller;
     try {
-      const resData = await submitProcessJob(withTaste(data), apiKey);
-      if (resData?.job_id && data.preselections) {
+      if (!(await checkKeyGate())) return;
+      setStatus('processing');
+      setLogs(['Initializing engine...']);
+      setResults(null);
+      setProcessingMedia(data);
+      if (data.preselections) setPreselections(data.preselections);
+
+      const resData = await submitProcessJob(withTaste(data), apiKey, { signal: controller.signal });
+      const jobId = resData?.job_id;
+      if (typeof jobId !== 'string' || jobId.length === 0) {
+        setStatus('error');
+        setLogs((l) => [...l, 'Unexpected server response — no job ID returned.']);
+        return;
+      }
+      if (resData?.duplicate) {
+        setLogs((l) => [...l, 'This exact request was already submitted — picking up the existing job instead of starting a duplicate.']);
+      }
+      if (data.preselections) {
         try {
-          localStorage.setItem(`clippyme_preselections_job_${resData.job_id}`, JSON.stringify(data.preselections));
+          localStorage.setItem(`clippyme_preselections_job_${jobId}`, JSON.stringify(data.preselections));
         } catch { /* ignore quota */ }
       }
-      setJobId(resData.job_id);
+      setJobId(jobId);
     } catch (e) {
-      setStatus('error');
-      setLogs((l) => [...l, `Error: ${e.message}`]);
+      const { status, message } = submitErrorMessage(e);
+      setStatus(status);
+      setLogs((l) => [...l, message]);
+    } finally {
+      submittingRef.current = false;
+      submitControllerRef.current = null;
+      setSubmitting(false);
     }
   };
 
   const handleBatchProcess = async (data) => {
-    if (!apiKey && !serverHasKey) {
-      setShowKeyModal(true);
-      return;
-    }
-    setStatus('processing');
-    setLogs(['Launching batch processing...']);
-    setResults(null);
-    if (data.preselections) setPreselections(data.preselections);
-
-    const urls = data.urls || [];
-    const files = data.files || [];
-
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    const controller = new AbortController();
+    submitControllerRef.current = controller;
     try {
+      if (!(await checkKeyGate())) return;
+      setStatus('processing');
+      setLogs(['Launching batch processing...']);
+      setResults(null);
+      if (data.preselections) setPreselections(data.preselections);
+
+      const urls = data.urls || [];
+      const files = data.files || [];
+
       const allJobIds = [];
 
       // 1. Submit URLs as a single backend batch (if any)
       if (urls.length > 0) {
-        const batchRes = await submitBatchJob(withTaste({ ...data, urls }), apiKey);
-        allJobIds.push(...batchRes.jobs.map((j) => j.job_id));
-        setLogs((l) => [...l, `Submitted ${batchRes.total} URL job(s)`]);
+        const batchRes = await submitBatchJob(withTaste({ ...data, urls }), apiKey, { signal: controller.signal });
+        const ids = (batchRes?.jobs || []).map((j) => j?.job_id).filter((j) => typeof j === 'string' && j.length > 0);
+        allJobIds.push(...ids);
+        setLogs((l) => [...l, `Submitted ${batchRes?.total ?? ids.length} URL job(s)`]);
       }
 
       // 2. Submit each file individually to /api/process
@@ -102,9 +169,14 @@ export function useJobSubmission({
               preselections: data.preselections,
             }),
             apiKey,
+            { signal: controller.signal },
           );
-          allJobIds.push(fileRes.job_id);
-          setLogs((l) => [...l, `Submitted file: ${f.name}`]);
+          if (typeof fileRes?.job_id === 'string' && fileRes.job_id.length > 0) {
+            allJobIds.push(fileRes.job_id);
+            setLogs((l) => [...l, `Submitted file: ${f.name}`]);
+          } else {
+            setLogs((l) => [...l, `Failed to submit ${f.name}: no job ID returned.`]);
+          }
         } catch (e) {
           setLogs((l) => [...l, `Failed to submit ${f.name}: ${e.message}`]);
         }
@@ -254,10 +326,20 @@ export function useJobSubmission({
       };
       pollRef.current = setTimeout(tick, POLL_MS);
     } catch (e) {
-      setStatus('error');
-      setLogs((l) => [...l, `Batch error: ${e.message}`]);
+      if (e?.name === 'AbortError') {
+        setStatus('idle');
+        setLogs((l) => [...l, 'Submission cancelled.']);
+      } else {
+        setStatus('error');
+        // TimeoutError carries its own user-friendly message.
+        setLogs((l) => [...l, e?.name === 'TimeoutError' ? e.message : `Batch error: ${e.message}`]);
+      }
+    } finally {
+      submittingRef.current = false;
+      submitControllerRef.current = null;
+      setSubmitting(false);
     }
   };
 
-  return { handleProcess, handleBatchProcess };
+  return { handleProcess, handleBatchProcess, submitting, cancelSubmit };
 }

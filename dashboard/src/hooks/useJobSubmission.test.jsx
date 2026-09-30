@@ -16,7 +16,7 @@ vi.mock('../lib/apiToken', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { submitBatchJob } from '../lib/api';
+import { submitBatchJob, submitProcessJob } from '../lib/api';
 import { apiFetch } from '../lib/apiToken';
 import { useJobSubmission } from './useJobSubmission';
 
@@ -46,10 +46,13 @@ function okStatus(status) {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  submitBatchJob.mockReset();
+  submitProcessJob.mockReset();
   submitBatchJob.mockResolvedValue({
     jobs: [{ job_id: 'job-a' }, { job_id: 'job-b' }],
     total: 2,
   });
+  submitProcessJob.mockResolvedValue({ job_id: 'job-1' });
 });
 
 afterEach(() => {
@@ -127,4 +130,91 @@ test('poll loop is cleared on unmount', async () => {
   expect(vi.getTimerCount()).toBe(1);
   unmount();
   expect(vi.getTimerCount()).toBe(0);
+});
+
+// --- H2/H4: single-submit guard, job_id validation, duplicate handling --------
+
+test('a second submit while one is in flight is ignored (no duplicate job)', async () => {
+  let release;
+  submitProcessJob.mockImplementation(
+    () => new Promise((resolve) => { release = () => resolve({ job_id: 'job-1' }); }),
+  );
+  const { handlers, props } = mountHook();
+
+  let p1; let p2;
+  await act(async () => {
+    p1 = handlers.handleProcess({ type: 'url', payload: 'u' });
+    p2 = handlers.handleProcess({ type: 'url', payload: 'u' });
+  });
+  await act(async () => { release(); await p1; await p2; });
+
+  expect(submitProcessJob).toHaveBeenCalledTimes(1);
+  expect(props.setJobId).toHaveBeenCalledTimes(1);
+  expect(props.setJobId).toHaveBeenCalledWith('job-1');
+});
+
+test('submit without a job_id surfaces an error instead of wedging on processing', async () => {
+  submitProcessJob.mockResolvedValue({ status: 'queued' }); // no job_id
+  const { handlers, props } = mountHook();
+
+  await act(() => handlers.handleProcess({ type: 'url', payload: 'u' }));
+
+  expect(props.setStatus).toHaveBeenLastCalledWith('error');
+  const logUpdater = props.setLogs.mock.calls.at(-1)[0];
+  expect(logUpdater(['x']).join(' ')).toMatch(/no job ID returned/);
+  expect(props.setJobId).not.toHaveBeenCalled();
+});
+
+test('duplicate:true picks up the returned job instead of treating it as new', async () => {
+  submitProcessJob.mockResolvedValue({ job_id: 'job-dup', status: 'queued', duplicate: true });
+  const { handlers, props } = mountHook();
+
+  await act(() => handlers.handleProcess({ type: 'url', payload: 'u' }));
+
+  expect(props.setJobId).toHaveBeenCalledWith('job-dup');
+  const logUpdater = props.setLogs.mock.calls.at(-1)[0];
+  expect(logUpdater(['x']).join(' ')).toMatch(/already submitted/);
+});
+
+test('unreachable backend shows a connection error, not the key modal', async () => {
+  const { handlers, props } = mountHook({
+    apiKey: '',
+    serverHasKey: false,
+    checkServerKey: async () => null, // unreachable
+  });
+
+  await act(() => handlers.handleProcess({ type: 'url', payload: 'u' }));
+
+  expect(props.setShowKeyModal).not.toHaveBeenCalled();
+  expect(props.setStatus).toHaveBeenLastCalledWith('error');
+  const logUpdater = props.setLogs.mock.calls.at(-1)[0];
+  expect(logUpdater(['x']).join(' ')).toMatch(/Could not reach the backend/);
+  expect(submitProcessJob).not.toHaveBeenCalled();
+});
+
+test('a positive no-key check opens the key modal', async () => {
+  const { handlers, props } = mountHook({
+    apiKey: '',
+    serverHasKey: false,
+    checkServerKey: async () => false, // reachable, no key
+  });
+
+  await act(() => handlers.handleProcess({ type: 'url', payload: 'u' }));
+
+  expect(props.setShowKeyModal).toHaveBeenCalledWith(true);
+  expect(submitProcessJob).not.toHaveBeenCalled();
+});
+
+test('a fresh positive key check submits without the modal', async () => {
+  submitProcessJob.mockResolvedValue({ job_id: 'job-9' });
+  const { handlers, props } = mountHook({
+    apiKey: '',
+    serverHasKey: false, // stale mount-time snapshot...
+    checkServerKey: async () => true, // ...overridden by the fresh check
+  });
+
+  await act(() => handlers.handleProcess({ type: 'url', payload: 'u' }));
+
+  expect(props.setShowKeyModal).not.toHaveBeenCalled();
+  expect(props.setJobId).toHaveBeenCalledWith('job-9');
 });

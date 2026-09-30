@@ -30,7 +30,7 @@ import {
 } from '../lib/collections';
 import { getCurrentUser, handleOAuthRedirect, isAuthEnabled, onAuthStateChange, signOut } from '../lib/supabaseClient';
 import { getVaultKey, setVaultKey, syncVaultOnSignIn } from '../lib/keyVault';
-import { optsToPreselections, restoreJob, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig, generateAllClipMetadata } from './realApi';
+import { optsToPreselections, restoreJob, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig, generateAllClipMetadata, configPresence } from './realApi';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
 import { clipStateToParams, buildBulkPlan } from '../lib/bulkApply';
@@ -123,6 +123,11 @@ export default function RedesignApp() {
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [user, setUser] = useState(() => getCurrentUser());
   const [showAuthModal, setShowAuthModal] = useState(false);
+  // Distinguishes the user's own sign-out from an unexpected session loss
+  // (e.g. the 401 path clearing a dead session) — only the latter prompts
+  // re-sign-in automatically.
+  const expectSignOutRef = useRef(false);
+  const hadUserRef = useRef(user);
 
   // Pull the per-account key vault into the local cache after sign-in, then
   // adopt the vault's Gemini key into state when it differs from what's shown.
@@ -141,8 +146,20 @@ export default function RedesignApp() {
     // Subscribe first: handleOAuthRedirect() notifies subscribers synchronously
     // when it recovers a session, so the subscription must exist before it runs.
     const unsub = onAuthStateChange((_event, session) => {
-      setUser(session?.user || null);
+      const nextUser = session?.user || null;
+      setUser(nextUser);
       if (_event === 'SIGNED_IN' && session?.user) pullVaultKeys();
+      if (_event === 'SIGNED_OUT') {
+        const expected = expectSignOutRef.current;
+        expectSignOutRef.current = false;
+        // Unexpected session loss (expired token + dead refresh token) —
+        // prompt re-sign-in instead of failing silently on the next request.
+        if (!expected && hadUserRef.current) {
+          setShowAuthModal(true);
+          pushToast('warn', 'Your session expired — please sign in again.');
+        }
+      }
+      hadUserRef.current = nextUser;
     });
     // Recover the session when returning from Google / OAuth sign-in, and make
     // sure React state reflects it even if the notification was missed.
@@ -154,7 +171,7 @@ export default function RedesignApp() {
       pullVaultKeys();
     }
     return unsub;
-  }, []);
+  }, [pullVaultKeys, pushToast]);
 
   const [tab, setTab] = useState(() => {
     const t = restoredSession?.activeTab;
@@ -301,6 +318,7 @@ export default function RedesignApp() {
   }, []);
 
   const handleSignOut = useCallback(async () => {
+    expectSignOutRef.current = true;
     try {
       await signOut();
       setUser(null);
@@ -475,17 +493,30 @@ export default function RedesignApp() {
       pushToast('error', 'Job failed: ' + String(errorMsg).slice(0, 80));
     },
     onProgress: (lg, step) => { setLogs(lg); if (step) setCurrentStep(step); },
+    // M1: surface connection loss as a visible toast instead of frozen logs.
+    onConnectionChange: (connected) => {
+      pushToast(connected ? 'success' : 'warn', connected
+        ? 'Backend connection restored.'
+        : 'Lost connection to the backend — retrying…');
+    },
   });
 
   const [serverHasKey, setServerHasKey] = useState(false);
-  useEffect(() => {
-    getConfig().then((cfg) => {
-      if (cfg?.server_has_gemini || cfg?.GEMINI_API_KEY) setServerHasKey(true);
-    }).catch(() => {});
+  // Fresh key check on mount AND on every submit attempt (via useJobSubmission's
+  // checkServerKey): only a positive "no key" opens the key modal; null means
+  // the backend was unreachable and callers must show a retryable connection
+  // error instead.
+  const checkServerKey = useCallback(async () => {
+    const cfg = await getConfig(); // never throws; null = unreachable
+    if (!cfg) return null;
+    const has = configPresence(cfg).gemini;
+    setServerHasKey(has);
+    return has;
   }, []);
+  useEffect(() => { checkServerKey(); }, [checkServerKey]);
 
-  const { handleProcess, handleBatchProcess } = useJobSubmission({
-    apiKey, serverHasKey, setShowKeyModal, setStatus, setLogs, setResults, setProcessingMedia,
+  const { handleProcess, handleBatchProcess, submitting: isSubmitting } = useJobSubmission({
+    apiKey, serverHasKey, checkServerKey, setShowKeyModal, setStatus, setLogs, setResults, setProcessingMedia,
     setPreselections, setJobId,
     onBatchFinished: ({ succeeded, failed, total }) => {
       setTab('history');
@@ -775,6 +806,7 @@ export default function RedesignApp() {
 
       {tab === 'create' && status === 'idle' && (
         <CreateView opts={opts} set={set} onPickPreset={pickPreset} onCreate={startJob}
+          submitting={isSubmitting}
           presets={presetList} defaultId={defaultPresetId}
           onSaveCurrent={onSaveCurrentPreset} onSetDefault={onSetDefaultPreset} onDelete={onDeletePreset} />
       )}

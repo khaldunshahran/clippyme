@@ -10,9 +10,14 @@ import * as vault from '../lib/keyVault';
 const getConfig = vi.fn();
 const saveConfig = vi.fn();
 
-vi.mock('./realApi', () => ({
-  getConfig: (...a) => getConfig(...a),
-  saveConfig: (...a) => saveConfig(...a),
+vi.mock('./realApi', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    // configPresence is pure logic: keep the real implementation so the
+    // SettingsView presence badges are tested against the real contract.
+    getConfig: (...a) => getConfig(...a),
+    saveConfig: (...a) => saveConfig(...a),
   getModels: vi.fn(async () => ({ models: [] })),
   cookiesStatus: vi.fn(async () => ({ configured: false })),
   uploadCookies: vi.fn(),
@@ -29,10 +34,11 @@ vi.mock('./realApi', () => ({
   getWatchdog: vi.fn(async () => ({ enabled: true, ai_diagnosis: true, provider: 'ntfy' })),
   saveWatchdog: vi.fn(async (p) => ({ enabled: true, ...p })),
   testWatchdogAlert: vi.fn(async () => ({ status: 'ok' })),
-}));
+  };
+});
 
-const EMPTY_CONFIG = { GEMINI_API_KEY: '', HF_TOKEN: '', DEEPGRAM_API_KEY: '', ELEVENLABS_API_KEY: '' };
-const SET_CONFIG = { ...EMPTY_CONFIG, GEMINI_API_KEY: 'AIza...xyz1' };
+const EMPTY_CONFIG = { server_has_gemini: false, has_hf_token: false, has_deepgram_key: false, has_elevenlabs_key: false, TWITCH_CLIENT_ID: '' };
+const SET_CONFIG = { ...EMPTY_CONFIG, server_has_gemini: true };
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -131,7 +137,7 @@ test('clearing a present key saves an empty value and the badge flips to empty',
 });
 
 test('Twitch client id/secret rows reflect backend present state', async () => {
-  getConfig.mockResolvedValue({ ...EMPTY_CONFIG, TWITCH_CLIENT_ID: 'abcd1234', TWITCH_CLIENT_SECRET: 'shhh12345678' });
+  getConfig.mockResolvedValue({ ...EMPTY_CONFIG, TWITCH_CLIENT_ID: 'abcd1234', has_twitch_secret: true });
   mount();
   const idRow = () => screen.getByLabelText('Twitch client ID').closest('.keyrow');
   const secretRow = () => screen.getByLabelText('Twitch client secret').closest('.keyrow');

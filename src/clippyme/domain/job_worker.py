@@ -8,12 +8,27 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 import time
 from typing import Awaitable, Callable, Dict
 
 logger = logging.getLogger("clippyme")
 
 MAX_LOG_LINES = int(os.environ.get("MAX_LOG_LINES", "2000"))
+
+# Serializes the reader thread's append+trim compound against concurrent
+# event-loop appends. Individual list ops are already GIL-atomic; the lock
+# keeps the "append then trim to cap" check-then-act from interleaving.
+_LOGS_LOCK = threading.Lock()
+
+
+def append_job_log(job: dict, message: str) -> None:
+    """Thread-safe append to a job's log list (any thread may call)."""
+    with _LOGS_LOCK:
+        logs = job["logs"]
+        logs.append(message)
+        if len(logs) > MAX_LOG_LINES:
+            del logs[: len(logs) - MAX_LOG_LINES]
 
 
 def enqueue_output(out, job_id: str, jobs: Dict[str, Dict]) -> None:
@@ -31,10 +46,7 @@ def enqueue_output(out, job_id: str, jobs: Dict[str, Dict]) -> None:
             if decoded_line:
                 logger.info("📝 [Job Output] %s", decoded_line)
                 if job_id in jobs:
-                    logs = jobs[job_id]["logs"]
-                    logs.append(decoded_line)
-                    if len(logs) > MAX_LOG_LINES:
-                        del logs[: len(logs) - MAX_LOG_LINES]
+                    append_job_log(jobs[job_id], decoded_line)
     except Exception as e:
         logger.error("Error reading output for job %s: %s", job_id, e)
     finally:
@@ -165,17 +177,24 @@ def make_workers(
                 logger.warning("Cleanup error: %s", e)
 
     async def run_job_wrapper(job_id: str) -> None:
-        """Run a single job and always release the concurrency slot."""
+        """Run a single job and release the concurrency slot it holds.
+
+        The slot may have been released early by a pause (see pause_job in
+        app.py); ``slot_held`` tracks ownership so we never double-release.
+        """
         try:
             job = jobs.get(job_id)
             if job:
+                job["slot_held"] = True
                 await run_job(job_id, job)
         except Exception as e:
             logger.error("Job wrapper error %s: %s", job_id, e)
         finally:
-            concurrency_semaphore.release()
+            job = jobs.get(job_id)
+            if job is None or job.pop("slot_held", False):
+                concurrency_semaphore.release()
+                logger.info("Released slot for job: %s", job_id)
             job_queue.task_done()
-            logger.info("Released slot for job: %s", job_id)
 
     async def process_queue() -> None:
         """Dispatch jobs and retain child tasks until they finish.

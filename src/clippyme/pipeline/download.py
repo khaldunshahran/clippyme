@@ -281,6 +281,9 @@ def download_youtube_video(url, output_dir=".", cookies_file_path=None):
         "url": url,
         "output_dir": abs_output_dir,
         "cookies_file_path": abs_cookies_file_path,
+        # Lets the backend abort this download via POST /download/cancel
+        # when the user cancels/stops the job mid-download.
+        "job_id": os.environ.get("CLIPPYME_JOB_ID"),
     }
 
     headers = {}

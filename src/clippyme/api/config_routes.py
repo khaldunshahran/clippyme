@@ -51,6 +51,19 @@ def enforce_config_access(request: Request) -> None:
         require_admin(request)
 
 
+def enforce_config_read_access(request: Request) -> None:
+    """Gate the public config read: trusted origin only, no admin required.
+
+    ``GET /api/config`` returns presence booleans (never secret values), so
+    any trusted same-site caller — including signed-in non-admin users and
+    pre-sign-in frontend bootstrapping — may read it. This is what lets the
+    website correctly detect ``server_has_gemini`` instead of misfiring the
+    "Add your Gemini key" modal. Mutations and key-material endpoints keep
+    the admin gate via :func:`enforce_config_access`.
+    """
+    require_trusted_config_request(request)
+
+
 router = APIRouter()
 
 
@@ -111,31 +124,39 @@ async def list_gemini_models(
 
 @router.get("/api/config")
 async def get_config(request: Request):
-    """Return current active configuration (keys are partially masked for safety)."""
-    enforce_config_access(request)
+    """Return current active configuration.
+
+    Secret values are NEVER returned — only booleans indicating whether each
+    key is configured. (Previously this returned partially-masked key
+    fragments, which still leaks key material to anyone who can reach this
+    endpoint.)
+    """
+    enforce_config_read_access(request)
     config = await asyncio.to_thread(load_persistent_config)
     env_gemini = os.environ.get("GEMINI_API_KEY", "").strip()
     active_gemini = env_gemini or config.get("GEMINI_API_KEY", "")
-    active_config = {
-        "GEMINI_API_KEY": active_gemini,
-        "HF_TOKEN": os.environ.get("HF_TOKEN") or config.get("HF_TOKEN", ""),
-        "DEEPGRAM_API_KEY": os.environ.get("DEEPGRAM_API_KEY") or config.get("DEEPGRAM_API_KEY", ""),
-        "ELEVENLABS_API_KEY": os.environ.get("ELEVENLABS_API_KEY") or config.get("ELEVENLABS_API_KEY", ""),
+    has_gemini = bool(active_gemini and active_gemini.strip())
+    has_hf = bool(os.environ.get("HF_TOKEN") or config.get("HF_TOKEN", ""))
+    has_deepgram = bool(os.environ.get("DEEPGRAM_API_KEY") or config.get("DEEPGRAM_API_KEY", ""))
+    has_elevenlabs = bool(os.environ.get("ELEVENLABS_API_KEY") or config.get("ELEVENLABS_API_KEY", ""))
+    has_twitch_secret = bool(os.environ.get("TWITCH_CLIENT_SECRET") or config.get("TWITCH_CLIENT_SECRET", ""))
+    return {
+        # Secrets: presence flags only, never values.
+        "server_has_gemini": has_gemini,
+        "has_hf_token": has_hf,
+        "has_deepgram_key": has_deepgram,
+        "has_elevenlabs_key": has_elevenlabs,
+        "has_twitch_secret": has_twitch_secret,
+        # Back-compat aliases for older frontends (also booleans now).
+        "GEMINI_API_KEY": has_gemini,
+        "HF_TOKEN": has_hf,
+        "DEEPGRAM_API_KEY": has_deepgram,
+        "ELEVENLABS_API_KEY": has_elevenlabs,
+        # Non-secret settings: returned as-is.
         "TRANSCRIPTION_PROVIDER": os.environ.get("TRANSCRIPTION_PROVIDER") or config.get("TRANSCRIPTION_PROVIDER", "whisper"),
         "GEMINI_MODEL": os.environ.get("GEMINI_MODEL") or config.get("GEMINI_MODEL", ""),
         "TWITCH_CLIENT_ID": os.environ.get("TWITCH_CLIENT_ID") or config.get("TWITCH_CLIENT_ID", ""),
-        "TWITCH_CLIENT_SECRET": os.environ.get("TWITCH_CLIENT_SECRET") or config.get("TWITCH_CLIENT_SECRET", ""),
     }
-    secret_keys = {"GEMINI_API_KEY", "HF_TOKEN", "DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY",
-                   "YOUTUBE_COOKIES", "TWITCH_CLIENT_SECRET"}
-    masked = {}
-    for k, v in active_config.items():
-        if k in secret_keys and v:
-            masked[k] = f"{v[:4]}...{v[-4:]}" if len(v) > 8 else "********"
-        else:
-            masked[k] = v
-    masked["server_has_gemini"] = bool(active_gemini)
-    return masked
 
 
 @router.post("/api/config")

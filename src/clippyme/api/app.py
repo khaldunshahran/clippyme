@@ -1,10 +1,13 @@
 import os
 import sys
+import time
 import uuid
+import json
 import shutil
 import glob
 import asyncio
 import logging
+import threading
 from dotenv import load_dotenv
 from typing import Dict, Optional
 
@@ -118,6 +121,133 @@ JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", str(7 * 8640
 # Application State
 job_queue = asyncio.Queue(maxsize=50)
 jobs: Dict[str, Dict] = {}
+# Idempotency keys for POST /api/process: (user_id, key) -> job_id.
+# Guards against duplicate jobs when the client retries a submission whose
+# response was lost (tunnel hang → "failed to fetch" → user clicks again).
+# Bounded in memory to the most recent entries so it can't grow without
+# limit; DURABLE via an append-only JSONL journal in DATA_DIR so a backend
+# restart doesn't lose the mapping and resurrect duplicates. The journal is
+# compacted whenever it grows past _IDEMPOTENCY_JOURNAL_COMPACT_LINES lines.
+_idempotency_keys: Dict[tuple, str] = {}
+_IDEMPOTENCY_KEY_CAP = 2000
+_IDEMPOTENCY_JOURNAL_FILENAME = "idempotency_journal.jsonl"
+_IDEMPOTENCY_JOURNAL_COMPACT_LINES = 4000
+_idempotency_journal_lock = threading.Lock()
+
+
+def _idempotency_journal_path() -> str:
+    return os.path.join(DATA_DIR, _IDEMPOTENCY_JOURNAL_FILENAME)
+
+
+def _replay_idempotency_journal() -> None:
+    """Load (user_id, key) -> job_id mappings from the durable journal.
+
+    Runs at startup (before the dispatcher) so retried submissions still
+    dedupe against jobs created in a previous server life. Corrupt lines are
+    skipped; a missing journal is not an error.
+    """
+    path = _idempotency_journal_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.exception("Could not read idempotency journal — starting empty")
+        return
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            user_id, key, job_id = rec["user_id"], rec["key"], rec["job_id"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if user_id and key and job_id:
+            _idempotency_keys[(str(user_id), str(key))] = str(job_id)
+            while len(_idempotency_keys) > _IDEMPOTENCY_KEY_CAP:
+                _idempotency_keys.pop(next(iter(_idempotency_keys)))
+
+
+def _compact_idempotency_journal_locked() -> None:
+    """Rewrite the journal with the current in-memory mappings (lock held)."""
+    path = _idempotency_journal_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            for (user_id, key), job_id in _idempotency_keys.items():
+                f.write(json.dumps({"user_id": user_id, "key": key,
+                                    "job_id": job_id, "ts": time.time()}) + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        logger.exception("Idempotency journal compaction failed")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _remember_idempotency_key(user_id: str, key: str, job_id: str) -> None:
+    _idempotency_keys[(user_id, key)] = job_id
+    while len(_idempotency_keys) > _IDEMPOTENCY_KEY_CAP:
+        _idempotency_keys.pop(next(iter(_idempotency_keys)))
+    # Durable append so the mapping survives a restart.
+    with _idempotency_journal_lock:
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(_idempotency_journal_path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"user_id": user_id, "key": key,
+                                    "job_id": job_id, "ts": time.time()}) + "\n")
+        except OSError:
+            logger.exception("Idempotency journal append failed — key kept in memory only")
+            return
+        # Compact when the journal grows well past the memory cap (every
+        # append writes one line, so this check is cheap: file size >> lines).
+        try:
+            if os.path.getsize(_idempotency_journal_path()) > _IDEMPOTENCY_JOURNAL_COMPACT_LINES * 160:
+                _compact_idempotency_journal_locked()
+        except OSError:
+            pass
+
+
+def _lookup_idempotency_key(user_id: str, key: str) -> Optional[str]:
+    job_id = _idempotency_keys.get((user_id, key))
+    if job_id is None:
+        # Memory miss (evicted by the cap or lost before journaling existed):
+        # scan the durable journal for the latest record for this pair. This
+        # is the rare path — steady-state lookups hit the in-memory dict.
+        job_id = _scan_idempotency_journal(user_id, key)
+        if job_id is not None:
+            _idempotency_keys[(user_id, key)] = job_id
+    if job_id and job_id in jobs:
+        return job_id
+    if job_id:
+        # Job is gone (evicted / backend restarted): key is stale, forget it.
+        _idempotency_keys.pop((user_id, key), None)
+    return None
+
+
+def _scan_idempotency_journal(user_id: str, key: str) -> Optional[str]:
+    """Return the latest job_id journalled for (user_id, key), or None."""
+    path = _idempotency_journal_path()
+    latest = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("user_id") == user_id and rec.get("key") == key and rec.get("job_id"):
+                    latest = str(rec["job_id"])
+    except (FileNotFoundError, OSError):
+        return None
+    return latest
 # Semaphore to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -160,6 +290,13 @@ async def lifespan(app: FastAPI):
                      job_queue=job_queue, output_root=OUTPUT_DIR)
     except Exception:
         logger.exception("Job journal recovery failed — starting with an empty queue")
+
+    # Replay the durable idempotency journal so submissions retried after a
+    # restart still dedupe against jobs from the previous server life.
+    try:
+        _replay_idempotency_journal()
+    except Exception:
+        logger.exception("Idempotency journal replay failed — starting with an empty key map")
 
     cleanup_jobs, process_queue, _run_job_wrapper = make_workers(
         jobs=jobs,
@@ -292,6 +429,9 @@ async def _supabase_jwt_gate(request: Request, call_next):
             claims = verify_supabase_jwt(auth[7:].strip())
             if claims:
                 request.state.supabase_user = claims["sub"]
+                # Full claims (incl. email) so get_current_user can build a
+                # per-user identity without re-verifying the token.
+                request.state.supabase_claims = claims
     return await call_next(request)
 
 
@@ -341,8 +481,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", "Authorization", "X-Gemini-Key", "X-API-Token"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Content-Type", "Authorization", "X-Gemini-Key", "X-API-Token", "Idempotency-Key"],
 )
 
 # Mount static files for serving videos.
@@ -402,6 +542,41 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+
+def _resolve_gemini_key(request: Request, persisted: Optional[dict]) -> Optional[str]:
+    """Resolve the effective Gemini API key for a request.
+
+    Priority: explicit ``X-Gemini-Key`` header, then the persisted server key,
+    then the ``GEMINI_API_KEY`` env var. A whitespace-only (or empty) header
+    is treated as missing so it can never shadow the server key with a blank
+    value — previously ``" "`` was truthy and broke the fallback chain.
+    """
+    header_key = (request.headers.get("X-Gemini-Key") or "").strip()
+    persisted_key = ((persisted or {}).get("GEMINI_API_KEY") or "").strip()
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    return header_key or persisted_key or env_key or None
+
+
+# Cap for JSON request bodies parsed manually via ``await request.json()``
+# (multipart uploads already stream through FastAPI's File handling).
+# Prevents a huge JSON payload from being buffered fully into memory.
+MAX_JSON_BODY_BYTES = 1_000_000  # 1 MB — submit payloads are a few KB
+
+
+async def _read_capped_json(request: Request) -> dict:
+    """Read a JSON body with a size cap; 413 if it exceeds the cap."""
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_JSON_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Request body too large")
+    raw = await request.body()
+    if len(raw) > MAX_JSON_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Request body too large")
+    try:
+        return json.loads(raw.decode("utf-8")) if raw else {}
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}")
+
+
 @app.post("/api/process")
 async def process_endpoint(
     request: Request,
@@ -415,11 +590,7 @@ async def process_endpoint(
     # ~20 single-job submissions/min per client; compute-heavy, so throttle.
     enforce_rate_limit(request, "process", capacity=20, refill_per_sec=20 / 60)
     persisted = await asyncio.to_thread(load_persistent_config)
-    api_key = (
-        request.headers.get("X-Gemini-Key")
-        or (persisted.get("GEMINI_API_KEY") if persisted else None)
-        or os.environ.get("GEMINI_API_KEY")
-    )
+    api_key = _resolve_gemini_key(request, persisted)
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
@@ -446,7 +617,7 @@ async def process_endpoint(
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         try:
-            body = await request.json()
+            body = await _read_capped_json(request)  # 1 MB cap, 413 over
             validated = ProcessRequest.model_validate(body or {})
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=exc.errors())
@@ -522,6 +693,20 @@ async def process_endpoint(
     allowed, reason = check_user_quota(user)
     if not allowed:
         raise HTTPException(status_code=402, detail=reason)
+
+    # Idempotency: a retried submission (same Idempotency-Key header) returns
+    # the already-created job instead of queueing a duplicate. The frontend
+    # sends a fresh UUID per "Create clips" click.
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()[:128]
+    if idempotency_key:
+        existing_job_id = _lookup_idempotency_key(user.id, idempotency_key)
+        if existing_job_id:
+            existing = jobs[existing_job_id]
+            return {
+                "job_id": existing_job_id,
+                "status": existing.get("status", "queued"),
+                "duplicate": True,
+            }
 
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
@@ -607,6 +792,9 @@ async def process_endpoint(
         on_change=persist_jobs, cleanup_paths=(input_path,), input_path=input_path,
         user_id=user.id,
     )
+    if idempotency_key:
+        _remember_idempotency_key(user.id, idempotency_key, job_id)
+        jobs[job_id]["idempotency_key"] = idempotency_key
 
     return {"job_id": job_id, "status": "queued"}
 
@@ -622,11 +810,7 @@ async def batch_process(
     # Each batch can enqueue up to 20 jobs, so limit batch calls more tightly.
     enforce_rate_limit(request, "batch", capacity=10, refill_per_sec=10 / 60)
     persisted = await asyncio.to_thread(load_persistent_config)
-    api_key = (
-        request.headers.get("X-Gemini-Key")
-        or (persisted.get("GEMINI_API_KEY") if persisted else None)
-        or os.environ.get("GEMINI_API_KEY")
-    )
+    api_key = _resolve_gemini_key(request, persisted)
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
@@ -744,7 +928,8 @@ def _verify_job_ownership(job_id: str, user: AuthUser) -> None:
 
 
 @app.get("/api/jobs/active")
-async def get_active_jobs(user: AuthUser = Depends(get_current_user)):
+async def get_active_jobs(request: Request, user: AuthUser = Depends(get_current_user)):
+    require_trusted_config_request(request)
     active = []
     for j_id, j in jobs.items():
         if not user.is_admin and j.get("user_id", "default_user") != user.id:
@@ -766,7 +951,8 @@ async def get_active_jobs(user: AuthUser = Depends(get_current_user)):
 
 
 @app.get("/api/status/{job_id}")
-async def get_status(job_id: str, user: AuthUser = Depends(get_current_user)):
+async def get_status(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
+    require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
     if job_id not in jobs:
@@ -795,13 +981,23 @@ async def get_status(job_id: str, user: AuthUser = Depends(get_current_user)):
                 except Exception:
                     pass
             try:
-                files = os.listdir(job_dir)
-                if files and user.is_admin:
+                # Only claim completion with evidence: a clip metadata file
+                # means the pipeline finished cutting. A nonempty directory
+                # alone (e.g. an interrupted download) must not report
+                # "complete" — that would strand the frontend poller on a
+                # terminal state for a job that never finished.
+                has_metadata = any(
+                    name.endswith("_metadata.json")
+                    for name in os.listdir(job_dir)
+                )
+                if has_metadata and user.is_admin:
                     return {
                         "status": "complete",
                         "logs": ["Job loaded from storage"],
                         "result": {},
                     }
+            except HTTPException:
+                raise
             except Exception:
                 pass
         raise HTTPException(status_code=404, detail="Job not found")
@@ -851,6 +1047,13 @@ async def pause_job(job_id: str, request: Request, user: AuthUser = Depends(get_
     n = await asyncio.to_thread(job_control.suspend_tree, proc.pid)
     job['status'] = 'paused'
     job['logs'].append(f"Job paused by user ({n} process(es) suspended).")
+    # A paused job must not hold its concurrency slot forever: release it so
+    # queued jobs can run. Resume re-acquires. slot_held prevents the wrapper
+    # from double-releasing when the job later finishes/is cancelled.
+    if job.pop('slot_held', False):
+        concurrency_semaphore.release()
+        job['logs'].append("Concurrency slot released while paused.")
+        logger.info("Job %s paused; concurrency slot released", job_id)
     logger.info("Job %s paused (%d procs)", job_id, n)
     persist_jobs()
     return {"success": True, "status": "paused"}
@@ -874,7 +1077,22 @@ async def resume_job(job_id: str, request: Request, user: AuthUser = Depends(get
     if not (proc and proc.poll() is None):
         raise HTTPException(status_code=409, detail="Job has no running process")
 
-    n = await asyncio.to_thread(job_control.resume_tree, proc.pid)
+    # Re-acquire a concurrency slot before waking the tree: another job may
+    # have taken the slot this job released when it was paused. This waits
+    # for a free slot instead of oversubscribing the GPU.
+    acquired_here = False
+    if not job.get('slot_held'):
+        await concurrency_semaphore.acquire()
+        job['slot_held'] = True
+        acquired_here = True
+    try:
+        n = await asyncio.to_thread(job_control.resume_tree, proc.pid)
+    except Exception:
+        # Don't leak the slot we just took if the resume itself failed.
+        if acquired_here:
+            job.pop('slot_held', False)
+            concurrency_semaphore.release()
+        raise
     job['status'] = 'processing'
     job['logs'].append(f"Job resumed by user ({n} process(es) resumed).")
     logger.info("Job %s resumed (%d procs)", job_id, n)
@@ -912,11 +1130,7 @@ async def retry_job_endpoint(job_id: str, request: Request, user: AuthUser = Dep
     _verify_job_ownership(job_id, user)
 
     persisted = await asyncio.to_thread(load_persistent_config)
-    api_key = (
-        request.headers.get("X-Gemini-Key")
-        or (persisted.get("GEMINI_API_KEY") if persisted else None)
-        or os.environ.get("GEMINI_API_KEY")
-    )
+    api_key = _resolve_gemini_key(request, persisted)
 
     from clippyme.domain.job_submission import retry_job_action
     try:
@@ -941,11 +1155,7 @@ async def rescore_job_endpoint(job_id: str, request: Request, user: AuthUser = D
     _verify_job_ownership(job_id, user)
 
     persisted = await asyncio.to_thread(load_persistent_config)
-    api_key = (
-        request.headers.get("X-Gemini-Key")
-        or (persisted.get("GEMINI_API_KEY") if persisted else None)
-        or os.environ.get("GEMINI_API_KEY")
-    )
+    api_key = _resolve_gemini_key(request, persisted)
 
     from clippyme.domain.rescore_service import rescore_job
     try:
@@ -976,6 +1186,8 @@ async def smart_cut_clip(job_id: str, clip_index: int, request: Request, user: A
     drop_ranges = None
     raw_body = await request.body()
     if raw_body:
+        if len(raw_body) > MAX_JSON_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body too large")
         try:
             body = await request.json()
         except ValueError as exc:
@@ -1213,21 +1425,25 @@ async def list_history(request: Request, user: AuthUser = Depends(get_current_us
     return {"jobs": await asyncio.to_thread(scan_history, OUTPUT_DIR, user_id=filter_user)}
 
 @app.get("/api/storage/breakdown")
-async def get_storage_stats(request: Request):
+async def get_storage_stats(request: Request, user: AuthUser = Depends(get_current_user)):
     """Return categorized disk usage breakdown across output/ and uploads/."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     from clippyme.domain.job_artifacts import get_storage_breakdown
     return await asyncio.to_thread(get_storage_breakdown, OUTPUT_DIR, UPLOAD_DIR)
 
 @app.post("/api/storage/cleanup")
-async def trigger_storage_cleanup(request: Request):
+async def trigger_storage_cleanup(request: Request, user: AuthUser = Depends(get_current_user)):
     """Run manual storage cleanup pass: purges partial downloads, ASR audio, uploads, and optionally source videos."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     body = {}
     if request.headers.get("content-type", "").startswith("application/json"):
         try:
-            body = await request.json()
-        except Exception:
+            body = await _read_capped_json(request)
+        except HTTPException as exc:
+            if exc.status_code == 413:
+                raise
             body = {}
 
     purge_raw_sources = bool(
@@ -1420,8 +1636,9 @@ async def publish_status_endpoint(task_id: str, request: Request, user: AuthUser
 # ---------------------------------------------------------------------------
 
 @app.get("/api/analytics/summary")
-async def get_analytics_summary_endpoint():
+async def get_analytics_summary_endpoint(request: Request):
     """Return aggregated stats, top-performing clips, and platform breakdowns."""
+    require_trusted_config_request(request)
     from clippyme.domain.analytics_service import get_analytics_summary
     return await asyncio.to_thread(get_analytics_summary)
 
@@ -1450,8 +1667,9 @@ async def track_analytics_endpoint(payload: dict, request: Request):
 
 
 @app.get("/api/analytics/insights")
-async def get_analytics_insights_endpoint():
+async def get_analytics_insights_endpoint(request: Request):
     """Return active learned performance rules and recommendations."""
+    require_trusted_config_request(request)
     from clippyme.domain.performance_feedback import analyze_performance_patterns, get_learned_patterns_prompt
     patterns = await asyncio.to_thread(analyze_performance_patterns)
     prompt_snippet = await asyncio.to_thread(get_learned_patterns_prompt)
@@ -1482,6 +1700,8 @@ async def live_monitor_stop(request: Request):
     raw = await request.body()
     req = None
     if raw:
+        if len(raw) > MAX_JSON_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body too large")
         try:
             body = await request.json()
         except Exception:
@@ -1501,10 +1721,8 @@ async def live_monitor_update_config(monitor_id: str, request: Request):
     FUTURE segments/publishes only, never retroactively."""
     require_trusted_config_request(request)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
-    try:
-        partial = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed JSON body")
+    # Capped reader: 400 on malformed JSON, 413 when the body is too large.
+    partial = await _read_capped_json(request)
     return {"monitor": live_monitor.update_config(monitor_id, partial)}
 
 
@@ -1513,10 +1731,8 @@ async def live_monitor_set_publishing(monitor_id: str, request: Request):
     """Pause/resume auto-publishing with a strict boolean request body."""
     require_trusted_config_request(request)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed JSON body")
+    # Capped reader: 400 on malformed JSON, 413 when the body is too large.
+    body = await _read_capped_json(request)
     try:
         req = LiveMonitorPublishingRequest.model_validate(body)
     except ValidationError as exc:
@@ -1549,7 +1765,11 @@ async def live_monitor_publish_pending_clip(monitor_id: str, clip_id: str, reque
     try:
         body = await request.body()
         if body:
+            if len(body) > MAX_JSON_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Request body too large")
             overrides = await request.json()
+    except HTTPException:
+        raise
     except Exception:
         pass
     return await live_monitor.publish_pending_clip(monitor_id, clip_id, overrides)
@@ -1572,9 +1792,10 @@ async def live_monitor_publish_all(monitor_id: str, request: Request):
 
 
 @app.post("/api/history/{job_id}/restore")
-async def restore_job(job_id: str, request: Request):
+async def restore_job(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
     """Restore a past job into the in-memory jobs dict so edit/hook/subtitle endpoints work."""
     require_trusted_config_request(request)
+    _verify_job_ownership(job_id, user)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
     job_dir = os.path.join(OUTPUT_DIR, job_id)

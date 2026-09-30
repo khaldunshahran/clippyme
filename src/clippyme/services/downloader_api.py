@@ -3,8 +3,9 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import yt_dlp
@@ -19,6 +20,41 @@ class DownloadRequest(BaseModel):
     url: str
     output_dir: str
     cookies_file_path: Optional[str] = None
+    job_id: Optional[str] = None
+
+
+class DownloadCancelRequest(BaseModel):
+    job_id: str
+
+
+class _DownloadCancelled(Exception):
+    """Raised when a download is cancelled via POST /download/cancel."""
+
+
+# Cancellation flags keyed by job_id. The /download endpoint runs
+# synchronously in-process; the progress hook polls the flag so a cancel
+# request aborts even a multi-hundred-MB download mid-stream instead of
+# letting yt-dlp finish into a directory the backend just deleted.
+_cancel_events: Dict[str, threading.Event] = {}
+_cancel_lock = threading.Lock()
+
+
+def _cancel_event_for(job_id: Optional[str]) -> Optional[threading.Event]:
+    if not job_id:
+        return None
+    with _cancel_lock:
+        event = _cancel_events.get(job_id)
+        if event is None:
+            event = threading.Event()
+            _cancel_events[job_id] = event
+        return event
+
+
+def _drop_cancel_event(job_id: Optional[str]) -> None:
+    if not job_id:
+        return
+    with _cancel_lock:
+        _cancel_events.pop(job_id, None)
 
 # We'll adapt the original _FORMAT_LADDER and attempts from download.py
 _FORMAT_LADDER = (
@@ -100,9 +136,14 @@ def _format_eta(secs):
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
-def _get_progress_hook(output_dir: str):
+def _get_progress_hook(output_dir: str, cancel_event: Optional[threading.Event] = None):
     last_update = [0]
     def hook(d):
+        # Abort promptly when the owning job was cancelled: raising from the
+        # hook stops yt-dlp mid-download instead of finishing a file nobody
+        # wants anymore.
+        if cancel_event is not None and cancel_event.is_set():
+            raise _DownloadCancelled("download cancelled by user")
         if d.get('status') == 'downloading':
             now = time.time()
             if now - last_update[0] < 0.5:
@@ -129,18 +170,23 @@ def _get_progress_hook(output_dir: str):
             total_str = _format_bytes(total)
             
             try:
-                from clippyme.domain.runtime_state import RuntimeState
-                rs = RuntimeState(output_dir)
-                rs.data["download_percent"] = max(0, min(100, percent))
+                # Progress goes to the sidecar file, NOT the runtime file:
+                # the orchestrator owns .clippyme_runtime.json and a
+                # read-modify-write here would race its stage transitions
+                # across processes. Readers merge the sidecar on load.
+                from clippyme.domain.runtime_state import write_download_progress
+                payload = {
+                    "download_percent": max(0, min(100, percent)),
+                }
                 if speed_str:
-                    rs.data["download_speed"] = speed_str
+                    payload["download_speed"] = speed_str
                 if eta_str:
-                    rs.data["download_eta"] = eta_str
+                    payload["download_eta"] = eta_str
                 if downloaded_str and total_str:
-                    rs.data["download_bytes"] = f"{downloaded_str} / {total_str}"
-                rs.save()
+                    payload["download_bytes"] = f"{downloaded_str} / {total_str}"
+                write_download_progress(output_dir, payload)
             except Exception as e:
-                logger.warning(f"Error saving download runtime state: {e}")
+                logger.warning(f"Error saving download progress: {e}")
     return hook
 
 
@@ -192,156 +238,206 @@ def download_video(req: DownloadRequest, request: Request = None):
 
     step_start_time = time.time()
     cookies_path = _resolve_cookies_path(req.cookies_file_path)
-    
-    if cookies_path:
-        attempts = [
-            ("default", True, False),      # web + cookies, NO po token — full quality, most reliable
-            ("web_safari", True, False),   # safari + cookies, NO po token
-            ("default", True, True),       # cookies + po token (only if bgutil server running)
-            ("web_safari", True, True),
-            ("web_embedded", True, False), # embedded player + cookies — slips past the web bot check
-            ("default", False, False),
-            ("web_embedded", False, False),# embedded player, no cookies — proven 720p bot-check bypass
-            ("web_safari", False, False),
-            ("default", False, True),
-            ("web_embedded", False, True),
-            ("web_safari", False, True),
-        ]
-    else:
-        attempts = [
-            ("default", False, False),
-            ("web_embedded", False, False),# embedded player — proven 720p bot-check bypass
-            ("web_safari", False, False),
-            ("default", False, True),
-            ("web_embedded", False, True),
-            ("web_safari", False, True),
-        ]
-    attempts.extend([
-        ("android_vr", False, False),
-        ("android", False, False),
-        ("ios", False, False),
-        ("mweb", False, False),
-    ])
 
-    base_ydl_opts = {
-        'format': _FORMAT_LADDER,
-        'merge_output_format': 'mp4',
-        'quiet': False,
-        'verbose': True,
-        'no_warnings': False,
-        'socket_timeout': 30,
-        'retries': 10,
-        'fragment_retries': 10,
-        'http_chunk_size': 10485760,
-        'cachedir': False,
-        'remote_components': ['ejs:github'],
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            ),
-        },
-    }
+    # Fresh cancellation flag for this download (a stale set flag from a
+    # previous cancelled attempt for the same job must not abort the new one).
+    cancel_event = _cancel_event_for(req.job_id)
+    if cancel_event is not None:
+        cancel_event.clear()
 
-    last_error = None
-    for i, (client_name, use_cookies, use_po_token) in enumerate(attempts, 1):
-        extractor_args = _extractor_args_for(client_name)
-        active_cookiefile = cookies_path if (use_cookies and cookies_path) else None
-        attempt_opts = {
-            **base_ydl_opts,
-            'cookiefile': active_cookiefile,
+    # Drop any stale progress sidecar from a previous attempt.
+    try:
+        from clippyme.domain.runtime_state import clear_download_progress
+        clear_download_progress(req.output_dir)
+    except Exception:
+        pass
+
+    try:
+        if cookies_path:
+            attempts = [
+                ("default", True, False),      # web + cookies, NO po token — full quality, most reliable
+                ("web_safari", True, False),   # safari + cookies, NO po token
+                ("default", True, True),       # cookies + po token (only if bgutil server running)
+                ("web_safari", True, True),
+                ("web_embedded", True, False), # embedded player + cookies — slips past the web bot check
+                ("default", False, False),
+                ("web_embedded", False, False),# embedded player, no cookies — proven 720p bot-check bypass
+                ("web_safari", False, False),
+                ("default", False, True),
+                ("web_embedded", False, True),
+                ("web_safari", False, True),
+            ]
+        else:
+            attempts = [
+                ("default", False, False),
+                ("web_embedded", False, False),# embedded player — proven 720p bot-check bypass
+                ("web_safari", False, False),
+                ("default", False, True),
+                ("web_embedded", False, True),
+                ("web_safari", False, True),
+            ]
+        attempts.extend([
+            ("android_vr", False, False),
+            ("android", False, False),
+            ("ios", False, False),
+            ("mweb", False, False),
+        ])
+
+        base_ydl_opts = {
+            'format': _FORMAT_LADDER,
+            'merge_output_format': 'mp4',
+            'quiet': False,
+            'verbose': True,
+            'no_warnings': False,
+            'socket_timeout': 30,
+            'retries': 10,
+            'fragment_retries': 10,
+            'http_chunk_size': 10485760,
+            'cachedir': False,
+            'remote_components': ['ejs:github'],
+            'http_headers': {
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+            },
         }
-        
-        if use_po_token:
-            if not extractor_args:
-                extractor_args = {}
-            extractor_args['youtubepot-bgutilhttp'] = {'base_url': ['http://127.0.0.1:4416']}
-            
-        if extractor_args:
-            attempt_opts['extractor_args'] = extractor_args
 
-        try:
-            info_opts = dict(attempt_opts)
-            info_opts['getcomments'] = True
-            ext_args = dict(info_opts.get('extractor_args') or {})
-            yt_args = dict(ext_args.get('youtube') or {})
-            yt_args.setdefault('comment_sort', ['top'])
-            yt_args.setdefault('max_comments', ['50'])
-            ext_args['youtube'] = yt_args
-            info_opts['extractor_args'] = ext_args
-
-            with yt_dlp.YoutubeDL(info_opts) as ydl:
-                info = ydl.extract_info(req.url, download=False)
-                video_title = info.get('title', 'remote_video')
-                sanitized_title = sanitize_filename(video_title)
-                _write_source_info(req.output_dir, info)
-
-            output_template = os.path.join(req.output_dir, f'{sanitized_title}.%(ext)s')
-            expected_file = os.path.join(req.output_dir, f'{sanitized_title}.mp4')
-            if os.path.exists(expected_file):
-                os.remove(expected_file)
-
-            ydl_opts = {
-                **attempt_opts,
-                'format': _FORMAT_LADDER,
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'overwrites': True,
-                'progress_hooks': [_get_progress_hook(req.output_dir)],
+        last_error = None
+        for i, (client_name, use_cookies, use_po_token) in enumerate(attempts, 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise _DownloadCancelled("download cancelled by user")
+            extractor_args = _extractor_args_for(client_name)
+            active_cookiefile = cookies_path if (use_cookies and cookies_path) else None
+            attempt_opts = {
+                **base_ydl_opts,
+                'cookiefile': active_cookiefile,
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([req.url])
+            
+            if use_po_token:
+                if not extractor_args:
+                    extractor_args = {}
+                extractor_args['youtubepot-bgutilhttp'] = {'base_url': ['http://127.0.0.1:4416']}
+                
+            if extractor_args:
+                attempt_opts['extractor_args'] = extractor_args
 
-            downloaded_file = os.path.join(req.output_dir, f'{sanitized_title}.mp4')
-            if not os.path.isfile(downloaded_file):
-                mp4_candidates = [
-                    os.path.join(req.output_dir, f)
-                    for f in os.listdir(req.output_dir)
-                    if f.endswith('.mp4') and not f.startswith('clip_') and not f.startswith('source_clip_')
-                ]
-                if mp4_candidates:
-                    downloaded_file = max(mp4_candidates, key=os.path.getmtime)
-            if not os.path.isfile(downloaded_file):
-                raise FileNotFoundError("yt-dlp completed without producing an MP4 file")
-
-            # Phase 1D(a): sub-720p downloads must not slip through as a log
-            # whisper — a bot-degraded source poisons the whole pipeline.
-            quality_warning = None
             try:
-                probe_cmd = [
-                    "ffprobe", "-v", "error", "-select_streams", "v:0",
-                    "-show_entries", "stream=height", "-of", "default=noprint_wrappers=1:nokey=1",
-                    downloaded_file
-                ]
-                probe_output = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
-                if probe_output.isdigit():
-                    height = int(probe_output)
-                    if height < 720:
-                        quality_warning = (
-                            f"downloaded at {height}p, below the 720p target — "
-                            "likely a bot-degraded client; source quality is reduced"
-                        )
-                        logger.warning(quality_warning)
-                        print(f"\n\u26a0\ufe0f  QUALITY WARNING: {quality_warning}\n", flush=True)
-            except Exception as probe_err:
-                logger.warning(f"Failed to probe download quality: {probe_err}")
+                info_opts = dict(attempt_opts)
+                info_opts['getcomments'] = True
+                ext_args = dict(info_opts.get('extractor_args') or {})
+                yt_args = dict(ext_args.get('youtube') or {})
+                yt_args.setdefault('comment_sort', ['top'])
+                yt_args.setdefault('max_comments', ['50'])
+                ext_args['youtube'] = yt_args
+                info_opts['extractor_args'] = ext_args
 
-            return {"downloaded_file": downloaded_file, "sanitized_title": sanitized_title,
-                    "quality_warning": quality_warning}
+                with yt_dlp.YoutubeDL(info_opts) as ydl:
+                    info = ydl.extract_info(req.url, download=False)
+                    video_title = info.get('title', 'remote_video')
+                    sanitized_title = sanitize_filename(video_title)
+                    _write_source_info(req.output_dir, info)
 
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Attempt {i} failed: {e}")
-            from clippyme.pipeline.download import classify_download_error
-            # If it's a fatal error, don't retry
-            err_msg = str(e)
-            if classify_download_error(err_msg) == "fatal":
-                logger.error(f"Fatal error encountered: {err_msg}")
-                raise HTTPException(status_code=400, detail=f"Fatal download error: {err_msg}")
-            # Else continue to next attempt
+                output_template = os.path.join(req.output_dir, f'{sanitized_title}.%(ext)s')
+                expected_file = os.path.join(req.output_dir, f'{sanitized_title}.mp4')
+                if os.path.exists(expected_file):
+                    os.remove(expected_file)
 
-    raise HTTPException(status_code=500, detail=f"All download attempts failed. Last error: {last_error}")
+                ydl_opts = {
+                    **attempt_opts,
+                    'format': _FORMAT_LADDER,
+                    'outtmpl': output_template,
+                    'merge_output_format': 'mp4',
+                    'overwrites': True,
+                    'progress_hooks': [_get_progress_hook(req.output_dir, cancel_event)],
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([req.url])
+
+                downloaded_file = os.path.join(req.output_dir, f'{sanitized_title}.mp4')
+                if not os.path.isfile(downloaded_file):
+                    mp4_candidates = [
+                        os.path.join(req.output_dir, f)
+                        for f in os.listdir(req.output_dir)
+                        if f.endswith('.mp4') and not f.startswith('clip_') and not f.startswith('source_clip_')
+                    ]
+                    if mp4_candidates:
+                        downloaded_file = max(mp4_candidates, key=os.path.getmtime)
+                if not os.path.isfile(downloaded_file):
+                    raise FileNotFoundError("yt-dlp completed without producing an MP4 file")
+
+                # Phase 1D(a): sub-720p downloads must not slip through as a log
+                # whisper — a bot-degraded source poisons the whole pipeline.
+                quality_warning = None
+                try:
+                    probe_cmd = [
+                        "ffprobe", "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=height", "-of", "default=noprint_wrappers=1:nokey=1",
+                        downloaded_file
+                    ]
+                    probe_output = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
+                    if probe_output.isdigit():
+                        height = int(probe_output)
+                        if height < 720:
+                            quality_warning = (
+                                f"downloaded at {height}p, below the 720p target — "
+                                "likely a bot-degraded client; source quality is reduced"
+                            )
+                            logger.warning(quality_warning)
+                            print(f"\n\u26a0\ufe0f  QUALITY WARNING: {quality_warning}\n", flush=True)
+                except Exception as probe_err:
+                    logger.warning(f"Failed to probe download quality: {probe_err}")
+
+                return {"downloaded_file": downloaded_file, "sanitized_title": sanitized_title,
+                        "quality_warning": quality_warning}
+
+            except _DownloadCancelled:
+                # Never swallowed by the retry loop: propagate immediately.
+                raise
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Attempt {i} failed: {e}")
+                from clippyme.pipeline.download import classify_download_error
+                # If it's a fatal error, don't retry
+                err_msg = str(e)
+                if classify_download_error(err_msg) == "fatal":
+                    logger.error(f"Fatal error encountered: {err_msg}")
+                    raise HTTPException(status_code=400, detail=f"Fatal download error: {err_msg}")
+                # Else continue to next attempt
+
+        raise HTTPException(status_code=500, detail=f"All download attempts failed. Last error: {last_error}")
+    except _DownloadCancelled:
+        logger.info("Download cancelled for job %s", req.job_id)
+        raise HTTPException(status_code=409, detail="Download cancelled by user")
+    finally:
+        _drop_cancel_event(req.job_id)
+
+
+@app.post("/download/cancel")
+def cancel_download(req: DownloadCancelRequest, request: Request = None):
+    """Signal a running /download to abort (keyed by job_id).
+
+    Same loopback/token authorization as /download. Best-effort: returns
+    whether a download was actually in flight for the job.
+    """
+    if request:
+        client_host = request.client.host if request.client else ""
+        internal_token = os.environ.get("CLIPPYME_INTERNAL_TOKEN", "").strip()
+        if internal_token:
+            provided_token = request.headers.get("x-api-token", "").strip()
+            if not provided_token or not hmac.compare_digest(internal_token, provided_token):
+                raise HTTPException(status_code=401, detail="Unauthorized downloader access")
+        elif client_host not in ("127.0.0.1", "::1", "localhost", "testclient"):
+            raise HTTPException(status_code=403, detail="Downloader microservice only accessible from localhost")
+
+    with _cancel_lock:
+        event = _cancel_events.get(req.job_id)
+    if event is None:
+        return {"cancelled": False, "reason": "no download in flight for job"}
+    event.set()
+    return {"cancelled": True}
+
 
 bgutil_process = None
 
