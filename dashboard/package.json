@@ -8,7 +8,8 @@
     "build": "vite build",
     "test": "vitest run",
     "lint": "eslint . --config eslint.a11y.config.js --report-unused-disable-directives --max-warnings 0",
-    "preview": "vite preview --port 5175 --strictPort"
+    "preview": "vite preview --port 5175 --strictPort",
+    "test:prod-mount": "node test-prod-mount.cjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.2",

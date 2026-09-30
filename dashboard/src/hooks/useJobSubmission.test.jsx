@@ -218,3 +218,23 @@ test('a fresh positive key check submits without the modal', async () => {
   expect(props.setShowKeyModal).not.toHaveBeenCalled();
   expect(props.setJobId).toHaveBeenCalledWith('job-9');
 });
+
+test('L2: failed submit clears the pre-set processingMedia (no stale preview)', async () => {
+  submitProcessJob.mockRejectedValue(new Error('tunnel down'));
+  const { handlers, props } = mountHook();
+
+  await act(() => handlers.handleProcess({ type: 'url', payload: 'u' }));
+
+  expect(props.setStatus).toHaveBeenLastCalledWith('error');
+  expect(props.setProcessingMedia).toHaveBeenCalledWith(null);
+});
+
+test('L2: submit with no job_id clears processingMedia too', async () => {
+  submitProcessJob.mockResolvedValue({ status: 'queued' }); // no job_id
+  const { handlers, props } = mountHook();
+
+  await act(() => handlers.handleProcess({ type: 'url', payload: 'u' }));
+
+  expect(props.setStatus).toHaveBeenLastCalledWith('error');
+  expect(props.setProcessingMedia).toHaveBeenCalledWith(null);
+});

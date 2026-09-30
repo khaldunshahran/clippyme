@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { Icon } from './icon';
 import { SidebarProgress } from './SidebarProgress';
 import { DeployBadge } from './DeployBadge';
@@ -236,8 +236,8 @@ export function NotFoundPage({ onHome, onCreate }) {
         <div className="nf-code" aria-hidden="true">404</div>
         <h1>This page got clipped.</h1>
         <p>
-          The link you followed doesn't exist anymore — it may have been moved or mistyped.
-          Your clips are safe; let's get you back to them.
+          The link you followed doesn&apos;t exist anymore — it may have been moved or mistyped.
+          Your clips are safe; let&apos;s get you back to them.
         </p>
         <div className="nf-row">
           <button type="button" className="btn btn-primary" onClick={onHome}>

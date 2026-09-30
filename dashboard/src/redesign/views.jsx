@@ -10,7 +10,6 @@ import {
   getZernio, saveZernio, discoverZernioAccounts,
   getWatchdog, saveWatchdog, testWatchdogAlert,
   listFonts, uploadFont, deleteFont, logoStatus, uploadLogo, deleteLogo,
-  researchProduct, generateUgcScripts, fetchViralTitles, refineViralTitles, generateThumbnail,
   configPresence,
 } from './realApi';
 import { SUB_FONTS } from './data';

@@ -123,10 +123,10 @@ const ClipCard = memo(function ClipCard({
                 color: 'var(--ink)',
                 borderColor: 'rgba(50, 160, 120, 0.4)',
               }}
-              title={`${((clip.analytics || state?.analytics).views || 0).toLocaleString()} views · ${((clip.analytics || state?.analytics).shares || 0).toLocaleString()} shares`}
+              title={`${((clip.analytics || state?.analytics || {}).views || 0).toLocaleString()} views · ${((clip.analytics || state?.analytics || {}).shares || 0).toLocaleString()} shares`}
             >
               <Icon n="bar-chart" />
-              {((clip.analytics || state?.analytics).views || 0).toLocaleString()} views
+              {((clip.analytics || state?.analytics || {}).views || 0).toLocaleString()} views
             </span>
           )}
         </div>

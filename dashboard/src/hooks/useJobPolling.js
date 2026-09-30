@@ -5,6 +5,10 @@ import { detectPipelineStep } from '../lib/pipelineStep';
 
 const BASE_DELAY = 2000;
 const MAX_DELAY = 30000;
+// M1: give up after this many consecutive failed polls instead of retrying
+// forever, mirroring the batch path's MAX_POLL_ERRORS. The backend job may
+// still be running — the message directs the user to the History tab.
+const MAX_CONSECUTIVE_ERRORS = 10;
 
 export function useJobPolling({
   jobId,
@@ -73,6 +77,16 @@ export function useJobPolling({
         if (consecutiveErrors >= 3 && !disconnectedAnnounced) {
           disconnectedAnnounced = true;
           callbacks.current.onConnectionChange?.(false, error);
+        }
+        // M1: stop polling after MAX_CONSECUTIVE_ERRORS dead rounds instead
+        // of retrying forever. A network outage is not a pipeline failure,
+        // so the message makes clear the job may still be running and points
+        // at the History tab for re-attaching once the server is reachable.
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          return terminal(
+            callbacks.current.onFailed,
+            `Lost contact with the backend after ${MAX_CONSECUTIVE_ERRORS} failed polls — polling stopped. The job may still be running; check the History tab once the server is reachable again.`,
+          );
         }
         // A network outage is not a pipeline failure. Keep the durable backend
         // job alive and retry with a ceiling instead of changing its status.

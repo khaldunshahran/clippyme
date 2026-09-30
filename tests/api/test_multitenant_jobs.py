@@ -88,10 +88,19 @@ def test_config_endpoints_gated_by_admin(client, monkeypatch):
     regular_token = make_test_jwt({"sub": "user_regular", "email": "reg@example.com", "role": "authenticated", "exp": time.time() + 3600}, "test-secret")
     admin_token = make_test_jwt({"sub": "admin_user", "email": "admin@example.com", "role": "admin", "exp": time.time() + 3600}, "test-secret")
 
-    # Regular user attempting to access /api/config -> 403 Forbidden
+    # GET /api/config returns presence booleans only (no secret material), so
+    # any trusted caller may read it — this is what lets the frontend detect
+    # server_has_gemini without misfiring the key modal.
     resp = client.get("/api/config", headers={"Authorization": f"Bearer {regular_token}", **ORIGIN})
-    assert resp.status_code == 403
+    assert resp.status_code == 200
 
     # Admin user accessing /api/config -> 200 OK
     resp_admin = client.get("/api/config", headers={"Authorization": f"Bearer {admin_token}", **ORIGIN})
     assert resp_admin.status_code == 200
+
+    # Mutations stay admin-gated: regular user POST -> 403 Forbidden
+    resp_post = client.post(
+        "/api/config", json={"keys": {"GEMINI_API_KEY": "x" * 20}},
+        headers={"Authorization": f"Bearer {regular_token}", **ORIGIN},
+    )
+    assert resp_post.status_code == 403

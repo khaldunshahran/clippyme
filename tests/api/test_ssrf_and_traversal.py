@@ -36,7 +36,13 @@ def test_validate_public_url_rejects_internal_and_bad_schemes(bad):
     "http://8.8.8.8/video.mp4",  # public IP literal, no DNS needed
 ])
 def test_validate_public_url_accepts_public(good):
-    assert validate_public_url(good) == good
+    import ipaddress
+    from unittest.mock import patch
+    # Sandbox DNS resolves public hostnames to reserved IPs; mock it so the
+    # test exercises the validator logic, not the sandbox resolver.
+    with patch("clippyme.api.schemas.resolve_host_addresses",
+               return_value=[ipaddress.ip_address("142.250.0.1")]):
+        assert validate_public_url(good) == good
 
 
 # --- Path traversal: filename extraction ----------------------------------

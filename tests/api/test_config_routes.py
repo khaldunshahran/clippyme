@@ -64,7 +64,7 @@ def test_untrusted_origin_rejected(client):
 # --- /api/config round-trip + secret masking --------------------------------
 
 def test_config_roundtrip_masks_secrets(client):
-    """POST then GET: secret keys come back masked, plain flags verbatim."""
+    """POST then GET: secret keys come back as presence booleans, plain flags verbatim."""
     r = client.post(
         "/api/config",
         json={"keys": {"GEMINI_API_KEY": "abcd12345678wxyz", "GEMINI_MODEL": "gemini-3.5-flash"}},
@@ -72,9 +72,8 @@ def test_config_roundtrip_masks_secrets(client):
     assert r.status_code == 200 and r.json()["success"] is True
 
     got = client.get("/api/config").json()
-    # 16-char secret → first4…last4, never verbatim.
-    assert got["GEMINI_API_KEY"] == "abcd...wxyz"
-    assert "12345678" not in got["GEMINI_API_KEY"]
+    # Secrets are never returned verbatim — only a presence boolean.
+    assert got["GEMINI_API_KEY"] is True
     # Non-secret flag passes through untouched.
     assert got["GEMINI_MODEL"] == "gemini-3.5-flash"
 
@@ -82,7 +81,7 @@ def test_config_roundtrip_masks_secrets(client):
 def test_config_short_secret_fully_masked(client):
     client.post("/api/config", json={"keys": {"HF_TOKEN": "short"}})
     got = client.get("/api/config").json()
-    assert got["HF_TOKEN"] == "********"
+    assert got["HF_TOKEN"] is True
 
 
 def test_config_rejects_unknown_key(client):

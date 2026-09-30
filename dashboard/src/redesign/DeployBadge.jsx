@@ -32,7 +32,6 @@ export function DeployBadge() {
       onClick={() => {
         // Tap-to-reveal on touch devices where hover doesn't exist.
         try {
-          // eslint-disable-next-line no-alert
           alert(detail);
         } catch { /* noop */ }
       }}

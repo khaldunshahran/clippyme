@@ -58,3 +58,43 @@ test('HTTP 404 is terminal: job not found on server', async () => {
   expect(callbacks.onConnectionChange).not.toHaveBeenCalled();
   expect(vi.getTimerCount()).toBe(0); // no more polling
 });
+
+test('stops after 10 consecutive poll errors with a terminal message', async () => {
+  pollJob.mockRejectedValue(new Error('tunnel down'));
+  const { callbacks } = mount();
+  // 1 immediate poll + 9 backoff ticks = 10 consecutive errors
+  await act(async () => {});
+  for (let i = 0; i < 9; i++) {
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+  }
+  expect(pollJob).toHaveBeenCalledTimes(10);
+  expect(callbacks.onFailed).toHaveBeenCalledTimes(1);
+  expect(callbacks.onFailed).toHaveBeenCalledWith(
+    expect.stringMatching(/lost contact with the backend after 10 failed polls/i)
+  );
+  expect(vi.getTimerCount()).toBe(0); // polling stopped, no more timers
+});
+
+test('error counter resets after a successful poll', async () => {
+  pollJob.mockRejectedValue(new Error('flaky'));
+  const { callbacks } = mount();
+  // Drive exactly 5 failed polls: 1 immediate + 4 on the backoff schedule
+  // (4s, 8s, 16s, 30s after consecutive errors 1-4).
+  await act(async () => {});
+  for (const ms of [4_000, 8_000, 16_000, 30_000]) {
+    await act(() => vi.advanceTimersByTimeAsync(ms));
+  }
+  expect(pollJob).toHaveBeenCalledTimes(5);
+  expect(callbacks.onFailed).not.toHaveBeenCalled();
+  // Backend recovers: the next poll succeeds and the streak resets.
+  pollJob.mockResolvedValue({ status: 'processing', progress: 10 });
+  await act(() => vi.advanceTimersByTimeAsync(30_000));
+  expect(pollJob).toHaveBeenCalledTimes(6);
+  // Back to failing — 4 more errors is only a streak of 4, not 10.
+  pollJob.mockRejectedValue(new Error('flaky again'));
+  for (const ms of [2_000, 4_000, 8_000, 16_000]) {
+    await act(() => vi.advanceTimersByTimeAsync(ms));
+  }
+  expect(pollJob).toHaveBeenCalledTimes(10);
+  expect(callbacks.onFailed).not.toHaveBeenCalled();
+});

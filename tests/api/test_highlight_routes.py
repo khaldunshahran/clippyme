@@ -6,18 +6,18 @@ from fastapi.testclient import TestClient
 
 from clippyme.api.app import app
 
-client = TestClient(app)
+client = TestClient(app, headers={"Origin": "http://localhost:5175"})
 
 
 def test_get_highlights_job_not_found(tmp_path):
     with patch("clippyme.api.highlight_routes.OUTPUT_DIR", str(tmp_path)):
-        res = client.get("/api/highlights/nonexistent_job_123")
+        res = client.get("/api/highlights/92345678-1234-4234-8234-123456789abc")
         assert res.status_code == 404
         assert "not found" in res.json()["detail"].lower()
 
 
 def test_get_highlights_success(tmp_path):
-    job_id = "test_job_highlights"
+    job_id = "12345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
     metadata_file = job_dir / f"{job_id}_metadata.json"
@@ -47,7 +47,7 @@ def test_get_highlights_success(tmp_path):
 
 
 def test_get_highlights_without_prior_metadata_creates_default(tmp_path):
-    job_id = "job_without_meta"
+    job_id = "22345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
     # Only source_info.json exists
@@ -64,7 +64,7 @@ def test_get_highlights_without_prior_metadata_creates_default(tmp_path):
 
 
 def test_plan_highlights_success(tmp_path):
-    job_id = "job_plan_test"
+    job_id = "32345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
 
@@ -111,7 +111,7 @@ def test_plan_highlights_success(tmp_path):
 
 
 def test_render_highlight_custom_cuts_and_aspect(tmp_path):
-    job_id = "job_render_aspect"
+    job_id = "42345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
 
@@ -166,7 +166,7 @@ def test_render_highlight_custom_cuts_and_aspect(tmp_path):
 
 
 def test_delete_highlight(tmp_path):
-    job_id = "job_del_test"
+    job_id = "52345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
 
@@ -189,7 +189,7 @@ def test_delete_highlight(tmp_path):
 
 
 def test_generate_all_highlights(tmp_path):
-    job_id = "job_gen_all"
+    job_id = "62345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
 
@@ -261,7 +261,7 @@ def test_generate_all_highlights(tmp_path):
 
 
 def test_apply_edit_highlight(tmp_path):
-    job_id = "job_apply_edit"
+    job_id = "72345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
 
@@ -308,8 +308,11 @@ def test_apply_edit_highlight(tmp_path):
 
 
 def test_process_endpoint_with_highlights_flag(tmp_path):
+    import ipaddress
     with patch("clippyme.api.app.OUTPUT_DIR", str(tmp_path)), \
-         patch("clippyme.api.app.submit_job") as mock_submit:
+         patch("clippyme.api.app.submit_job") as mock_submit, \
+         patch("clippyme.api.schemas.resolve_host_addresses",
+               return_value=[ipaddress.ip_address("142.250.0.1")]):
         res = client.post(
             "/api/process",
             json={
@@ -328,7 +331,7 @@ def test_process_endpoint_with_highlights_flag(tmp_path):
 
 
 def test_render_highlights_with_hook_and_logo(tmp_path):
-    job_id = "job_hook_logo_test"
+    job_id = "82345678-1234-4234-8234-123456789abc"
     job_dir = tmp_path / job_id
     job_dir.mkdir(parents=True)
 

@@ -5,7 +5,10 @@ from fastapi.testclient import TestClient
 
 from clippyme.api.app import app
 
-client = TestClient(app)
+# Channel routes are gated by require_trusted_config_request; the client sends
+# a trusted browser origin by default so tests exercise the handlers, not the gate.
+TRUSTED = {"Origin": "http://localhost:5175"}
+client = TestClient(app, headers=TRUSTED)
 
 MOCK_CHANNELS = [
     {
@@ -59,8 +62,7 @@ def test_create_update_delete_channel():
         "banner_handle": "@Tech",
     }
     with patch("clippyme.api.channel_routes.create_channel", return_value=new_ch):
-        res = client.post(
-            "/api/channels",
+        res = client.post("/api/channels",
             json={"name": "Tech Channel", "niches": ["tech"], "banner_handle": "@Tech"},
             headers={"Origin": "http://localhost:5175"},
         )
@@ -68,8 +70,7 @@ def test_create_update_delete_channel():
         assert res.json()["channel"]["name"] == "Tech Channel"
 
     with patch("clippyme.api.channel_routes.update_channel", return_value={**new_ch, "name": "Updated Tech"}):
-        res_put = client.put(
-            "/api/channels/ch_tech",
+        res_put = client.put("/api/channels/ch_tech",
             json={"name": "Updated Tech"},
             headers={"Origin": "http://localhost:5175"},
         )
@@ -77,8 +78,7 @@ def test_create_update_delete_channel():
         assert res_put.json()["channel"]["name"] == "Updated Tech"
 
     with patch("clippyme.api.channel_routes.delete_channel", return_value=True):
-        res_del = client.delete(
-            "/api/channels/ch_tech",
+        res_del = client.delete("/api/channels/ch_tech",
             headers={"Origin": "http://localhost:5175"},
         )
         assert res_del.status_code == 200

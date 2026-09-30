@@ -110,6 +110,7 @@ export function useJobSubmission({
       if (typeof jobId !== 'string' || jobId.length === 0) {
         setStatus('error');
         setLogs((l) => [...l, 'Unexpected server response — no job ID returned.']);
+        setProcessingMedia(null); // L2: don't leave the pre-set media stale
         return;
       }
       if (resData?.duplicate) {
@@ -125,6 +126,9 @@ export function useJobSubmission({
       const { status, message } = submitErrorMessage(e);
       setStatus(status);
       setLogs((l) => [...l, message]);
+      // L2: the pre-set processingMedia would otherwise linger in state
+      // behind the error view.
+      setProcessingMedia(null);
     } finally {
       submittingRef.current = false;
       submitControllerRef.current = null;

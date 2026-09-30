@@ -151,7 +151,7 @@ def test_require_trusted_request_rejects_when_no_client():
 
 # --- Sec-Fetch-Site CSRF guard (regression for the IP-fallback bypass) ------
 
-@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+@pytest.mark.parametrize("site", ["cross-site"])
 def test_require_trusted_request_rejects_cross_site_sec_fetch(site):
     # A cross-origin browser request (e.g. an HTML form POST that omits Origin)
     # still carries a browser-set Sec-Fetch-Site header that JS cannot forge.
@@ -161,6 +161,16 @@ def test_require_trusted_request_rejects_cross_site_sec_fetch(site):
     with pytest.raises(HTTPException) as exc:
         require_trusted_config_request(req)
     assert exc.value.status_code == 403
+
+
+def test_require_trusted_request_allows_same_site_without_origin_from_loopback():
+    # Finding #4 remediation: Sec-Fetch-Site: same-site is no longer rejected
+    # outright. Without an Origin header there is no allow-list to check, so
+    # it falls through to the local-client branch. This is safe: same-site is
+    # a forbidden header — an attacker's site can only ever produce
+    # cross-site, never same-site.
+    req = _FakeRequest(origin=None, client_host="127.0.0.1", sec_fetch_site="same-site")
+    require_trusted_config_request(req)  # must not raise
 
 
 def test_require_trusted_request_cross_site_beats_trusted_origin(monkeypatch):
@@ -240,34 +250,36 @@ def test_client_ip_x_real_ip_fallback(monkeypatch):
 @pytest.fixture(autouse=True)
 def _clear_rate_state():
     security._rate_state.clear()
+    security._invalidate_jwt_secret_cache()
     yield
     security._rate_state.clear()
+    security._invalidate_jwt_secret_cache()
 
 
 def test_rate_limit_allows_until_capacity_then_blocks():
     key = ("bucket", "1.2.3.4")
-    # capacity 3, no refill within the same instant
-    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is True
-    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is True
-    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is True
-    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is False
+    # capacity 3, no refill within the same instant. None = allowed.
+    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is None
+    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is None
+    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is None
+    assert security._rate_limit_allow(key, 3, 0.0, now=100.0) is not None
 
 
 def test_rate_limit_refills_over_time():
     key = ("bucket", "1.2.3.4")
-    assert security._rate_limit_allow(key, 1, 1.0, now=0.0) is True
-    assert security._rate_limit_allow(key, 1, 1.0, now=0.0) is False
+    assert security._rate_limit_allow(key, 1, 1.0, now=0.0) is None
+    assert security._rate_limit_allow(key, 1, 1.0, now=0.0) is not None
     # one second later, one token refilled
-    assert security._rate_limit_allow(key, 1, 1.0, now=1.0) is True
+    assert security._rate_limit_allow(key, 1, 1.0, now=1.0) is None
 
 
 def test_rate_limit_isolated_per_client_and_bucket():
-    assert security._rate_limit_allow(("a", "ip1"), 1, 0.0, now=0.0) is True
-    assert security._rate_limit_allow(("a", "ip1"), 1, 0.0, now=0.0) is False
+    assert security._rate_limit_allow(("a", "ip1"), 1, 0.0, now=0.0) is None
+    assert security._rate_limit_allow(("a", "ip1"), 1, 0.0, now=0.0) is not None
     # different client → fresh bucket
-    assert security._rate_limit_allow(("a", "ip2"), 1, 0.0, now=0.0) is True
+    assert security._rate_limit_allow(("a", "ip2"), 1, 0.0, now=0.0) is None
     # different bucket, same client → fresh
-    assert security._rate_limit_allow(("b", "ip1"), 1, 0.0, now=0.0) is True
+    assert security._rate_limit_allow(("b", "ip1"), 1, 0.0, now=0.0) is None
 
 
 def test_enforce_rate_limit_raises_429(monkeypatch):
@@ -286,13 +298,13 @@ def test_eviction_judges_each_bucket_by_its_own_capacity(monkeypatch):
     # capacity) and idle entries survived while active ones got mass-purged.
     monkeypatch.setattr(security, "_RATE_STATE_MAX", 3)
     # Idle small bucket: full at its own capacity (2.0).
-    assert security._rate_limit_allow(("small", "ip1"), 2, 10.0, now=0.0) is True
+    assert security._rate_limit_allow(("small", "ip1"), 2, 10.0, now=0.0) is None
     # Two active large buckets, freshly drained (no refill).
-    assert security._rate_limit_allow(("big", "ip2"), 30, 0.0, now=100.0) is True
-    assert security._rate_limit_allow(("big", "ip3"), 30, 0.0, now=100.0) is True
+    assert security._rate_limit_allow(("big", "ip2"), 30, 0.0, now=100.0) is None
+    assert security._rate_limit_allow(("big", "ip3"), 30, 0.0, now=100.0) is None
     # Table is at max → the next call triggers targeted eviction. The small
     # bucket refilled to ITS capacity long ago and must be the one dropped.
-    assert security._rate_limit_allow(("big", "ip4"), 30, 0.0, now=100.0) is True
+    assert security._rate_limit_allow(("big", "ip4"), 30, 0.0, now=100.0) is None
     assert ("small", "ip1") not in security._rate_state
     assert ("big", "ip2") in security._rate_state
     assert ("big", "ip3") in security._rate_state

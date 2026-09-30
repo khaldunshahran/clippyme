@@ -204,7 +204,7 @@ export function Home(props) {
     .filter(([, s]) => s && !s.publishedAt && s.scheduledAt)
     .sort(([, a], [, b]) => toTime(a.scheduledAt) - toTime(b.scheduledAt));
 
-  const queueTitle = (key, state, i) => {
+  const queueTitle = (key, state) => {
     if (state && state.title) return state.title;
     const match = clipList.find((c) => clipKey(c, -1) === key);
     if (match && match.title) return match.title;
@@ -487,7 +487,7 @@ export function Home(props) {
               <Icon n="send" />
             </div>
             <h3>Nothing published yet</h3>
-            <p>When you publish a clip — or schedule one — it'll show up here.</p>
+            <p>When you publish a clip — or schedule one — it&apos;ll show up here.</p>
             <Btn variant="ghost" icon="scissors" onClick={() => go('clips')}>
               Browse clips
             </Btn>

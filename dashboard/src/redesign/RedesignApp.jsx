@@ -129,6 +129,18 @@ export default function RedesignApp() {
   const expectSignOutRef = useRef(false);
   const hadUserRef = useRef(user);
 
+  // Toast helpers are declared before the effects that use them: the auth
+  // effect below lists pushToast in its dependency array, and reading it
+  // before initialization would throw a temporal-dead-zone ReferenceError.
+  const dismissToast = useCallback((id) => setToasts((items) => items.filter((item) => item.id !== id)), []);
+
+  const pushToast = useCallback((type, msg) => {
+    const id = Date.now() + Math.random();
+    setToasts((t) => [...t.slice(-4), { id, type, msg }]);
+    const tid = setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3600);
+    toastTimerIds.current.push(tid);
+  }, []);
+
   // Pull the per-account key vault into the local cache after sign-in, then
   // adopt the vault's Gemini key into state when it differs from what's shown.
   const pullVaultKeys = useCallback(() => {
@@ -307,15 +319,6 @@ export default function RedesignApp() {
   }, [tab, viewingHistory, saveToHistory]);
 
   useSessionPersistence({ status, jobId, results, processingMedia, activeTab: tab, preselections });
-
-  const dismissToast = useCallback((id) => setToasts((items) => items.filter((item) => item.id !== id)), []);
-
-  const pushToast = useCallback((type, msg) => {
-    const id = Date.now() + Math.random();
-    setToasts((t) => [...t.slice(-4), { id, type, msg }]);
-    const tid = setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3600);
-    toastTimerIds.current.push(tid);
-  }, []);
 
   const handleSignOut = useCallback(async () => {
     expectSignOutRef.current = true;
