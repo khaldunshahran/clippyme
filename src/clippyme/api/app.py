@@ -1748,13 +1748,11 @@ async def get_clip_project(job_id: str, clip_index: int, request: Request, user:
         data = json.load(f)
     # Stable word IDs: stored projects predate them. Run the migration on
     # read (idempotent) so the editor always sees IDs; the first write
-    # persists the migrated form. Duplicate IDs are left for the write path
-    # to reject -- reads stay permissive.
+    # persists the migrated form. Duplicate IDs are REPAIRED on read
+    # (fresh IDs from next_word_id + warning logged); the write path
+    # (validate_project) still rejects them.
     from clippyme.domain.clip_project import _backfill_word_ids
-    try:
-        data = _backfill_word_ids(data)
-    except ValueError:
-        pass
+    data = _backfill_word_ids(data, repair_duplicates=True)
     return data
 
 
@@ -1817,6 +1815,76 @@ async def save_clip_project(job_id: str, clip_index: int, request: Request, user
         job_dir=resolved.job_dir, clip_index=clip_index, project=project,
         expected_version=body.get("expected_version"))
     return {"version": version, "project": project.model_dump()}
+
+
+# ---------------------------------------------------------------------------
+# Test-project duplication (Phase A item 6a)
+# ---------------------------------------------------------------------------
+# Test mutations (Playwright, scripts) MUST run against a duplicated test
+# job, never against the live job. The duplicate is a fresh UUID job dir
+# carrying a .test_job marker; only clip-project-*.json + the job metadata
+# are copied (project-level tests need no media). Cleanup refuses any dir
+# without the marker.
+
+TEST_JOB_MARKER = ".test_job"
+
+
+@app.post("/api/project/{job_id}/duplicate-test")
+async def duplicate_test_project(job_id: str, request: Request,
+                                 user: AuthUser = Depends(get_current_user)):
+    """Duplicate a job's clip projects into an isolated test job dir."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    src_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(src_dir):
+        raise HTTPException(status_code=404, detail="Job not found")
+    test_job_id = str(uuid.uuid4())
+    dst_dir = os.path.join(OUTPUT_DIR, test_job_id)
+    os.makedirs(dst_dir, exist_ok=False)
+    try:
+        copied = 0
+        for name in sorted(os.listdir(src_dir)):
+            if name.startswith("clip-project-") and name.endswith(".json"):
+                shutil.copy2(os.path.join(src_dir, name),
+                             os.path.join(dst_dir, name))
+                copied += 1
+        if not copied:
+            raise HTTPException(
+                status_code=404, detail="No clip projects to duplicate")
+        metas = glob.glob(os.path.join(src_dir, "*_metadata.json"))
+        if not metas:
+            raise HTTPException(
+                status_code=404, detail="No job metadata to duplicate")
+        for m in metas:
+            shutil.copy2(m, os.path.join(dst_dir, os.path.basename(m)))
+        with open(os.path.join(dst_dir, TEST_JOB_MARKER), "w",
+                   encoding="utf-8") as f:
+            json.dump({"source_job_id": job_id,
+                       "created_at": datetime.now(timezone.utc).isoformat()},
+                      f)
+    except Exception:
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        raise
+    return {"test_job_id": test_job_id, "source_job_id": job_id,
+            "projects_copied": copied}
+
+
+@app.delete("/api/project/{job_id}/duplicate-test")
+async def delete_test_project(job_id: str, request: Request,
+                              user: AuthUser = Depends(get_current_user)):
+    """Delete an isolated test job dir. Refuses non-test jobs."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    target = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isfile(os.path.join(target, TEST_JOB_MARKER)):
+        raise HTTPException(
+            status_code=400, detail="Not a test job dir; refusing to delete")
+    _verify_job_ownership(job_id, user)
+    shutil.rmtree(target, ignore_errors=True)
+    return {"deleted": True, "job_id": job_id}
 
 
 # ---------------------------------------------------------------------------

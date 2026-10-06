@@ -22,12 +22,15 @@ against before POSTing.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 SCHEMA_TAG = "nugget.clip-project/1"
+
+logger = logging.getLogger(__name__)
 
 
 class CropBox(BaseModel):
@@ -66,6 +69,12 @@ class CaptionWord(BaseModel):
     w: str
     start: float = Field(ge=0, description="source seconds")
     end: float = Field(ge=0, description="source seconds")
+    removed: bool = Field(
+        default=False,
+        description="word carved out of the timeline; kept with its ID for "
+                    "strikethrough/restore (ID-keyed data like colors/emoji "
+                    "survives)",
+    )
 
 
 class Captions(BaseModel):
@@ -122,12 +131,15 @@ class RenderSpec(BaseModel):
     encoder: Literal["nvenc", "libx264"] = "nvenc"
 
 
-def _backfill_word_ids(data: dict) -> dict:
-    """Migration for stable word IDs (runs inside validate_project).
+def _backfill_word_ids(data: dict, *, repair_duplicates: bool = False) -> dict:
+    """Migration for stable word IDs.
 
     - Assigns missing word IDs as f'w{counter}', advancing the counter.
     - Advances the counter past any numeric IDs already present (w{N}).
-    - Raises ValueError on duplicate word IDs.
+    - Duplicate word IDs: raises ValueError by default (write path --
+      validate_project rejects). When repair_duplicates=True (read path),
+      reassigns fresh IDs from the counter to the duplicates, bumps the
+      counter past them, and logs a warning instead of raising.
 
     Idempotent: already-migrated projects pass through unchanged.
     """
@@ -151,6 +163,7 @@ def _backfill_word_ids(data: dict) -> dict:
             except ValueError:
                 pass
     seen: set[str] = set()
+    repaired: list[str] = []
     for w in words:
         if not isinstance(w, dict):
             continue
@@ -160,8 +173,21 @@ def _backfill_word_ids(data: dict) -> dict:
             counter += 1
             w["id"] = wid
         if wid in seen:
-            raise ValueError(f"duplicate word id: {wid!r}")
+            if not repair_duplicates:
+                raise ValueError(f"duplicate word id: {wid!r}")
+            # Read-path repair: give the duplicate a fresh ID from the
+            # counter (already advanced past every w{N} above, so this
+            # cannot collide) and keep going.
+            repaired.append(wid)
+            wid = f"w{counter}"
+            counter += 1
+            w["id"] = wid
         seen.add(wid)
+    if repaired:
+        logger.warning(
+            "repaired %d duplicate word id(s) on read, reassigned fresh ids: %s",
+            len(repaired), ", ".join(sorted(set(repaired))),
+        )
     caps["next_word_id"] = counter
     return data
 

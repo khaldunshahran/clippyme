@@ -489,6 +489,11 @@ def _map_words_to_timeline(project: ClipProject) -> tuple[list[dict], float]:
 
     mapped: list[dict] = []
     for w in words:
+        if w.get("removed"):
+            # Carved out of the timeline: the word object stays in
+            # captions.words (ID stable, strikethrough/restore in the UI)
+            # but it is never rendered into captions.
+            continue
         ws, we = float(w["start"]), float(w["end"])
         text = (w.get("w") or "").strip()
         if not text or we <= ws:

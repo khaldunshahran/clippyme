@@ -5,7 +5,11 @@
  * the mutated project. All times are SOURCE time -- segments store source
  * seconds, and drops are derived as segment gaps (see timebase.js).
  */
-import { removeSpanFromSegments, splitSegmentAt } from './timebase.js';
+import {
+  removeSpanFromSegments,
+  restoreSpanToSegments,
+  splitSegmentAt,
+} from './timebase.js';
 
 export function wordById(project, id) {
   return (project?.captions?.words || []).find((w) => w.id === id) || null;
@@ -58,6 +62,25 @@ export function applyRemoveWords(project, words) {
   if (keptTotal(project.segments) >= keptBefore) {
     throw new Error("nothing to remove: span is already dropped");
   }
+  // Flag the words: they stay in captions.words with their stable IDs so
+  // the transcript can strike them through, they can be restored, and
+  // ID-keyed data (colors/emoji) survives. compose.py skips removed words.
+  for (const w of words) w.removed = true;
+  project.origin = "user";
+  return project;
+}
+
+/**
+ * Slice 1: restore removed words -> clear the flag and merge the
+ * [min start, max end] span back into the segments (union).
+ */
+export function applyRestoreWords(project, words) {
+  const targets = (words || []).filter((w) => w && w.removed);
+  if (!targets.length) throw new Error("no removed words selected");
+  const s = Math.min(...targets.map((w) => w.start));
+  const e = Math.max(...targets.map((w) => w.end));
+  project.segments = restoreSpanToSegments(project.segments || [], s, e);
+  for (const w of targets) w.removed = false;
   project.origin = "user";
   return project;
 }
@@ -67,11 +90,16 @@ function keptTotal(segments) {
 }
 
 /** Menu descriptor for the transcript panel (slice 1 only). */
-export function slice1Menu({ hasRange }) {
-  return [
+export function slice1Menu({ hasRange, hasRemoved, allRemoved }) {
+  if (allRemoved) return [{ id: "restore", label: "Restore" }];
+  const items = [
     { id: "edit", label: "Edit words" },
     { id: "split", label: "Split & trim" },
-    { id: "remove", label: "Remove caption & video", danger: true,
-      hint: hasRange ? "selected range" : undefined },
   ];
+  if (hasRemoved) items.push({ id: "restore", label: "Restore" });
+  items.push({
+    id: "remove", label: "Remove caption & video", danger: true,
+    hint: hasRange ? "selected range" : undefined,
+  });
+  return items;
 }

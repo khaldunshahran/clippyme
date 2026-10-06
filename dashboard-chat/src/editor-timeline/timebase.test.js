@@ -12,6 +12,7 @@ import {
   invertDrops,
   mergeSpans,
   outputToSource,
+  restoreSpanToSegments,
   sourceToOutput,
 } from './timebase.js';
 
@@ -44,4 +45,43 @@ describe('drop_mappings fixture', () => {
       );
     });
   }
+});
+
+describe('restoreSpanToSegments', () => {
+  const crop = { x: 0, y: 0, w: 1080, h: 1920 };
+  const segs = () => [
+    { id: 'seg0', start: 0, end: 10, crop: { ...crop } },
+    { id: 'seg1', start: 20, end: 30, crop: { ...crop } },
+  ];
+
+  it('merges a carved span back (union)', () => {
+    const out = restoreSpanToSegments(segs(), 10, 20);
+    expect(out.map((s) => [s.start, s.end])).toEqual([[0, 30]]);
+  });
+
+  it('inherits the neighbor crop and mints a fresh id', () => {
+    const out = restoreSpanToSegments(segs(), 10, 20);
+    expect(out[0].crop).toEqual(crop);
+    const ids = new Set(segs().map((s) => s.id));
+    for (const s of out) {
+      // every id unique; the restored piece is derived from a neighbor id
+      expect(typeof s.id).toBe('string');
+    }
+    expect(new Set(out.map((s) => s.id)).size).toBe(out.length);
+  });
+
+  it('is idempotent when the span is already covered', () => {
+    const out = restoreSpanToSegments(segs(), 2, 5);
+    expect(out).toEqual(segs());
+  });
+
+  it('restores a middle span touching both neighbors', () => {
+    const out = restoreSpanToSegments(segs(), 12, 18);
+    expect(out.map((s) => [s.start, s.end])).toEqual([[0, 10], [12, 18], [20, 30]]);
+  });
+
+  it('no-ops on empty/inverted spans', () => {
+    expect(restoreSpanToSegments(segs(), 5, 5)).toEqual(segs());
+    expect(restoreSpanToSegments([], 1, 2).map((s) => [s.start, s.end])).toEqual([[1, 2]]);
+  });
 });

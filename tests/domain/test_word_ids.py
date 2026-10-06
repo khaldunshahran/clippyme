@@ -101,3 +101,64 @@ def test_word_edits_rejects_bad_values():
         apply_copilot_patch(p, {"word_edits": {"w0": "  "}})
     with pytest.raises(ValueError, match="non-empty object"):
         apply_copilot_patch(p, {"word_edits": {}})
+
+
+# --- Phase A: removed flag + read-path duplicate repair --------------------
+
+def test_removed_flag_defaults_false_and_roundtrips():
+    d = _project_dict(captions={"words": _words(2)})
+    p = validate_project(d)
+    assert all(w.removed is False for w in p.captions.words)
+    rt = validate_project(p.model_dump())
+    assert [w.id for w in rt.captions.words] == ["w0", "w1"]
+    assert all(w.removed is False for w in rt.captions.words)
+
+
+def test_removed_words_keep_ids_and_edits():
+    d = _project_dict(captions={"words": _words(3)})
+    d["captions"]["words"][1]["removed"] = True
+    p = validate_project(d)
+    assert p.captions.words[1].id == "w1"
+    assert p.captions.words[1].removed is True
+    # ID-keyed edits still resolve to the removed word.
+    apply_copilot_patch(p, {"word_edits": {"w1": "kept"}})
+    assert p.captions.edits == {"w1": "kept"}
+
+
+def test_map_words_skips_removed():
+    from clippyme.domain.project_render import _map_words_to_timeline
+    d = _project_dict(captions={"words": _words(3)})
+    d["captions"]["words"][1]["removed"] = True
+    p = validate_project(d)
+    mapped, _dur = _map_words_to_timeline(p)
+    assert [w["word"] for w in mapped] == ["word0", "word2"]
+
+
+def test_read_repair_reassigns_duplicate_ids(caplog):
+    d = _project_dict()
+    words = _words(3)
+    words[2]["id"] = "w1"  # duplicate of words[1]
+    d["captions"] = {"words": words, "next_word_id": 3}
+    out = _backfill_word_ids(d, repair_duplicates=True)  # must not raise
+    assert [w["id"] for w in out["captions"]["words"]] == ["w0", "w1", "w3"]
+    assert out["captions"]["next_word_id"] == 4
+    assert "duplicate word id" in caplog.text
+
+
+def test_read_repair_still_rejects_on_write():
+    d = _project_dict()
+    words = _words(2)
+    words[1]["id"] = "w0"
+    d["captions"] = {"words": words}
+    with pytest.raises(ValueError, match="duplicate word id"):
+        _backfill_word_ids(d)  # strict: no repair flag
+    with pytest.raises(ValueError, match="duplicate word id"):
+        validate_project(d)
+
+
+def test_read_repair_backfills_missing_ids_too():
+    d = _project_dict()
+    d["captions"] = {"words": _words(3, with_ids=False)}
+    out = _backfill_word_ids(d, repair_duplicates=True)
+    assert [w["id"] for w in out["captions"]["words"]] == ["w0", "w1", "w2"]
+    assert out["captions"]["next_word_id"] == 3

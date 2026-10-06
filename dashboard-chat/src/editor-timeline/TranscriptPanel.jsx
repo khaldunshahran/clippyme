@@ -6,6 +6,7 @@ import {
 } from './timebase.js';
 import {
   applyRemoveWords,
+  applyRestoreWords,
   applySplitAtWord,
   applyWordEdit,
   displayWord,
@@ -171,6 +172,19 @@ export default function TranscriptPanel({
         );
         setSel([]);
         pushToast?.('Removed from timeline');
+      } else if (id === 'restore') {
+        if (!targets.length) return;
+        await applyEdit(
+          `restore ${targets.length} word${targets.length > 1 ? 's' : ''}`,
+          (before) => {
+            const ws = targets
+              .map((t) => (before.captions.words || []).find((x) => x.id === t.id))
+              .filter(Boolean);
+            return applyRestoreWords(before, ws);
+          }
+        );
+        setSel([]);
+        pushToast?.('Restored to timeline');
       }
     }).catch(() => {});
   };
@@ -191,7 +205,12 @@ export default function TranscriptPanel({
     }).catch(() => {});
   };
 
-  const menuItems = slice1Menu({ hasRange: selectedWords.length > 1 });
+  const menuItems = slice1Menu({
+    hasRange: selectedWords.length > 1,
+    hasRemoved: selectedWords.some((w) => w.removed),
+    allRemoved:
+      selectedWords.length > 0 && selectedWords.every((w) => w.removed),
+  });
 
   return (
     <div className="tp" data-testid="transcript-panel">
@@ -223,7 +242,10 @@ export default function TranscriptPanel({
             'tp-w',
             sel.includes(w.id) ? 'sel' : '',
             activeId === w.id ? 'active' : '',
-            sourceToOutput(w.start, segments) == null ? 'dropped' : '',
+            // The removed flag is the source of truth (set on carve-out);
+            // the derived check covers spans dropped by other means.
+            w.removed ? 'removed'
+              : sourceToOutput(w.start, segments) == null ? 'dropped' : '',
           ].join(' ');
           if (editingId === w.id) {
             return (

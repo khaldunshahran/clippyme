@@ -154,3 +154,50 @@ export function removeSpanFromSegments(segments, s, e, minKeep = 0.3) {
 function r3(x) {
   return Math.round(x * 1000) / 1000;
 }
+
+/**
+ * Restore a source-time span [s, e] back into the segments (union).
+ *
+ * The restored piece inherits the crop of the nearest kept neighbor (the
+ * span was carved from contiguous footage, so the neighbor's crop is the
+ * best guess). The new id is `${neighborId}r` (+ extra 'r's on collision);
+ * IDs are never reused. Idempotent: a span already fully covered by the
+ * segments changes nothing. Result is sorted and disjoint.
+ */
+export function restoreSpanToSegments(segments, s, e) {
+  s = Number(s);
+  e = Number(e);
+  if (!(e > s)) return (segments || []).map((x) => ({ ...x }));
+  const segs = (segments || []).map((x) => ({ ...x, crop: { ...x.crop } }));
+  if (segs.some((x) => Number(x.start) <= s && Number(x.end) >= e)) return segs;
+  // Nearest neighbor by edge distance; a touching neighbor wins ties.
+  let best = null;
+  let bestScore = Infinity;
+  for (const x of segs) {
+    const a = Number(x.start);
+    const b = Number(x.end);
+    const touches = Math.abs(b - s) < 1e-6 || Math.abs(a - e) < 1e-6 ? 0 : 1;
+    const d = Math.min(Math.abs(a - s), Math.abs(b - s), Math.abs(a - e), Math.abs(b - e));
+    const score = touches * 1e9 + d;
+    if (score < bestScore) {
+      bestScore = score;
+      best = x;
+    }
+  }
+  const crop = best ? { ...best.crop } : { x: 0, y: 0, w: 1080, h: 1920 };
+  const taken = new Set(segs.map((x) => x.id));
+  let id = `${best ? best.id : 'seg'}r`;
+  while (taken.has(id)) id += 'r';
+  segs.push({ id, start: r3(s), end: r3(e), crop, transition_in: 'cut' });
+  segs.sort((x, y) => x.start - y.start);
+  const merged = [];
+  for (const x of segs) {
+    const last = merged[merged.length - 1];
+    if (last && x.start <= last.end + 1e-6) {
+      last.end = Math.max(last.end, x.end);
+    } else {
+      merged.push(x);
+    }
+  }
+  return merged;
+}
