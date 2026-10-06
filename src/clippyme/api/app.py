@@ -6,6 +6,7 @@ import shutil
 import glob
 import asyncio
 import logging
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Dict, Optional
 
@@ -30,7 +31,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
@@ -49,6 +50,7 @@ from clippyme.domain.errors import ClippyMeError, NotFoundError, ValidationError
 from clippyme.domain.uploads import stream_upload_within_limit, FileTooLarge
 from clippyme.domain.clip_endpoints import run_smart_cut, restore_job_from_disk
 from clippyme.domain.clip_resolve import resolve_clip
+from clippyme.domain import clip_tools
 from clippyme.domain import job_control
 from clippyme.domain.job_actions import cancel_job_action, stop_job_action
 from clippyme.domain.job_journal import JOURNAL_FILENAME, make_journal_writer, recover_jobs
@@ -66,6 +68,7 @@ from clippyme.api.schemas import (
     ProcessRequest,
     PublishRequest,
     ReframeRequest,
+    ScheduleClipRequest,
     SteerRequest,
     ValidateUrlRequest,
     _validate_drop_ranges,
@@ -2052,6 +2055,153 @@ async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishReques
         req=req.model_dump(), zernio_cfg=zernio_cfg,
     )
 
+
+# ---------------------------------------------------------------------------
+# Clip popup actions (chat-UI): duplicate / schedule / upscale / export XML
+# ---------------------------------------------------------------------------
+
+@app.post("/api/clips/{job_id}/{clip_index}/duplicate")
+async def duplicate_clip_endpoint(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Deep-copy a clip: new metadata entry, new rendered mp4, copied project.
+
+    The source clip is never modified. Returns the new clip's index.
+    """
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    result = await asyncio.to_thread(
+        clip_tools.duplicate_clip, job_id, clip_index, OUTPUT_DIR)
+    return {"ok": True, **result}
+
+
+def _require_future_iso(value: str) -> str:
+    """Validate scheduled_for is a future ISO 8601 timestamp (400 otherwise)."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=400, detail="scheduled_for must be an ISO 8601 timestamp")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=400, detail="scheduled_for must be a future timestamp")
+    return value
+
+
+@app.post("/api/clips/{job_id}/{clip_index}/schedule")
+async def schedule_clip_endpoint(job_id: str, clip_index: int, req: ScheduleClipRequest, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Schedule a clip for timed posting via Zernio (no local poller).
+
+    Thin honest wrapper: builds a PublishRequest and calls the existing
+    publish_clip_flow -- Zernio performs the actual timed post. Persists a
+    clip-schedule-<index>.json record in the job dir.
+    """
+    require_trusted_config_request(request)
+    # Same throttle bucket as immediate publishes.
+    enforce_rate_limit(request, "publish", capacity=30, refill_per_sec=30 / 60)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    data = req.model_dump()
+    scheduled_for = data.get("scheduled_for")
+    if data["schedule_mode"] == "manual" and not scheduled_for:
+        raise HTTPException(
+            status_code=400,
+            detail="schedule_mode='manual' requires scheduled_for")
+    if scheduled_for:
+        _require_future_iso(scheduled_for)
+
+    resolved = await asyncio.to_thread(
+        resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
+
+    # Reuse the full publish schema so platform/timezone validation is
+    # identical to /api/publish.
+    publish_req = PublishRequest(
+        title=data["title"],
+        caption=data["caption"],
+        platforms=data["platforms"],
+        schedule_mode=data["schedule_mode"],
+        scheduled_for=scheduled_for,
+        timezone=data["timezone"],
+    )
+    zernio_cfg = await asyncio.to_thread(load_zernio_config)
+    result = await publish_clip_flow(
+        job_id=job_id, clip_index=clip_index, resolved=resolved,
+        req=publish_req.model_dump(), zernio_cfg=zernio_cfg,
+    )
+
+    record = {
+        "job_id": job_id,
+        "clip_index": clip_index,
+        "schedule_mode": data["schedule_mode"],
+        "scheduled_for": result.get("scheduled_for") or scheduled_for,
+        "platforms": data["platforms"],
+        "title": data["title"],
+        "caption": data["caption"],
+        "timezone": data["timezone"],
+        "post_id": result.get("post_id"),
+        "status": result.get("status") or "scheduled",
+    }
+    await asyncio.to_thread(
+        clip_tools.write_schedule_record, resolved.job_dir, clip_index, record)
+
+    response = {
+        "ok": True,
+        "scheduled_for": record["scheduled_for"],
+        "status": "scheduled",
+    }
+    if record["post_id"]:
+        response["post_id"] = record["post_id"]
+    return response
+
+
+@app.get("/api/clips/{job_id}/{clip_index}/schedule")
+async def get_clip_schedule_endpoint(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Return the persisted schedule record, or {"scheduled": False}."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    resolved = await asyncio.to_thread(
+        resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
+    record = await asyncio.to_thread(
+        clip_tools.read_schedule_record, resolved.job_dir, clip_index)
+    return record if record else {"scheduled": False}
+
+
+@app.post("/api/clips/{job_id}/{clip_index}/upscale")
+async def upscale_clip_endpoint(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
+    """ffmpeg 2x lanczos upscale (long edge capped at 2560px).
+
+    Writes upscaled_<stem>.mp4 next to the original -- the source clip is
+    never overwritten. NVENC when available, libx264 fallback.
+    """
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    result = await asyncio.to_thread(
+        clip_tools.upscale_clip, job_id, clip_index, OUTPUT_DIR)
+    return {"ok": True, **result}
+
+
+@app.get("/api/clips/{job_id}/{clip_index}/export-xml")
+async def export_clip_xml_endpoint(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Generate a minimal valid FCP7 (xmeml) timeline for the clip.
+
+    Built from the clip-project JSON segments (falling back to the clip's
+    start/end bounds). 400 when no timeline data exists -- never an empty
+    timeline.
+    """
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    path, filename = await asyncio.to_thread(
+        clip_tools.export_timeline_xml, job_id, clip_index, OUTPUT_DIR)
+    return FileResponse(path, media_type="application/xml", filename=filename)
 
 # ---------------------------------------------------------------------------
 # Published Performance Analytics & Feedback Loop endpoints

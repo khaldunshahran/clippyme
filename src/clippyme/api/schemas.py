@@ -450,6 +450,44 @@ class PublishRequest(BaseModel):
         return _validate_overlay_params(value)
 
 
+class ScheduleClipRequest(BaseModel):
+    """Per-clip schedule request (chat-UI clip popup).
+
+    A thin, honest wrapper over the publish flow: Zernio performs the actual
+    timed posting (``scheduledFor``) via ``publish_clip_flow`` -- no local
+    poller. The backend additionally persists a ``clip-schedule-<index>.json``
+    record in the job dir (retrievable via GET ``.../schedule``).
+    """
+
+    scheduled_for: Optional[str] = Field(None, max_length=64)
+    platforms: List[dict] = Field(..., min_length=1, max_length=14)
+    title: str = Field("", max_length=500)
+    caption: str = Field("", max_length=2200)
+    timezone: str = Field("Europe/Rome", max_length=64)
+    schedule_mode: str = Field("manual", pattern=r"^(auto|manual)$")
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_tz(cls, value: str) -> str:
+        return _validate_timezone(value)  # type: ignore[return-value]
+
+    @field_validator("scheduled_for")
+    @classmethod
+    def _validate_scheduled_for(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("scheduled_for must be an ISO 8601 timestamp") from exc
+        return value
+
+    @field_validator("platforms")
+    @classmethod
+    def _validate_platforms(cls, value: List[dict]) -> List[dict]:
+        return validate_publish_platforms(value)
+
+
 class LiveMonitorStopRequest(BaseModel):
     monitor_id: Optional[str] = Field(
         None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9:_-]+$"
