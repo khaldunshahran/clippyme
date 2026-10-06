@@ -14,17 +14,21 @@ export const DEFAULT_SETTINGS = {
   genre: '',            // -> clip_type
   clipStyle: '',        // -> instructions hint
   aspect: '9:16',
-  clipLength: 'auto',   // auto | short | medium | long
-  captions: '',         // caption_style_default preset ('' = default)
+  clipLength: 'all',    // all | shorts | mid | long | custom (system duration modes)
+  captions: '',         // caption_style_default preset ('' = system auto-chooses)
   timeframe: null,      // {start, end} seconds | null
-  maxClips: 5,
+  customMin: 15,        // custom clip-length bounds (seconds)
+  customMax: 60,
 };
 
+// System duration modes (old dashboard create.jsx realApi.js):
+// shorts 15-60s, mid 60-180s, long 180-600s, all = diverse mix, custom = user bounds.
 const LENGTH_PRESETS = {
-  auto: {},
-  short: { min_duration: 10, max_duration: 20 },
-  medium: { min_duration: 20, max_duration: 45 },
-  long: { min_duration: 45, max_duration: 90 },
+  all: { duration_mode: 'all' },
+  shorts: { duration_mode: 'shorts', min_duration: 15, max_duration: 60 },
+  mid: { duration_mode: 'mid', min_duration: 60, max_duration: 180 },
+  long: { duration_mode: 'long', min_duration: 180, max_duration: 600 },
+  custom: { duration_mode: 'custom' },
 };
 
 function newThread() {
@@ -127,8 +131,8 @@ export function useChat() {
         : t)));
       if (validation.valid && validation.downloadable) {
         const title = validation.title || url;
-        patchThread(threadId, { phase: 'settings', title: title.length > 42 ? `${title.slice(0, 42)}…` : title });
-        setSettingsOpen(true);
+        patchThread(threadId, { phase: 'caption-pick', title: title.length > 42 ? `${title.slice(0, 42)}…` : title });
+        pushMsg(threadId, { role: 'ai', kind: 'caption-picker', data: { validation } });
       } else {
         pushMsg(threadId, {
           role: 'ai', kind: 'error',
@@ -150,11 +154,16 @@ export function useChat() {
   // ---------------- submit ----------------
   const buildPayload = (thread) => {
     const s = thread.settings;
-    const len = LENGTH_PRESETS[s.clipLength] || {};
+    const len = { ...(LENGTH_PRESETS[s.clipLength] || LENGTH_PRESETS.all) };
+    if (s.clipLength === 'custom') {
+      const mn = Math.min(900, Math.max(5, Number(s.customMin) || 15));
+      const mx = Math.min(900, Math.max(5, Number(s.customMax) || 60));
+      len.min_duration = Math.min(mn, mx);
+      len.max_duration = Math.max(mn, mx);
+    }
     const payload = {
       url: thread.url,
       aspect: s.aspect || '9:16',
-      max_clips: s.maxClips || 5,
       ...len,
     };
     if (s.model) payload.model = s.model;
@@ -181,6 +190,13 @@ export function useChat() {
       try {
         const p = await getProgress(jobId);
         patchThread(threadId, { progress: p });
+        const failed = p && (p.stage === 'failed' || p.stage === 'error');
+        if (failed) {
+          stopPoll(threadId);
+          pushMsg(threadId, { role: 'ai', kind: 'error', text: `The clip job failed${p.detail ? `: ${p.detail}` : ''}. Nothing was rendered \u2014 you can try again with a different link.` });
+          patchThread(threadId, { phase: 'error', error: 'job failed' });
+          return;
+        }
         const done = p && (p.progress >= 100 || p.stage === 'completed' || p.stage === 'done');
         if (done) {
           stopPoll(threadId);
@@ -205,6 +221,11 @@ export function useChat() {
     tick();
     pollRef.current[threadId] = setInterval(tick, POLL_MS);
   }, [patchThread, pushMsg, stopPoll]);
+
+  const proceedToSettings = useCallback((threadId) => {
+    patchThread(threadId, { phase: 'settings' });
+    setSettingsOpen(true);
+  }, [patchThread]);
 
   const confirmSettings = useCallback(async (threadId, settings) => {
     const thread = threads.find((t) => t.id === threadId);
@@ -301,7 +322,7 @@ export function useChat() {
     popupClip, setPopupClip,
     editorTarget, setEditorTarget,
     createThread, selectThread, deleteThread,
-    sendMessage, confirmSettings, patchThread,
+    sendMessage, confirmSettings, proceedToSettings, patchThread,
     DEFAULT_SETTINGS,
   };
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { X, Clapperboard, Clock } from 'lucide-react';
 import {
-  CAPTION_OPTIONS, MODEL_OPTIONS, GENRE_OPTIONS, STYLE_OPTIONS,
+  MODEL_OPTIONS, GENRE_OPTIONS, STYLE_OPTIONS,
   ASPECT_OPTIONS, LENGTH_OPTIONS, parseTime, formatTime,
 } from './constants.js';
 import { fmtDur } from '../api/chatApi.js';
@@ -130,18 +130,16 @@ export default function SettingsPopup({ validation, initial, onConfirm, onClose 
           <div>
             <span className="nc-label">Clip length</span>
             <Segmented options={LENGTH_OPTIONS} value={s.clipLength} onChange={(id) => set({ clipLength: id })} />
-          </div>
-
-          <div>
-            <span className="nc-label">Captions</span>
-            <select className="nc-select" style={{ width: '100%' }} value={s.captions} onChange={(e) => set({ captions: e.target.value })}>
-              {CAPTION_OPTIONS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
-            </select>
-          </div>
-
-          <div>
-            <span className="nc-label">Clips to make</span>
-            <Segmented options={[3, 5, 8, 12].map((n) => ({ id: n, label: String(n) }))} value={s.maxClips} onChange={(id) => set({ maxClips: id })} />
+            {s.clipLength === 'custom' && (
+              <div className="nc-anim-fade-in" style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
+                <input className="nc-input" type="number" min={5} max={900} value={s.customMin ?? 15}
+                  onChange={(e) => set({ customMin: e.target.value })} style={{ width: 90 }} aria-label="Min seconds" />
+                <span style={{ color: 'var(--nc-text-faint)' }}>\u2013</span>
+                <input className="nc-input" type="number" min={5} max={900} value={s.customMax ?? 60}
+                  onChange={(e) => set({ customMax: e.target.value })} style={{ width: 90 }} aria-label="Max seconds" />
+                <span style={{ fontSize: 12, color: 'var(--nc-text-faint)' }}>seconds</span>
+              </div>
+            )}
           </div>
 
           <div>

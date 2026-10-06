@@ -3,7 +3,7 @@ import { fmtEta } from '../api/chatApi.js';
 
 /** Minimal progress card: thumbnail + full title + % + ETA. No pipeline internals. */
 export default function ProgressPill({ progress, title, thumbnail, state }) {
-  if (state === 'submitting' || !progress) {
+  if (!progress) {
     return (
       <div className="nc-card nc-anim-fade-up" style={{ padding: 14, display: 'flex', gap: 12, alignItems: 'center', maxWidth: 560 }}>
         <div className="nc-skeleton" style={{ width: 96, height: 54, flexShrink: 0, borderRadius: 8 }} />

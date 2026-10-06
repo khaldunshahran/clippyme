@@ -42,7 +42,7 @@ export default function App() {
     popupClip, setPopupClip,
     editorTarget, setEditorTarget,
     createThread, selectThread, deleteThread,
-    sendMessage, confirmSettings, patchThread,
+    sendMessage, confirmSettings, proceedToSettings, patchThread,
     DEFAULT_SETTINGS,
   } = chat;
 
@@ -173,6 +173,8 @@ export default function App() {
             onEditClip={(i) => openEditor(activeId, i)}
             onScheduleClip={(i) => openSchedule(activeId, i)}
             onViewAll={() => setGridOpen(true)}
+            onCaptionSelect={(id) => activeId && patchThread(activeId, { settings: { ...(active?.settings || {}), captions: id } })}
+            onCaptionContinue={() => activeId && proceedToSettings(activeId)}
           />
         )}
 

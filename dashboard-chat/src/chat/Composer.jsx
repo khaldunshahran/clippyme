@@ -6,16 +6,14 @@ import { CAPTION_OPTIONS, captionLabel } from './constants.js';
 
 const CHIP_DEFS = [
   { key: 'aspect', label: 'Aspect', options: ['9:16', '1:1', '16:9'] },
-  { key: 'clipLength', label: 'Length', options: ['auto', 'short', 'medium', 'long'] },
+  { key: 'clipLength', label: 'Length', options: ['all', 'shorts', 'mid', 'long', 'custom'] },
   { key: 'captions', label: 'Captions', options: CAPTION_OPTIONS.map((o) => o.id) },
-  { key: 'maxClips', label: 'Clips', options: [3, 5, 8, 12] },
 ];
 
 const CHIP_LABELS = {
   aspect: (v) => v,
-  clipLength: (v) => ({ auto: 'Auto length', short: '10–20s', medium: '20–45s', long: '45–90s' }[v] || v),
+  clipLength: (v) => ({ all: 'Mix', shorts: '<60s', mid: '1\u20133m', long: '3\u201310m', custom: 'Custom' }[v] || v),
   captions: (v) => captionLabel(v),
-  maxClips: (v) => `${v} clips`,
 };
 
 export default function Composer({ onSend, disabled, phase, settings, onSettingsChange, onOpenSettings }) {

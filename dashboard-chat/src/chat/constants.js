@@ -45,12 +45,17 @@ export const STYLE_OPTIONS = [
 
 export const ASPECT_OPTIONS = ['9:16', '1:1', '16:9'];
 
+// Clip-length tiers mirror the system's duration modes (old dashboard
+// create.jsx + backend min/max_duration): mix, <60s, 1-3m, 3-10m, custom.
 export const LENGTH_OPTIONS = [
-  { id: 'auto', label: 'Auto' },
-  { id: 'short', label: '10–20s' },
-  { id: 'medium', label: '20–45s' },
-  { id: 'long', label: '45–90s' },
+  { id: 'all', label: 'Mix / All' },
+  { id: 'shorts', label: '<60s' },
+  { id: 'mid', label: '1–3m' },
+  { id: 'long', label: '3–10m' },
+  { id: 'custom', label: 'Custom' },
 ];
+
+export const CAPTION_DEFAULT_LS_KEY = 'nugget-caption-default-v1';
 
 export function parseTime(str) {
   // "m:ss" or "h:mm:ss" -> seconds

@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { Loader2, TriangleAlert, Info, Link2 } from 'lucide-react';
 import ProgressPill from './ProgressPill.jsx';
 import ClipRow from './ClipRow.jsx';
+import CaptionCarousel from './CaptionCarousel.jsx';
 
 function ValidateMsg({ data }) {
   const { state, url, validation, error } = data || {};
@@ -54,7 +55,7 @@ function ValidateMsg({ data }) {
   );
 }
 
-export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleClip, onViewAll }) {
+export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue }) {
   const bottomRef = useRef(null);
   const msgs = thread?.messages || [];
 
@@ -86,6 +87,18 @@ export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleC
           switch (m.kind) {
             case 'validate':
               return <div key={m.id}><ValidateMsg data={m.data} /></div>;
+            case 'caption-picker':
+              return (
+                <div key={m.id}>
+                  <CaptionCarousel
+                    validation={m.data?.validation}
+                    selected={thread.settings?.captions || ''}
+                    locked={thread.phase !== 'caption-pick'}
+                    onSelect={(id) => onCaptionSelect && onCaptionSelect(id)}
+                    onContinue={() => onCaptionContinue && onCaptionContinue()}
+                  />
+                </div>
+              );
             case 'progress': {
               const st = m.data?.state;
               return (
