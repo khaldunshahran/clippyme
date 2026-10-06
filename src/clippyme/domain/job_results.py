@@ -10,7 +10,7 @@ import sys
 
 from clippyme.domain.clip_resolve import clip_filename_for
 from clippyme.pipeline.reframe_ops import normalize_letterbox_zoom
-from clippyme.domain.runtime_state import runtime_result_fields
+from clippyme.domain.runtime_state import runtime_result_fields, worker_python
 
 logger = logging.getLogger("clippyme")
 
@@ -63,6 +63,8 @@ def build_main_cmd(
     clip_type: str | None = None,
     duration_mode: str | None = None,
     highlights: bool = False,
+    caption_style_default: str | None = None,
+    source_timeframe: tuple | None = None,
 ) -> list[str]:
     """Build argv for the checkpointed backend pipeline.
 
@@ -100,7 +102,7 @@ def build_main_cmd(
     if input_path and input_path.lstrip().startswith("-"):
         raise ValueError("input_path must not start with '-'")
 
-    cmd = [sys.executable, "-u", "-m", "clippyme.pipeline.orchestrator"]
+    cmd = [worker_python(), "-u", "-m", "clippyme.pipeline.orchestrator"]
     if url:
         cmd.extend(["-u", url])
         if cookies_path and os.path.exists(cookies_path):
@@ -143,6 +145,16 @@ def build_main_cmd(
         cmd.extend(["--duration-mode", duration_mode.strip()])
     if highlights:
         cmd.append("--highlights")
+    if caption_style_default and str(caption_style_default).strip():
+        cmd.extend(["--caption-style-default", str(caption_style_default).strip()])
+    if source_timeframe is not None:
+        try:
+            _tf_s, _tf_e = float(source_timeframe[0]), float(source_timeframe[1])
+        except (TypeError, ValueError, IndexError):
+            raise ValueError(f"invalid source_timeframe: {source_timeframe!r}")
+        if not (_tf_e > _tf_s >= 0):
+            raise ValueError(f"invalid source_timeframe: {source_timeframe!r}")
+        cmd.extend(["--source-timeframe", f"{_tf_s:.3f},{_tf_e:.3f}"])
     return cmd
 
 

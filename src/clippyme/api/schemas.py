@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from clippyme.domain.job_results import ALLOWED_LANGUAGES, GEMINI_MODEL_RE, MAX_INSTRUCTIONS_LEN
 from clippyme.netutil import resolve_host_addresses
@@ -81,6 +81,19 @@ def _validate_timezone(value: Optional[str]) -> Optional[str]:
     return normalized
 
 
+class SourceTimeframe(BaseModel):
+    """Limit the pipeline to a [start, end) window of the source, in seconds."""
+
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "SourceTimeframe":
+        if self.end <= self.start:
+            raise ValueError("source_timeframe.end must be greater than start")
+        return self
+
+
 class ProcessRequest(BaseModel):
     url: str = Field(..., max_length=2048)
     instructions: Optional[str] = Field(None, max_length=MAX_INSTRUCTIONS_LEN)
@@ -102,6 +115,13 @@ class ProcessRequest(BaseModel):
     clip_type: Optional[str] = Field(None, max_length=64)
     duration_mode: Optional[str] = Field(None, max_length=32)
     highlights: Optional[bool] = False
+    caption_style_default: Optional[str] = Field(
+        None, max_length=32,
+        description="Caption preset applied at compose time for every clip of the job",
+    )
+    source_timeframe: Optional[SourceTimeframe] = Field(
+        None, description="Process only this [start, end) window of the source (seconds)",
+    )
 
     @field_validator("url")
     @classmethod
@@ -114,6 +134,22 @@ class ProcessRequest(BaseModel):
     @classmethod
     def _bound_language(cls, value: Optional[str]) -> Optional[str]:
         return _validate_language(value)
+
+    @field_validator("caption_style_default")
+    @classmethod
+    def _bound_caption_style(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        from clippyme.domain.subtitles import SUBTITLE_PRESETS
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized not in SUBTITLE_PRESETS:
+            raise ValueError(
+                f"unknown caption style: {value!r} "
+                f"(known: {sorted(SUBTITLE_PRESETS)})"
+            )
+        return normalized
 
 
 class BatchRequest(BaseModel):

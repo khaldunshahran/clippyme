@@ -217,6 +217,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--clip-type", type=str, default=None)
     parser.add_argument("--duration-mode", type=str, default=None)
     parser.add_argument("--highlights", action="store_true", help="Generate full-video multi-tier highlight reels")
+    parser.add_argument("--caption-style-default", type=str, default=None,
+                        help="Caption preset applied at compose time for every clip")
+    parser.add_argument("--source-timeframe", type=str, default=None,
+                        help="Process only this source window, as 'start,end' seconds")
     return parser.parse_args(argv)
 
 
@@ -255,7 +259,13 @@ def _transcript_cache_key(args: argparse.Namespace) -> str | None:
         offset = float(getattr(args, "start_offset", 0.0) or 0.0)
     except (TypeError, ValueError):
         offset = 0.0
-    return f"{args.url}#start={int(offset)}" if offset > 0 else args.url
+    window = str(getattr(args, "source_timeframe", "") or "").strip()
+    key = args.url
+    if offset > 0:
+        key += f"#start={int(offset)}"
+    if window:
+        key += f"#window={window}"
+    return key
 
 
 def _trim_head(input_video: str, output_dir: str, offset: float) -> str:
@@ -293,6 +303,64 @@ def _trim_head(input_video: str, output_dir: str, offset: float) -> str:
     return os.path.abspath(trimmed)
 
 
+def _trim_window(input_video: str, output_dir: str, timeframe: str | None) -> str:
+    """Limit processing to the [start, end) source window, stream-copied.
+
+    Mechanism: a fast ffmpeg ``-ss start -i <src> -t (end-start) -c copy``
+    pre-trim of the downloaded source into ``windowed_<basename>``.
+    Stream copy cuts at keyframes only, so window edges are approximate
+    to +/- a GOP -- fine for "process this section" semantics, and it
+    avoids a full re-encode of long sources. ``end`` is clamped to the
+    probed source duration (never fails, never extends). Any failure
+    falls back to the untrimmed source so a bad window never fails a job.
+    Every downstream timestamp (transcript words, clip bounds, caption
+    timings) is relative to the trimmed file, so nothing else needs to
+    know about the window.
+    """
+    raw = (timeframe or "").strip()
+    if not raw:
+        return input_video
+    try:
+        start_s, end_s = raw.split(",", 1)
+        start, end = float(start_s), float(end_s)
+    except (TypeError, ValueError):
+        print(f"⚠️ Ignoring malformed --source-timeframe {timeframe!r}", flush=True)
+        return input_video
+    if not (end > start >= 0):
+        print(f"⚠️ Ignoring invalid --source-timeframe {timeframe!r}", flush=True)
+        return input_video
+    try:
+        probe = probe_media(input_video) or {}
+        duration = float(probe.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration > 0:
+        end = min(end, duration)
+        if not (end > start):
+            print(
+                f"⚠️ --source-timeframe [{start:.1f},{end:.1f}] is empty after "
+                "clamping to the source duration; using the full source",
+                flush=True,
+            )
+            return input_video
+    windowed = os.path.join(output_dir, f"windowed_{os.path.basename(input_video)}")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", input_video,
+             "-t", f"{end - start:.3f}", "-c", "copy",
+             "-avoid_negative_ts", "make_zero", windowed],
+            check=True, capture_output=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"⚠️ source-timeframe trim failed ({exc}); using the full source", flush=True)
+        return input_video
+    if not _valid_file(windowed, 10_000):
+        print("⚠️ source-timeframe trim produced nothing; using the full source", flush=True)
+        return input_video
+    print(f"✂️ Limited source to [{start:.1f}s, {end:.1f}s]", flush=True)
+    return os.path.abspath(windowed)
+
+
 def _prepare_input(args: argparse.Namespace, output_dir: str, state: RuntimeState, legacy):
     state.start("acquiring", "acquiring source media")
     if args.input:
@@ -319,6 +387,7 @@ def _prepare_input(args: argparse.Namespace, output_dir: str, state: RuntimeStat
     if not _valid_file(input_video):
         raise FileNotFoundError(f"Input file not found or empty: {input_video}")
     input_video = _trim_head(input_video, output_dir, getattr(args, "start_offset", 0.0))
+    input_video = _trim_window(input_video, output_dir, getattr(args, "source_timeframe", None))
     state.complete_stage(
         "acquiring",
         artifacts={
@@ -481,6 +550,8 @@ def _load_or_analyze(
 
     clips_data["transcript"] = transcript
     clips_data["aspect"] = args.aspect
+    if getattr(args, "caption_style_default", None):
+        clips_data["caption_style_default"] = args.caption_style_default
     shorts = clips_data.get("shorts") or []
     max_clips = _max_clips_from_env()
     if max_clips and len(shorts) > max_clips:

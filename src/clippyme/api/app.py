@@ -420,6 +420,8 @@ async def process_endpoint(
     clip_type = None
     duration_mode = None
     highlights = False
+    caption_style_default = None
+    source_timeframe = None
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         try:
@@ -445,6 +447,9 @@ async def process_endpoint(
         clip_type = validated.clip_type
         duration_mode = validated.duration_mode
         highlights = bool(validated.highlights)
+        caption_style_default = validated.caption_style_default
+        _tf = validated.source_timeframe
+        source_timeframe = (_tf.start, _tf.end) if _tf else None
 
     # For multipart/form-data uploads, extract reframe_mode + language from form fields
     if "multipart/form-data" in content_type:
@@ -467,6 +472,14 @@ async def process_endpoint(
         clip_type = form.get("clip_type", clip_type) or None
         duration_mode = form.get("duration_mode", duration_mode) or None
         highlights = str(form.get("highlights", "")).lower() in {"1", "true", "yes"} or highlights
+        caption_style_default = form.get("caption_style_default", caption_style_default) or None
+        _tf_raw = (form.get("source_timeframe", "") or "").strip()
+        if _tf_raw:
+            try:
+                _tf_s, _tf_e = _tf_raw.split(",", 1)
+                source_timeframe = (float(_tf_s), float(_tf_e))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="source_timeframe must be 'start,end' seconds")
         # Validate the multipart values through the same schema for
         # consistency — we drop the url requirement since we're using
         # an uploaded file path.
@@ -488,6 +501,11 @@ async def process_endpoint(
                 "clip_type": clip_type,
                 "duration_mode": duration_mode,
                 "highlights": highlights,
+                "caption_style_default": caption_style_default,
+                "source_timeframe": (
+                    {"start": source_timeframe[0], "end": source_timeframe[1]}
+                    if source_timeframe else None
+                ),
             })
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=exc.errors())
@@ -567,6 +585,8 @@ async def process_endpoint(
             clip_type=clip_type,
             duration_mode=duration_mode,
             highlights=highlights,
+            caption_style_default=caption_style_default,
+            source_timeframe=source_timeframe,
         )
     except ValueError as exc:
         await asyncio.to_thread(shutil.rmtree, job_output_dir, True)

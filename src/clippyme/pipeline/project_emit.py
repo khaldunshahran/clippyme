@@ -173,7 +173,7 @@ def _build_project(
             }
         ],
         "captions": {
-            "style": CAPTION_STYLE_DEFAULT,
+            "style": clips_data.get("caption_style_default") or CAPTION_STYLE_DEFAULT,
             "position": CAPTION_POSITION_DEFAULT,
             "words": words,
             "edits": {},
