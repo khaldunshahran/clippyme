@@ -1,0 +1,210 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Nugget Chat — design system (ChatGPT-like, dark)
+   Own variable namespace (--nc-*) — never touches the editor's
+   clay tokens. All motion is transform/opacity only (60fps).
+   ============================================================ */
+
+:root {
+  --nc-bg: #0a0a0b;
+  --nc-bg-soft: #101012;
+  --nc-panel: #141416;
+  --nc-card: #17171a;
+  --nc-card-hover: #1d1d21;
+  --nc-border: rgba(255, 255, 255, 0.08);
+  --nc-border-strong: rgba(255, 255, 255, 0.14);
+  --nc-text: #f2f2f3;
+  --nc-text-dim: #a7a7ad;
+  --nc-text-faint: #6e6e76;
+  --nc-accent: #0a81d9;
+  --nc-accent-soft: rgba(10, 129, 217, 0.14);
+  --nc-green: #34c77b;
+  --nc-amber: #f5a524;
+  --nc-red: #f31260;
+  --nc-radius: 14px;
+  --nc-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--nc-bg);
+  color: var(--nc-text);
+  font-family: var(--nc-font);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+* { box-sizing: border-box; }
+::selection { background: rgba(10, 129, 217, 0.35); }
+
+/* ---------- scrollbars ---------- */
+.nc-scroll { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.16) transparent; }
+.nc-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.nc-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 99px; }
+.nc-scroll::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- keyframes (transform/opacity only) ---------- */
+@keyframes nc-fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes nc-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes nc-pop-in {
+  from { opacity: 0; transform: scale(0.96) translateY(8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes nc-slide-in-right {
+  from { opacity: 0; transform: translateX(24px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes nc-shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+@keyframes nc-pulse-dot {
+  0%, 100% { opacity: 0.35; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1); }
+}
+@keyframes nc-spin { to { transform: rotate(360deg); } }
+@keyframes nc-bar-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+
+.nc-anim-fade-up   { animation: nc-fade-up 0.32s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.nc-anim-fade-in   { animation: nc-fade-in 0.22s ease-out both; }
+.nc-anim-pop-in    { animation: nc-pop-in 0.28s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.nc-anim-slide-in  { animation: nc-slide-in-right 0.3s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .nc-anim-fade-up, .nc-anim-fade-in, .nc-anim-pop-in, .nc-anim-slide-in {
+    animation-duration: 0.01ms;
+  }
+}
+
+/* ---------- skeleton ---------- */
+.nc-skeleton {
+  border-radius: 8px;
+  background: linear-gradient(90deg, #1a1a1e 25%, #232328 50%, #1a1a1e 75%);
+  background-size: 800px 100%;
+  animation: nc-shimmer 1.4s linear infinite;
+}
+
+/* ---------- generic bits ---------- */
+.nc-card {
+  background: var(--nc-card);
+  border: 1px solid var(--nc-border);
+  border-radius: var(--nc-radius);
+}
+.nc-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; border-radius: 999px;
+  background: var(--nc-panel);
+  border: 1px solid var(--nc-border);
+  color: var(--nc-text-dim);
+  font-size: 12.5px; font-weight: 500;
+  cursor: pointer; user-select: none; white-space: nowrap;
+  transition: transform 0.12s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.nc-chip:hover { background: var(--nc-card-hover); color: var(--nc-text); }
+.nc-chip:active { transform: scale(0.96); }
+.nc-chip[data-active="true"] {
+  background: var(--nc-accent-soft);
+  border-color: rgba(10, 129, 217, 0.55);
+  color: #7fc4f7;
+}
+.nc-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; border-radius: 10px;
+  background: transparent; border: 1px solid transparent;
+  color: var(--nc-text-dim); cursor: pointer;
+  transition: transform 0.12s ease, background 0.15s ease, color 0.15s ease;
+}
+.nc-icon-btn:hover { background: rgba(255,255,255,0.07); color: var(--nc-text); }
+.nc-icon-btn:active { transform: scale(0.92); }
+.nc-icon-btn:disabled { opacity: 0.35; cursor: default; transform: none; }
+
+.nc-btn-primary {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 18px; border-radius: 12px; border: none;
+  background: var(--nc-accent); color: #fff;
+  font-size: 14px; font-weight: 600; cursor: pointer;
+  transition: transform 0.12s ease, filter 0.15s ease;
+}
+.nc-btn-primary:hover { filter: brightness(1.1); }
+.nc-btn-primary:active { transform: scale(0.97); }
+.nc-btn-primary:disabled { opacity: 0.5; cursor: default; transform: none; }
+
+.nc-btn-ghost {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 18px; border-radius: 12px;
+  background: transparent; color: var(--nc-text-dim);
+  border: 1px solid var(--nc-border-strong);
+  font-size: 14px; font-weight: 500; cursor: pointer;
+  transition: transform 0.12s ease, background 0.15s ease;
+}
+.nc-btn-ghost:hover { background: rgba(255,255,255,0.06); color: var(--nc-text); }
+.nc-btn-ghost:active { transform: scale(0.97); }
+
+.nc-input, .nc-select, .nc-textarea {
+  background: var(--nc-bg-soft);
+  border: 1px solid var(--nc-border);
+  border-radius: 10px;
+  color: var(--nc-text);
+  font-size: 13.5px;
+  padding: 9px 12px;
+  outline: none;
+  transition: border-color 0.15s ease;
+  font-family: inherit;
+}
+.nc-input:focus, .nc-select:focus, .nc-textarea:focus {
+  border-color: rgba(10, 129, 217, 0.6);
+}
+.nc-select { cursor: pointer; }
+.nc-label { font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--nc-text-faint); margin-bottom: 6px; display: block; }
+
+/* ---------- clip row scroll snap ---------- */
+.nc-clip-row {
+  display: flex; gap: 14px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  padding: 4px 2px 12px;
+  -webkit-overflow-scrolling: touch;
+}
+.nc-clip-row > * { scroll-snap-align: start; flex: 0 0 auto; }
+
+/* ---------- modal ---------- */
+.nc-modal-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(4, 4, 6, 0.72);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+  animation: nc-fade-in 0.2s ease-out both;
+}
+.nc-modal {
+  animation: nc-pop-in 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+  max-height: calc(100vh - 40px);
+  display: flex; flex-direction: column;
+}
+
+/* ---------- composer focus (themed, replaces UA glow) ---------- */
+.nc-composer-input:focus { outline: none !important; box-shadow: none !important; }
+.nc-composer .nc-card:focus-within {
+  border-color: rgba(10, 129, 217, 0.45);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.35), 0 0 0 3px rgba(10,129,217,0.12);
+}
+
+/* ---------- error fallback ---------- */
+.nc-error-fallback {
+  height: 100%; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 12px;
+  color: var(--nc-text-dim); font-family: var(--nc-font);
+}

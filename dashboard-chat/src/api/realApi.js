@@ -1,0 +1,1054 @@
+// Real backend calls the redesign needs beyond api.js (submit/poll). Mirrors
+// the exact payloads the production components use, so the redesign talks to
+// the same endpoints with the same contracts.
+// Explicit .js extensions: plain Node (npm test / node --test) resolves ESM
+// strictly, and Vite accepts the explicit form unchanged.
+import { getApiUrl } from './config.js';
+import { apiFetch } from './apiToken.js';
+import { seedToggles, seedHookParams, seedSubtitleParams, seedLogoParams, seedBannerParams } from './seedClipParams.js';
+import { clipDownloadName } from './clipFilename.js';
+
+export { clipDownloadName };
+
+// Only http/https absolute URLs are honoured as-is; anything else (javascript:,
+// data:, blob:, or a bare "httpfoo:" that slips past a startsWith check) is
+// treated as a relative path and resolved against our own backend. This stops
+// a malicious/compromised API response from injecting a scheme that executes
+// when set as an <a href> / <video src>.
+export function safeResolveUrl(url) {
+  const raw = url || '';
+  try {
+    const u = new URL(raw, window.location.origin);
+    if (u.protocol === 'http:' || u.protocol === 'https:') {
+      // Absolute http(s) → keep; relative → getApiUrl maps to backend.
+      return /^https?:\/\//i.test(raw) ? raw : getApiUrl(raw);
+    }
+  } catch { /* fall through to backend-relative */ }
+  return getApiUrl(raw);
+}
+
+export function clipVideoSrc(clip, bust) {
+  const full = safeResolveUrl(clip?.video_url || '');
+  return bust ? `${full}${full.includes('?') ? '&' : '?'}v=${bust}` : full;
+}
+
+// Source for the clip preview, honouring an applied edit. After "Apply &
+// reprocess": if layers were composed, a `previewUrl` (a separate composed
+// file) takes priority; otherwise we fall back to the raw/reframed clip with
+// the reframe cache-buster so a re-reframed clip re-fetches.
+export function clipPreviewSrc(clip, state) {
+  if (state?.previewUrl) {
+    const full = safeResolveUrl(state.previewUrl);
+    const b = state.previewBust;
+    return b ? `${full}${full.includes('?') ? '&' : '?'}v=${b}` : full;
+  }
+  if (clip?.composed_video_url) {
+    const full = safeResolveUrl(clip.composed_video_url);
+    const b = state?.reframeBust;
+    return b ? `${full}${full.includes('?') ? '&' : '?'}v=${b}` : full;
+  }
+  return clipVideoSrc(clip, state?.reframeBust);
+}
+
+export function downloadClip(clip, index) {
+  const a = document.createElement('a');
+  a.href = safeResolveUrl(clip.composed_video_url || clip.video_url || '');
+  a.download = clipDownloadName(clip, index);
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+export async function cancelJob(jobId) {
+  try { await apiFetch(getApiUrl(`/api/cancel/${jobId}`), { method: 'POST' }); } catch { /* best-effort */ }
+}
+
+// Suspend the job's process tree (status → paused). Resumable.
+export async function pauseJob(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/pause/${jobId}`), { method: 'POST' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// Resume a paused job (status → processing).
+export async function resumeJob(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/resume/${jobId}`), { method: 'POST' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// Graceful stop: kill the subprocess but KEEP the clips finished so far
+// (status → stopped). Unlike cancelJob, which hard-discards all output.
+export async function stopJob(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/stop/${jobId}`), { method: 'POST' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+export async function composeClip(jobId, index, { toggles, hook_params, subtitle_params, logo_params, grade_params, banner_params, drop_ranges }) {
+  const res = await apiFetch(getApiUrl(`/api/compose/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ toggles, hook_params, subtitle_params, logo_params, grade_params: grade_params || {}, banner_params: banner_params || {}, drop_ranges: drop_ranges || [] }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json(); // { composed_url }
+}
+
+// Conversational trim: a plain-English instruction → Gemini → spans to cut
+// (clip-relative seconds). Returns { drop_ranges: [[s,e],...], explanation }.
+export async function editClipAI(jobId, index, instruction, model) {
+  const res = await apiFetch(getApiUrl(`/api/edit-ai/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ instruction, ...(model ? { model } : {}) }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Per-clip transcript segments (clip-relative seconds) for the manual-trim UI.
+// Returns { segments: [{index, text, start, end}], duration, language }.
+// ---------------------------------------------------------------------------
+// Clip editor projects (Phase 2/3a): versioned clip-project.json documents.
+// ---------------------------------------------------------------------------
+
+// Load a clip project: latest draft, or ?version=N for a specific version.
+// Returns the full ClipProject dict. Throws on 404 (no project yet).
+export async function getClipProject(jobId, index, version = null) {
+  const q = version ? `?version=${encodeURIComponent(version)}` : '';
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/${index}${q}`));
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json();
+}
+
+// Save a draft project version (validated server-side, version bumped, NO
+// render). Returns { version, project }.
+export async function saveClipProject(jobId, index, project) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/${index}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Render a full ClipProject. Returns { composed_url, version, deduped }.
+export async function composeProject(jobId, index, project) {
+  const res = await apiFetch(getApiUrl(`/api/compose/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Generate clip-project.json for clips of an old job that lack them.
+// Never re-renders. Returns { results: [{clip_index, status}] }.
+export async function backfillClipProjects(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/backfill`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Upload a music track for the editor (raw bytes; the server validates it is
+// real audio and enforces a 20MB cap). Returns { file: "audio/<name>", size }.
+export async function uploadAudio(jobId, file) {
+  const res = await apiFetch(getApiUrl(`/api/audio/upload?job_id=${encodeURIComponent(jobId)}&filename=${encodeURIComponent(file.name)}`), {
+    method: 'POST',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Batch-apply one edit across clips: {clip_indices, patch} ->
+// { results: [{clip_index, version} | {clip_index, error}] }.
+export async function batchApplyProjects(jobId, clipIndices, patch) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/batch-apply`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clip_indices: clipIndices, patch }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// List recorded project versions (newest last).
+// Returns { versions: [{version, origin, created_at, project_file, output_file, output_url}], latest }.
+export async function listClipProjectVersions(jobId, index) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/${index}/versions`));
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getClipTranscript(jobId, index) {
+  const res = await apiFetch(getApiUrl(`/api/transcript/${jobId}/${index}`));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// Download a clip, composing first (subtitles/hook/smart-cut) when any toggle
+// is active for it, otherwise grabbing the raw clip. Shared by the per-clip
+// download button and bulk export. Returns 'composed' | 'raw'.
+export async function exportClip(jobId, index, clip, state, preselections) {
+  const toggles = state?.toggles ?? seedToggles(preselections);
+  const any = Object.values(toggles || {}).some(Boolean);
+  if (!any) { downloadClip(clip, index); return 'raw'; }
+  const hook = state?.hookParams ?? seedHookParams(clip, preselections);
+  const subs = state?.subtitleParams ?? seedSubtitleParams(preselections);
+  const logo = state?.logoParams ?? seedLogoParams(preselections);
+  const grade = state?.gradeParams ?? { preset: preselections?.grade?.preset || 'none' };
+  const banner = state?.bannerParams ?? seedBannerParams(preselections);
+  // Resolve to the backend's ABSOLUTE `shorts` position, not the array
+  // position `index` — they diverge once a manual-publish gap skips a
+  // deleted_after_publish clip (see job_results._build_clips).
+  const apiIndex = clip?.original_index ?? index;
+  const { composed_url } = await composeClip(jobId, apiIndex, {
+    toggles,
+    hook_params: toggles.hook ? hook : {},
+    subtitle_params: toggles.subtitles ? subs : {},
+    logo_params: toggles.logo ? logo : {},
+    grade_params: toggles.grade ? grade : {},
+    banner_params: toggles.banner ? banner : {},
+    drop_ranges: toggles.smartcut ? (state?.dropRanges || []) : [],
+  });
+  const href = safeResolveUrl(composed_url);
+  const a = document.createElement('a');
+  a.href = href; a.download = clipDownloadName(clip, index); a.style.display = 'none';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  return 'composed';
+}
+
+export async function reframeClip(jobId, index, mode) {
+  const res = await apiFetch(getApiUrl(`/api/reframe/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reframe_mode: mode }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json(); // { success, new_video_url }
+}
+
+export async function publishClip(jobId, index, body) {
+  const res = await apiFetch(getApiUrl(`/api/publish/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    let msg = err.detail || `HTTP ${res.status}`;
+    if (Array.isArray(msg)) {
+      msg = msg.map((m) => (m.msg ? `${m.loc ? m.loc.slice(1).join('.') + ': ' : ''}${m.msg}` : JSON.stringify(m))).join(', ');
+    } else if (typeof msg === 'object' && msg !== null) {
+      msg = JSON.stringify(msg);
+    }
+    const e = new Error(String(msg));
+    e.status = res.status;
+    throw e;
+  }
+  return res.json().catch(() => ({}));
+}
+
+export async function generateClipMetadata(jobId, index, instruction = '') {
+  const res = await apiFetch(getApiUrl(`/api/generate-metadata/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ instruction }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json(); // { speaker_name, title, hashtags, caption, platforms }
+}
+
+export async function generateAllClipMetadata(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/generate-metadata/${jobId}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json();
+}
+
+export async function restoreJob(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/history/${jobId}/restore`), { method: 'POST' });
+  if (!res.ok) { const e = new Error('Restore failed'); e.status = res.status; throw e; }
+  return res.json(); // { result: { clips, cost_analysis } }
+}
+
+// Jobs that actually exist on disk right now. The History list is driven by
+// localStorage (survives rebuilds), but the clip files live in output/ — a
+// docker rebuild/cleanup can wipe them while the localStorage entry lingers.
+// Cross-checking against this set lets the UI flag entries that can no longer
+// be opened instead of failing silently on click. Returns a Set of jobIds;
+// empty Set on any error (treated as "unknown" → don't disable anything).
+export async function listBackendJobs() {
+  try {
+    const res = await apiFetch(getApiUrl('/api/history'));
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.jobs) ? data.jobs : [];
+  } catch { return []; }
+}
+
+export async function listBackendJobIds() {
+  try {
+    const jobs = await listBackendJobs();
+    return new Set(jobs.map((j) => j.jobId).filter(Boolean));
+  } catch { return null; }
+}
+
+// --- config / settings ----------------------------------------------------
+
+export async function getConfig() {
+  const res = await apiFetch(getApiUrl('/api/config'));
+  // null (not {}) on failure — callers must not mistake "couldn't reach the
+  // backend" for "no keys configured" and wipe already-known present state.
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function saveConfig(keys) {
+  const res = await apiFetch(getApiUrl('/api/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keys }),
+  });
+  if (!res.ok) throw new Error('Save config failed');
+  return res.json().catch(() => ({}));
+}
+
+export async function getModels(apiKey) {
+  const res = await apiFetch(getApiUrl('/api/config/models'), { headers: { 'X-Gemini-Key': apiKey } });
+  if (!res.ok) return { models: [] };
+  return res.json();
+}
+
+export async function cookiesStatus() {
+  const res = await apiFetch(getApiUrl('/api/config/cookies/status'));
+  if (!res.ok) return { configured: false };
+  return res.json();
+}
+
+export async function uploadCookies(file) {
+  const fd = new FormData();
+  fd.append('cookies_file', file);
+  const res = await apiFetch(getApiUrl('/api/config/cookies'), { method: 'POST', body: fd });
+  if (!res.ok) throw new Error('Cookie upload failed');
+  return res.json().catch(() => ({}));
+}
+
+export async function deleteCookies() {
+  const res = await apiFetch(getApiUrl('/api/config/cookies'), { method: 'DELETE' });
+  if (!res.ok) throw new Error('Cookie remove failed');
+  return res.json().catch(() => ({}));
+}
+
+// --- Custom fonts (e.g. licensed Stratos) ---------------------------------
+export async function listFonts() {
+  const res = await apiFetch(getApiUrl('/api/config/fonts'));
+  if (!res.ok) return { fonts: [] };
+  return res.json();
+}
+
+export async function uploadFont(file) {
+  const fd = new FormData();
+  fd.append('font_file', file);
+  const res = await apiFetch(getApiUrl('/api/config/fonts'), { method: 'POST', body: fd });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Font upload failed'); }
+  return res.json().catch(() => ({}));
+}
+
+export async function deleteFont(name) {
+  const res = await apiFetch(getApiUrl(`/api/config/fonts/${encodeURIComponent(name)}`), { method: 'DELETE' });
+  if (!res.ok) throw new Error('Font remove failed');
+  return res.json().catch(() => ({}));
+}
+
+// --- Brand logo / watermark ------------------------------------------------
+export async function logoStatus() {
+  const res = await apiFetch(getApiUrl('/api/config/logo/status'));
+  if (!res.ok) return { configured: false };
+  return res.json();
+}
+
+export async function uploadLogo(file) {
+  const fd = new FormData();
+  fd.append('logo_file', file);
+  const res = await apiFetch(getApiUrl('/api/config/logo'), { method: 'POST', body: fd });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Logo upload failed'); }
+  return res.json().catch(() => ({}));
+}
+
+export async function deleteLogo() {
+  const res = await apiFetch(getApiUrl('/api/config/logo'), { method: 'DELETE' });
+  if (!res.ok) throw new Error('Logo remove failed');
+  return res.json().catch(() => ({}));
+}
+
+export async function getZernio() {
+  const res = await apiFetch(getApiUrl('/api/config/zernio'));
+  if (!res.ok) return { configured: false };
+  return res.json();
+}
+
+export async function saveZernio(payload) {
+  const res = await apiFetch(getApiUrl('/api/config/zernio'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error('Save Zernio failed');
+  return res.json().catch(() => ({}));
+}
+
+export async function discoverZernioAccounts() {
+  const res = await apiFetch(getApiUrl('/api/zernio/accounts'));
+  if (!res.ok) throw new Error('Discover failed');
+  return res.json();
+}
+
+// --- Watchdog & Mobile Alerts ----------------------------------------------
+
+export async function getWatchdog() {
+  const res = await apiFetch(getApiUrl('/api/config/watchdog'));
+  if (!res.ok) return { enabled: false };
+  return res.json();
+}
+
+export async function saveWatchdog(payload) {
+  const res = await apiFetch(getApiUrl('/api/config/watchdog'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to save Watchdog settings');
+  }
+  return res.json().catch(() => ({}));
+}
+
+export async function testWatchdogAlert(payload) {
+  const res = await apiFetch(getApiUrl('/api/config/watchdog/test'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Test alert failed');
+  }
+  return res.json().catch(() => ({}));
+}
+
+// --- Kick live-channel monitor ---------------------------------------------
+
+export async function startLiveMonitor(config) {
+  const res = await apiFetch(getApiUrl('/api/live-monitor/start'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    // FastAPI 422 detail is an array of {loc, msg} objects — flatten it to
+    // "field: message" text or the toast reads "[object Object]".
+    const detail = Array.isArray(err.detail)
+      ? err.detail.map((d) => `${(d.loc || []).slice(1).join('.')}: ${d.msg}`).join('; ')
+      : err.detail;
+    throw new Error(detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function stopLiveMonitor(monitorId) {
+  const res = await apiFetch(getApiUrl('/api/live-monitor/stop'), {
+    method: 'POST',
+    ...(monitorId ? {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ monitor_id: monitorId }),
+    } : {}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
+export async function getLiveMonitorStatus({ signal } = {}) {
+  const res = await apiFetch(getApiUrl('/api/live-monitor/status'), { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function updateMonitorConfig(monitorId, partial) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/config`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(partial),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function setMonitorPublishing(monitorId, enabled) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/publishing`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getPendingLiveClips(monitorId) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/pending-clips`));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return data.pending_clips || [];
+}
+
+export async function publishPendingLiveClip(monitorId, clipId, overrides = null) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/publish-pending/${encodeURIComponent(clipId)}`), {
+    method: 'POST',
+    ...(overrides ? {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(overrides),
+    } : {}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function dismissPendingLiveClip(monitorId, clipId) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/pending-clip/${encodeURIComponent(clipId)}`), {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function publishAllPendingLiveClips(monitorId) {
+  const res = await apiFetch(getApiUrl(`/api/live-monitor/${encodeURIComponent(monitorId)}/publish-all-pending`), {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Map the redesign's flat `opts` into the preselections shape the existing
+// hooks + seedClipParams expect (subtitles/hook as truthy objects).
+export function optsToPreselections(opts) {
+  return {
+    // Tri-state reframe mode. Fall back to the legacy boolean (`reframe`) for
+    // any persisted preselections saved before the 3-mode selector landed.
+    // 'object' is the legacy name for 'subject' (FrameShift face-first); the
+    // backend accepts both but normalize here so new jobs persist the new name.
+    reframe_mode: (opts.reframeMode === 'object' ? 'subject' : opts.reframeMode) || (opts.reframe === false ? 'disabled' : 'auto'),
+    // Fixed letterbox zoom (percent). Only meaningful with reframe 'disabled';
+    // 0/absent = the whole frame between the black bars.
+    letterbox_zoom: Number(opts.letterboxZoom) || 0,
+    aspect: opts.aspect || '9:16',
+    language: opts.language,
+    no_zoom: !opts.zoom,
+    skip_analysis: !opts.detect,
+    smartcut: opts.smartcut,
+    model: (opts.model || '').trim() || undefined,
+    min_duration: opts.durationMode === 'custom' ? (Number(opts.minDuration) || null) : (opts.durationMode === 'shorts' ? 15 : opts.durationMode === 'mid' ? 60 : opts.durationMode === 'long' ? 180 : null),
+    max_duration: opts.durationMode === 'custom' ? (Number(opts.maxDuration) || null) : (opts.durationMode === 'shorts' ? 60 : opts.durationMode === 'mid' ? 180 : opts.durationMode === 'long' ? 600 : null),
+    min_clips: opts.clipsAuto ? null : (Number(opts.minClips) || (Number(opts.clips) ? Math.max(1, Number(opts.clips) - 2) : null)),
+    max_clips: opts.clipsAuto ? null : (Number(opts.maxClips) || Number(opts.clips) || null),
+    clip_type: (opts.clipType || 'viral').trim(),
+    duration_mode: (opts.durationMode || 'all').trim(),
+    subtitles: opts.subtitles
+      ? {
+          mode: opts.subMode, preset: opts.subPreset, position: opts.subPosition || 'bottom',
+          // Horizontal alignment applies to both modes ('center' | 'left').
+          align: opts.subAlign || 'center',
+          // Vertical nudge applies to both modes.
+          offset_y: opts.subOffsetY || 0,
+          // Karaoke font-size override (0 = Auto → use the preset size; omitted
+          // so seedSubtitleParams doesn't force a value) + text/stroke colours
+          // (stroke defaults black; both recolourable per preset).
+          ...(opts.subMode === 'karaoke'
+            ? {
+                font_color: opts.subColor || '#FFFFFF',
+                outline_color: opts.subStroke || '#000000',
+                ...(opts.subFontSize > 0 ? { font_size: opts.subFontSize } : {}),
+              }
+            : {}),
+          // Classic-mode typography (karaoke draws style from the preset, so
+          // these are only meaningful for classic).
+          ...(opts.subMode === 'classic'
+            ? {
+                font: opts.subFont || 'Montserrat-Black',
+                font_color: opts.subColor || '#FFFFFF',
+                border_width: opts.subOutlineW ?? 2,
+                bg_opacity: opts.subBg ? 0.6 : 0,
+                bg_color: '#000000',
+              }
+            : {}),
+        }
+      : false,
+    hook: opts.hooks ? { position: opts.hookPos, size: opts.hookSize, ...(opts.hookStyle || {}) } : false,
+    // Logo overlay is a compose-time layer (not a process-time arg) — persisted
+    // here only so each generated clip inherits the toggle + placement default.
+    logo: opts.logo ? { position: opts.logoPos || 'top-right', size: opts.logoSize || 'M' } : false,
+    // Colour grade default for every generated clip (compose-time layer). Off
+    // ('none') → omitted so seedToggles leaves the grade toggle off.
+    grade: opts.gradePreset && opts.gradePreset !== 'none' ? { preset: opts.gradePreset } : false,
+    // Attribution banner default (compose-time layer). No source URL exists
+    // yet at Create time, so this is just the user's manual choice — the
+    // per-job auto-suggestion (source_info.banner) only prefills the Edit
+    // modal once a job has actually run.
+    banner: opts.banner
+      ? { enabled: true, platform: opts.bannerPlatform || 'kick', handle: opts.bannerHandle || '', y_pct: opts.bannerYPct ?? 0.85 }
+      : false,
+  };
+}
+
+// Seconds → m:ss for clip duration display.
+export function fmtDuration(start, end) {
+  const s = Math.max(0, Math.round((end || 0) - (start || 0)));
+  const m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// --- AI Dubbing API ---
+export async function fetchDubbingLanguages() {
+  const res = await apiFetch(getApiUrl('/api/dubbing/languages'));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function dubClip(jobId, clipIndex, targetLanguage, sourceLanguage = null) {
+  const res = await apiFetch(getApiUrl(`/api/dubbing/${jobId}/${clipIndex}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_language: targetLanguage, source_language: sourceLanguage }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// --- YouTube Studio API ---
+export async function fetchViralTitles(transcriptText, language = 'en') {
+  const res = await apiFetch(getApiUrl('/api/studio/titles'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcript_text: transcriptText, language }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function refineViralTitles(context, userInstruction, history = []) {
+  const res = await apiFetch(getApiUrl('/api/studio/titles/refine'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ context, user_instruction: userInstruction, history }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function fetchChapters(segments) {
+  const res = await apiFetch(getApiUrl('/api/studio/chapters'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ segments }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function generateThumbnail(title, videoContext = '', extraPrompt = '', aspectRatio = '16:9', model = null) {
+  const res = await apiFetch(getApiUrl('/api/studio/thumbnail'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title,
+      video_context: videoContext,
+      extra_prompt: extraPrompt,
+      aspect_ratio: aspectRatio,
+      model,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// --- AI Shorts / UGC API ---
+export async function researchProduct(urlOrDescription) {
+  const res = await apiFetch(getApiUrl('/api/ugc/research'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url_or_description: urlOrDescription }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function generateUgcScripts(researchData, targetLanguage = 'en') {
+  const res = await apiFetch(getApiUrl('/api/ugc/scripts'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ research_data: researchData, target_language: targetLanguage }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// --- AI Highlights & Supercut API ---
+export async function planHighlights(jobId, targetDuration = 60, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/plan`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ target_duration: targetDuration }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function generateAllHighlights(jobId, params = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/generate-all`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function applyEditHighlight(jobId, highlightId, params = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/${highlightId}/apply-edit`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function renderHighlightReel(jobId, params = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/render`), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getHighlights(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}`));
+  if (!res.ok) {
+    return { highlights: [] };
+  }
+  return res.json();
+}
+
+export async function deleteHighlight(jobId, filename) {
+  const res = await apiFetch(getApiUrl(`/api/highlights/${jobId}/${filename}`), {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function retryJobApi(jobId, apiKey = '') {
+  const headers = {};
+  if (apiKey) headers['X-Gemini-Key'] = apiKey;
+  const res = await apiFetch(getApiUrl(`/api/retry/${jobId}`), {
+    method: 'POST',
+    headers,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Trend Radar & AI Content Sourcing
+// ---------------------------------------------------------------------------
+
+export async function getTrends({ category = '', includeClipped = true } = {}) {
+  const params = new URLSearchParams();
+  if (category) params.set('category', category);
+  if (!includeClipped) params.set('include_clipped', 'false');
+  const qs = params.toString() ? `?${params.toString()}` : '';
+  const res = await apiFetch(getApiUrl(`/api/trends${qs}`));
+  if (!res.ok) {
+    return { topics: [], total: 0, last_scanned: null };
+  }
+  return res.json();
+}
+
+export async function triggerTrendScan(apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const res = await apiFetch(getApiUrl('/api/trends/scan'), {
+    method: 'POST',
+    headers,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Scan failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function clipTrendVideo({ topicId = null, channelId = null, videoUrl, instructions = '', presetId = 'viral', reframeMode = 'auto' } = {}, apiKey = '') {
+  const key = (apiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_key') : '') || '').trim();
+  const headers = { 'Content-Type': 'application/json', ...(key ? { 'X-Gemini-Key': key } : {}) };
+  const payload = {
+    topic_id: topicId,
+    channel_id: channelId,
+    video_url: videoUrl,
+    instructions,
+    preset_id: presetId,
+    reframe_mode: reframeMode,
+  };
+  const res = await apiFetch(getApiUrl('/api/trends/clip'), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `1-Click Clip failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getTrendConfig() {
+  const res = await apiFetch(getApiUrl('/api/trends/config'));
+  if (!res.ok) return { interval_hours: 3, auto_scan: true, categories: [] };
+  return res.json();
+}
+
+export async function updateTrendConfig(config) {
+  const res = await apiFetch(getApiUrl('/api/trends/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Config update failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Channel Management & Topic Routing
+// ---------------------------------------------------------------------------
+
+export async function getChannels() {
+  const res = await apiFetch(getApiUrl('/api/channels'));
+  if (!res.ok) return { channels: [], total: 0 };
+  return res.json();
+}
+
+export async function matchChannelForCategory(category = '') {
+  const qs = category ? `?category=${encodeURIComponent(category)}` : '';
+  const res = await apiFetch(getApiUrl(`/api/channels/match${qs}`));
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.matched || null;
+}
+
+export async function createChannel(data) {
+  const res = await apiFetch(getApiUrl('/api/channels'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Create channel failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function updateChannel(channelId, patch) {
+  const res = await apiFetch(getApiUrl(`/api/channels/${encodeURIComponent(channelId)}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Update channel failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function deleteChannel(channelId) {
+  const res = await apiFetch(getApiUrl(`/api/channels/${encodeURIComponent(channelId)}`), {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Delete channel failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Published Performance Analytics & Continuous Learning Loop
+// ---------------------------------------------------------------------------
+
+export async function getAnalyticsSummary() {
+  const res = await apiFetch(getApiUrl('/api/analytics/summary'));
+  if (!res.ok) return { total_published: 0, total_views: 0, total_shares: 0, total_likes: 0, total_comments: 0, avg_retention: 0, clips: [] };
+  return res.json();
+}
+
+export async function syncAnalytics() {
+  const res = await apiFetch(getApiUrl('/api/analytics/sync'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Sync analytics failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function trackClipAnalytics(clipId, metrics = {}) {
+  const res = await apiFetch(getApiUrl('/api/analytics/track'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clip_id: clipId, metrics }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Track analytics failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getAnalyticsInsights() {
+  const res = await apiFetch(getApiUrl('/api/analytics/insights'));
+  if (!res.ok) return { patterns: {}, prompt_snippet: '' };
+  return res.json();
+}
+
