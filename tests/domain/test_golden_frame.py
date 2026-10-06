@@ -37,7 +37,11 @@ FONTS_DIR = os.path.join(FIXTURES, "fonts")
 GOLDEN_DIR = os.path.join(FIXTURES, "golden")
 FONT_NAME = "DejaVu Sans"
 PER_CHANNEL_TOL = 16
-MAX_DIFF_PCT = 2.0
+# Tight: the burn pipeline is bit-deterministic (same-input re-render =
+# 0.0000% diff), so even a single changed word (0.31% in the negative
+# control) fails. References are generated in the same CI env that runs
+# the test, so no cross-machine AA variance budget is needed.
+MAX_DIFF_PCT = 0.1
 W, H = 608, 1080
 
 ffmpeg = shutil.which("ffmpeg")
@@ -104,7 +108,10 @@ def _render_frame(project, at, tmp_path):
     _run([ffmpeg, "-y", "-i", "blank.mp4", "-ss", str(at),
           "-vf", "subtitles=t.ass:fontsdir=fonts",
           "-frames:v", "1", "frame.png"], cwd=tmp_path)
-    return os.path.join(str(tmp_path), "frame.png")
+    ass_path = os.path.join(str(tmp_path), "t.ass")
+    with open(ass_path, encoding="utf-8") as f:
+        ass_text = f.read()
+    return os.path.join(str(tmp_path), "frame.png"), ass_text
 
 
 def _diff_pct(frame_path, ref_path):
@@ -117,17 +124,22 @@ def _diff_pct(frame_path, ref_path):
     return 100.0 * bad / (a.size[0] * a.size[1])
 
 
-def _check_or_generate(name, project, at, tmp_path, generate_golden):
+def _check_or_generate(name, project, at, tmp_path, generate_golden,
+                       expect_text=None):
     ref = os.path.join(GOLDEN_DIR, name + ".png")
     if generate_golden:
         os.makedirs(GOLDEN_DIR, exist_ok=True)
-        frame = _render_frame(project, at, tmp_path)
+        frame, ass_text = _render_frame(project, at, tmp_path)
         shutil.copy(frame, ref)
         pytest.skip(f"generated golden reference {ref}")
     if not os.path.isfile(ref):
         pytest.skip(f"missing golden reference {ref} "
                     "(run with --generate-golden in CI)")
-    frame = _render_frame(project, at, tmp_path)
+    frame, ass_text = _render_frame(project, at, tmp_path)
+    if expect_text:
+        # The edit must reach the burned caption track, not just the pixels.
+        assert expect_text in ass_text, (
+            f"{name}: {expect_text!r} not in generated ASS")
     pct = _diff_pct(frame, ref)
     assert pct <= MAX_DIFF_PCT, (
         f"{name}: {pct:.2f}% of pixels differ from the golden frame "
@@ -140,7 +152,8 @@ def test_edited_word_frame(tmp_path, generate_golden):
     project = _project(_words(4, texts=["hello", "brave", "new", "world"]),
                        edits={"w1": "edited"})
     _check_or_generate("edited_word", project, at=1.7,
-                       tmp_path=tmp_path, generate_golden=generate_golden)
+                       tmp_path=tmp_path, generate_golden=generate_golden,
+                       expect_text="EDITED")  # classic_white uppercases
 
 
 @pytest.mark.skipif(not ffmpeg, reason="ffmpeg not on PATH")
@@ -156,4 +169,5 @@ def test_dropped_span_frame(tmp_path, generate_golden):
     ]
     project = _project(words, segments=[_seg(0, 10), _seg(20, 30, 1)])
     _check_or_generate("dropped_span", project, at=14.5,
-                       tmp_path=tmp_path, generate_golden=generate_golden)
+                       tmp_path=tmp_path, generate_golden=generate_golden,
+                       expect_text="KEPTWORD")
