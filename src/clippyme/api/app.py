@@ -1745,7 +1745,17 @@ async def get_clip_project(job_id: str, clip_index: int, request: Request, user:
         raise HTTPException(
             status_code=404, detail="No project found for this clip")
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Stable word IDs: stored projects predate them. Run the migration on
+    # read (idempotent) so the editor always sees IDs; the first write
+    # persists the migrated form. Duplicate IDs are left for the write path
+    # to reject -- reads stay permissive.
+    from clippyme.domain.clip_project import _backfill_word_ids
+    try:
+        data = _backfill_word_ids(data)
+    except ValueError:
+        pass
+    return data
 
 
 @app.get("/api/project/{job_id}/{clip_index}/versions")
