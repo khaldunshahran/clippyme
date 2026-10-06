@@ -10,6 +10,7 @@ touched. We pin the status-machine behaviour the frontend relies on:
 * graceful stop keeps the finished clips (status 'stopped', kept_clips count)
 * a queued job can be stopped before its subprocess ever launches
 """
+import asyncio
 import pytest
 from fastapi.testclient import TestClient
 

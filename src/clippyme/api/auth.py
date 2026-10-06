@@ -225,12 +225,24 @@ def _parse_id_set(env_name: str) -> Set[str]:
 
 
 def allowed_user_ids() -> Set[str]:
-    """Supabase ``sub`` values permitted to call the API (env ALLOWED_USER_IDS)."""
+    """Supabase ``sub`` values permitted to call the API (env ALLOWED_USER_IDS).
+
+    NOTE: this is the *non-admin* allow-list. Admin IDs from
+    ``ADMIN_USER_IDS`` are ALWAYS allowed (admin implies access) and do not
+    need to be listed here. See ``admin_user_ids``.
+    """
     return _parse_id_set("ALLOWED_USER_IDS")
 
 
 def admin_user_ids() -> Set[str]:
-    """Supabase ``sub`` values granted admin privileges (env ADMIN_USER_IDS)."""
+    """Supabase ``sub`` values granted admin privileges (env ADMIN_USER_IDS).
+
+    ADMIN IMPLIES ACCESS: every admin ID is automatically allowed to call
+    the API (``get_current_user`` unions this set into the effective
+    allow-list). Admins never need a separate ``ALLOWED_USER_IDS`` entry.
+    First-boot: setting ONLY ``ADMIN_USER_IDS`` (with ``ALLOWED_USER_IDS``
+    empty/unset) admits the admin and denies everyone else.
+    """
     return _parse_id_set("ADMIN_USER_IDS")
 
 
@@ -318,6 +330,8 @@ def get_current_user(request: Request) -> AuthUser:
     admin_secret = configured_admin_secret()
     req_admin_secret = request.headers.get("x-admin-secret", "").strip()
     if admin_secret and req_admin_secret and hmac.compare_digest(admin_secret, req_admin_secret):
+        if hasattr(request, "state"):
+            request.state.user_id = "admin"
         return AuthUser(id="admin", email="admin@clippyme.internal", role="admin", is_admin=True)
 
     # Shared LAN token: non-browser callers only. Browsers always send
@@ -331,6 +345,8 @@ def get_current_user(request: Request) -> AuthUser:
             if not supplied and auth_hdr.lower().startswith("bearer "):
                 supplied = auth_hdr[7:].strip()
             if supplied and hmac.compare_digest(lan_token, supplied):
+                if hasattr(request, "state"):
+                    request.state.user_id = "admin"
                 return AuthUser(id="admin", email="lan_admin@clippyme.internal", role="admin", is_admin=True)
 
     # Explicit dev bypass. An explicitly enabled auth configuration
@@ -339,7 +355,10 @@ def get_current_user(request: Request) -> AuthUser:
     if dev_bypass_enabled() and not is_production():
         if os.environ.get("AUTH_ENABLED", "0").strip().lower() not in _TRUE_VALUES:
             if _dev_bypass_request_ok(request):
-                return _default_local_admin()
+                _admin = _default_local_admin()
+                if hasattr(request, "state"):
+                    request.state.user_id = _admin.id
+                return _admin
             # Bypass refused: request looks Cloudflare-originated (or at least
             # not local dev). Fall through to the 401 below.
 
@@ -378,6 +397,8 @@ def get_current_user(request: Request) -> AuthUser:
 
     email = claims.get("email")
     role = claims.get("role", "authenticated")
+    if hasattr(request, "state"):
+        request.state.user_id = user_id
     return AuthUser(id=user_id, email=email, role=role, is_admin=is_admin)
 
 
@@ -397,6 +418,8 @@ def require_admin(
     admin_secret = configured_admin_secret()
     req_admin_secret = request.headers.get("x-admin-secret", "").strip()
     if admin_secret and req_admin_secret and hmac.compare_digest(admin_secret, req_admin_secret):
+        if hasattr(request, "state"):
+            request.state.user_id = "admin"
         return AuthUser(id="admin", email="admin@clippyme.internal", role="admin", is_admin=True)
 
     raise HTTPException(

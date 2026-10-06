@@ -58,3 +58,31 @@ Dev:
 Per-user rate limits (authenticated LLM/spend routes): studio 10–20/hr,
 UGC research 10/hr + scripts 20/hr, highlights plan 10/hr / render 5/hr /
 generate-all 5/hr / apply-edit 10/hr, dubbing 5/hr. See `security.py`.
+
+## Structured access log
+
+Every request logs one JSON line to `logs/access.jsonl` with exactly these
+fields: `timestamp` (UTC ISO-8601), `method`, `path`, `status`,
+`user_id` (from the auth context, `null` if unauthenticated),
+`cf_connecting_ip` (the `CF-Connecting-IP` header, `null` if absent).
+
+NEVER logged: request/response bodies, headers (other than
+`CF-Connecting-IP`), tokens, or API keys.
+
+Retention: the log rotates daily at midnight and keeps 30 days
+(`TimedRotatingFileHandler`, `backupCount=30`). Older files are deleted
+automatically.
+
+## Admin allow-list semantics
+
+- `ADMIN_USER_IDS` (comma-separated Supabase `sub` values) grants admin.
+- **Admin implies access**: every admin ID is automatically allowed to call
+  the API. Admins do NOT need a separate `ALLOWED_USER_IDS` entry.
+  (`get_current_user` unions `ADMIN_USER_IDS` into the effective allow-list.)
+- First-boot: setting ONLY `ADMIN_USER_IDS` (with `ALLOWED_USER_IDS`
+  empty/unset) admits the admin and denies everyone else (403
+  `NOT_ALLOWLISTED`).
+- An empty/unset `ALLOWED_USER_IDS` denies everyone except admins
+  (fail closed in every environment; the explicit `AUTH_DISABLED_DEV=1`
+  dev bypass is the only exception, and it refuses Cloudflare-originated
+  requests).

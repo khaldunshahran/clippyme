@@ -1,4 +1,5 @@
 import json
+import time
 import os
 import sys
 import uuid
@@ -324,6 +325,45 @@ async def _security_headers(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+    return response
+
+
+# --- structured access log -------------------------------------------------
+# One JSON line per request: timestamp, method, path, status, user_id,
+# cf_connecting_ip. NEVER logs bodies, headers (except CF-Connecting-IP),
+# or keys/secrets. Written to logs/access.jsonl, rotated daily, 30-day
+# retention (see docs/deploy.md).
+import logging.handlers as _lh
+
+_access_logger = logging.getLogger("clippyme.access")
+_access_logger.setLevel(logging.INFO)
+_access_logger.propagate = False
+if not _access_logger.handlers:
+    os.makedirs("logs", exist_ok=True)
+    _ah = _lh.TimedRotatingFileHandler(
+        "logs/access.jsonl", when="midnight", interval=1,
+        backupCount=30, encoding="utf-8",
+    )
+    _ah.setFormatter(logging.Formatter("%(message)s"))
+    _access_logger.addHandler(_ah)
+
+
+@app.middleware("http")
+async def _access_log(request: Request, call_next):
+    """Log one JSON line per request (see above). Never breaks the request."""
+    response = await call_next(request)
+    try:
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "user_id": getattr(request.state, "user_id", None),
+            "cf_connecting_ip": request.headers.get("cf-connecting-ip"),
+        }
+        _access_logger.info(json.dumps(entry))
+    except Exception:
+        pass
     return response
 
 

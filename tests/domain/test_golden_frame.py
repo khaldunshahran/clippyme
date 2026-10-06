@@ -46,6 +46,15 @@ W, H = 608, 1080
 
 ffmpeg = shutil.which("ffmpeg")
 
+# Golden-frame tests are STRICT in CI (fail on drift) and SKIPPED locally
+# unless RUN_GOLDEN=1 is set. CI sets GITHUB_ACTIONS=true. References must
+# be generated in the CI environment (--generate-golden); the laptop
+# renderer drifts (ffmpeg/libass) and must not gate local runs.
+_GOLDEN_ENABLED = (
+    os.environ.get("RUN_GOLDEN") == "1"
+    or os.environ.get("GITHUB_ACTIONS") == "true"
+)
+
 
 def _project(words, edits=None, segments=None):
     d = {
@@ -147,6 +156,7 @@ def _check_or_generate(name, project, at, tmp_path, generate_golden,
 
 
 @pytest.mark.skipif(not ffmpeg, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(not _GOLDEN_ENABLED, reason="golden tests run in CI or with RUN_GOLDEN=1")
 def test_edited_word_frame(tmp_path, generate_golden):
     """A word edit changes the burned caption (slice 1)."""
     project = _project(_words(4, texts=["hello", "brave", "new", "world"]),
@@ -157,6 +167,7 @@ def test_edited_word_frame(tmp_path, generate_golden):
 
 
 @pytest.mark.skipif(not ffmpeg, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(not _GOLDEN_ENABLED, reason="golden tests run in CI or with RUN_GOLDEN=1")
 def test_dropped_span_frame(tmp_path, generate_golden):
     """After a drop, the frame at output t shows the source-shifted word.
 
