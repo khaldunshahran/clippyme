@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import uuid
@@ -36,6 +37,7 @@ from pydantic import ValidationError
 from clippyme.api.auth import AuthUser, get_current_user
 
 from clippyme.domain.job_results import build_main_cmd, canonical_reframe_mode
+from clippyme.domain.runtime_state import worker_python
 from clippyme.domain.compose import compose_layers
 from clippyme.domain.reframe_service import run_reframe
 from clippyme.domain.errors import ClippyMeError, NotFoundError, ValidationError
@@ -137,6 +139,7 @@ live_monitor = LiveMonitorRegistry(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("pipeline worker interpreter: %s", worker_python())
     # Recover journalled jobs from the previous server life BEFORE the
     # dispatcher starts: queued jobs are re-enqueued, interrupted ones are
     # marked failed (or restored as completed when their result is on disk).
@@ -309,7 +312,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", "Authorization", "X-Gemini-Key", "X-API-Token"],
+    allow_headers=["Content-Type", "Authorization", "X-Gemini-Key", "X-API-Token", "Idempotency-Key"],
 )
 
 # Mount static files for serving videos.
@@ -1278,13 +1281,64 @@ async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, reques
 
     resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, OUTPUT_DIR)
 
+    # Phase 2 (clip editor): a full ClipProject dict wins over legacy toggles.
+    if req.project is not None:
+        from pydantic import ValidationError as PydanticValidationError
+        from clippyme.domain.clip_project import validate_project
+        from clippyme.domain.compose import ComposeOrderError
+        from clippyme.domain.project_render import (
+            ProjectRenderError, render_project)
+        try:
+            project = validate_project(req.project)
+        except PydanticValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid clip project: {exc.errors()}",
+            )
+        try:
+            result = await render_project(
+                job_id=job_id,
+                clip_index=clip_index,
+                project=project,
+                job_dir=resolved.job_dir,
+                metadata=resolved.metadata,
+                clip_info=resolved.clip_info,
+                naming="versioned",
+            )
+        except (ProjectRenderError, ComposeOrderError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except (HTTPException, ClippyMeError):
+            raise
+        except Exception as e:
+            logger.error("Project render error for job %s clip %d: %s",
+                         job_id, clip_index, e)
+            raise HTTPException(status_code=500, detail="Compose pipeline failed")
+        return {
+            "composed_url": f"/videos/{job_id}/{result.output_basename}",
+            "version": result.version,
+            "deduped": result.deduped,
+        }
+
+    # Legacy toggles path: map to an equivalent ClipProject and render through
+    # the SAME project-render path (byte-identical output, existing naming).
     try:
-        composed_filename = await compose_layers(
-            base_clip=resolved.clip_path,
-            job_dir=resolved.job_dir,
+        from clippyme.domain.clip_project import toggles_to_project
+        from clippyme.domain.project_render import (
+            ProjectRenderError, render_project)
+        from clippyme.pipeline.media_qa import probe_media as _probe
+        _src_probe = _probe(resolved.clip_path)
+        _src_dur = float(_src_probe.get("duration") or 0)
+        legacy_project = toggles_to_project(
+            job_id=job_id,
             clip_index=clip_index,
-            metadata=resolved.metadata,
-            clip_info=resolved.clip_info,
+            base_clip=os.path.basename(resolved.clip_path),
+            source_file=os.path.basename(resolved.clip_path),
+            source_width=int(_src_probe.get("width") or 608),
+            source_height=int(_src_probe.get("height") or 1080),
+            source_duration=_src_dur,
+            render_width=int(_src_probe.get("width") or 608),
+            render_height=int(_src_probe.get("height") or 1080),
+            fps=int(_src_probe.get("fps") or 30),
             toggles=req.toggles,
             hook_params=req.hook_params,
             subtitle_params=req.subtitle_params,
@@ -1292,13 +1346,324 @@ async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, reques
             grade_params=req.grade_params,
             banner_params=req.banner_params,
             drop_ranges=req.drop_ranges,
+            metadata=resolved.metadata,
         )
-        return {"composed_url": f"/videos/{job_id}/{composed_filename}"}
+        result = await render_project(
+            job_id=job_id,
+            clip_index=clip_index,
+            project=legacy_project,
+            job_dir=resolved.job_dir,
+            metadata=resolved.metadata,
+            clip_info=resolved.clip_info,
+            drop_ranges=req.drop_ranges,
+            naming="legacy",
+        )
+        return {"composed_url": f"/videos/{job_id}/{result.output_basename}"}
+    except ProjectRenderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except (HTTPException, ClippyMeError):
         raise
     except Exception as e:
         logger.error("Compose error for job %s clip %d: %s", job_id, clip_index, e)
         raise HTTPException(status_code=500, detail="Compose pipeline failed")
+
+
+# ---------------------------------------------------------------------------
+# Clip editor project (Phase 2) endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/project/{job_id}/{clip_index}")
+async def get_clip_project(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user), version: int | None = None):
+    """Return the latest clip-project JSON for a clip (or ``?version=N``)."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    resolved = await asyncio.to_thread(
+        resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
+    from clippyme.domain.project_render import get_project_path
+    path = get_project_path(resolved.job_dir, clip_index, version)
+    if not path:
+        raise HTTPException(
+            status_code=404, detail="No project found for this clip")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@app.get("/api/project/{job_id}/{clip_index}/versions")
+async def list_clip_project_versions(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
+    """List recorded project versions for a clip (newest last). Read-only."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    resolved = await asyncio.to_thread(
+        resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
+    from clippyme.domain.project_render import _load_version_map
+    entry = _load_version_map(resolved.job_dir).get(str(clip_index), {})
+    versions = []
+    for ver_key in sorted((entry.get("versions") or {}).keys(), key=lambda k: int(k)):
+        rec = (entry.get("versions") or {})[ver_key] or {}
+        out = rec.get("output_file") or ""
+        versions.append({
+            "version": int(rec.get("version") or ver_key),
+            "origin": rec.get("origin") or "auto",
+            "created_at": rec.get("created_at") or "",
+            "project_file": rec.get("project_file") or "",
+            "output_file": out,
+            "output_url": f"/videos/{job_id}/{out}" if out else "",
+        })
+    return {"versions": versions, "latest": int(entry.get("latest") or 0)}
+
+
+@app.put("/api/project/{job_id}/{clip_index}")
+async def save_clip_project(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Save a draft project version: validate, bump version, NO render."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    body = await request.json()
+    project_data = body.get("project")
+    if not isinstance(project_data, dict):
+        raise HTTPException(
+            status_code=400, detail="Missing 'project' dict in request body")
+    from pydantic import ValidationError as PydanticValidationError
+    from clippyme.domain.clip_project import validate_project
+    from clippyme.domain.project_render import save_project_version
+    try:
+        project = validate_project(project_data)
+    except PydanticValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid clip project: {exc.errors()}",
+        )
+    resolved = await asyncio.to_thread(
+        resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
+    # 3b: archive-and-bump lives in the shared helper (also used by
+    # batch-apply) -- one implementation, no drift.
+    version, project = save_project_version(
+        job_dir=resolved.job_dir, clip_index=clip_index, project=project)
+    return {"version": version, "project": project.model_dump()}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b: editor audio upload + batch-apply
+# ---------------------------------------------------------------------------
+
+AUDIO_UPLOAD_LIMIT = 20 * 1024 * 1024  # 20MB
+AUDIO_DIRNAME = "audio"
+
+
+def _sanitize_audio_filename(name: str) -> str:
+    """Basename + safe chars + audio extension allowlist (400 otherwise)."""
+    import re as _re
+    base = os.path.basename((name or "").strip())
+    safe = _re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    if not safe or safe in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    ext = os.path.splitext(safe)[1].lower()
+    if ext not in (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio type {ext!r} (mp3/wav/m4a/aac/ogg/flac)")
+    return safe
+
+
+@app.post("/api/audio/upload")
+async def upload_audio(job_id: str, filename: str, request: Request,
+                       user: AuthUser = Depends(get_current_user)):
+    """Upload a music track for the clip editor (raw request body bytes).
+
+    No multipart dependency: the client POSTs raw bytes with
+    ``?job_id=...&filename=...``. Stored under ``<job_dir>/audio/`` and
+    validated as real audio via ffprobe. Returns the project-relative path
+    for ``audio[].file``.
+    """
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "audio_upload", capacity=20, refill_per_sec=20 / 60)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    safe_name = _sanitize_audio_filename(filename)
+    body = await request.body()
+    if len(body) > AUDIO_UPLOAD_LIMIT:
+        raise HTTPException(status_code=413, detail="File too large. Max 20MB")
+    if len(body) < 1024:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found")
+    audio_dir = os.path.join(job_dir, AUDIO_DIRNAME)
+    os.makedirs(audio_dir, exist_ok=True)
+    dest = os.path.join(audio_dir, safe_name)
+    tmp = dest + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(body)
+    from clippyme.domain.project_render import _has_audio_stream
+    if not await asyncio.to_thread(_has_audio_stream, tmp):
+        os.remove(tmp)
+        raise HTTPException(
+            status_code=400, detail="Uploaded file has no audio stream")
+    os.replace(tmp, dest)
+    return {"file": f"{AUDIO_DIRNAME}/{safe_name}", "size": len(body)}
+
+
+@app.post("/api/project/{job_id}/batch-apply")
+async def batch_apply_projects(job_id: str, request: Request,
+                               user: AuthUser = Depends(get_current_user)):
+    """Apply one edit (patch) across several clips of a job.
+
+    Body: {"clip_indices": [int, ...], "patch": {caption_style?,
+    caption_position?, hook_text?, grade_preset?}}. Each clip's latest
+    project is patched, re-validated, and saved as a new user version
+    (the auto v1 record is never touched). Returns per-clip results.
+    """
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "batch_apply", capacity=10, refill_per_sec=10 / 60)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    body = await request.json()
+    clip_indices = body.get("clip_indices")
+    patch = body.get("patch")
+    if (not isinstance(clip_indices, list) or not clip_indices
+            or any(not isinstance(x, int) or isinstance(x, bool) or x < 0
+                   for x in clip_indices)):
+        raise HTTPException(
+            status_code=400,
+            detail="clip_indices must be a non-empty list of clip indices")
+    if len(clip_indices) > 50:
+        raise HTTPException(status_code=400, detail="Too many clips (max 50)")
+    if not isinstance(patch, dict) or not patch:
+        raise HTTPException(
+            status_code=400, detail="patch must be a non-empty dict")
+    from clippyme.domain.clip_project import (
+        apply_batch_patch, project_from_json, validate_project)
+    from clippyme.domain.project_render import (
+        get_project_path, save_project_version)
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found")
+    results: list[dict] = []
+    for ci in clip_indices:
+        try:
+            path = await asyncio.to_thread(get_project_path, job_dir, ci)
+            if not path:
+                results.append({"clip_index": ci,
+                                "error": "No project found for this clip"})
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                project = project_from_json(f.read())
+            try:
+                apply_batch_patch(project, patch)
+            except ValueError as exc:
+                results.append({"clip_index": ci, "error": str(exc)[:200]})
+                continue
+            # Re-validate the mutated model: never silently corrupt.
+            project = validate_project(project.model_dump())
+            project.origin = "user"
+            project.idempotency_key = str(uuid.uuid4())
+            version, _ = save_project_version(
+                job_dir=job_dir, clip_index=ci, project=project)
+            results.append({"clip_index": ci, "version": version})
+        except Exception as exc:  # per-clip isolation: one bad clip can't fail the batch
+            results.append({"clip_index": ci, "error": str(exc)[:200]})
+    return {"results": results}
+
+
+def _find_backfill_source(job_dir: str, clip_filename: str | None):
+    """Locate the source slice for backfill.
+
+    Returns (path, is_final_fallback). The source slice is normally
+    ``source_<clip_filename>``, but titles are sometimes translated between
+    the slice cut and the final render (e.g. Italian slice, English final).
+    The ``_clip_<N>`` number suffix is stable across translation, so match on
+    that. As a last resort, fall back to the final clip file itself (already
+    9:16 -- the emitter's center-crop math degrades to full-frame).
+    """
+    import glob as _glob
+    import re as _re
+    if clip_filename:
+        cand = os.path.join(job_dir, f"source_{clip_filename}")
+        if os.path.isfile(cand):
+            return cand, False
+        m = _re.search(r"_clip_(\d+)\.mp4$", clip_filename)
+        if m:
+            num = m.group(1)
+            for p in sorted(_glob.glob(os.path.join(job_dir, "source_*.mp4"))):
+                if _re.search(r"_clip_%s\.mp4$" % num, os.path.basename(p)):
+                    return p, False
+        final = os.path.join(job_dir, clip_filename)
+        if os.path.isfile(final):
+            return final, True
+    return None, False
+
+
+@app.post("/api/project/{job_id}/backfill")
+async def backfill_clip_projects(job_id: str, request: Request, user: AuthUser = Depends(get_current_user)):
+    """Generate clip-project.json for clips missing them. Never re-renders."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found")
+    from clippyme.domain.project_render import get_project_path
+    from clippyme.pipeline.project_emit import emit_clip_project
+    metadata: dict = {}
+    import glob as _glob
+    meta_candidates = sorted(_glob.glob(os.path.join(job_dir, "*_metadata.json")))
+    meta_candidates += [os.path.join(job_dir, n)
+                        for n in ("_metadata.json", "metadata.json")]
+    for p in meta_candidates:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+                if isinstance(metadata, dict) and (metadata.get("clips") or metadata.get("shorts")):
+                    break
+                metadata = {}
+            except (OSError, ValueError):
+                pass
+    clips = metadata.get("clips") or metadata.get("shorts") or []
+    results: list[dict] = []
+    for index, clip in enumerate(clips):
+        if not isinstance(clip, dict):
+            continue
+        if get_project_path(job_dir, index):
+            results.append({"clip_index": index, "status": "exists"})
+            continue
+        start, end = clip.get("start"), clip.get("end")
+        clip_filename = clip.get("clip_filename")
+        if not (isinstance(start, (int, float))
+                and isinstance(end, (int, float))
+                and end > start and clip_filename):
+            results.append({"clip_index": index,
+                            "status": "skipped_no_bounds"})
+            continue
+        clip_source, _src_is_final = _find_backfill_source(
+            job_dir, clip_filename)
+        if not clip_source:
+            results.append({"clip_index": index,
+                            "status": "skipped_no_source"})
+            continue
+        clip_final = os.path.join(job_dir, clip_filename)
+        path = emit_clip_project(
+            output_dir=job_dir,
+            job_id=job_id,
+            index=index,
+            start=float(start),
+            end=float(end),
+            clip=clip,
+            clips_data=metadata,
+            clip_source=clip_source,
+            clip_final=clip_final,
+        )
+        results.append({"clip_index": index,
+                        "status": "created" if path else "failed"})
+    return {"job_id": job_id, "results": results}
 
 
 # ---------------------------------------------------------------------------

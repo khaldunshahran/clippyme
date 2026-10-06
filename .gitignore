@@ -78,3 +78,6 @@ fonts/NotoColorEmoji.ttf
 # Local reference and test outputs
 openshorts_repo/
 output_test/
+
+# editor-program backup files
+*.bak-*

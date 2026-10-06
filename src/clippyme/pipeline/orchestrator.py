@@ -29,6 +29,7 @@ from typing import Any
 
 from clippyme.domain.runtime_state import RuntimeState
 from clippyme.pipeline.media_qa import inspect_clip, probe_media
+from clippyme.pipeline.project_emit import emit_clip_project
 from clippyme.pipeline.preflight import (
     PreflightInputs,
     PreflightRejected,
@@ -581,6 +582,19 @@ def _render_one_clip(
             clip["qa"] = report
             state.mark_clip(index, _qa_status(report), report)
             _save_metadata(metadata_file, clips_data)
+            # Phase 1 (clip editor): emit the default-edit project. Additive
+            # only -- emit_clip_project never raises.
+            emit_clip_project(
+                output_dir=output_dir,
+                job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
+                index=index,
+                start=start,
+                end=end,
+                clip=clip,
+                clips_data=clips_data,
+                clip_source=clip_source,
+                clip_final=clip_final,
+            )
             print(f"♻️ Resume: clip {index + 1}/{total} already valid", flush=True)
             return True
         try:
@@ -682,6 +696,19 @@ def _render_one_clip(
             status = _qa_status(last_report)
             state.mark_clip(index, status, last_report)
             _save_metadata(metadata_file, clips_data)
+            # Phase 1 (clip editor): emit the default-edit project. Additive
+            # only -- emit_clip_project never raises.
+            emit_clip_project(
+                output_dir=output_dir,
+                job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
+                index=index,
+                start=start,
+                end=end,
+                clip=clip,
+                clips_data=clips_data,
+                clip_source=clip_source,
+                clip_final=clip_final,
+            )
             warning_text = (
                 f" with {len(last_report.get('warnings') or [])} warning(s)"
                 if status == "warning"

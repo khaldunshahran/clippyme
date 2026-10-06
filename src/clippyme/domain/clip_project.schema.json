@@ -1,0 +1,401 @@
+{
+  "$defs": {
+    "AudioTrack": {
+      "properties": {
+        "file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "music file; null = no music (v1)",
+          "title": "File"
+        },
+        "volume": {
+          "default": 1.0,
+          "maximum": 2.0,
+          "minimum": 0.0,
+          "title": "Volume",
+          "type": "number"
+        },
+        "offset": {
+          "default": 0.0,
+          "minimum": 0.0,
+          "title": "Offset",
+          "type": "number"
+        }
+      },
+      "title": "AudioTrack",
+      "type": "object"
+    },
+    "CaptionWord": {
+      "properties": {
+        "w": {
+          "title": "W",
+          "type": "string"
+        },
+        "start": {
+          "minimum": 0,
+          "title": "Start",
+          "type": "number"
+        },
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "number"
+        }
+      },
+      "required": [
+        "w",
+        "start",
+        "end"
+      ],
+      "title": "CaptionWord",
+      "type": "object"
+    },
+    "Captions": {
+      "properties": {
+        "style": {
+          "default": "hormozi",
+          "title": "Style",
+          "type": "string"
+        },
+        "position": {
+          "default": "lower-third",
+          "title": "Position",
+          "type": "string"
+        },
+        "words": {
+          "items": {
+            "$ref": "#/$defs/CaptionWord"
+          },
+          "title": "Words",
+          "type": "array"
+        },
+        "edits": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "word-index (as string) -> corrected text",
+          "title": "Edits",
+          "type": "object"
+        }
+      },
+      "title": "Captions",
+      "type": "object"
+    },
+    "CropBox": {
+      "description": "9:16 crop window inside the 16:9 source slice (source pixel coords).",
+      "properties": {
+        "x": {
+          "minimum": 0,
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "minimum": 0,
+          "title": "Y",
+          "type": "number"
+        },
+        "w": {
+          "exclusiveMinimum": 0,
+          "title": "W",
+          "type": "number"
+        },
+        "h": {
+          "exclusiveMinimum": 0,
+          "title": "H",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "w",
+        "h"
+      ],
+      "title": "CropBox",
+      "type": "object"
+    },
+    "Grade": {
+      "properties": {
+        "preset": {
+          "default": "default",
+          "title": "Preset",
+          "type": "string"
+        }
+      },
+      "title": "Grade",
+      "type": "object"
+    },
+    "Overlay": {
+      "description": "Text overlays: hooks, banners.",
+      "properties": {
+        "type": {
+          "enum": [
+            "hook",
+            "banner"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "style": {
+          "default": "viral",
+          "title": "Style",
+          "type": "string"
+        },
+        "start": {
+          "description": "clip-relative seconds",
+          "minimum": 0,
+          "title": "Start",
+          "type": "number"
+        },
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "number"
+        },
+        "position": {
+          "default": "top",
+          "title": "Position",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "text",
+        "start",
+        "end"
+      ],
+      "title": "Overlay",
+      "type": "object"
+    },
+    "ProjectSegment": {
+      "description": "One timeline segment. v1: editor works single-segment; schema allows many.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "start": {
+          "description": "source seconds, inclusive",
+          "minimum": 0,
+          "title": "Start",
+          "type": "number"
+        },
+        "end": {
+          "description": "source seconds, exclusive",
+          "exclusiveMinimum": 0,
+          "title": "End",
+          "type": "number"
+        },
+        "crop": {
+          "$ref": "#/$defs/CropBox"
+        },
+        "transition_in": {
+          "default": "cut",
+          "enum": [
+            "cut",
+            "fade"
+          ],
+          "title": "Transition In",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "start",
+        "end",
+        "crop"
+      ],
+      "title": "ProjectSegment",
+      "type": "object"
+    },
+    "RenderSpec": {
+      "properties": {
+        "width": {
+          "default": 608,
+          "exclusiveMinimum": 0,
+          "title": "Width",
+          "type": "integer"
+        },
+        "height": {
+          "default": 1080,
+          "exclusiveMinimum": 0,
+          "title": "Height",
+          "type": "integer"
+        },
+        "fps": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "title": "Fps",
+          "type": "integer"
+        },
+        "encoder": {
+          "default": "nvenc",
+          "enum": [
+            "nvenc",
+            "libx264"
+          ],
+          "title": "Encoder",
+          "type": "string"
+        }
+      },
+      "title": "RenderSpec",
+      "type": "object"
+    },
+    "SourceRef": {
+      "properties": {
+        "file": {
+          "description": "16:9 source slice on disk, e.g. source_<clip>.mp4",
+          "title": "File",
+          "type": "string"
+        },
+        "width": {
+          "exclusiveMinimum": 0,
+          "title": "Width",
+          "type": "integer"
+        },
+        "height": {
+          "exclusiveMinimum": 0,
+          "title": "Height",
+          "type": "integer"
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "source slice duration in seconds (informational)",
+          "title": "Duration"
+        }
+      },
+      "required": [
+        "file",
+        "width",
+        "height"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema": {
+      "const": "nugget.clip-project/1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "version": {
+      "default": 1,
+      "description": "increments per save",
+      "minimum": 1,
+      "title": "Version",
+      "type": "integer"
+    },
+    "origin": {
+      "default": "auto",
+      "enum": [
+        "auto",
+        "user",
+        "legacy"
+      ],
+      "title": "Origin",
+      "type": "string"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "clip_index": {
+      "minimum": 0,
+      "title": "Clip Index",
+      "type": "integer"
+    },
+    "idempotency_key": {
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceRef"
+    },
+    "segments": {
+      "items": {
+        "$ref": "#/$defs/ProjectSegment"
+      },
+      "minItems": 1,
+      "title": "Segments",
+      "type": "array"
+    },
+    "captions": {
+      "$ref": "#/$defs/Captions"
+    },
+    "overlays": {
+      "items": {
+        "$ref": "#/$defs/Overlay"
+      },
+      "title": "Overlays",
+      "type": "array"
+    },
+    "audio": {
+      "items": {
+        "$ref": "#/$defs/AudioTrack"
+      },
+      "title": "Audio",
+      "type": "array"
+    },
+    "grade": {
+      "$ref": "#/$defs/Grade"
+    },
+    "render": {
+      "$ref": "#/$defs/RenderSpec"
+    },
+    "base_clip": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Base Clip"
+    },
+    "legacy_params": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Legacy Params"
+    }
+  },
+  "required": [
+    "schema",
+    "job_id",
+    "clip_index",
+    "source",
+    "segments"
+  ],
+  "title": "ClipProject",
+  "type": "object"
+}

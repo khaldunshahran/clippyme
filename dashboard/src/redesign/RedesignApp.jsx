@@ -18,6 +18,7 @@ import { TrendRadarView } from './trendRadar';
 import { ChannelsView } from './channels';
 import { AnalyticsView } from './analyticsView';
 import { EditClipModal } from './captions';
+import { ClipEditorView } from './clipEditor';
 import { AuthModal } from './AuthModal';
 import { getCurrentUser, isAuthEnabled, onAuthStateChange, signOut } from '../lib/supabaseClient';
 import { optsToPreselections, restoreJob, listBackendJobs, cancelJob, pauseJob, resumeJob, stopJob, retryJobApi, reframeClip, composeClip, getConfig, generateAllClipMetadata } from './realApi';
@@ -167,6 +168,8 @@ export default function RedesignApp() {
   useEffect(() => () => { toastTimerIds.current.forEach(clearTimeout); }, []);
   const [publishClips, setPublishClips] = useState(null);
   const [editClip, setEditClip] = useState(null);
+  // Dedicated clip editor page (Phase 3a): { jobId, clipIndex, clip } or null.
+  const [editorTarget, setEditorTarget] = useState(null);
   const [bulkEdit, setBulkEdit] = useState(null);
   const [viewingHistory, setViewingHistory] = useState(false);
   const [historyJob, setHistoryJob] = useState(null);
@@ -514,6 +517,12 @@ export default function RedesignApp() {
 
   const openPublish = (clips) => setPublishClips(Array.isArray(clips) ? clips : [clips]);
 
+  // Open the dedicated editor for one clip. clipIndex is the backend's
+  // ABSOLUTE `shorts` position (original_index ?? array index).
+  const openEditor = (c, i, ejobId) => setEditorTarget({
+    jobId: ejobId, clipIndex: c?.original_index ?? i, clip: c,
+  });
+
   const goTab = (next) => {
     if (next === 'create' && (status === 'complete' || status === 'error')) {
       setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setProcessingMedia(null); setCurrentStep(null);
@@ -521,6 +530,7 @@ export default function RedesignApp() {
     }
     setViewingHistory(false);
     setHistoryJob(null);
+    setEditorTarget(null);
     setTab(next);
   };
 
@@ -646,25 +656,35 @@ export default function RedesignApp() {
         </div>
       )}
 
-      {tab === 'create' && status === 'idle' && (
+      {editorTarget && (
+        <ClipEditorView
+          jobId={editorTarget.jobId}
+          clipIndex={editorTarget.clipIndex}
+          clip={editorTarget.clip}
+          onBack={() => setEditorTarget(null)}
+          pushToast={pushToast}
+        />
+      )}
+      {!editorTarget && tab === 'create' && status === 'idle' && (
         <CreateView opts={opts} set={set} onPickPreset={pickPreset} onCreate={startJob}
           presets={presetList} defaultId={defaultPresetId}
           onSaveCurrent={onSaveCurrentPreset} onSetDefault={onSetDefaultPreset} onDelete={onDeletePreset} />
       )}
-      {tab === 'create' && (status === 'processing' || status === 'error') && (
+      {!editorTarget && tab === 'create' && (status === 'processing' || status === 'error') && (
         <ProcessingView media={processingMedia} status={status} logs={logs} step={currentStep}
           clips={clips} opts={opts} onCancel={resetToCreate} onRetry={retryJob}
           paused={paused} onPause={pauseCurrent} onResume={resumeCurrent} onStop={stopCurrent} />
       )}
-      {tab === 'create' && status === 'complete' && (
+      {!editorTarget && tab === 'create' && status === 'complete' && (
         <ResultsView clips={clips} jobId={jobId} preselections={preselections}
           clipStates={clipStates} onUpdateClipState={updateClipStateT} onBack={resetToCreate}
           onPublish={openPublish} onPublishAll={openPublish} onEdit={(c, i) => setEditClip({ clip: c, idx: i })}
           onApplyToAll={applyClipToAll} onEditSelected={(targets) => setBulkEdit({ targets })}
+          onOpenEditor={(c, i) => openEditor(c, i, jobId)}
           pushToast={pushToast} />
       )}
 
-      {tab === 'trends' && (
+      {!editorTarget && tab === 'trends' && (
         <TrendRadarView
           apiKey={apiKey}
           pushToast={pushToast}
@@ -689,24 +709,24 @@ export default function RedesignApp() {
         />
       )}
 
-      {tab === 'channels' && (
+      {!editorTarget && tab === 'channels' && (
         <ChannelsView
           pushToast={pushToast}
           onSelectChannelForRadar={() => setTab('trends')}
         />
       )}
 
-      {tab === 'analytics' && <AnalyticsView pushToast={pushToast} />}
+      {!editorTarget && tab === 'analytics' && <AnalyticsView pushToast={pushToast} />}
 
-      {tab === 'live' && <LiveMonitorView pushToast={pushToast} />}
+      {!editorTarget && tab === 'live' && <LiveMonitorView pushToast={pushToast} />}
 
-      {tab === 'history' && !viewingHistory && (
+      {!editorTarget && tab === 'history' && !viewingHistory && (
         <HistoryView history={history} availableIds={availableJobIds}
           onOpen={openHistoryJob}
           onDelete={(id) => { deleteFromHistory(id); pushToast('info', 'Job deleted'); }}
           onClear={() => { clearHistory(); pushToast('info', 'History cleared'); }} />
       )}
-      {tab === 'history' && viewingHistory && historyJob && (
+      {!editorTarget && tab === 'history' && viewingHistory && historyJob && (
         <div className="fade-in">
           <div className="container" style={{ paddingTop: 24, paddingBottom: 0 }}>
             <Btn variant="secondary" size="sm" icon="arrow-left" onClick={() => { setViewingHistory(false); setHistoryJob(null); }}>Back to history</Btn>
@@ -716,12 +736,13 @@ export default function RedesignApp() {
             onPublish={openPublish} onPublishAll={openPublish} onEdit={(c, i) => setEditClip({ clip: c, idx: i })}
             onApplyToAll={applyClipToAll}
             onEditSelected={(targets) => setBulkEdit({ targets })}
+            onOpenEditor={(c, i) => openEditor(c, i, historyJob.jobId)}
             pushToast={pushToast} />
         </div>
       )}
 
-      {tab === 'highlights' && <HighlightsStudioView apiKey={apiKey} onToast={(t) => pushToast(t.type, t.message)} />}
-      {tab === 'settings' && <SettingsView apiKey={apiKey} onApiKey={setApiKey} cookiesConfigured={cookiesConfigured} onCookiesChange={setCookiesConfigured} pushToast={pushToast} />}
+      {!editorTarget && tab === 'highlights' && <HighlightsStudioView apiKey={apiKey} onToast={(t) => pushToast(t.type, t.message)} />}
+      {!editorTarget && tab === 'settings' && <SettingsView apiKey={apiKey} onApiKey={setApiKey} cookiesConfigured={cookiesConfigured} onCookiesChange={setCookiesConfigured} pushToast={pushToast} />}
 
       {publishClips && (
         <PublishModal clips={publishClips} jobId={viewingHistory && historyJob ? historyJob.jobId : jobId}

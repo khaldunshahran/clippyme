@@ -1,7 +1,8 @@
 import { memo, useCallback, useMemo, useState } from 'react';
 import { Icon, Btn, Badge, RingGauge, PebbleWaveform } from './primitives';
 import { LazyVideo } from './LazyVideo';
-import { clipPreviewSrc, fmtDuration, downloadClip, exportClip } from './realApi';
+import { clipPreviewSrc, fmtDuration, downloadClip, exportClip, batchApplyProjects } from './realApi';
+import { SUBTITLE_PRESETS, GRADE_PRESETS } from './data';
 import { PlatformMockupOverlay, PlatformCaptionSection } from './PlatformMockupOverlay';
 
 const REFRAME_ICON = { auto: 'crop', subject: 'scan-face', object: 'scan-face', disabled: 'square' };
@@ -23,6 +24,7 @@ const ClipCard = memo(function ClipCard({
   preselections,
   onUpdate,
   onEdit,
+  onOpenEditor,
   onApplyToAll,
   selectMode,
   onPublish,
@@ -238,6 +240,23 @@ const ClipCard = memo(function ClipCard({
         </button>
       )}
 
+      {!selectMode && onOpenEditor && (
+        <button
+          type="button"
+          className="clip-edit"
+          disabled={processing}
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenEditor(clip, index);
+          }}
+          aria-label={`Open ${title} in the clip editor`}
+          title="Open in the clip editor (trim, captions, hook)"
+        >
+          <Icon n="scissors" />
+          Open in editor
+        </button>
+      )}
+
       {/* Actions */}
       {!selectMode && (
         <div className="clip-foot">
@@ -300,6 +319,87 @@ const ClipCard = memo(function ClipCard({
   );
 });
 
+function BatchEditPanel({ jobId, selected, onDone, pushToast }) {
+  const [capStyle, setCapStyle] = useState('');
+  const [capPos, setCapPos] = useState('');
+  const [hookText, setHookText] = useState('');
+  const [grade, setGrade] = useState('');
+  const [busy, setBusy] = useState(false);
+  const sel = { background: 'var(--surface-deep, #f4f1ea)', border: '1px solid rgba(51,46,38,.18)',
+    borderRadius: 8, padding: '6px 10px', fontSize: 13, color: 'var(--ink, #222)', width: '100%',
+    boxSizing: 'border-box' };
+  const lab = { display: 'block', fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+    letterSpacing: '.5px', color: 'var(--ink-dim, #666)', marginBottom: 6 };
+  const apply = async () => {
+    const patch = {};
+    if (capStyle) patch.caption_style = capStyle;
+    if (capPos) patch.caption_position = capPos;
+    if (hookText.trim()) patch.hook_text = hookText.trim();
+    if (grade) patch.grade_preset = grade;
+    if (!Object.keys(patch).length) { pushToast?.('warn', 'Pick at least one edit first'); return; }
+    const indices = selected.map(({ c, i }) => c.original_index ?? i);
+    setBusy(true);
+    try {
+      const { results = [] } = await batchApplyProjects(jobId, indices, patch);
+      const okd = results.filter((r) => r.version).length;
+      const failed = results.filter((r) => r.error);
+      onDone();
+      pushToast?.(failed.length ? 'warn' : 'success',
+        failed.length
+          ? `Batch edit: ${okd} updated, ${failed.length} failed (${failed[0].error})`
+          : `Batch edit applied to ${okd} clip${okd === 1 ? '' : 's'} (new draft versions)`);
+    } catch (e) {
+      pushToast?.('error', 'Batch edit failed: ' + ((e && e.message) || e).slice(0, 140));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div style={{ background: 'var(--surface)', boxShadow: 'var(--clay-raised-md)',
+      borderRadius: 'var(--r-panel)', padding: '16px 20px', marginBottom: 28 }}>
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>
+        Batch edit {selected.length} clip{selected.length === 1 ? '' : 's'}
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--ink-dim, #666)', marginBottom: 14 }}>
+        One edit applied to every selected clip as a new draft version. The AI cut (v1) is never touched.
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 14 }}>
+        <label><span style={lab}>Caption style</span>
+          <select value={capStyle} onChange={(e) => setCapStyle(e.target.value)} style={sel}>
+            <option value="">— no change —</option>
+            {SUBTITLE_PRESETS.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
+          </select>
+        </label>
+        <label><span style={lab}>Caption position</span>
+          <select value={capPos} onChange={(e) => setCapPos(e.target.value)} style={sel}>
+            <option value="">— no change —</option>
+            <option value="top">Top</option>
+            <option value="middle">Middle</option>
+            <option value="bottom">Bottom</option>
+          </select>
+        </label>
+        <label><span style={lab}>Hook text</span>
+          <input value={hookText} onChange={(e) => setHookText(e.target.value)}
+            placeholder="New hook for all selected…" style={sel} />
+        </label>
+        <label><span style={lab}>Grade preset</span>
+          <select value={grade} onChange={(e) => setGrade(e.target.value)} style={sel}>
+            <option value="">— no change —</option>
+            <option value="default">Default (off)</option>
+            {GRADE_PRESETS.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
+          </select>
+        </label>
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+        <Btn variant="primary" size="sm" icon="wand-sparkles" loading={busy} disabled={busy} onClick={apply}>
+          {busy ? 'Applying…' : `Apply to ${selected.length}`}
+        </Btn>
+        <Btn variant="ghost" size="sm" onClick={onDone}>Cancel</Btn>
+      </div>
+    </div>
+  );
+}
+
 export function ResultsView({
   clips,
   jobId,
@@ -311,6 +411,7 @@ export function ResultsView({
   onPublish,
   onPublishAll,
   onEdit,
+  onOpenEditor,
   onApplyToAll,
   onEditSelected,
   embedded,
@@ -318,6 +419,7 @@ export function ResultsView({
 }) {
   const [selectMode, setSelectMode] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [batchOpen, setBatchOpen] = useState(false);
   const visible = useMemo(
     () => clips.map((clip, index) => ({ c: clip, i: index })).filter(({ i }) => !clipStates[i]?.deleted),
     [clips, clipStates]
@@ -427,6 +529,9 @@ export function ResultsView({
             {allSelected ? 'Deselect all' : 'Select all'}
           </Btn>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+            <Btn variant="ghost" size="sm" icon="wand-sparkles" disabled={!selected.length} onClick={() => setBatchOpen((v) => !v)}>
+              Batch edit
+            </Btn>
             <Btn variant="ghost" size="sm" icon="sliders-horizontal" disabled={!selected.length} onClick={() => onEditSelected(selected)}>
               Edit {selected.length || ''}
             </Btn>
@@ -438,6 +543,11 @@ export function ResultsView({
             </Btn>
           </div>
         </div>
+      )}
+
+      {selectMode && batchOpen && selected.length > 0 && (
+        <BatchEditPanel jobId={jobId} selected={selected}
+          onDone={() => setBatchOpen(false)} pushToast={pushToast} />
       )}
 
       {visible.length ? (
@@ -454,6 +564,7 @@ export function ResultsView({
               selectMode={selectMode}
               onPublish={onPublish}
               onEdit={onEdit}
+              onOpenEditor={onOpenEditor}
               onApplyToAll={onApplyToAll}
               pushToast={pushToast}
             />

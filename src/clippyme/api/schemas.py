@@ -240,7 +240,7 @@ def _validate_drop_ranges(value):
     return value
 
 
-_ALLOWED_TOGGLES = frozenset({"smartcut", "hook", "subtitles", "logo", "grade", "banner"})
+_ALLOWED_TOGGLES = frozenset({"smartcut", "hook", "subtitles", "logo", "grade", "banner", "lowerThirds"})
 
 
 def _validate_toggles(value):
@@ -278,6 +278,17 @@ def validate_publish_platforms(value: List[dict]) -> List[dict]:
 
 
 class ComposeRequest(BaseModel):
+    """Edit/reprocess a clip's composed output.
+
+    Phase 2: accepts EITHER legacy ``toggles``+params (existing fields
+    untouched) OR ``project`` (a full ClipProject dict). When ``project``
+    is present it wins; it is validated and rendered through
+    ``domain.project_render.render_project``.
+    """
+    project: dict | None = Field(
+        default=None,
+        description="Full ClipProject dict (Phase 2 editor). Wins over toggles.",
+    )
     toggles: dict = Field(default_factory=dict)
     hook_params: dict = Field(default_factory=dict)
     subtitle_params: dict = Field(default_factory=dict)

@@ -116,6 +116,108 @@ export async function editClipAI(jobId, index, instruction, model) {
 
 // Per-clip transcript segments (clip-relative seconds) for the manual-trim UI.
 // Returns { segments: [{index, text, start, end}], duration, language }.
+// ---------------------------------------------------------------------------
+// Clip editor projects (Phase 2/3a): versioned clip-project.json documents.
+// ---------------------------------------------------------------------------
+
+// Load a clip project: latest draft, or ?version=N for a specific version.
+// Returns the full ClipProject dict. Throws on 404 (no project yet).
+export async function getClipProject(jobId, index, version = null) {
+  const q = version ? `?version=${encodeURIComponent(version)}` : '';
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/${index}${q}`));
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json();
+}
+
+// Save a draft project version (validated server-side, version bumped, NO
+// render). Returns { version, project }.
+export async function saveClipProject(jobId, index, project) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/${index}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Render a full ClipProject. Returns { composed_url, version, deduped }.
+export async function composeProject(jobId, index, project) {
+  const res = await apiFetch(getApiUrl(`/api/compose/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Generate clip-project.json for clips of an old job that lack them.
+// Never re-renders. Returns { results: [{clip_index, status}] }.
+export async function backfillClipProjects(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/backfill`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Upload a music track for the editor (raw bytes; the server validates it is
+// real audio and enforces a 20MB cap). Returns { file: "audio/<name>", size }.
+export async function uploadAudio(jobId, file) {
+  const res = await apiFetch(getApiUrl(`/api/audio/upload?job_id=${encodeURIComponent(jobId)}&filename=${encodeURIComponent(file.name)}`), {
+    method: 'POST',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// Batch-apply one edit across clips: {clip_indices, patch} ->
+// { results: [{clip_index, version} | {clip_index, error}] }.
+export async function batchApplyProjects(jobId, clipIndices, patch) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/batch-apply`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clip_indices: clipIndices, patch }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// List recorded project versions (newest last).
+// Returns { versions: [{version, origin, created_at, project_file, output_file, output_url}], latest }.
+export async function listClipProjectVersions(jobId, index) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/${index}/versions`));
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function getClipTranscript(jobId, index) {
   const res = await apiFetch(getApiUrl(`/api/transcript/${jobId}/${index}`));
   if (!res.ok) throw new Error(`HTTP ${res.status}`);

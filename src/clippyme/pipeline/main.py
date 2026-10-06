@@ -267,11 +267,11 @@ def _transcribe_whisper_chunked(model, audio_path: str, language: str | None, ch
     detected_lang = language or "en"
 
     if total_duration > 0 and total_duration <= chunk_duration:
-        segs, info = model.transcribe(audio_path, word_timestamps=True, language=language)
+        segs, info = model.transcribe(audio_path, word_timestamps=True, language=language, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500))
         return list(segs), getattr(info, "language", detected_lang)
 
     if total_duration <= 0:
-        segs, info = model.transcribe(audio_path, word_timestamps=True, language=language)
+        segs, info = model.transcribe(audio_path, word_timestamps=True, language=language, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500))
         return list(segs), getattr(info, "language", detected_lang)
 
     all_segments = []
@@ -973,7 +973,7 @@ if __name__ == '__main__':
                     empty['gemini_exhausted'] = True
                 _meta = os.path.join(output_dir, f"{video_title}_metadata.json")
                 _tmp = _meta + '.tmp'
-                with open(_tmp, 'w') as f:
+                with open(_tmp, 'w', encoding="utf-8") as f:
                     json.dump(empty, f, indent=2)
                 os.replace(_tmp, _meta)
                 print("🚫 Monitor: no valid clips this segment — skipping.")
@@ -1040,7 +1040,7 @@ if __name__ == '__main__':
                     pass
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             metadata_tmp = metadata_file + ".tmp"
-            with open(metadata_tmp, 'w') as f:
+            with open(metadata_tmp, 'w', encoding="utf-8") as f:
                 json.dump(clips_data, f, indent=2)
             os.replace(metadata_tmp, metadata_file)
             print(f"   Saved metadata to {metadata_file}")
@@ -1071,7 +1071,7 @@ if __name__ == '__main__':
                 # shows zero clips for the whole run. Same atomic tmp+replace
                 # write as the initial dump above; N clips is small (<=~10),
                 # so N extra small writes is cheap.
-                with open(metadata_tmp, 'w') as f:
+                with open(metadata_tmp, 'w', encoding="utf-8") as f:
                     json.dump(clips_data, f, indent=2)
                 os.replace(metadata_tmp, metadata_file)
                 # Keep the 16:9 source slice persistently so the user can

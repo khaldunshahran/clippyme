@@ -16,6 +16,90 @@ from clippyme.domain.errors import ValidationError
 
 logger = logging.getLogger(__name__)
 
+
+class ComposeOrderError(ValidationError):
+    """A requested compose layer order violates a documented timing/z-order
+    constraint (maps to 400 via the ClippyMeError handler)."""
+
+    status_code = 400
+
+
+# Canonical compose order. Promoted from the long comment in
+# ``_compose_layers_impl`` into machine-checked data (Phase 0.2):
+# subtitle timestamps are derived from the original transcript using absolute
+# clip_start/clip_end, so subtitles must be burned BEFORE smartcut shortens
+# the clip; grade must run before any overlay so the colour transform hits
+# source frames only; hook/logo are static overlays that must land after
+# smartcut, logo topmost.
+CANONICAL_LAYER_ORDER = ("grade", "subtitles", "smartcut", "hook", "logo")
+
+# (earlier, later, reason) — each pair must hold whenever both layers are
+# present in a requested order. Together they form the total order above.
+_LAYER_ORDER_CONSTRAINTS = (
+    ("grade", "subtitles",
+     "grade must run before subtitles so the colour transform applies to "
+     "source frames, not to overlay glyphs"),
+    ("grade", "hook",
+     "grade must run before hook so the hook keeps its exact authored "
+     "colours instead of being tinted"),
+    ("grade", "logo",
+     "grade must run before logo so the brand mark keeps its exact colours "
+     "instead of being tinted"),
+    ("subtitles", "smartcut",
+     "subtitle timestamps assume pre-smartcut length (absolute "
+     "clip_start/clip_end from the transcript); burning subtitles after "
+     "smartcut would let them drift as silences are removed"),
+    ("subtitles", "hook",
+     "hook is composited on top of everything including subtitles; burning "
+     "subtitles after the hook would paint caption glyphs over the hook text"),
+    ("smartcut", "hook",
+     "hook is a static overlay that must appear on every surviving frame; "
+     "it must be applied after smartcut removes silences"),
+    ("hook", "logo",
+     "logo is the topmost brand mark and must composite after the hook"),
+)
+
+# Toggle keys the compose path understands. "banner" rides inside the
+# subtitles pass (see _compose_layers_impl), so it validates at the
+# subtitles position.
+_KNOWN_LAYERS = ("grade", "subtitles", "banner", "smartcut", "hook", "logo")
+
+
+def validate_layer_order(order) -> list:
+    """Validate a requested compose layer order against the timing/z-order
+    constraints.
+
+    ``order`` may be None (canonical order), a list of layer names, or any
+    subset thereof. Returns the normalised order.
+
+    Raises:
+        ComposeOrderError: naming the violated constraint, e.g.
+            ``"SMARTCUT before SUBTITLES breaks compose timing: subtitle
+            timestamps assume pre-smartcut length ..."``.
+    """
+    if order is None:
+        return list(CANONICAL_LAYER_ORDER)
+    norm = ["subtitles" if str(layer).strip().lower() == "banner" else str(layer).strip().lower()
+            for layer in order]
+    unknown = [layer for layer in norm if layer not in CANONICAL_LAYER_ORDER]
+    if unknown:
+        raise ComposeOrderError(
+            f"unknown compose layer(s): {', '.join(sorted(set(unknown)))}; "
+            f"known layers: {', '.join(_KNOWN_LAYERS)}"
+        )
+    seen = set()
+    for layer in norm:
+        if layer in seen:
+            raise ComposeOrderError(f"duplicate compose layer: {layer!r}")
+        seen.add(layer)
+    for earlier, later, reason in _LAYER_ORDER_CONSTRAINTS:
+        if earlier in norm and later in norm and norm.index(earlier) > norm.index(later):
+            raise ComposeOrderError(
+                f"{later.upper()} before {earlier.upper()} breaks compose timing: "
+                f"{reason} (requested order: {' -> '.join(norm)})"
+            )
+    return norm
+
 from clippyme.domain.smartcut import smart_cut
 from clippyme.domain.subtitles import generate_ass_karaoke, generate_srt, burn_subtitles
 
@@ -138,6 +222,7 @@ async def _apply_smartcut(
     clip_info: dict,
     intermediate_files: list,
     drop_ranges=None,
+    layer_order: list | None = None,
 ) -> str:
     # Smart Cut caching is delegated entirely to smart_cut() itself, which
     # writes a plan-hashed output (`{base}_smartcut_{hash}.mp4`) and validates
@@ -461,6 +546,7 @@ async def compose_layers(
     grade_params: dict = None,
     banner_params: dict = None,
     drop_ranges=None,
+    layer_order: list | None = None,
 ) -> str:
     """Run the active layer pipeline. Returns the final composed filename (basename).
 
@@ -473,6 +559,8 @@ async def compose_layers(
     (Download racing Publish's compose_first) would delete/overwrite each
     other's in-flight files. Different clips compose in parallel as before.
     """
+    requested_order = validate_layer_order(layer_order)
+    logger.info("compose_layers: layer_order=%s", requested_order)
     async with clip_lock(job_dir, clip_index):
         return await _compose_layers_impl(
             base_clip=base_clip, job_dir=job_dir, clip_index=clip_index,
