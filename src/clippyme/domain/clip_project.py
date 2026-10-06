@@ -25,7 +25,7 @@ import json
 import uuid
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 SCHEMA_TAG = "nugget.clip-project/1"
 
@@ -58,9 +58,14 @@ class ProjectSegment(BaseModel):
 
 
 class CaptionWord(BaseModel):
+    # Stable word ID (e.g. "w12"): assigned at project creation from
+    # Captions.next_word_id, persisted, never reused. Splits/drops never
+    # renumber; re-transcription carries IDs over by (rounded start, text).
+    # All word-keyed patch data (edits, and later slices' keys) uses IDs.
+    id: str = Field(default="", description="stable word ID, e.g. 'w12'")
     w: str
-    start: float = Field(ge=0)
-    end: float = Field(ge=0)
+    start: float = Field(ge=0, description="source seconds")
+    end: float = Field(ge=0, description="source seconds")
 
 
 class Captions(BaseModel):
@@ -69,7 +74,12 @@ class Captions(BaseModel):
     words: list[CaptionWord] = Field(default_factory=list)
     edits: dict[str, str] = Field(
         default_factory=dict,
-        description="word-index (as string) -> corrected text",
+        description="word ID (or legacy word-index as string) -> corrected text",
+    )
+    next_word_id: int = Field(
+        default=0,
+        ge=0,
+        description="persisted counter; fresh word IDs are f'w{next_word_id}', then it increments",
     )
 
 
@@ -112,6 +122,50 @@ class RenderSpec(BaseModel):
     encoder: Literal["nvenc", "libx264"] = "nvenc"
 
 
+def _backfill_word_ids(data: dict) -> dict:
+    """Migration for stable word IDs (runs inside validate_project).
+
+    - Assigns missing word IDs as f'w{counter}', advancing the counter.
+    - Advances the counter past any numeric IDs already present (w{N}).
+    - Raises ValueError on duplicate word IDs.
+
+    Idempotent: already-migrated projects pass through unchanged.
+    """
+    if not isinstance(data, dict):
+        return data
+    caps = data.get("captions")
+    if not isinstance(caps, dict):
+        return data
+    words = caps.get("words") or []
+    try:
+        counter = int(caps.get("next_word_id") or 0)
+    except (TypeError, ValueError):
+        counter = 0
+    if counter < 0:
+        counter = 0
+    for w in words:
+        wid = (w.get("id") or "") if isinstance(w, dict) else ""
+        if isinstance(wid, str) and wid.startswith("w"):
+            try:
+                counter = max(counter, int(wid[1:]) + 1)
+            except ValueError:
+                pass
+    seen: set[str] = set()
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        wid = (w.get("id") or "").strip()
+        if not wid:
+            wid = f"w{counter}"
+            counter += 1
+            w["id"] = wid
+        if wid in seen:
+            raise ValueError(f"duplicate word id: {wid!r}")
+        seen.add(wid)
+    caps["next_word_id"] = counter
+    return data
+
+
 class ClipProject(BaseModel):
     # NOTE: the field name "schema" intentionally matches the plan's contract
     # ("nugget.clip-project/1"). Pydantic v2 emits a harmless UserWarning that
@@ -138,6 +192,12 @@ class ClipProject(BaseModel):
     # evolve the project.
     base_clip: Optional[str] = Field(default=None)
     legacy_params: Optional[dict] = Field(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_word_ids(cls, data):
+        # Stable word-ID migration: backfill + counter advance + dup check.
+        return _backfill_word_ids(data)
 
 
 def validate_project(data: dict) -> ClipProject:
@@ -255,7 +315,9 @@ def toggles_to_project(
                 except (TypeError, ValueError):
                     continue
                 if we > ws >= 0:
-                    words.append(CaptionWord(w=text, start=ws, end=we))
+                    # Stable word IDs from the persisted counter: w0, w1, ...
+                    words.append(CaptionWord(
+                        id=f"w{len(words)}", w=text, start=ws, end=we))
 
     overlays: list[Overlay] = []
     if toggles.get("hook") and (hook_params.get("text") or "").strip():
@@ -306,6 +368,7 @@ def toggles_to_project(
             position=subtitle_params.get("position", "bottom"),
             words=words,
             edits={},
+            next_word_id=len(words),
         ),
         overlays=overlays,
         audio=[AudioTrack()],

@@ -7,8 +7,12 @@ import { saveClipProject } from '../api/realApi.js';
  * Floating, collapsible AI copilot inside the editor.
  * Sends prompt-based edits via edit-ai mode=patch, reports what changed,
  * and lets the user apply the validated patch to the stored project.
+ *
+ * Condition 4: applying routes through the editor's serialized edit queue
+ * (props.applyEdit) so copilot edits are undoable and never race panel
+ * edits. Falls back to a direct save only when no queue is provided.
  */
-export default function CopilotPanel({ jobId, clipIndex }) {
+export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
   const [open, setOpen] = useState(true);
   const [prompt, setPrompt] = useState('');
   const [busy, setBusy] = useState(false);
@@ -39,7 +43,18 @@ export default function CopilotPanel({ jobId, clipIndex }) {
     if (!result?.project || applying) return;
     setApplying(true);
     try {
-      await saveClipProject(jobId, clipIndex, result.project);
+      const patched = result.project;
+      const label = `copilot: ${(prompt.trim() || 'edit').slice(0, 60)}`;
+      if (applyEdit) {
+        // Through the serialized queue: snapshot + undo + optimistic
+        // concurrency (expected_version = the version the patch was
+        // computed against).
+        await applyEdit(label, () => patched, {
+          expectedVersion: patched.version,
+        });
+      } else {
+        await saveClipProject(jobId, clipIndex, patched);
+      }
       setApplied(true);
     } catch (e) {
       setResult({ ok: false, error: `Apply failed: ${e.message}` });

@@ -1800,8 +1800,12 @@ async def save_clip_project(job_id: str, clip_index: int, request: Request, user
         resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
     # 3b: archive-and-bump lives in the shared helper (also used by
     # batch-apply) -- one implementation, no drift.
+    # expected_version enables optimistic concurrency (undo/redo + the
+    # editor's serialized mutation queue); ConflictError -> 409 via the
+    # app-level ClippyMeError handler.
     version, project = save_project_version(
-        job_dir=resolved.job_dir, clip_index=clip_index, project=project)
+        job_dir=resolved.job_dir, clip_index=clip_index, project=project,
+        expected_version=body.get("expected_version"))
     return {"version": version, "project": project.model_dump()}
 
 
@@ -1885,6 +1889,7 @@ async def batch_apply_projects(job_id: str, request: Request,
     body = await request.json()
     clip_indices = body.get("clip_indices")
     patch = body.get("patch")
+    expected_version = body.get("expected_version")
     if (not isinstance(clip_indices, list) or not clip_indices
             or any(not isinstance(x, int) or isinstance(x, bool) or x < 0
                    for x in clip_indices)):
@@ -1923,7 +1928,8 @@ async def batch_apply_projects(job_id: str, request: Request,
             project.origin = "user"
             project.idempotency_key = str(uuid.uuid4())
             version, _ = save_project_version(
-                job_dir=job_dir, clip_index=ci, project=project)
+                job_dir=job_dir, clip_index=ci, project=project,
+                expected_version=expected_version)
             results.append({"clip_index": ci, "version": version})
         except Exception as exc:  # per-clip isolation: one bad clip can't fail the batch
             results.append({"clip_index": ci, "error": str(exc)[:200]})

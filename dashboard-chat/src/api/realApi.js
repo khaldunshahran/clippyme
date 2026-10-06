@@ -136,15 +136,20 @@ export async function getClipProject(jobId, index, version = null) {
 
 // Save a draft project version (validated server-side, version bumped, NO
 // render). Returns { version, project }.
-export async function saveClipProject(jobId, index, project) {
+export async function saveClipProject(jobId, index, project, { expectedVersion } = {}) {
   const res = await apiFetch(getApiUrl(`/api/project/${jobId}/${index}`), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project }),
+    // expectedVersion enables optimistic concurrency: the backend rejects
+    // with 409 when the stored version has moved on (undo/redo + the
+    // editor's serialized mutation queue rely on this).
+    body: JSON.stringify({ project, expected_version: expectedVersion ?? null }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
   }
   return res.json();
 }

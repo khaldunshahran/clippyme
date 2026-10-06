@@ -37,3 +37,18 @@ def _heavy_runtime_available() -> bool:
 collect_ignore_glob = []
 if not _heavy_runtime_available():
     collect_ignore_glob.append("pipeline/test_main_*.py")
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--generate-golden", action="store_true", default=False,
+        help="regenerate golden-frame reference PNGs "
+             "(CI environment only; committed references must come from CI)")
+
+
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture
+def generate_golden(request):
+    return request.config.getoption("--generate-golden")

@@ -187,16 +187,23 @@ def apply_copilot_patch(project, patch: dict):
         edits = patch["word_edits"]
         if not isinstance(edits, dict) or not edits:
             raise ValueError("word_edits must be a non-empty object")
-        word_count = len(project.captions.words or [])
+        words = project.captions.words or []
+        by_id = {w.id: i for i, w in enumerate(words) if w.id}
         for key, val in edits.items():
-            if not isinstance(key, str) or not key.isdigit():
-                raise ValueError(f"word_edits key must be a word index string, got {key!r}")
-            if word_count and int(key) >= word_count:
-                raise ValueError(
-                    f"word_edits index {key} out of range ({word_count} words)")
             if not isinstance(val, str) or not val.strip():
                 raise ValueError(f"word_edits[{key}] must be a non-empty string")
-            project.captions.edits[str(int(key))] = val.strip()[:MAX_WORD_EDIT_CHARS]
+            idx = None
+            # Stable word IDs first; legacy word-index strings still accepted.
+            if isinstance(key, str) and key in by_id:
+                idx = by_id[key]
+            elif isinstance(key, str) and key.isdigit() and int(key) < len(words):
+                idx = int(key)
+            if idx is None:
+                raise ValueError(
+                    f"word_edits key must be a word id or a word index "
+                    f"string, got {key!r}")
+            wid = words[idx].id or str(idx)
+            project.captions.edits[wid] = val.strip()[:MAX_WORD_EDIT_CHARS]
 
     if "crop_nudge" in patch:
         nudge = patch["crop_nudge"]

@@ -36,7 +36,7 @@ import uuid
 from clippyme.domain.clip_project import ClipProject, project_to_json
 from clippyme.domain.compose import compose_layers, validate_layer_order
 from clippyme.domain.encode import x264_video_args
-from clippyme.domain.errors import ValidationError
+from clippyme.domain.errors import ConflictError, ValidationError
 from clippyme.pipeline.media_qa import inspect_clip, probe_media
 
 logger = logging.getLogger(__name__)
@@ -205,7 +205,8 @@ def _timeline_layout(segs: list[dict]) -> tuple[list[dict], float]:
 
 
 def save_project_version(*, job_dir: str, clip_index: int,
-                         project: ClipProject) -> tuple[int, ClipProject]:
+                         project: ClipProject,
+                         expected_version: int | None = None) -> tuple[int, ClipProject]:
     """Archive-and-bump: the shared draft-save primitive.
 
     Archives the pre-existing working copy (e.g. the pipeline-emitted AI
@@ -213,7 +214,18 @@ def save_project_version(*, job_dir: str, clip_index: int,
     the new working copy + versioned file and records the version. Returns
     (version, project). Used by PUT /api/project/{job}/{clip} and POST
     .../batch-apply -- one implementation, no drift.
+
+    Optimistic concurrency: when expected_version is given, the save is
+    rejected with ConflictError (409) unless it matches the latest stored
+    version -- the editor's undo/redo and serialized mutation queue rely on
+    this to never clobber a newer edit.
     """
+    if expected_version is not None:
+        latest = latest_project_version(job_dir, clip_index)
+        if int(expected_version) != latest:
+            raise ConflictError(
+                f"stale project version: expected {expected_version}, "
+                f"latest is {latest} -- refresh and retry")
     cur_path = get_project_path(job_dir, clip_index)
     if cur_path:
         try:
@@ -442,13 +454,18 @@ def _map_words_to_timeline(project: ClipProject) -> tuple[list[dict], float]:
     are dropped. Edits apply to the original words-list indices first.
     """
     words = [w.model_dump() for w in project.captions.words]
-    for idx_str, corrected in (project.captions.edits or {}).items():
-        try:
-            idx = int(idx_str)
-        except (TypeError, ValueError):
-            continue
-        if 0 <= idx < len(words):
-            words[idx]["w"] = corrected
+    # Edits are keyed by stable word ID; legacy word-index strings still work.
+    by_id = {w.get("id"): i for i, w in enumerate(words) if w.get("id")}
+    for key, corrected in (project.captions.edits or {}).items():
+        idx = by_id.get(key)
+        if idx is None:
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= idx < len(words):
+                continue
+        words[idx]["w"] = corrected
 
     # 3b: timeline offsets account for crossfade overlaps (a faded segment
     # starts its fade_in before the previous segment ends).
