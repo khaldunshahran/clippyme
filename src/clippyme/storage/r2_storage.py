@@ -163,7 +163,7 @@ def upload_bytes_to_r2(
 
     req = urllib.request.Request(url, data=data, headers=signed_headers, method="PUT")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:  # nosec B310 - signed R2 URL from config
             status = getattr(resp, "status", 200)
             if status >= 300:
                 raise RuntimeError(f"R2 upload failed with status {status}")

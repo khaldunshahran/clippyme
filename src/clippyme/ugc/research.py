@@ -15,7 +15,7 @@ def _validate_safe_url(url: str) -> str:
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Only http and https schemes are permitted.")
     host = parsed.host
-    if not host or host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+    if not host or host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):  # nosec B104 - blocklist check, not a bind
         raise ValueError("Invalid target host.")
     addrs = resolve_host_addresses(host, timeout=5.0)
     if not addrs:

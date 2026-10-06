@@ -139,7 +139,7 @@ def create_stripe_checkout(user: AuthUser, success_url: str, cancel_url: str) ->
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - hardcoded Stripe URL
         result = json.loads(resp.read().decode("utf-8"))
         return {
             "session_id": result.get("id"),

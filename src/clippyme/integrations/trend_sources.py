@@ -70,7 +70,7 @@ def parse_google_news_rss(xml_bytes: bytes, category: str = "general", max_items
         return items
 
     try:
-        root = ET.fromstring(xml_bytes)
+        root = ET.fromstring(xml_bytes)  # nosec B314 - RSS size-limited before parsing
     except ET.ParseError as exc:
         logger.warning("Failed to parse Google News RSS XML: %s", exc)
         return items
@@ -121,7 +121,7 @@ def parse_google_trends_rss(xml_bytes: bytes, max_items: int = 15) -> List[Trend
         return items
 
     try:
-        root = ET.fromstring(xml_bytes)
+        root = ET.fromstring(xml_bytes)  # nosec B314 - RSS size-limited before parsing
     except ET.ParseError as exc:
         logger.warning("Failed to parse Google Trends RSS XML: %s", exc)
         return items
