@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +26,21 @@ from typing import Any
 RUNTIME_FILENAME = ".clippyme_runtime.json"
 CHECKPOINT_DIRNAME = ".clippyme_checkpoint"
 SCHEMA_VERSION = 1
+
+
+def worker_python() -> str:
+    """Interpreter for pipeline worker subprocesses.
+
+    Explicit ``CLIPPYME_WORKER_PYTHON`` wins; otherwise the backend's own
+    interpreter (correct when the backend runs in the project venv).
+    Never a bare ``"python"`` -- PATH resolution can pick a foreign
+    interpreter without the ``clippyme`` package (observed: user-local
+    Python 3.13).
+    """
+    override = (os.environ.get("CLIPPYME_WORKER_PYTHON") or "").strip().strip(chr(34))
+    if override:
+        return override
+    return sys.executable
 
 STAGE_ORDER = (
     "queued",

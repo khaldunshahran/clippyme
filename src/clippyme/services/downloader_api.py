@@ -199,16 +199,21 @@ def download_video(req: DownloadRequest, request: Request = None):
             ("web_safari", True, False),   # safari + cookies, NO po token
             ("default", True, True),       # cookies + po token (only if bgutil server running)
             ("web_safari", True, True),
+            ("web_embedded", True, False), # embedded player + cookies - slips past the web bot check
             ("default", False, False),
+            ("web_embedded", False, False),# embedded player, no cookies - proven 720p bot-check bypass
             ("web_safari", False, False),
             ("default", False, True),
+            ("web_embedded", False, True),
             ("web_safari", False, True),
         ]
     else:
         attempts = [
             ("default", False, False),
+            ("web_embedded", False, False),# embedded player, no cookies - proven 720p bot-check bypass
             ("web_safari", False, False),
             ("default", False, True),
+            ("web_embedded", False, True),
             ("web_safari", False, True),
         ]
     attempts.extend([
@@ -227,6 +232,8 @@ def download_video(req: DownloadRequest, request: Request = None):
         'socket_timeout': 30,
         'retries': 10,
         'fragment_retries': 10,
+        'concurrent_fragments': 8,
+        'force_ipv4': True,
         'http_chunk_size': 10485760,
         'cachedir': False,
         'remote_components': ['ejs:github'],
@@ -240,6 +247,8 @@ def download_video(req: DownloadRequest, request: Request = None):
     }
 
     last_error = None
+    gate_failures = 0
+    total_failures = 0
     for i, (client_name, use_cookies, use_po_token) in enumerate(attempts, 1):
         extractor_args = _extractor_args_for(client_name)
         active_cookiefile = cookies_path if (use_cookies and cookies_path) else None
@@ -272,6 +281,19 @@ def download_video(req: DownloadRequest, request: Request = None):
                 sanitized_title = sanitize_filename(video_title)
                 _write_source_info(req.output_dir, info)
 
+            # 720p minimum gate (pre-download): a bot-degraded client may only
+            # offer <720p formats despite the ladder. Don't waste bandwidth
+            # downloading it - fail this attempt and try the next client.
+            sel_height = info.get('height') or 0
+            for _f in info.get('requested_formats') or []:
+                if (_f.get('vcodec') or 'none') != 'none':
+                    sel_height = max(sel_height, _f.get('height') or 0)
+            if sel_height and sel_height < 720:
+                raise RuntimeError(
+                    "requested format not available at >=720p via '%s' "
+                    "(best offered: %sp); trying next client" % (client_name, sel_height)
+                )
+
             output_template = os.path.join(req.output_dir, f'{sanitized_title}.%(ext)s')
             expected_file = os.path.join(req.output_dir, f'{sanitized_title}.mp4')
             if os.path.exists(expected_file):
@@ -300,6 +322,7 @@ def download_video(req: DownloadRequest, request: Request = None):
             if not os.path.isfile(downloaded_file):
                 raise FileNotFoundError("yt-dlp completed without producing an MP4 file")
 
+            probe_height = None
             try:
                 probe_cmd = [
                     "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -308,16 +331,26 @@ def download_video(req: DownloadRequest, request: Request = None):
                 ]
                 probe_output = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
                 if probe_output.isdigit():
-                    height = int(probe_output)
-                    if height < 720:
-                        logger.warning(f"downloaded at {height}p, below 720p target — likely bot-degraded client")
+                    probe_height = int(probe_output)
             except Exception as probe_err:
                 logger.warning(f"Failed to probe download quality: {probe_err}")
+            if probe_height is not None and probe_height < 720:
+                try:
+                    os.remove(downloaded_file)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    "requested format not available at >=720p on disk via '%s' "
+                    "(downloaded %sp); rejecting file and trying next client" % (client_name, probe_height)
+                )
 
             return {"downloaded_file": downloaded_file, "sanitized_title": sanitized_title}
 
         except Exception as e:
             last_error = e
+            total_failures += 1
+            if ">=720p" in str(e):
+                gate_failures += 1
             logger.warning(f"Attempt {i} failed: {e}")
             from clippyme.pipeline.download import classify_download_error
             # If it's a fatal error, don't retry
@@ -327,6 +360,11 @@ def download_video(req: DownloadRequest, request: Request = None):
                 raise HTTPException(status_code=400, detail=f"Fatal download error: {err_msg}")
             # Else continue to next attempt
 
+    if gate_failures and gate_failures == total_failures:
+        raise HTTPException(
+            status_code=500,
+            detail=f"no >=720p format available via any client; refusing to deliver a sub-720p file. Last error: {last_error}",
+        )
     raise HTTPException(status_code=500, detail=f"All download attempts failed. Last error: {last_error}")
 
 bgutil_process = None
