@@ -80,6 +80,19 @@ export async function signInWithGoogle() {
   if (error) throw error;
 }
 
+/** Clear the legacy localStorage token keys (the X-API-Token path was removed;
+ *  stale values must not linger where old code could pick them up). */
+export function clearLegacyTokenKeys() {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.removeItem('clippyme_api_token');
+      window.localStorage.removeItem('clippyme_auth_token');
+    }
+  } catch {
+    // ignore (private mode etc.)
+  }
+}
+
 export async function signOut() {
   try {
     const supabase = await getSupabase();
@@ -87,4 +100,5 @@ export async function signOut() {
   } catch {
     // ignore — local session state is cleared by the caller anyway
   }
+  clearLegacyTokenKeys();
 }

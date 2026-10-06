@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { LogIn, Loader2, ShieldAlert, LogOut, TriangleAlert } from 'lucide-react';
 import { signInWithGoogle, signOut, isSupabaseConfigured } from '../api/supabase.js';
 
@@ -127,5 +127,37 @@ export function ForbiddenView({ onSignOut }) {
         {busy ? 'Signing out…' : 'Sign out'}
       </button>
     </Shell>
+  );
+}
+
+/**
+ * Minimal auto-dismissing toast for non-blocking auth notices
+ * (e.g. ADMIN_ONLY / ORIGIN_REJECTED 403s). Fixed-position, no takeover.
+ */
+export function AuthToast({ message, onClose }) {
+  useEffect(() => {
+    if (!message) return undefined;
+    const t = setTimeout(onClose, 4500);
+    return () => clearTimeout(t);
+  }, [message, onClose]);
+
+  if (!message) return null;
+
+  return (
+    <div
+      role="alert"
+      style={{
+        position: 'fixed', left: '50%', bottom: 28, transform: 'translateX(-50%)',
+        zIndex: 9999, maxWidth: 'min(440px, calc(100vw - 40px))',
+        background: 'rgba(22,22,28,0.97)', color: 'var(--nc-text)',
+        border: '1px solid rgba(255,176,32,0.4)', borderRadius: 12,
+        padding: '12px 16px', fontSize: 13, lineHeight: 1.5,
+        display: 'flex', gap: 10, alignItems: 'flex-start',
+        boxShadow: '0 10px 34px rgba(0,0,0,0.5)',
+      }}
+    >
+      <TriangleAlert size={16} style={{ flexShrink: 0, marginTop: 2, color: '#ffb020' }} />
+      <span>{message}</span>
+    </div>
   );
 }

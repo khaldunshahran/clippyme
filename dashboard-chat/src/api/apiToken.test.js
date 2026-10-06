@@ -4,13 +4,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 vi.mock('./supabase.js', () => ({
   getAccessToken: vi.fn(),
   refreshSessionNow: vi.fn(),
+  clearLegacyTokenKeys: vi.fn(),
 }));
 
-import { apiFetch, setAuthEventHandler } from './apiToken.js';
+import { apiFetch, setAuthEventHandler, _resetRefreshForTests } from './apiToken.js';
 import { getAccessToken, refreshSessionNow } from './supabase.js';
 
 const ok = (body = {}) =>
   new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+const forbidden = (code) =>
+  new Response(JSON.stringify(code ? { detail: 'denied', code } : { detail: 'denied' }), {
+    status: 403,
+    headers: { 'Content-Type': 'application/json' },
+  });
 
 describe('apiFetch (Supabase session auth)', () => {
   let fetchMock;
@@ -18,7 +25,8 @@ describe('apiFetch (Supabase session auth)', () => {
 
   beforeEach(() => {
     events = [];
-    setAuthEventHandler((t) => events.push(t));
+    setAuthEventHandler((t, d) => events.push([t, d]));
+    _resetRefreshForTests();
     fetchMock = vi.fn(async () => ok());
     vi.stubGlobal('fetch', fetchMock);
     getAccessToken.mockReset().mockResolvedValue('tok-abc');
@@ -28,6 +36,7 @@ describe('apiFetch (Supabase session auth)', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     setAuthEventHandler(null);
+    _resetRefreshForTests();
   });
 
   it('attaches Authorization: Bearer <session token> and never X-API-Token', async () => {
@@ -65,7 +74,7 @@ describe('apiFetch (Supabase session auth)', () => {
     expect(res.status).toBe(401);
     expect(refreshSessionNow).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1); // no retry without a fresh token
-    expect(events).toEqual(['signed-out']);
+    expect(events).toEqual([['signed-out', undefined]]);
   });
 
   it('on 401 even after refresh+retry: emits signed-out', async () => {
@@ -73,14 +82,65 @@ describe('apiFetch (Supabase session auth)', () => {
     fetchMock.mockResolvedValue(new Response('unauthorized', { status: 401 }));
     await apiFetch('https://x/api/process', { method: 'POST' });
     expect(fetchMock).toHaveBeenCalledTimes(2); // original + exactly one retry
-    expect(events).toEqual(['signed-out']);
+    expect(events).toEqual([['signed-out', undefined]]);
   });
 
-  it('on 403: emits forbidden (does not loop to login)', async () => {
-    fetchMock.mockResolvedValue(new Response('forbidden', { status: 403 }));
+  it('concurrent 401s share a single in-flight refresh', async () => {
+    refreshSessionNow.mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve('tok-fresh'), 25)),
+    );
+    fetchMock
+      .mockResolvedValueOnce(new Response('u', { status: 401 }))
+      .mockResolvedValueOnce(new Response('u', { status: 401 }))
+      .mockResolvedValue(ok({ ok: 1 }));
+    const [r1, r2] = await Promise.all([
+      apiFetch('https://x/api/a'),
+      apiFetch('https://x/api/b'),
+    ]);
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    expect(refreshSessionNow).toHaveBeenCalledTimes(1); // deduped, not 2
+    expect(events).toEqual([]);
+  });
+
+  it('on 403 NOT_ALLOWLISTED: emits forbidden (full-screen)', async () => {
+    fetchMock.mockResolvedValue(forbidden('NOT_ALLOWLISTED'));
     const res = await apiFetch('https://x/api/process', { method: 'POST' });
     expect(res.status).toBe(403);
     expect(refreshSessionNow).not.toHaveBeenCalled();
-    expect(events).toEqual(['forbidden']);
+    expect(events).toEqual([['forbidden', 'NOT_ALLOWLISTED']]);
+  });
+
+  it('on 403 ADMIN_ONLY: emits forbidden-toast (no takeover)', async () => {
+    fetchMock.mockResolvedValue(forbidden('ADMIN_ONLY'));
+    const res = await apiFetch('https://x/api/process', { method: 'POST' });
+    expect(res.status).toBe(403);
+    expect(refreshSessionNow).not.toHaveBeenCalled();
+    expect(events).toEqual([['forbidden-toast', 'ADMIN_ONLY']]);
+  });
+
+  it('on 403 ORIGIN_REJECTED: emits forbidden-toast (no takeover)', async () => {
+    fetchMock.mockResolvedValue(forbidden('ORIGIN_REJECTED'));
+    const res = await apiFetch('https://x/api/process', { method: 'POST' });
+    expect(res.status).toBe(403);
+    expect(events).toEqual([['forbidden-toast', 'ORIGIN_REJECTED']]);
+  });
+
+  it('on 403 with no code: defaults to forbidden (full-screen)', async () => {
+    fetchMock.mockResolvedValue(forbidden(null));
+    await apiFetch('https://x/api/process', { method: 'POST' });
+    expect(events).toEqual([['forbidden', 'NOT_ALLOWLISTED']]);
+  });
+
+  it('on 403 with unknown code: defaults to forbidden (full-screen)', async () => {
+    fetchMock.mockResolvedValue(forbidden('SOMETHING_NEW'));
+    await apiFetch('https://x/api/process', { method: 'POST' });
+    expect(events).toEqual([['forbidden', 'NOT_ALLOWLISTED']]);
+  });
+
+  it('on 403 with non-JSON body: defaults to forbidden (full-screen)', async () => {
+    fetchMock.mockResolvedValue(new Response('<html>proxy error</html>', { status: 403 }));
+    await apiFetch('https://x/api/process', { method: 'POST' });
+    expect(events).toEqual([['forbidden', 'NOT_ALLOWLISTED']]);
   });
 });
