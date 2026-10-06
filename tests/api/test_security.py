@@ -163,11 +163,21 @@ def test_require_trusted_request_rejects_cross_site_sec_fetch(site):
     assert exc.value.status_code == 403
 
 
-def test_require_trusted_request_cross_site_beats_trusted_origin(monkeypatch):
-    # Sec-Fetch-Site is checked first, so a spoofed-but-allow-listed Origin
-    # cannot rescue a cross-site request.
+def test_require_trusted_request_allowlisted_origin_beats_cross_site_sec_fetch(monkeypatch):
+    # a8cd0f9: an allow-listed Origin is trusted regardless of Sec-Fetch-Site.
+    # Browsers always send a genuine Origin on fetch/XHR (JS cannot forge it),
+    # so this un-breaks cross-origin API access from production frontends.
+    # The no-Origin CSRF hole stays closed (see
+    # test_require_trusted_request_rejects_cross_site_sec_fetch).
     monkeypatch.setattr(security, "ALLOWED_ORIGINS", ["http://localhost:5175"])
     req = _FakeRequest(origin="http://localhost:5175", client_host="127.0.0.1",
+                       sec_fetch_site="cross-site")
+    assert require_trusted_config_request(req) is None
+
+
+def test_require_trusted_request_rejects_unlisted_origin(monkeypatch):
+    monkeypatch.setattr(security, "ALLOWED_ORIGINS", ["http://localhost:5175"])
+    req = _FakeRequest(origin="http://evil.example", client_host="127.0.0.1",
                        sec_fetch_site="cross-site")
     with pytest.raises(HTTPException) as exc:
         require_trusted_config_request(req)

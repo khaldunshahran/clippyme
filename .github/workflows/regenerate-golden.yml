@@ -1,0 +1,58 @@
+name: Regenerate golden frames
+
+# Source of truth for golden-frame references: they must be generated in the
+# CI environment (ubuntu-latest, same runner image as the backend CI job),
+# never on a dev machine. Run manually via workflow_dispatch; the job commits
+# the regenerated PNGs back to the branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to regenerate golden PNGs on"
+        required: true
+        default: "feat/openshorts-modular-ports"
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    name: Regenerate golden PNGs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install package + host-test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[host-tests]"
+          pip install pytest
+
+      - name: Regenerate golden references
+        run: pytest tests/domain/test_golden_frame.py --generate-golden -q
+
+      - name: Commit regenerated PNGs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/fixtures/golden/
+          if git diff --cached --quiet; then
+            echo "No golden PNG changes."
+          else
+            git commit -m "Regenerate golden-frame references in CI (ubuntu-latest)"
+            git push origin HEAD:${{ inputs.branch }}
+          fi

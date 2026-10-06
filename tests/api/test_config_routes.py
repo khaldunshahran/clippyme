@@ -51,8 +51,17 @@ def client(tmp_path, monkeypatch):
 
 # --- trusted-client gate ----------------------------------------------------
 
-def test_cross_site_request_rejected(client):
+def test_allowlisted_origin_passes_despite_cross_site_sec_fetch(client):
+    # a8cd0f9: an allow-listed Origin is trusted regardless of Sec-Fetch-Site.
+    # The client fixture already sends Origin: http://localhost:5175.
     r = client.get("/api/config", headers={"Sec-Fetch-Site": "cross-site"})
+    assert r.status_code == 200
+
+
+def test_cross_site_without_origin_rejected():
+    # No Origin + cross-site fetch metadata -> rejected (CSRF hole stays closed).
+    naked = TestClient(app_module.app)
+    r = naked.get("/api/config", headers={"Sec-Fetch-Site": "cross-site"})
     assert r.status_code == 403
 
 

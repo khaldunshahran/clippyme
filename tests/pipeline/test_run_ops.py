@@ -3,7 +3,12 @@
 These pin logic that previously lived inline in main.py's __main__ block,
 where no unit test could reach it.
 """
+import json
 import os
+import shutil
+import subprocess
+
+import pytest
 
 from clippyme.pipeline.run_ops import (
     build_cut_command,
@@ -55,16 +60,80 @@ def test_cut_command_shape_and_precision():
     assert cmd[cmd.index("-ss") + 1] == "12.346"          # 3-decimal rounding
     assert cmd[cmd.index("-t") + 1] == f"{47.9 - 12.3456:.3f}"
     assert cmd[-1] == "/out/source_clip.mp4"
-    # CFR + aac audio ride along for the persisted source slice.
-    assert cmd[cmd.index("-vsync") + 1] == "cfr"
-    assert cmd[cmd.index("-c:a") + 1] == "aac"
+    # Stream-copy contract: no re-encode flags ride along.
+    assert cmd[cmd.index("-c:v") + 1] == "copy"
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "-vsync" not in cmd
+    assert "libx264" not in cmd
 
 
-def test_cut_command_uses_shared_x264_settings():
-    from clippyme.domain.encode import x264_video_args
+def test_cut_command_is_stream_copy_not_reencode():
+    """build_cut_command must NOT re-encode the source slice.
+
+    The slice is a fast, lossless stream copy; the old test asserting shared
+    x264 settings encoded the pre-stream-copy contract.
+    """
     cmd = build_cut_command("/in.mp4", 0, 10, "/out.mp4")
-    for arg in x264_video_args(faststart=False):
-        assert arg in cmd
+    assert cmd[cmd.index("-c:v") + 1] == "copy"
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "libx264" not in cmd
+    assert "-crf" not in cmd
+
+def test_stream_copy_cut_keyframe_granularity(tmp_path):
+    """Quantify stream-copy seek granularity on a real file.
+
+    build_cut_command seeks with ``-ss`` BEFORE ``-i`` and copies the stream,
+    so the slice really starts at the keyframe at/before the requested start
+    (up to ~one GOP early). This measures that offset instead of theorizing:
+    it runs the command's seek flags WITHOUT the ``-avoid_negative_ts``
+    rebase and reads the first packet's DTS via ffprobe, so
+    ``requested_start - actual_start`` IS the keyframe offset. Skips when
+    ffmpeg/ffprobe are unavailable.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg/ffprobe not available")
+    src = str(tmp_path / "src.mp4")
+    # 30fps, GOP=60 -> keyframes every 2s: at 0, 2, 4, 6, 8.
+    subprocess.run(
+        [ffmpeg, "-y", "-f", "lavfi", "-i",
+         "testsrc=duration=10:size=320x240:rate=30",
+         "-c:v", "libx264", "-g", "60", "-pix_fmt", "yuv420p", src],
+        check=True, capture_output=True)
+    start, length = 3.5, 4.0  # 3.5s is not a keyframe
+    probe_out = str(tmp_path / "probe.mp4")
+    probe_cmd = build_cut_command(src, start, start + length, probe_out)
+    # Drop the timestamp rebase so ffprobe reveals the true seek point.
+    probe_cmd = [a for a in probe_cmd
+                 if a not in ("-avoid_negative_ts", "make_zero")]
+    subprocess.run(probe_cmd, check=True, capture_output=True)
+    out = subprocess.run(
+        [ffprobe, "-v", "quiet", "-select_streams", "v:0",
+         "-show_entries", "packet=dts_time", "-of", "csv=p=0",
+         "-read_intervals", "%+#1", probe_out],
+        check=True, capture_output=True, text=True).stdout.strip().splitlines()
+    first_dts = float(out[0])
+    actual_start = start + first_dts  # first_dts <= 0: keyframe at/before start
+    offset = start - actual_start
+    print(f"\nkeyframe-granularity: requested={start}, "
+          f"actual={actual_start:.3f}, offset={offset:.3f}s (GOP=2.0s)")
+    assert 0.0 <= offset < 2.0, f"cut started {offset:.3f}s before request"
+    # And the real command (with rebase): the slice ENDS at the requested end
+    # (seek target + length), so the persisted duration is the requested
+    # length PLUS the head offset -- the clip is longer than asked, starting
+    # early. This is the documented stream-copy contract, not a bug in the
+    # test: word timings mapped against the requested start therefore run up
+    # to ~one GOP early relative to the slice's actual audio.
+    real_out = str(tmp_path / "cut.mp4")
+    subprocess.run(build_cut_command(src, start, start + length, real_out),
+                   check=True, capture_output=True)
+    dur = float(subprocess.run(
+        [ffprobe, "-v", "quiet", "-select_streams", "v:0",
+         "-show_entries", "format=duration", "-of", "csv=p=0", real_out],
+        check=True, capture_output=True, text=True).stdout.strip())
+    assert abs(dur - (length + offset)) < 0.15, (
+        f"duration {dur} != requested {length} + offset {offset:.3f}")
 
 
 def test_vfr_normalization_command_uses_shared_encode_policy(monkeypatch):

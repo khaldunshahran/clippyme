@@ -103,13 +103,15 @@ def build_vfr_normalization_command(input_video: str, dest: str) -> list[str]:
 def build_cut_command(input_video: str, start: float, end: float, dest: str) -> list[str]:
     """ffmpeg argv for cutting the 16:9 source slice of one clip.
 
-    ``-ss`` BEFORE ``-i`` uses fast input seek (jump to the keyframe before
-    ``start``, decode forward to the exact time). ``-pix_fmt yuv420p`` +
-    ``-vsync cfr`` guarantee the persisted slice is universally decodable and
-    constant-frame-rate, so the downstream reframe render (raw frames at a
-    fixed ``-r``) can't drift against audio even if the original download was
-    VFR. Shared x264 settings (CRF 18 / medium): this slice feeds every later
-    generation, so it must not be the weak link.
+    Stream-copy cut: ``-ss`` BEFORE ``-i`` seeks to the nearest keyframe at
+    or before ``start`` (no decoding), then ``-c:v copy -c:a copy`` remuxes
+    without re-encoding -- fast and lossless. The trade-off is keyframe
+    granularity: the persisted slice really starts at that keyframe, up to
+    ~one GOP before the requested ``start``. ``-avoid_negative_ts make_zero``
+    re-bases timestamps so the slice starts at zero. Downstream stages
+    (transcription word times, compose) all operate on the slice's own
+    timeline and the final render re-encodes, so the granularity only affects
+    the initial AI moment boundaries, never word-level edit precision.
     """
     clip_duration = float(end) - float(start)
     return [

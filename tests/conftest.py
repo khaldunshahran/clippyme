@@ -52,3 +52,14 @@ import pytest as _pytest  # noqa: E402
 @_pytest.fixture
 def generate_golden(request):
     return request.config.getoption("--generate-golden")
+
+
+@_pytest.fixture(autouse=True)
+def _pin_video_encoder(monkeypatch):
+    """Hermetic encoder default for the host suite.
+
+    The dev laptop sets ``CLIPPYME_VIDEO_ENCODER=nvenc`` machine-wide; tests
+    asserting libx264-shaped encode args must not depend on machine env. Pin
+    libx264 unless a test overrides it explicitly via monkeypatch.
+    """
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")

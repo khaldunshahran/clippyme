@@ -1829,10 +1829,23 @@ async def save_clip_project(job_id: str, clip_index: int, request: Request, user
 TEST_JOB_MARKER = ".test_job"
 
 
+def _test_endpoints_enabled() -> bool:
+    """Test-project duplication endpoints are opt-in and OFF by default.
+
+    Gate: CLIPPYME_ENABLE_TEST_ENDPOINTS=1/true/yes/on. When off, the
+    endpoints 404 as if they did not exist (checked before auth so a
+    disabled endpoint reveals nothing).
+    """
+    return os.environ.get("CLIPPYME_ENABLE_TEST_ENDPOINTS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 @app.post("/api/project/{job_id}/duplicate-test")
 async def duplicate_test_project(job_id: str, request: Request,
                                  user: AuthUser = Depends(get_current_user)):
     """Duplicate a job's clip projects into an isolated test job dir."""
+    if not _test_endpoints_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
@@ -1875,6 +1888,8 @@ async def duplicate_test_project(job_id: str, request: Request,
 async def delete_test_project(job_id: str, request: Request,
                               user: AuthUser = Depends(get_current_user)):
     """Delete an isolated test job dir. Refuses non-test jobs."""
+    if not _test_endpoints_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
