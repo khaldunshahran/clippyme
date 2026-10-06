@@ -30,7 +30,8 @@ Required env (laptop, production):
 - `AUTH_ENABLED=1`
 - `SUPABASE_URL=https://frdlpogmqnozhgyrrhgf.supabase.co`
 - `ALLOWED_USER_IDS=<comma-separated Supabase sub values>` — valid JWTs not on
-  the list get 403. Empty in production denies everyone (fail closed).
+  the list get 403. An empty/unset list denies everyone in every environment
+  (fail closed); the explicit dev bypass is the only exception.
 - `ADMIN_USER_IDS=<comma-separated Supabase sub values>` — admin privileges.
   No email-based admin exists anymore.
 
@@ -40,11 +41,17 @@ Optional:
 - `ADMIN_SECRET_KEY` — `x-admin-secret` header bypass (ops use).
 - `TRUST_PROXY` — leave `0`/unset. Enabling `1` is blocked until the proving
   tests pass (forged Referer/Host, XFF spoofing, public-IP direct).
+- `LOG_PEER_ADDRESS=1` — one-time, off-by-default debug log of the socket peer
+  address as seen by `client_ip()`. Logs once per process at INFO level, then
+  never again (no log spam). Intended for diagnosing trust decisions (e.g. why
+  a tunneled request's peer is not loopback). Leave off in production.
 
 Dev:
 - `AUTH_DISABLED_DEV=1` — explicit dev bypass (local default admin). Rejected
   at startup when `ENV=production`. An explicit `AUTH_ENABLED=1` always wins
-  over the bypass.
+  over the bypass. The bypass additionally refuses any request carrying
+  `CF-Connecting-IP`/`CF-Ray` headers or a non-local Host header, so a
+  Cloudflare-originated request can never gain admin through it.
 - Production startup refuses to boot unless `AUTH_ENABLED=1` + `SUPABASE_URL`
   are set AND the JWKS fetch succeeds (one boot fetch; failure = no start).
 

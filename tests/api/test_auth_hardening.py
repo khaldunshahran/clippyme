@@ -49,101 +49,85 @@ def mint_for(sub, priv):
     return mint_valid(sub=sub, priv=priv, kid=KID)
 
 
-# --- 401 matrix -----------------------------------------------------------------
-
 JOB = "00000000-0000-4000-8000-0000000000a1"
 MON = "00000000-0000-4000-8000-0000000000b2"
 
-ROUTES_401 = [
-    # app.py — state-changing
-    ("POST", "/api/process"), ("POST", "/api/batch"),
-    ("POST", "/api/validate-url"),
-    ("POST", f"/api/cancel/{JOB}"), ("POST", f"/api/pause/{JOB}"),
-    ("POST", f"/api/resume/{JOB}"), ("POST", f"/api/stop/{JOB}"),
-    ("POST", f"/api/jobs/{JOB}/retry"), ("POST", f"/api/jobs/{JOB}/rescore"),
-    ("POST", f"/api/jobs/{JOB}/steer"),
-    ("POST", f"/api/smartcut/{JOB}/0"), ("POST", f"/api/edit-ai/{JOB}/0"),
-    ("POST", f"/api/generate-metadata/{JOB}"),
-    ("POST", f"/api/generate-metadata/{JOB}/0"),
-    ("POST", f"/api/reframe/{JOB}/0"),
-    ("POST", "/api/storage/cleanup"),
-    ("DELETE", f"/api/history/{JOB}"),
-    ("POST", f"/api/compose/{JOB}/0"),
-    ("PUT", f"/api/project/{JOB}/0"),
-    ("POST", f"/api/project/{JOB}/duplicate-test"),
-    ("DELETE", f"/api/project/{JOB}/duplicate-test"),
-    ("POST", "/api/audio/upload"),
-    ("POST", f"/api/project/{JOB}/batch-apply"),
-    ("POST", f"/api/project/{JOB}/backfill"),
-    ("POST", f"/api/publish/{JOB}/0"),
-    ("POST", f"/api/clips/{JOB}/0/duplicate"),
-    ("POST", f"/api/clips/{JOB}/0/schedule"),
-    ("POST", f"/api/clips/{JOB}/0/upscale"),
-    ("POST", "/api/analytics/sync"), ("POST", "/api/analytics/track"),
-    ("POST", "/api/live-monitor/start"), ("POST", "/api/live-monitor/stop"),
-    ("POST", f"/api/live-monitor/{MON}/config"),
-    ("POST", f"/api/live-monitor/{MON}/publishing"),
-    ("POST", f"/api/live-monitor/{MON}/publish-clip/clip1"),
-    ("DELETE", f"/api/live-monitor/{MON}/pending-clip/clip1"),
-    ("POST", f"/api/live-monitor/{MON}/publish-all"),
-    ("POST", f"/api/history/{JOB}/restore"),
-    # app.py — data-returning GETs
-    ("GET", "/api/jobs/active"), ("GET", f"/api/status/{JOB}"),
-    ("GET", f"/api/progress/{JOB}"), ("GET", f"/api/transcript/{JOB}/0"),
-    ("GET", "/api/history"), ("GET", "/api/storage/breakdown"),
-    ("GET", f"/api/project/{JOB}/0"), ("GET", f"/api/project/{JOB}/0/versions"),
-    ("GET", f"/api/clips/{JOB}/0/schedule"), ("GET", f"/api/clips/{JOB}/0/export-xml"),
-    ("GET", "/api/analytics/summary"), ("GET", "/api/analytics/insights"),
-    ("GET", "/api/live-monitor/status"),
-    ("GET", f"/api/live-monitor/{MON}/pending-clips"),
-    # studio / ugc / highlights / dubbing
-    ("POST", "/api/studio/titles"), ("POST", "/api/studio/titles/refine"),
-    ("POST", "/api/studio/chapters"), ("POST", "/api/studio/thumbnail"),
-    ("POST", "/api/ugc/research"), ("POST", "/api/ugc/scripts"),
-    ("POST", f"/api/highlights/{JOB}/plan"),
-    ("POST", f"/api/highlights/{JOB}/render"),
-    ("POST", f"/api/highlights/{JOB}"),
-    ("POST", f"/api/highlights/{JOB}/generate-all"),
-    ("POST", f"/api/highlights/{JOB}/hl1/apply-edit"),
-    ("GET", f"/api/highlights/{JOB}"),
-    ("DELETE", f"/api/highlights/{JOB}/file.mp4"),
-    ("GET", "/api/dubbing/languages"),
-    ("POST", f"/api/dubbing/{JOB}/0"),
-    # trends
-    ("GET", "/api/trends"), ("POST", "/api/trends/scan"),
-    ("POST", "/api/trends/clip"), ("GET", "/api/trends/config"),
-    ("POST", "/api/trends/config"),
-    # config (admin-only)
-    ("GET", "/api/config"), ("GET", "/api/config/models"),
-    ("POST", "/api/config"), ("POST", "/api/config/cookies"),
-    ("GET", "/api/config/cookies/status"), ("DELETE", "/api/config/cookies"),
-    ("GET", "/api/config/fonts"), ("POST", "/api/config/fonts"),
-    ("DELETE", "/api/config/fonts/somefont"),
-    ("GET", "/api/config/logo/status"), ("POST", "/api/config/logo"),
-    ("DELETE", "/api/config/logo"),
-    ("GET", "/api/config/zernio"), ("POST", "/api/config/zernio"),
-    ("GET", "/api/zernio/accounts"),
-    ("GET", "/api/config/watchdog"), ("POST", "/api/config/watchdog"),
-    ("POST", "/api/config/watchdog/test"),
-    # billing / channels
-    ("GET", "/api/billing/usage"), ("POST", "/api/billing/checkout"),
-    ("GET", "/api/channels/match"), ("GET", "/api/channels/chan1"),
-    ("PUT", "/api/channels/chan1"), ("DELETE", "/api/channels/chan1"),
-]
+
+# --- 401 matrix (generated from route table) ---
+
+# --- route-table-generated 401 matrix (item 2) ---------------------------------
+# Every APIRoute in the live app must require authentication, except an
+# explicit exemption list. Adding a new route without a guard FAILS the suite.
+
+from fastapi.routing import APIRoute
+
+# (method, path) pairs that are deliberately open. Everything else must 401.
+EXEMPT_401 = {
+    ("GET", "/"): "root",
+    ("GET", "/api/health"): "health check",
+    ("POST", "/api/billing/webhook"): "Stripe HMAC signature (own auth)",
+}
+# Framework routes (/docs, /openapi.json, /redoc) are Starlette Route objects,
+# not APIRoute, and are not covered here; they expose only the API schema.
+
+_PATH_PARAM_DUMMIES = {
+    "job_id": "00000000-0000-4000-8000-0000000000a1",
+    "monitor_id": "00000000-0000-4000-8000-0000000000b2",
+    "clip_index": "0",
+    "filename": "file.mp4",
+    "clip_id": "clip1",
+    "channel_id": "chan1",
+    "name": "somefont",
+}
 
 
-@pytest.mark.parametrize("method,path", ROUTES_401)
+def _concrete_path(path: str) -> str:
+    import re
+    def _sub(m):
+        name = m.group(1)
+        return _PATH_PARAM_DUMMIES.get(name, "x")
+    return re.sub(r"\{(\w+)\}", _sub, path)
+
+
+def _iter_guarded_routes():
+    """Yield (method, concrete_path) for every APIRoute needing auth."""
+    seen = set()
+    for route in app_module.app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for method in sorted(route.methods):
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            key = (method, route.path)
+            if key in EXEMPT_401:
+                continue
+            seen.add((method, _concrete_path(route.path)))
+    return sorted(seen)
+
+
+def test_401_matrix_covers_all_guarded_routes(auth_client):
+    """Meta-test: report the exact route count and assert exemptions are valid."""
+    routes = _iter_guarded_routes()
+    # Sanity: the exemption list must only contain routes that actually exist.
+    all_paths = {(m, r.path) for r in app_module.app.routes
+                 if isinstance(r, APIRoute) for m in r.methods}
+    for key in EXEMPT_401:
+        assert key in all_paths, f"stale exemption {key}"
+    print(f"\n401 matrix covers {len(routes)} routes "
+          f"({len(EXEMPT_401)} exempt)")
+    assert len(routes) > 90, "route table unexpectedly small"
+
+
+@pytest.mark.parametrize("method,path", _iter_guarded_routes())
 def test_unauthenticated_gets_401(auth_client, method, path):
     client = auth_client["client"]
     # No Authorization header at all; Origin present (browser-like).
-    r = client.request(method, path, headers=ORIGIN)
+    # GETs with a body are not sent; POST/PUT/DELETE send empty JSON.
+    kwargs = {"headers": ORIGIN}
+    if method in ("POST", "PUT", "DELETE", "PATCH"):
+        kwargs["json"] = {}
+    r = client.request(method, path, **kwargs)
     assert r.status_code == 401, f"{method} {path} -> {r.status_code}, expected 401"
-
-
-def test_health_and_root_stay_open(auth_client):
-    client = auth_client["client"]
-    assert client.get("/", headers=ORIGIN).status_code == 200
-    assert client.get("/api/health", headers=ORIGIN).status_code == 200
 
 
 # --- forged Referer / Host are NOT trusted ---------------------------------------
@@ -202,6 +186,16 @@ def test_trust_proxy_bare_curl_from_public_ip_fails(monkeypatch):
     with pytest.raises(Exception) as exc:
         require_trusted_config_request(req)
     assert getattr(exc.value, "status_code", None) == 403
+
+
+@pytest.mark.parametrize("peer", ["::1", "::ffff:127.0.0.1"])
+def test_trust_proxy_ipv6_loopback_peers_trusted(monkeypatch, peer):
+    """IPv6 loopback forms must be treated as trusted peers."""
+    monkeypatch.setenv("TRUST_PROXY", "1")
+    # No Origin/SFS: falls through to the private-IP gate, which must pass
+    # for loopback peers in any representation.
+    req = _fake_request({}, client_host=peer)
+    require_trusted_config_request(req)  # must not raise
 
 
 def test_trust_proxy_forged_xff_ignored_when_peer_untrusted(monkeypatch):
@@ -289,3 +283,64 @@ def test_rate_limit_keyed_per_user(monkeypatch):
     # user 2 has a fresh budget despite sharing the IP
     assert enforce_rate_limit(req_b, "testbucket", 2, 0, user_id="u2") is None
     sec_mod._rate_state.clear()
+
+# --- item 7: machine-readable 403 codes -----------------------------------------
+
+def test_403_code_not_allowlisted(auth_client, monkeypatch):
+    """Valid JWT, sub not on ALLOWED_USER_IDS -> 403 NOT_ALLOWLISTED."""
+    client = auth_client["client"]
+    priv = auth_client["priv"]
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user_allowed")
+    token = mint_for("user_intruder", priv)
+    r = client.get(f"/api/status/{JOB}", headers={
+        "Authorization": f"Bearer {token}", **ORIGIN})
+    assert r.status_code == 403
+    body = r.json()
+    assert body["code"] == "NOT_ALLOWLISTED"
+    assert "allow-list" in body["detail"]
+
+
+def test_403_code_admin_only(auth_client, monkeypatch):
+    """Allow-listed non-admin on admin route -> 403 ADMIN_ONLY."""
+    client = auth_client["client"]
+    priv = auth_client["priv"]
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user_pleb")
+    monkeypatch.delenv("ADMIN_USER_IDS", raising=False)
+    token = mint_for("user_pleb", priv)
+    r = client.get("/api/config", headers={
+        "Authorization": f"Bearer {token}", **ORIGIN})
+    assert r.status_code == 403
+    body = r.json()
+    assert body["code"] == "ADMIN_ONLY"
+    assert "Administrative" in body["detail"]
+
+
+def test_403_code_origin_rejected(auth_client, monkeypatch):
+    """Evil Origin browser request -> 403 ORIGIN_REJECTED (not 401)."""
+    client = auth_client["client"]
+    priv = auth_client["priv"]
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user_ok")
+    token = mint_for("user_ok", priv)
+    r = client.post("/api/process", headers={
+        "Authorization": f"Bearer {token}",
+        "Origin": "https://evil.example",
+        "Sec-Fetch-Site": "cross-site",
+    }, json={})
+    assert r.status_code == 403
+    body = r.json()
+    assert body["code"] == "ORIGIN_REJECTED"
+    assert body["detail"]
+
+
+def test_403_body_shape(auth_client, monkeypatch):
+    """All 403 bodies are {"detail": str, "code": str}."""
+    client = auth_client["client"]
+    priv = auth_client["priv"]
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user_allowed")
+    token = mint_for("user_intruder", priv)
+    r = client.get(f"/api/status/{JOB}", headers={
+        "Authorization": f"Bearer {token}", **ORIGIN})
+    body = r.json()
+    assert set(body.keys()) == {"detail", "code"}
+    assert isinstance(body["detail"], str)
+    assert isinstance(body["code"], str)

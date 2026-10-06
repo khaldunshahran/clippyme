@@ -1,11 +1,14 @@
 """Trust/origin helpers for ClippyMe config endpoints."""
 import hmac
+import logging
 import ipaddress
 import os
 import time
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import HTTPException, Request
+
+logger = logging.getLogger("clippyme")
 
 DEFAULT_ALLOWED_ORIGINS = (
     "http://localhost:5173",
@@ -43,6 +46,9 @@ def _trust_proxy_enabled() -> bool:
     return os.environ.get("TRUST_PROXY", "0") == "1"
 
 
+_peer_address_logged = False
+
+
 def client_ip(request: Request) -> str:
     """Best-effort real client IP used for trust + rate-limit decisions.
 
@@ -68,6 +74,10 @@ def client_ip(request: Request) -> str:
     proxy is supported; a chain would need a trusted-hop count.)
     """
     peer = request.client.host if request.client else ""
+    global _peer_address_logged
+    if not _peer_address_logged and os.environ.get("LOG_PEER_ADDRESS", "0") == "1":
+        _peer_address_logged = True
+        logger.info("client_ip: socket peer address (one-time debug): %r", peer)
     if _trust_proxy_enabled() and is_trusted_client_host(peer):
         fwd = request.headers.get("x-forwarded-for")
         if fwd:
@@ -158,18 +168,18 @@ def require_trusted_config_request(request: Request) -> None:
 
     sec_fetch_site = request.headers.get("sec-fetch-site")
     if sec_fetch_site in ("cross-site", "same-site"):
-        raise HTTPException(status_code=403, detail="Cross-site requests are not allowed.")
+        raise HTTPException(status_code=403, detail={"message": "Cross-site requests are not allowed.", "code": "ORIGIN_REJECTED"})
     if sec_fetch_site == "same-origin":
         return
 
     if origin:
-        raise HTTPException(status_code=403, detail="Origin not allowed for config access.")
+        raise HTTPException(status_code=403, detail={"message": "Origin not allowed for config access.", "code": "ORIGIN_REJECTED"})
 
     client_host = client_ip(request)
     if is_trusted_client_host(client_host):
         return
 
-    raise HTTPException(status_code=403, detail="Config access requires a trusted local origin.")
+    raise HTTPException(status_code=403, detail={"message": "Config access requires a trusted local origin.", "code": "ORIGIN_REJECTED"})
 
 
 # --- optional API token (deliberate LAN deployments) ------------------------

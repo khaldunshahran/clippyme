@@ -327,6 +327,23 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    """Render machine-readable 403 codes.
+
+    Auth/origin guards raise HTTPException(403, detail={"message", "code"});
+    this shapes the body as {"detail": "<human>", "code": "<CODE>"} so the
+    frontend can key UX off the code. All other HTTPExceptions keep FastAPI's
+    default {"detail": ...} shape.
+    """
+    from fastapi.responses import JSONResponse
+    if exc.status_code == 403 and isinstance(exc.detail, dict) and "code" in exc.detail:
+        content = {"detail": exc.detail.get("message", ""), "code": exc.detail["code"]}
+    else:
+        content = {"detail": exc.detail}
+    return JSONResponse(content, status_code=exc.status_code, headers=exc.headers)
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_error_handler(request: Request, exc: RequestValidationError):
     from fastapi.encoders import jsonable_encoder

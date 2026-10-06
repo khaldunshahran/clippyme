@@ -62,7 +62,7 @@ def test_dev_bypass_returns_local_admin(monkeypatch):
     monkeypatch.delenv("AUTH_ENABLED", raising=False)
     monkeypatch.delenv("SUPABASE_URL", raising=False)
     monkeypatch.delenv("ENV", raising=False)
-    user = get_current_user(MockRequest({}))
+    user = get_current_user(MockRequest({"host": "localhost:8000"}))
     assert user.id == "default_user"
     assert user.is_admin
 

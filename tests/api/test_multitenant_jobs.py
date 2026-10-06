@@ -43,6 +43,8 @@ def client():
 
 
 def test_user_job_isolation(client, mt_env, monkeypatch):
+    # Empty allow-list now denies everyone; allow-list both test users.
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user_a,user_b")
     mint = mt_env
     token_a = mint("user_a")
     token_b = mint("user_b")

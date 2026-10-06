@@ -308,3 +308,101 @@ def test_no_origin_lan_token_accepted(monkeypatch):
     req = MockRequest(headers={"authorization": "Bearer lan-secret-token"})
     user = get_current_user(req)
     assert user.is_admin
+
+
+# --- item 3 additions: hostile iss/jku, no-kid, malformed, refetch cap --------
+
+def _b64url_json(obj):
+    import base64, json
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+
+def test_hostile_iss_gets_401_not_500(jwks_env, ec_keys, monkeypatch):
+    """A token with an attacker-controlled iss is rejected (401, not 500)."""
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user-123")
+    token = mint_valid(ec_keys=ec_keys, iss="https://evil.example/auth/v1")
+    with pytest.raises(HTTPException) as exc:
+        get_current_user(_bearer(token))
+    assert exc.value.status_code == 401
+
+
+def test_jku_header_is_ignored(jwks_env, ec_keys, monkeypatch):
+    """The jku/x5u headers must never influence key selection.
+
+    A token pointing jku at an attacker URL with an unknown kid must be
+    rejected — we only ever use the JWKS URL derived from SUPABASE_URL.
+    """
+    import jwt as pyjwt_local
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user-123")
+    priv1 = ec_keys[KID_1][0]
+    payload = {"sub": "user-123", "exp": time.time() + 3600,
+               "iss": TEST_ISSUER, "aud": "authenticated"}
+    token = pyjwt_local.encode(
+        payload, priv1, algorithm="ES256",
+        headers={"kid": "kid-attacker-unknown",
+                 "jku": "https://evil.example/.well-known/jwks.json",
+                 "x5u": "https://evil.example/cert.pem"})
+    with pytest.raises(HTTPException) as exc:
+        get_current_user(_bearer(token))
+    assert exc.value.status_code == 401
+
+
+def test_no_kid_gets_401_not_500(jwks_env, ec_keys, monkeypatch):
+    """A token without a kid header -> 401 (never a 500)."""
+    import jwt as pyjwt_local
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user-123")
+    priv1 = ec_keys[KID_1][0]
+    payload = {"sub": "user-123", "exp": time.time() + 3600,
+               "iss": TEST_ISSUER, "aud": "authenticated"}
+    # pyjwt always sets kid only if provided; craft manually without kid.
+    token = pyjwt_local.encode(payload, priv1, algorithm="ES256")
+    assert "kid" not in pyjwt_local.get_unverified_header(token)
+    with pytest.raises(HTTPException) as exc:
+        get_current_user(_bearer(token))
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.parametrize("bad_token", [
+    "not-a-jwt",
+    "only.two",
+    "a.b.c.d",
+    "!!!.@@@.###",
+])
+def test_malformed_token_gets_401_not_500(jwks_env, bad_token, monkeypatch):
+    """Malformed tokens -> 401 (never a 500)."""
+    monkeypatch.setenv("ALLOWED_USER_IDS", "user-123")
+    with pytest.raises(HTTPException) as exc:
+        get_current_user(_bearer(bad_token))
+    assert exc.value.status_code == 401
+
+
+def test_refetch_cap_under_junk_kid_flood(jwks_env, ec_keys):
+    """Junk-kid flooding triggers at most one JWKS refetch per 60s."""
+    fake = jwks_env["fake"]
+    fake.fetch_count = 0
+    # prime: one valid decode populates cache (may fetch once)
+    decode_jwt(mint_valid(ec_keys=ec_keys))
+    fetches_after_prime = fake.fetch_count
+    # flood with junk kids
+    for i in range(10):
+        token = mint_valid(priv=ec_keys[KID_1][0],
+                           kid=f"junk-kid-{i}", ec_keys=ec_keys)
+        with pytest.raises(ValueError, match="[Uu]nknown JWT key id|refetch"):
+            decode_jwt(token)
+    # At most one refetch for the whole flood (the first junk kid); the rest
+    # are throttled by the 60s cap.
+    assert fake.fetch_count - fetches_after_prime <= 1
+
+
+def test_empty_allowlist_denies_outside_production_too(jwks_env, ec_keys, monkeypatch):
+    """Empty ALLOWED_USER_IDS denies everyone, even outside production.
+
+    (Changed from the old 'empty-outside-production-passes' behavior.)
+    """
+    monkeypatch.delenv("ALLOWED_USER_IDS", raising=False)
+    monkeypatch.delenv("ADMIN_USER_IDS", raising=False)
+    monkeypatch.delenv("ENV", raising=False)  # explicitly NOT production
+    token = mint_valid(sub="user-123", ec_keys=ec_keys)
+    with pytest.raises(HTTPException) as exc:
+        get_current_user(_bearer(token))
+    assert exc.value.status_code == 403

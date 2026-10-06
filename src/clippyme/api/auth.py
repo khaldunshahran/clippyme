@@ -234,6 +234,34 @@ def admin_user_ids() -> Set[str]:
     return _parse_id_set("ADMIN_USER_IDS")
 
 
+def _dev_bypass_request_ok(request: Request) -> bool:
+    """Whether the explicit dev bypass may apply to this request.
+
+    The bypass must NEVER grant admin to a request that arrived via
+    Cloudflare. Cloudflare always attaches ``CF-Connecting-IP`` and ``CF-Ray``
+    to tunneled requests; their presence (even if spoofed by a direct client)
+    fails closed here. Additionally the Host must look like local development
+    (localhost / 127.0.0.1 / ::1, with or without port). ``testserver`` is
+    Starlette TestClient's default Host and is allowed so the test-suite can
+    exercise the bypass; it is not a routable name and the bypass is rejected
+    at startup in production anyway.
+    """
+    if request.headers.get("cf-connecting-ip") or request.headers.get("cf-ray"):
+        return False
+    host = request.headers.get("host", "").strip().lower()
+    if not host:
+        return False
+    if host.startswith("["):
+        # Bracketed IPv6 literal with optional port: [::1]:8000
+        hostname = host[1:].split("]")[0]
+    elif host.count(":") > 1:
+        # Bare IPv6 literal (a port would require brackets): ::1
+        hostname = host
+    else:
+        hostname = host.split(":")[0]
+    return hostname in {"localhost", "127.0.0.1", "::1", "testserver"}
+
+
 def _default_local_admin() -> AuthUser:
     return AuthUser(
         id="default_user",
@@ -279,10 +307,11 @@ def get_current_user(request: Request) -> AuthUser:
        ``iss``/``aud`` checked, ``exp`` + ``sub`` required).
 
     Allow-lists: ``ALLOWED_USER_IDS`` (comma-separated Supabase ``sub``
-    values). A valid JWT whose sub is not allow-listed -> 403. ``ADMIN_USER_IDS``
-    grants admin (and implies access). In production an empty allow-list
-    denies everyone (fail closed); outside production an empty allow-list
-    permits any valid JWT (dev/test flexibility).
+    values). A valid JWT whose sub is not allow-listed -> 403, and an empty
+    allow-list denies everyone (fail closed in every environment). The
+    explicit dev bypass (``AUTH_DISABLED_DEV=1``) is the only exception, and
+    it refuses requests that look Cloudflare-originated. ``ADMIN_USER_IDS``
+    grants admin (and implies access).
     """
     import hmac
 
@@ -309,7 +338,10 @@ def get_current_user(request: Request) -> AuthUser:
     # combined by accident; SUPABASE_URL alone does not block the bypass.
     if dev_bypass_enabled() and not is_production():
         if os.environ.get("AUTH_ENABLED", "0").strip().lower() not in _TRUE_VALUES:
-            return _default_local_admin()
+            if _dev_bypass_request_ok(request):
+                return _default_local_admin()
+            # Bypass refused: request looks Cloudflare-originated (or at least
+            # not local dev). Fall through to the 401 below.
 
     token = extract_bearer_token(request)
     if not token:
@@ -333,20 +365,16 @@ def get_current_user(request: Request) -> AuthUser:
     admins = admin_user_ids()
     is_admin = user_id in admins
     if not is_admin:
+        # Default-deny: the allow-list is the gate. An empty/unset
+        # ALLOWED_USER_IDS admits nobody (fail closed in every environment;
+        # the explicit dev bypass above is the only way around it).
         effective_allowed = allowed_user_ids() | admins
-        if effective_allowed:
-            if user_id not in effective_allowed:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access denied: user is not on the server allow-list.",
-                )
-        elif is_production():
-            # Fail closed: production with no allow-list configured admits nobody.
+        if user_id not in effective_allowed:
             raise HTTPException(
                 status_code=403,
-                detail="Access denied: server user allow-list is empty.",
+                detail={"message": "Access denied: user is not on the server allow-list.",
+                        "code": "NOT_ALLOWLISTED"},
             )
-        # Non-production with an empty allow-list: any valid JWT is accepted.
 
     email = claims.get("email")
     role = claims.get("role", "authenticated")
@@ -373,7 +401,8 @@ def require_admin(
 
     raise HTTPException(
         status_code=403,
-        detail="Administrative privileges required to access this resource.",
+        detail={"message": "Administrative privileges required to access this resource.",
+                "code": "ADMIN_ONLY"},
     )
 
 
