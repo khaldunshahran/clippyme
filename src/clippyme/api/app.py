@@ -37,7 +37,12 @@ from pydantic import ValidationError
 from clippyme.api.auth import AuthUser, get_current_user
 
 from clippyme.domain.job_results import build_main_cmd, canonical_reframe_mode
-from clippyme.domain.runtime_state import worker_python
+from clippyme.domain.runtime_state import (
+    STAGE_ORDER,
+    STAGE_PROGRESS,
+    load_runtime_state,
+    worker_python,
+)
 from clippyme.domain.compose import compose_layers
 from clippyme.domain.reframe_service import run_reframe
 from clippyme.domain.errors import ClippyMeError, NotFoundError, ValidationError
@@ -782,6 +787,79 @@ async def get_status(job_id: str, user: AuthUser = Depends(get_current_user)):
         "status": job['status'],
         "logs": job.get('logs', [])[-500:],
         "result": job.get('result')
+    }
+
+
+def _estimate_eta_from_stages(state: dict) -> int | None:
+    """ETA in seconds, estimated from completed stage durations.
+
+    Method: for each completed stage with a recorded duration, take the
+    progress it covered (STAGE_PROGRESS[stage] minus STAGE_PROGRESS of the
+    previous stage in STAGE_ORDER) and divide its seconds by that coverage
+    to get a seconds-per-progress-point rate. The mean rate over completed
+    stages is extrapolated over the remaining progress (100 - current
+    progress). Returns None when there is insufficient data (no completed
+    stage durations, fewer than 5 progress points covered, or progress
+    already at/above 100) rather than guessing.
+    """
+    durations = state.get("stage_durations") or {}
+    completed = state.get("completed_stages") or []
+    try:
+        progress = float(state.get("progress") or 0)
+    except (TypeError, ValueError):
+        progress = 0.0
+    if progress >= 100:
+        return None
+    total_points = 0.0
+    total_seconds = 0.0
+    for stage in completed:
+        if stage not in STAGE_PROGRESS or stage not in durations:
+            continue
+        try:
+            idx = STAGE_ORDER.index(stage)
+        except ValueError:
+            continue
+        prev = STAGE_ORDER[idx - 1] if idx > 0 else None
+        prev_points = STAGE_PROGRESS.get(prev, 0) if prev else 0
+        points = STAGE_PROGRESS[stage] - prev_points
+        try:
+            secs = float(durations[stage] or 0)
+        except (TypeError, ValueError):
+            continue
+        if points > 0 and secs > 0:
+            total_points += points
+            total_seconds += secs
+    if total_points < 5 or total_seconds <= 0:
+        return None
+    remaining = 100.0 - progress
+    if remaining <= 0:
+        return None
+    return max(0, int(remaining * (total_seconds / total_points)))
+
+
+@app.get("/api/progress/{job_id}")
+async def get_progress(job_id: str, user: AuthUser = Depends(get_current_user)):
+    """Live progress-pill data: percent, stage, ETA. Read-only.
+
+    Sources the job's ``.clippyme_runtime.json`` (written atomically by the
+    orchestrator); ``/api/status`` behavior is untouched.
+    """
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    state = load_runtime_state(job_dir)
+    if not state:
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        progress = int(state.get("progress") or 0)
+    except (TypeError, ValueError):
+        progress = 0
+    return {
+        "progress": max(0, min(100, progress)),
+        "stage": state.get("stage") or "unknown",
+        "eta_seconds": _estimate_eta_from_stages(state),
+        "detail": state.get("detail"),
     }
 
 @app.post("/api/cancel/{job_id}")
