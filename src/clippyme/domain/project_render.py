@@ -154,7 +154,20 @@ def get_project_path(job_dir: str, clip_index: int,
 def latest_project_version(job_dir: str, clip_index: int) -> int:
     """Highest version recorded for a clip (0 when none)."""
     entry = _load_version_map(job_dir).get(str(clip_index), {})
-    return int(entry.get("latest") or 0)
+    latest = int(entry.get("latest") or 0)
+    if latest:
+        return latest
+    # Pipeline-created projects predate the version map: fall back to the
+    # working copy's version field so optimistic concurrency (expected_version)
+    # works on first save instead of spuriously 409ing.
+    path = get_project_path(job_dir, clip_index)
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return int(json.load(f).get("version") or 0)
+        except (OSError, ValueError):
+            pass
+    return 0
 
 
 # ---------------------------------------------------------------------------
