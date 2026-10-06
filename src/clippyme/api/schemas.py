@@ -362,6 +362,13 @@ class EditAIRequest(BaseModel):
     model: Optional[str] = Field(
         None, max_length=64, pattern=r"^gemini-[A-Za-z0-9.\-]{1,64}$"
     )
+    mode: Literal["trim", "patch"] = Field(
+        "trim",
+        description="trim = NL -> drop_ranges (default, unchanged); "
+        "patch = NL -> validated ClipProject patch (Phase B2 copilot)",
+    )
+
+
 class SteerRequest(BaseModel):
     """Phase B1: steer a running job's moment selection with a prompt."""
 

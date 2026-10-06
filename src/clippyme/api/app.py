@@ -1271,9 +1271,19 @@ async def edit_clip_ai(
     user: AuthUser = Depends(get_current_user),
     api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
 ):
-    """Conversational clip trim: a plain-English instruction \u2192 Gemini \u2192 the
-    clip-relative spans to remove. The returned `drop_ranges` feed the SAME
-    manual-trim machinery as the tap-to-cut UI (compose / publish honour them)."""
+    """Conversational clip editing.
+
+    mode="trim" (default, unchanged): plain-English instruction -> Gemini ->
+    clip-relative spans to remove; the returned `drop_ranges` feed the SAME
+    manual-trim machinery as the tap-to-cut UI.
+
+    mode="patch" (Phase B2 copilot): instruction -> Gemini -> a validated
+    ClipProject patch (hook text, caption style/position, word corrections,
+    crop nudge, grade preset). The patch passes `validate_project()` +
+    layer-order checks; invalid patches 400 and the stored project is never
+    touched. The patched project is RETURNED, not saved -- the client saves
+    it explicitly via PUT /api/project.
+    """
     require_trusted_config_request(request)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
@@ -1294,6 +1304,12 @@ async def edit_clip_ai(
     if not key:
         raise HTTPException(status_code=400, detail="Gemini API key not configured")
 
+    if req.mode == "patch":
+        return await _edit_ai_patch(
+            job_id=job_id, clip_index=clip_index, resolved=resolved,
+            segments=segments, instruction=req.instruction,
+            api_key=key, model=model)
+
     from clippyme.domain.clip_edit_ai import suggest_drops
     result = await asyncio.to_thread(
         suggest_drops,
@@ -1304,6 +1320,74 @@ async def edit_clip_ai(
         clip_duration=duration,
     )
     return {"drop_ranges": result["drops"], "explanation": result["explanation"]}
+
+
+async def _edit_ai_patch(*, job_id, clip_index, resolved, segments,
+                         instruction, api_key, model):
+    """Phase B2: NL instruction -> validated ClipProject patch (not saved)."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    from clippyme.domain.clip_project import validate_project
+    from clippyme.domain.copilot_patch import (
+        apply_patch_to_project_data,
+        project_summary_for_prompt,
+        suggest_project_patch,
+    )
+    from clippyme.domain.compose import ComposeOrderError
+    from clippyme.domain.project_render import get_project_path
+
+    path = await asyncio.to_thread(
+        get_project_path, resolved.job_dir, clip_index, None)
+    if not path:
+        raise HTTPException(
+            status_code=404, detail="No project found for this clip")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            project_data = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Could not read clip project: {exc}")
+    try:
+        project = validate_project(project_data)
+    except PydanticValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Stored clip project is invalid: {exc.errors()}")
+
+    summary = project_summary_for_prompt(project)
+    try:
+        result = await asyncio.to_thread(
+            suggest_project_patch,
+            api_key=api_key,
+            model=model,
+            project_summary=summary,
+            segments=segments,
+            instruction=instruction,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not understand the AI edit: {exc}")
+
+    patch = result["patch"]
+    if not patch:
+        return {
+            "applied": False,
+            "patch": {},
+            "project": project.model_dump(),
+            "explanation": result["explanation"],
+        }
+    try:
+        patched = await asyncio.to_thread(
+            apply_patch_to_project_data, project.model_dump(), patch)
+    except (ValueError, PydanticValidationError, ComposeOrderError) as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        raise HTTPException(status_code=400, detail=f"Invalid patch: {detail}")
+    return {
+        "applied": True,
+        "patch": patch,
+        "project": patched,
+        "explanation": result["explanation"],
+    }
 
 
 @app.post("/api/generate-metadata/{job_id}")
