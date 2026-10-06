@@ -66,7 +66,9 @@ from clippyme.api.schemas import (
     ProcessRequest,
     PublishRequest,
     ReframeRequest,
+    ValidateUrlRequest,
     _validate_drop_ranges,
+    validate_public_url,
 )
 from clippyme.api.security import (
     ALLOWED_ORIGINS,
@@ -860,6 +862,110 @@ async def get_progress(job_id: str, user: AuthUser = Depends(get_current_user)):
         "stage": state.get("stage") or "unknown",
         "eta_seconds": _estimate_eta_from_stages(state),
         "detail": state.get("detail"),
+    }
+
+
+_validate_probe_semaphore = asyncio.Semaphore(3)
+
+
+def _probe_url_metadata(url: str) -> dict:
+    """Blocking yt-dlp metadata probe. Runs in a thread; never downloads.
+
+    Uses the downloader's established client strategy (web_embedded player,
+    no cookies -- the proven bot-check bypass) with metadata-only
+    extraction. Raises on any failure; callers translate that into
+    ``downloadable: false`` with a reason.
+    """
+    import yt_dlp
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 10,
+        "retries": 1,
+        "fragment_retries": 1,
+        "force_ipv4": True,
+        "cachedir": False,
+        "remote_components": ["ejs:github"],
+        "extractor_args": {"youtube": {"player_client": ["web_embedded"]}},
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        },
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise RuntimeError("probe returned no metadata")
+    if info.get("_type") == "playlist":
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries:
+            raise RuntimeError("playlist has no playable entries")
+        info = entries[0]
+    return {
+        "title": info.get("title"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
+    }
+
+
+@app.post("/api/validate-url")
+async def validate_url(
+    req: ValidateUrlRequest,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Check a video URL is valid and downloadable. Read-only, never downloads.
+
+    Fast probe with a hard 15 s cap: bot-walls and timeouts report
+    ``downloadable: false`` with a reason instead of hanging the request.
+    """
+    require_trusted_config_request(request)
+    try:
+        url = validate_public_url(req.url)
+    except ValueError as exc:
+        return {
+            "valid": False,
+            "downloadable": False,
+            "reason": str(exc),
+            "title": None,
+            "duration": None,
+            "thumbnail": None,
+        }
+    async with _validate_probe_semaphore:
+        try:
+            info = await asyncio.wait_for(
+                asyncio.to_thread(_probe_url_metadata, url), timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            return {
+                "valid": True,
+                "downloadable": False,
+                "reason": "probe timed out after 15s (site bot protection likely)",
+                "title": None,
+                "duration": None,
+                "thumbnail": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - probe surface is intentionally broad
+            return {
+                "valid": True,
+                "downloadable": False,
+                "reason": (str(exc) or "probe failed")[-300:],
+                "title": None,
+                "duration": None,
+                "thumbnail": None,
+            }
+    return {
+        "valid": True,
+        "downloadable": True,
+        "reason": None,
+        "title": info.get("title"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
     }
 
 @app.post("/api/cancel/{job_id}")

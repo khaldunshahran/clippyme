@@ -151,6 +151,12 @@ class BatchRequest(BaseModel):
         return _validate_language(value)
 
 
+class ValidateUrlRequest(BaseModel):
+    """Body for POST /api/validate-url: is this video URL downloadable?"""
+
+    url: str = Field(..., max_length=2048)
+
+
 _ALLOWED_CONFIG_KEYS = frozenset({
     "GEMINI_API_KEY", "GEMINI_MODEL", "YOUTUBE_COOKIES", "HF_TOKEN",
     "HUGGINGFACE_TOKEN", "DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY",
