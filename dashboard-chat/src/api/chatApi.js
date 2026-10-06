@@ -15,13 +15,22 @@ async function req(method, path, body, { timeoutMs = 30000 } = {}) {
     });
     const text = await res.text();
     let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = { _raw: text }; }
+    let badJson = false;
+    try { data = text ? JSON.parse(text) : null; } catch { badJson = !!text; data = { _raw: text }; }
     if (!res.ok) {
       const msg = (data && (data.detail || data.message || data.error)) || `HTTP ${res.status}`;
       const err = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
       err.status = res.status;
       err.data = data;
       throw err;
+    }
+    if (badJson) {
+      // e.g. a CDN/proxy served the SPA HTML for an /api route: fail loudly
+      // instead of letting callers render garbage (the old silent 0% freeze).
+      const berr = new Error(`API returned a non-JSON response (HTTP ${res.status})`);
+      berr.status = res.status;
+      berr.data = data;
+      throw berr;
     }
     return data;
   } finally {

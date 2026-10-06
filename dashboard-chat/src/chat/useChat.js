@@ -186,9 +186,13 @@ export function useChat() {
 
   const startPoll = useCallback((threadId, jobId) => {
     stopPoll(threadId);
+    let fails = 0;
+    let failNoticed = false;
     const tick = async () => {
       try {
         const p = await getProgress(jobId);
+        fails = 0;
+        failNoticed = false;
         patchThread(threadId, { progress: p });
         const failed = p && (p.stage === 'failed' || p.stage === 'error');
         if (failed) {
@@ -215,7 +219,13 @@ export function useChat() {
           }
         }
       } catch {
-        // transient poll failure — keep polling; the pill shows last-known state
+        // Transient poll failure: keep polling, but after 3 in a row say so
+        // instead of failing silently forever (e.g. a proxy serving HTML).
+        fails += 1;
+        if (fails >= 3 && !failNoticed) {
+          failNoticed = true;
+          pushMsg(threadId, { role: 'ai', kind: 'notice', text: "I'm having trouble reaching the clip server - I'll keep trying in the background." });
+        }
       }
     };
     tick();
