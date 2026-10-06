@@ -126,28 +126,38 @@ def is_trusted_client_host(client_host: Optional[str]) -> bool:
 def require_trusted_config_request(request: Request) -> None:
     """Protect config + state-changing endpoints from cross-site browser access.
 
-    Three layers, checked in order:
+    Layers, checked in order:
 
-    1. ``Sec-Fetch-Site`` — a *forbidden* request header set by the browser and
-       not writable from JavaScript. Any value of ``cross-site`` / ``same-site``
-       means a different origin initiated the request, so we reject outright.
-       This closes the CSRF hole where a plain HTML ``<form>`` POST (which omits
-       ``Origin`` in some browser/network configs) would otherwise fall through
-       to the private-IP branch below and be trusted.
-    2. ``Origin`` — when present it must match the allow-list.
-    3. Private/loopback client IP — only reached for non-browser clients (curl,
-       CLI scripts) that send neither ``Sec-Fetch-Site`` nor ``Origin``.
+    1. ``Origin`` — when present and on the operator's explicit allow-list,
+       the request is trusted regardless of ``Sec-Fetch-Site``. The
+       allow-list is the deliberate cross-origin deployment surface
+       (production frontends); CORS already permits these origins, so this
+       gate must agree with it. Browser ``fetch``/XHR always send ``Origin``
+       and JavaScript cannot forge it, so an allow-listed ``Origin``
+       presented by a browser is genuine.
+    2. ``Sec-Fetch-Site`` — a *forbidden* request header set by the browser
+       and not writable from JavaScript. Any value of ``cross-site`` /
+       ``same-site`` without an allow-listed ``Origin`` is rejected outright.
+       This closes the CSRF hole where a plain HTML ``<form>`` POST (which
+       omits ``Origin`` in some browser/network configs) would otherwise
+       fall through to the private-IP branch below and be trusted.
+    3. ``same-origin`` fetch metadata, trusted ``Referer``/``Host`` — local
+       same-origin traffic.
+    4. Private/loopback client IP — only reached for non-browser clients
+       (curl, CLI scripts) that send neither ``Sec-Fetch-Site`` nor
+       ``Origin``.
     """
+    origin = request.headers.get("origin")
+    if origin and is_trusted_origin(origin):
+        return
+
     sec_fetch_site = request.headers.get("sec-fetch-site")
     if sec_fetch_site in ("cross-site", "same-site"):
         raise HTTPException(status_code=403, detail="Cross-site requests are not allowed.")
     if sec_fetch_site == "same-origin":
         return
 
-    origin = request.headers.get("origin")
     if origin:
-        if is_trusted_origin(origin):
-            return
         raise HTTPException(status_code=403, detail="Origin not allowed for config access.")
 
     referer = request.headers.get("referer")
