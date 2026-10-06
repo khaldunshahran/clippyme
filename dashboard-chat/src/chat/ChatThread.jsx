@@ -1,10 +1,19 @@
 import { useEffect, useRef } from 'react';
 import { Loader2, TriangleAlert, Info, Link2 } from 'lucide-react';
-import ProgressPill from './ProgressPill.jsx';
+import { ProgressBody } from './ProgressPill.jsx';
 import ClipRow from './ClipRow.jsx';
 import CaptionCarousel from './CaptionCarousel.jsx';
 
-function ValidateMsg({ data }) {
+/**
+ * Single card for a validated link. It MORPHS in place through the job
+ * lifecycle instead of spawning a second progress card:
+ *  - validating/caption-pick/settings → "Link looks good — set up your clips"
+ *  - submitting/clipping/done          → progress bar + % + ETA (same card)
+ *  - error                             → honest error state (same card)
+ * No duplicate thumbnails, no layout jump: only the bottom line swaps,
+ * with a subtle fade (transform/opacity).
+ */
+function ValidateMsg({ data, thread }) {
   const { state, url, validation, error } = data || {};
   if (state === 'checking') {
     return (
@@ -28,17 +37,31 @@ function ValidateMsg({ data }) {
   // done
   const v = validation || {};
   if (v.valid && v.downloadable) {
+    const phase = thread?.phase;
+    const failed = phase === 'error';
+    const morph = phase === 'submitting' || phase === 'clipping' || phase === 'done';
     return (
-      <div className="nc-card nc-anim-fade-up" style={{ padding: 12, display: 'flex', gap: 12, alignItems: 'center', maxWidth: 480, borderColor: 'rgba(52,199,123,0.35)' }}>
+      <div className="nc-card nc-anim-fade-up" style={{ padding: 12, display: 'flex', gap: 12, alignItems: 'center', maxWidth: 480, borderColor: failed ? 'rgba(243,18,96,0.4)' : 'rgba(52,199,123,0.35)' }}>
         {v.thumbnail
           ? <img src={v.thumbnail} alt="" style={{ width: 96, height: 54, objectFit: 'cover', borderRadius: 8, background: '#000' }} draggable={false} />
           : <div className="nc-skeleton" style={{ width: 96, height: 54, borderRadius: 8 }} />}
-        <div style={{ minWidth: 0 }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
             {v.title || 'Video'}
           </div>
-          <div style={{ fontSize: 12, color: 'var(--nc-green)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 5 }}>
-            <Link2 size={12} /> Link looks good — set up your clips
+          <div key={failed ? 'err' : morph ? 'progress' : 'idle'} className="nc-anim-fade-up" style={{ marginTop: morph || failed ? 10 : 4 }}>
+            {failed ? (
+              <div style={{ fontSize: 12, color: 'var(--nc-red)', display: 'flex', alignItems: 'center', gap: 5 }}>
+                <TriangleAlert size={12} style={{ flexShrink: 0 }} />
+                <span>{thread?.error || 'The clip job failed.'}</span>
+              </div>
+            ) : morph ? (
+              <ProgressBody progress={thread?.progress} status={phase === 'done' ? 'done' : undefined} />
+            ) : (
+              <div style={{ fontSize: 12, color: 'var(--nc-green)', display: 'flex', alignItems: 'center', gap: 5 }}>
+                <Link2 size={12} /> Link looks good — set up your clips
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -86,7 +109,7 @@ export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleC
           // AI messages
           switch (m.kind) {
             case 'validate':
-              return <div key={m.id}><ValidateMsg data={m.data} /></div>;
+              return <div key={m.id}><ValidateMsg data={m.data} thread={thread} /></div>;
             case 'caption-picker':
               return (
                 <div key={m.id}>
@@ -99,19 +122,11 @@ export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleC
                   />
                 </div>
               );
-            case 'progress': {
-              const st = m.data?.state;
-              return (
-                <div key={m.id}>
-                  <ProgressPill
-                    state={st}
-                    progress={thread.progress}
-                    title={thread.validation?.title}
-                    thumbnail={thread.validation?.thumbnail}
-                  />
-                </div>
-              );
-            }
+            case 'progress':
+              // Legacy: progress used to be a separate message (pre-merge).
+              // The validation card now morphs in place; render nothing so
+              // old persisted threads don't show a duplicate card.
+              return null;
             case 'clips':
               return (
                 <div key={m.id}>
@@ -146,10 +161,6 @@ export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleC
               );
           }
         })}
-        {/* live progress pill follows the thread while clipping (updates in place) */}
-        {thread.phase === 'clipping' && !msgs.some((m) => m.kind === 'progress') && (
-          <div><ProgressPill progress={thread.progress} title={thread.validation?.title} thumbnail={thread.validation?.thumbnail} state="clipping" /></div>
-        )}
         <div ref={bottomRef} style={{ height: 4 }} />
       </div>
     </div>

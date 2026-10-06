@@ -194,7 +194,7 @@ export function useChat() {
         if (failed) {
           stopPoll(threadId);
           pushMsg(threadId, { role: 'ai', kind: 'error', text: `The clip job failed${p.detail ? `: ${p.detail}` : ''}. Nothing was rendered \u2014 you can try again with a different link.` });
-          patchThread(threadId, { phase: 'error', error: 'job failed' });
+          patchThread(threadId, { phase: 'error', error: p.detail ? `The clip job failed: ${p.detail}` : 'The clip job failed.' });
           return;
         }
         const done = p && (p.progress >= 100 || p.stage === 'completed' || p.stage === 'done');
@@ -232,7 +232,8 @@ export function useChat() {
     if (!thread || !thread.url) return;
     setSettingsOpen(false);
     patchThread(threadId, { settings: { ...settings }, phase: 'submitting', error: null });
-    pushMsg(threadId, { role: 'ai', kind: 'progress', data: { state: 'submitting' } });
+    // No separate progress message: the validation card morphs in place
+    // (ValidateMsg renders ProgressBody once phase is submitting/clipping).
     try {
       const payload = buildPayload({ ...thread, settings });
       const res = await submitJob(payload);
