@@ -30,6 +30,48 @@ _VALID_PRESETS = {
     "medium", "slow", "slower", "veryslow",
 }
 
+
+def _video_encoder() -> str:
+    """Resolved video encoder: CLIPPYME_VIDEO_ENCODER (nvenc | libx264)."""
+    raw = (os.getenv("CLIPPYME_VIDEO_ENCODER") or "").strip().lower()
+    if raw == "nvenc":
+        return "nvenc"
+    return "libx264"
+
+
+def video_encoder() -> str:
+    """Public accessor for the resolved encoder name (nvenc | libx264)."""
+    return _video_encoder()
+
+
+# NVENC presets are the p1..p7 scale; p4 is the balanced default.
+_VALID_NVENC_PRESETS = frozenset({"p1", "p2", "p3", "p4", "p5", "p6", "p7"})
+_DEFAULT_NVENC_PRESET = "p4"
+# NVENC constant-quality default (1..51 scale, like CRF; lower = better).
+_DEFAULT_NVENC_CQ = 20
+
+
+def nvenc_preset() -> str:
+    """Resolved NVENC preset: CLIPPYME_NVENC_PRESET (p1..p7) or p4."""
+    raw = (os.getenv("CLIPPYME_NVENC_PRESET") or "").strip().lower()
+    if raw in _VALID_NVENC_PRESETS:
+        return raw
+    return _DEFAULT_NVENC_PRESET
+
+
+def nvenc_cq() -> int:
+    """Resolved NVENC constant-quality: CLIPPYME_NVENC_CQ (1..51) or 20."""
+    raw = (os.getenv("CLIPPYME_NVENC_CQ") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if 1 <= v <= 51:
+                return v
+        except ValueError:
+            pass
+    return _DEFAULT_NVENC_CQ
+
+
 # A single compose-layer ffmpeg pass on a ≤75s clip finishes in seconds; a pass
 # that runs this long is hung, not slow. Every compose-layer subprocess.run
 # passes this timeout because those calls execute on asyncio's shared default
@@ -72,21 +114,30 @@ def x264_preset() -> str:
 
 
 def x264_video_args(crf=None, preset=None, pix_fmt="yuv420p", faststart=True):
-    """Return the shared ``-c:v libx264 …`` argument list for one encode pass.
+    """Return the shared video-encoder argument list for one encode pass.
 
-    ``crf`` / ``preset`` override the env/default when given (e.g. a deliberately
-    higher-quality master pass, or a faster preset for a cheap intermediate).
-    ``pix_fmt`` defaults to ``yuv420p`` for universal player/mobile decode
-    (pass ``None`` to omit). ``faststart`` writes the moov atom up front so the
+    Encoder is chosen by CLIPPYME_VIDEO_ENCODER (nvenc | libx264,
+    default libx264):
+    - libx264: -preset (x264 preset) + -crf as before.
+    - nvenc: -c:v h264_nvenc -preset pN -cq N. crf is ignored in this
+      mode (NVENC constant-quality -cq plays that role instead); a caller
+      preset is honored only if it is a valid NVENC preset (p1..p7).
+
+    pix_fmt defaults to yuv420p for universal player/mobile decode
+    (pass None to omit). faststart writes the moov atom up front so the
     mp4 is progressively playable and uploads cleanly to social. Audio flags
-    (``-c:a copy`` / ``aac`` / ``-an``) stay at the call site — this only owns
+    (-c:a copy / aac / -an) stay at the call site: this only owns
     the video codec settings.
     """
-    args = [
-        "-c:v", "libx264",
-        "-preset", preset or x264_preset(),
-        "-crf", str(crf if crf is not None else x264_crf()),
-    ]
+    if _video_encoder() == "nvenc":
+        nv_preset = preset if str(preset or "").lower() in _VALID_NVENC_PRESETS else nvenc_preset()
+        args = ["-c:v", "h264_nvenc", "-preset", nv_preset, "-cq", str(nvenc_cq())]
+    else:
+        args = [
+            "-c:v", "libx264",
+            "-preset", preset or x264_preset(),
+            "-crf", str(crf if crf is not None else x264_crf()),
+        ]
     if pix_fmt:
         args += ["-pix_fmt", pix_fmt]
     if faststart:
