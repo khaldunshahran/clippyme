@@ -195,12 +195,7 @@ body {
   display: flex; flex-direction: column;
 }
 
-/* ---------- composer focus (themed, replaces UA glow) ---------- */
-.nc-composer-input:focus { outline: none !important; box-shadow: none !important; }
-.nc-composer .nc-card:focus-within {
-  border-color: rgba(10, 129, 217, 0.45);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.35), 0 0 0 3px rgba(10,129,217,0.12);
-}
+/* composer focus glow removed per user request 2026-10-06 — stays flat on focus */
 
 /* ---------- error fallback ---------- */
 .nc-error-fallback {
