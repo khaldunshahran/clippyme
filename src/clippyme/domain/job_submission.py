@@ -10,7 +10,7 @@ import os
 import shutil
 
 from clippyme.domain.errors import ClippyMeError, NotFoundError, ValidationError
-from clippyme.domain.runtime_state import RuntimeState, runtime_result_fields
+from clippyme.domain.runtime_state import RuntimeState, runtime_result_fields, worker_python
 
 logger = logging.getLogger("clippyme")
 
@@ -123,6 +123,8 @@ async def retry_job_action(
         }
 
     cmd = list(existing.get("cmd")) if (existing and existing.get("cmd")) else None
+    if cmd and cmd[0] in ("python", "python3", "py"):
+        cmd[0] = worker_python()
     env = dict(existing.get("env")) if (existing and existing.get("env")) else None
     input_path = existing.get("input_path") if existing else None
 
@@ -164,7 +166,7 @@ async def retry_job_action(
             except Exception:
                 pass
 
-        cmd = ["python", "-m", "clippyme.pipeline.orchestrator"]
+        cmd = [worker_python(), "-m", "clippyme.pipeline.orchestrator"]
         if input_video and os.path.isfile(input_video):
             cmd.extend(["-i", input_video])
             input_path = input_video
