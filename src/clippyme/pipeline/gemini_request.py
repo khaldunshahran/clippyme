@@ -24,54 +24,32 @@ MODEL_PRICING = {
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
 }
 
-# ISO 639-1 code -> explicit language name for the prompt's OUTPUT LANGUAGE block.
-# Named explicitly because few-shot examples in other languages otherwise
-# drag the model into writing titles/hooks in the example language.
-_LANGUAGE_NAMES = {
-    "en": "English", "it": "Italian", "es": "Spanish", "fr": "French",
-    "de": "German", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
-    "ru": "Russian", "uk": "Ukrainian", "ja": "Japanese", "zh": "Chinese",
-    "ko": "Korean", "ar": "Arabic", "hi": "Hindi", "tr": "Turkish",
-    "sv": "Swedish", "fi": "Finnish", "da": "Danish", "no": "Norwegian",
-    "nb": "Norwegian", "ro": "Romanian", "el": "Greek", "cs": "Czech",
-    "hu": "Hungarian", "id": "Indonesian", "ms": "Malay", "th": "Thai",
-    "vi": "Vietnamese", "he": "Hebrew", "fa": "Persian",
-}
+# NOTE (user requirement): EVERYTHING the AI writes is ALWAYS English.
+# No language detection, no per-transcript switching - the OUTPUT LANGUAGE
+# block below is hardcoded and the prompt contains zero non-English examples.
 
 
-def resolve_output_language(transcript_result, output_language=None):
-    """Return the explicit language NAME the prompt must demand.
+def resolve_output_language(transcript_result=None, output_language=None):
+    """Always returns "English".
 
-    Priority: explicit ``output_language`` param -> the transcript result's
-    ``language`` field (set by every transcription provider: Deepgram,
-    ElevenLabs, Faster-Whisper) -> English default. ISO codes are normalized
-    ("en-US" -> "en") and mapped to full names so the model sees "English",
-    not "en".
+    Kept for backward compatibility (callers may pass ``output_language``);
+    per user requirement every AI-written text field is ALWAYS English,
+    no matter what language the transcript is in.
     """
-    raw = (output_language or "").strip().lower()
-    if not raw:
-        raw = str((transcript_result or {}).get("language") or "").strip().lower()
-    code = raw.replace("_", "-").split("-")[0]
-    return _LANGUAGE_NAMES.get(code, "English")
+    return "English"
 
 
-def build_output_language_block(language_name):
-    """The explicit OUTPUT LANGUAGE block - injected at the TOP of the prompt.
-
-    Naming the target language explicitly is what stops the model from
-    following the language of the few-shot examples instead.
-    """
+def build_output_language_block(language_name=None):
+    """Hardcoded English directive - injected at the TOP of the prompt."""
     return (
-        f"## OUTPUT LANGUAGE: {language_name}\n"
-        f"Every text field you emit (viral_reason, descriptions, titles, "
-        f"hook_text) MUST be written in {language_name}. This overrides any "
-        f"language suggested by the examples below - the examples demonstrate "
-        f"patterns and structure, never the target language."
+        "## OUTPUT LANGUAGE: English\n"
+        "Every text field you emit (viral_reason, descriptions, titles, "
+        "hook_text) MUST be written in English, always. Never use any other "
+        "language, no matter what language the transcript is in."
     )
 
 
-GEMINI_PROMPT_TEMPLATE = """
-{output_language_block}
+GEMINI_PROMPT_TEMPLATE = """{output_language_block}
 
 You are a senior video editor specialized in social media virality across YouTube Shorts, TikTok, IG Reels, and YouTube Highlights. Read the ENTIRE transcript + word-level timestamps and select {target_moments_instruction} MOST COMPELLING {duration_descriptor} moments.
 {clip_type_focus_block}
@@ -162,19 +140,19 @@ normally on the words alone.
   the first word of a sentence and close on the last word of a sentence.
 - viral_reason MUST be at least 20 characters and cite the specific hook, payoff or quote
 - viral_hook_text is REQUIRED, NEVER empty: 3-8 words, written AS A SCROLL-STOPPING OVERLAY — NOT a transcript quote, NOT the first words the speaker says. It is standalone copywriting designed to make someone stop scrolling on TikTok/Reels. Use one of these proven patterns:
-    * Curiosity gap: "What they don't want you to know", "Nessuno ti dice questo"
-    * POV / relatable: "POV: you just realized…", "POV: sei il primo a scoprirlo"
-    * Counter-intuitive claim: "I was doing it wrong", "Stavo sbagliando tutto"
-    * Direct question: "What if you're wrong?", "E se fosse tutto falso?"
-    * Number / stakes: "3 things nobody tells you", "3 cose che nessuno dice"
-    * Warning / callout: "Stop scrolling if…", "Non guardare se…"
-    * Stakes / consequence: "This ends his career", "Dopo questo può smettere"
-    * Prediction bait: "Guess the number", "Indovina quanto vale"
-  The hook must TEASE the content of the clip without spoiling the payoff. Same language as the transcript. Title Case or Sentence case, never ALL CAPS.
+    * Curiosity gap: "What they don't want you to know", "Nobody ever tells you this"
+    * POV / relatable: "POV: you just realized it", "POV: you're the first to find out"
+    * Counter-intuitive claim: "I was doing it wrong", "I had it backwards the whole time"
+    * Direct question: "What if you're wrong?", "What if it's all fake?"
+    * Number / stakes: "3 things nobody tells you", "3 things nobody talks about"
+    * Warning / callout: "Stop scrolling if...", "Don't watch if..."
+    * Stakes / consequence: "This ends his career", "He could quit after this"
+    * Prediction bait: "Guess the number", "Guess what it's worth"
+  The hook must TEASE the content of the clip without spoiling the payoff. Always in English. Title Case or Sentence case, never ALL CAPS.
 - No generic intros/outros or pure sponsorship unless they ARE the hook
 
 ## LANGUAGE RULE
-Every text field (viral_reason, descriptions, titles, hook_text) MUST be in the SAME LANGUAGE as the transcript - see ## OUTPUT LANGUAGE at the top of this prompt for the exact target language. When in doubt, match the transcript's language, never the examples'.
+Every text field (viral_reason, descriptions, titles, hook_text) MUST be written in English, always. Never use any other language, no matter what language the transcript is in.
 
 ## SPEAKER ATTRIBUTION RULE (CRITICAL)
 The transcript carries NO reliable speaker identity — you cannot tell who is
@@ -183,8 +161,8 @@ reaction to a specific named person (in video_title_for_youtube_short,
 viral_hook_text or viral_reason) UNLESS that exact name is EXPLICITLY spoken in
 the transcript words of THAT clip. Any name listed only in the user context/
 instructions does NOT count as evidence of who is speaking. When the speaker is
-not named in the clip, use a generic reference instead (e.g. "un concorrente",
-"uno di loro", "in villa", "chi parla") — never guess. A wrong name is far worse
+not named in the clip, use a generic reference instead (e.g. "a competitor",
+"one of them", "the streamer", "the speaker") — never guess. A wrong name is far worse
 than no name.
 ONE EXCEPTION: when a CHANNEL OWNER is given in VIDEO METADATA, that name may be
 the SUBJECT of a title/hook (whose stream this is, what happened on it) — but
@@ -194,26 +172,23 @@ because the voice may belong to a guest.
 
 ## TITLE & CAPTION COPY (this is where clips win or die)
 A title is NOT a summary of the clip. It is bait: its only job is to make
-someone stop, watch, and COMMENT. Flat descriptive titles ("Trova una moneta
-rara") are a failure even when the clip is great.
+someone stop, watch, and COMMENT. Flat descriptive titles ("Finds a rare coin") are a failure even when the clip is great.
 
 Write video_title_for_youtube_short and both descriptions with these rules:
 
 1. PLAY UP THE STAKES. Take what actually happens and frame it at its most
    dramatic, most absurd or most consequential reading. A rare coin is not "a
-   coin" — it is "il pezzo che ripaga un anno di stream".
+   coin" — it is "the piece that pays for a year of streaming".
 2. SPECULATE OUT LOUD. A consequence that does not happen in the clip is
    allowed ONLY as open speculation, never as a statement of fact — use a
-   conditional, a question, or a "dopo questo…" framing:
-     OK:  "Dopo un cimelio da 10k, <creator> smette di fare live?"
-     OK:  "Con questo pezzo può chiudere lo stream e andare in pensione"
-     NO:  "<creator> ha annunciato che smette" ← invented fact = a lie
+   conditional, a question, or an "after this..." framing:
+     OK:  "After a 10k relic, does <creator> quit streaming?"
+     OK:  "With this piece he could end the stream and retire"
+     NO:  "<creator> announced he's quitting" ← invented fact = a lie
 3. BAIT THE COMMENTS IMPLICITLY. At least one of the three text fields must
    give the viewer something to reply to: an opinion that splits the audience,
-   a debatable valuation, a genuine question, a "ditemi che sbaglio", a guess
-   invited before the reveal. NEVER use mechanical engagement bait — "commenta
-   X e ti mando…", "metti like se sei d'accordo", "seguimi e ti seguo", "solo
-   il 10% ci riesce". Those are demoted/feed-ineligible by TikTok and Meta
+   a debatable valuation, a genuine question, a "tell me I'm wrong", a guess
+   invited before the reveal. NEVER use mechanical engagement bait — "comment X and I'll send it to you", "like if you agree", "follow me and I'll follow you", "only 10% can do this". Those are demoted/feed-ineligible by TikTok and Meta
    policy; an honest ask for an opinion is explicitly allowed.
 4. LEAVE THE LOOP OPEN. Name the object/number/reaction, never the outcome —
    the payoff must be watched, not read.
@@ -227,11 +202,10 @@ Write video_title_for_youtube_short and both descriptions with these rules:
    contain is misleading metadata and gets the account penalised.
 7. STACK EXACTLY TWO triggers per title (e.g. stakes + open loop). One is
    flat, three reads as spam.
-8. Register: spoken streamer talk, informal second person (in Italian always
-   "tu"/"voi", never "lei" — and "voi" is what pulls replies). Sentence case
+8. Register: spoken streamer talk, informal second person (always informal second-person "you" - that is what pulls replies). Sentence case
    or lowercase, CAPS on at most one or two words for emphasis, never the
-   whole line, at most one emoji. No "non crederai mai", no emoji walls, no
-   hashtag spam, no machine-translated English templates. Sound like a viewer
+   whole line, at most one emoji. No "you won't believe", no emoji walls, no
+   hashtag spam, no generic translated templates. Sound like a viewer
    in chat, not like a newspaper headline.
 9. NAME PLACEMENT: lead with the creator's name only when it is the draw;
    otherwise lead with the moment and put the name second. Use the handle the
@@ -239,19 +213,19 @@ Write video_title_for_youtube_short and both descriptions with these rules:
 
 Title patterns that work (rotate them — the same template every clip burns
 credibility fast):
-  * Consequence bait:   "Dopo questo <creator> può smettere di streammare"
-  * Valuation debate:   "Quanto pensate valga? Io dico 10k"
-  * Underreaction:      "Trova un pezzo da 10k e reagisce così"
-  * Ratio / stakes:     "1 euro speso, 10.000 trovati"
-  * Near-emotion:       "Ha quasi pianto quando ha capito cos'era"
-  * Prediction bait:    "Indovinate quanto vale prima che lo dica"
-  * Second-person POV:  "POV: apri la scatola e c'è quello"
-  * Split opinion:      "Lo venderei subito. Voi no, lo so"
-  * Open question:      "Secondo voi è vero o è finto?"
-  * Chat as antagonist: "La chat gli ha detto di venderlo. Aveva ragione?"
-  * Withheld reveal:    "Non riusciva più a parlare. Guardate perché"
-  * Streak / number:    "Il terzo colpo di fila, e nessuno ne parla"
-  * Understatement:     "10.000 euro e ha detto solo 'ok'"
+  * Consequence bait:   "After this <creator> could quit streaming"
+  * Valuation debate:   "What do you think it's worth? I say 10k"
+  * Underreaction:      "Finds a 10k piece and reacts like this"
+  * Ratio / stakes:     "1 euro spent, 10,000 found"
+  * Near-emotion:       "He almost cried when he realized what it was"
+  * Prediction bait:    "Guess what it's worth before he says it"
+  * Second-person POV:  "POV: you open the box and it's right there"
+  * Split opinion:      "I'd sell it immediately. You wouldn't, I know"
+  * Open question:      "Real or fake - what do you think?"
+  * Chat as antagonist: "Chat told him to sell it. Were they right?"
+  * Withheld reveal:    "He couldn't talk anymore. Watch why"
+  * Streak / number:    "Third hit in a row, and nobody talks about it"
+  * Understatement:     "10,000 euros and all he said was 'ok'"
 
 A deliberately debatable ANGLE (a valuation you call too low, a choice you
 call wrong) is the strongest comment driver — people correct a claim far more
@@ -262,13 +236,13 @@ money-making or news: that is misinformation, not bait.
 ## FEW-SHOT EXAMPLES
 GOOD TITLES (engagement-first, grounded in what the clip shows):
   clip: the streamer digs up a collectible and says it is worth about 10k
-  video_title_for_youtube_short="Dopo un cimelio da 10k può anche smettere di fare live"   ← speculative consequence, not stated as fact
-  video_title_for_youtube_short="Ne ha trovato uno da 10.000 euro e fa finta di niente"    ← underreaction + number
-  video_title_for_youtube_short="Voi lo vendereste? Io manco per idea"                     ← splits the comments
+  video_title_for_youtube_short="After a 10k relic he could quit streaming for good"   # speculative consequence, not stated as fact
+  video_title_for_youtube_short="Found one worth 10,000 euros and acts like it's nothing"    ← underreaction + number
+  video_title_for_youtube_short="Would you sell it? Not me, no way"                     ← splits the comments
 BAD TITLES:
-  "Il momento in cui trova la moneta"     ← summary, no bait, no reason to comment
-  "NON CREDERAI MAI A COSA TROVA 😱😱"    ← caps + generic clickbait, zero information
-  "Ha annunciato che chiude il canale"    ← invented fact, contradicts the clip
+  "The moment he finds the coin"     ← summary, no bait, no reason to comment
+  "YOU WILL NOT BELIEVE WHAT HE FINDS 😱😱"    ← caps + generic clickbait, zero information
+  "He announced he's shutting down the channel"    ← invented fact, contradicts the clip
 
 GOOD (score 87):
   start=12.340 end=37.900
@@ -311,9 +285,7 @@ JSON formatting rules (violating = parse failure):
 - No trailing commas before }} or ]
 - Strings stay on a single line (no raw \\n mid-string)
 - Every description ENDS with a conversation opener: a genuine question or a
-  debatable opinion about what just happened ("Voi l'avreste venduto?", "Per me
-  ha sbagliato, ditemi che sbaglio"). Never a mechanical CTA ("commenta X e ti
-  mando…", "metti like se…", "seguimi e ti seguo") — that is engagement bait and
+  debatable opinion about what just happened ("Would you have sold it?", "I think he got it wrong, tell me I'm wrong"). Never a mechanical CTA ("comment X and I'll send it to you", "like if you", "follow me and I'll follow you") — that is engagement bait and
   costs the clip its feed eligibility.
 
 Output schema:
@@ -324,11 +296,11 @@ Output schema:
       "start": 12.340,
       "end": 37.900,
       "viral_score": 87,
-      "viral_reason": "<>=20 chars, cite specific hook/payoff/quote, same language as transcript>",
+      "viral_reason": "<>=20 chars, cite specific hook/payoff/quote, in English>",
       "video_description_for_tiktok": "<TikTok description with relevant hashtags, ends with a genuine question or debatable opinion>",
       "video_description_for_instagram": "<Instagram description with relevant hashtags, ends with a genuine question or debatable opinion>",
       "video_title_for_youtube_short": "<max 100 chars, engagement-first bait per TITLE & CAPTION COPY — stakes/speculation/comment trigger, grounded in the clip, never a flat summary>",
-      "viral_hook_text": "<REQUIRED, 3-8 words, scroll-stopping overlay copy — NOT a transcript quote. Use curiosity gap, POV, counter-claim, question, number, or warning pattern. Same language as transcript.>",
+      "viral_hook_text": "<REQUIRED, 3-8 words, scroll-stopping overlay copy — NOT a transcript quote. Use curiosity gap, POV, counter-claim, question, number, or warning pattern. In English.>",
       "speaker_name": "<Identified speaker name or prominent subject in this moment if detectable from dialogue or context (e.g. 'John Kiriakou', 'Judge Napolitano', or empty if unknown)>",
       "duration_tier": "<REQUIRED: 'short' (30-60s) | 'mid' (60-180s) | 'extended' (180-300s)>",
       "target_platforms": ["#tiktok", "#youtube_shorts", "#instagram_reels"],
