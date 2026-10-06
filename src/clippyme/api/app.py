@@ -66,6 +66,7 @@ from clippyme.api.schemas import (
     ProcessRequest,
     PublishRequest,
     ReframeRequest,
+    SteerRequest,
     ValidateUrlRequest,
     _validate_drop_ranges,
     validate_public_url,
@@ -1136,6 +1137,72 @@ async def rescore_job_endpoint(job_id: str, request: Request, user: AuthUser = D
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+_STEER_PAST_ANALYSIS_STAGES = frozenset({
+    "cutting", "reframing", "quality", "finalizing",
+    "completed", "failed", "cancelled", "stopped",
+})
+
+
+@app.post("/api/jobs/{job_id}/steer")
+async def steer_job(job_id: str, req: SteerRequest, request: Request,
+                   user: AuthUser = Depends(get_current_user)):
+    """Phase B1: steer a running job's moment selection with a prompt.
+
+    The prompt is persisted on the job's runtime state; the orchestrator
+    consumes it at the analysis/moment-selection checkpoint and appends it
+    to the Gemini instructions. If the job already passed analysis, the
+    steer is REJECTED (409) with a clear message -- never silently ignored.
+    """
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    state = load_runtime_state(job_dir)
+    if not state:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    from clippyme.domain.runtime_state import RuntimeState
+
+    stage = state.get("stage") or "unknown"
+    completed = set(state.get("completed_stages") or [])
+    past_checkpoint = bool(state.get("steering_checkpoint_passed"))
+    if past_checkpoint or "analyzing" in completed or stage in _STEER_PAST_ANALYSIS_STAGES:
+        missed = state.get("steering_missed") or []
+        return JSONResponse(
+            status_code=409,
+            content={
+                "accepted": False,
+                "stage": stage,
+                "reason": (
+                    "job is already past the steering point (moment selection "
+                    "has run) -- this prompt was NOT applied; it will apply "
+                    "to your next job"
+                ),
+                "missed_steering": len(missed),
+            },
+        )
+    try:
+        pending = await asyncio.to_thread(
+            _steer_add_prompt, job_dir, job_id, req.prompt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "accepted": True,
+        "stage": stage,
+        "steering_pending": pending,
+        "note": "prompt will be applied at the moment-selection checkpoint",
+    }
+
+
+def _steer_add_prompt(job_dir: str, job_id: str, prompt: str) -> int:
+    """Blocking helper: append a steering prompt to the job runtime state."""
+    from clippyme.domain.runtime_state import RuntimeState
+
+    rs = RuntimeState(job_dir, job_id=job_id)
+    return rs.add_steering(prompt)
+
+
 @app.post("/api/smartcut/{job_id}/{clip_index}")
 async def smart_cut_clip(job_id: str, clip_index: int, request: Request, user: AuthUser = Depends(get_current_user)):
     """Generate a smart-cut version of a clip (silences + filler words removed)."""
@@ -1204,7 +1271,7 @@ async def edit_clip_ai(
     user: AuthUser = Depends(get_current_user),
     api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
 ):
-    """Conversational clip trim: a plain-English instruction → Gemini → the
+    """Conversational clip trim: a plain-English instruction \u2192 Gemini \u2192 the
     clip-relative spans to remove. The returned `drop_ranges` feed the SAME
     manual-trim machinery as the tap-to-cut UI (compose / publish honour them)."""
     require_trusted_config_request(request)

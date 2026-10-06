@@ -4,7 +4,7 @@ from __future__ import annotations
 import ipaddress
 import math
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -362,6 +362,10 @@ class EditAIRequest(BaseModel):
     model: Optional[str] = Field(
         None, max_length=64, pattern=r"^gemini-[A-Za-z0-9.\-]{1,64}$"
     )
+class SteerRequest(BaseModel):
+    """Phase B1: steer a running job's moment selection with a prompt."""
+
+    prompt: str = Field(..., min_length=1, max_length=1000)
 
 
 class GenerateMetadataRequest(BaseModel):

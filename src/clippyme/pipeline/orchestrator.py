@@ -510,21 +510,44 @@ def _load_or_analyze(
     default_metadata = os.path.join(output_dir, f"{safe_title}_metadata.json")
     metadata_file = prior_metadata or default_metadata
     if state.completed("analyzing"):
+        # Phase B: analysis is checkpointed -- any steering that arrived
+        # after the checkpoint (e.g. queued before a backend restart)
+        # can never apply. Record it loudly instead of dropping it.
+        _missed = state.consume_steering()
+        if _missed:
+            state.note_missed_steering(
+                _missed, "job resumed from the analysis checkpoint; "
+                "steering arrived too late to affect moment selection")
         saved = _load_json(metadata_file)
         if saved and isinstance(saved.get("shorts"), list):
             print("♻️ Resume: reusing analysis metadata checkpoint", flush=True)
             return saved, metadata_file
 
     state.start("analyzing", "selecting and validating clip candidates")
+    # Phase B: mid-job steering. Consume pending user prompts here --
+    # this marks the steering checkpoint as passed, so the API rejects
+    # later prompts (409) instead of silently ignoring them.
+    _steer_prompts = state.consume_steering()
     if args.skip_analysis:
+        if _steer_prompts:
+            state.note_missed_steering(
+                _steer_prompts,
+                "analysis skipped for this job (skip_analysis); "
+                "steering could not be applied")
         clips_data = _whole_video_fallback(video_title, duration)
     else:
         from clippyme.pipeline.audience_intel import load_audience_intel
         audience_intel = load_audience_intel(output_dir)
+        _instructions = args.instructions
+        if _steer_prompts:
+            _extra = "\n\n".join(f"[User steering] {p}" for p in _steer_prompts)
+            _instructions = f"{_instructions}\n\n{_extra}" if _instructions else _extra
+            print(f"\U0001F9ED steering: applying {len(_steer_prompts)} user "
+                  f"prompt(s) to moment selection", flush=True)
         clips_data = legacy.get_viral_clips(
             transcript,
             duration,
-            instructions=args.instructions,
+            instructions=_instructions,
             min_duration=args.min_duration,
             max_duration=args.max_duration,
             min_clips=args.min_clips,
@@ -547,6 +570,13 @@ def _load_or_analyze(
             else:
                 print("⚠️ No valid AI/topic clips; using whole-video fallback", flush=True)
                 clips_data = _whole_video_fallback(video_title, duration)
+        # Phase B: steering that arrived while moment selection was
+        # running missed the checkpoint -- record it, never drop it.
+        _late = state.consume_steering()
+        if _late:
+            state.note_missed_steering(
+                _late, "arrived after moment selection ran; "
+                "steering applies to the next job")
 
     clips_data["transcript"] = transcript
     clips_data["aspect"] = args.aspect

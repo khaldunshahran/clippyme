@@ -318,6 +318,56 @@ class RuntimeState:
         qa["failed"] = sum(1 for value in reports.values() if value.get("status") == "failed")
         self.save()
 
+    # ------------------------------------------------------------------
+    # Phase B: mid-job steering. The chat UI POSTs user prompts to
+    # /api/jobs/{id}/steer; they land here (persisted, restart-safe) and the
+    # orchestrator consumes them at the analysis/moment-selection checkpoint.
+    # Steering submitted after the checkpoint is rejected (409) by the API --
+    # never silently ignored.
+    # ------------------------------------------------------------------
+    def add_steering(self, prompt: str) -> int:
+        """Queue a user steering prompt. Returns the pending count."""
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            raise ValueError("steering prompt must not be empty")
+        pending = self.data.setdefault("steering_pending", [])
+        pending.append({"prompt": prompt[:1000], "created_at": time.time()})
+        if len(pending) > 10:
+            del pending[:-10]
+        self.save()
+        return len(pending)
+
+    def consume_steering(self) -> list[str]:
+        """Pop pending steering prompts (marks the checkpoint as passed).
+
+        Called by the orchestrator immediately before moment selection runs.
+        After this, newly submitted steering is past the steering point.
+        """
+        pending = self.data.get("steering_pending") or []
+        prompts = [str(item.get("prompt", "")).strip() for item in pending
+                   if isinstance(item, dict) and str(item.get("prompt", "")).strip()]
+        if prompts:
+            consumed = self.data.setdefault("steering_consumed", [])
+            now = time.time()
+            consumed.extend({"prompt": p, "consumed_at": now} for p in prompts)
+        self.data["steering_pending"] = []
+        self.data["steering_checkpoint_passed"] = True
+        self.save()
+        return prompts
+
+    def note_missed_steering(self, prompts: list[str], reason: str) -> None:
+        """Record steering that could not be applied (loud, not silent)."""
+        prompts = [p for p in (prompts or []) if p]
+        if not prompts:
+            return
+        missed = self.data.setdefault("steering_missed", [])
+        now = time.time()
+        missed.extend({"prompt": p, "reason": str(reason), "at": now} for p in prompts)
+        self.save()
+
+    def steering_checkpoint_passed(self) -> bool:
+        return bool(self.data.get("steering_checkpoint_passed"))
+
     def fail(self, error: str, *, resumable: bool = True) -> None:
         self.data["stage"] = "failed"
         self.data["progress"] = 100
