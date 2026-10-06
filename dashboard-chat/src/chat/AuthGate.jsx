@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { getSupabase, signOut } from '../api/supabase.js';
 import { setAuthEventHandler } from '../api/apiToken.js';
+import { emitSessionReset } from '../api/sessionReset.js';
 import { LoginView, ForbiddenView, AuthToast } from './AuthScreens.jsx';
 
 /**
@@ -18,6 +19,10 @@ export default function AuthGate({ children }) {
   const [state, setState] = useState('loading');
   const [toast, setToast] = useState('');
   const unsubRef = useRef(null);
+  // Last seen Supabase user id. A change (or sign-out) means per-user state
+  // (undo history, cached projects, editor state) must be dropped so it can
+  // never leak across users.
+  const lastUserIdRef = useRef(null);
 
   const goLogin = useCallback(() => {
     signOut().catch(() => {});
@@ -31,17 +36,21 @@ export default function AuthGate({ children }) {
 
     // Backend-driven auth events from apiFetch.
     // 'signed-out' (401 refresh-exhausted) -> login.
-    // 'forbidden' (403 NOT_ALLOWLISTED) -> full-screen.
-    // 'forbidden-toast' (403 ADMIN_ONLY / ORIGIN_REJECTED) -> toast notice.
+    // 'forbidden' (403 NOT_ALLOWLISTED only) -> full-screen.
+    // 'forbidden-toast' (all other 403s) -> toast notice with the status.
     setAuthEventHandler((type, detail) => {
       if (!alive) return;
       if (type === 'signed-out') goLogin();
       else if (type === 'forbidden') setState('forbidden');
       else if (type === 'forbidden-toast') {
+        const code = detail?.code || '';
+        const status = detail?.status || 403;
         setToast(
-          detail === 'ADMIN_ONLY'
+          code === 'ADMIN_ONLY'
             ? 'This action needs admin access.'
-            : 'Request blocked: this origin is not allowed.',
+            : code === 'ORIGIN_REJECTED'
+              ? 'Request blocked: this origin is not allowed.'
+              : `Request failed (${status}).`,
         );
       }
     });
@@ -51,9 +60,17 @@ export default function AuthGate({ children }) {
         const supabase = await getSupabase();
         const { data } = await supabase.auth.getSession();
         if (!alive) return;
+        lastUserIdRef.current = data?.session?.user?.id || null;
         setState(data?.session ? 'app' : 'login');
-        const { data: sub } = supabase.auth.onAuthStateChange((event) => {
+        const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
           if (!alive) return;
+          const userId = session?.user?.id || null;
+          // Sign-out, or a different user signing in: drop all per-user
+          // state before the UI switches over.
+          if (event === 'SIGNED_OUT' || (lastUserIdRef.current && userId && userId !== lastUserIdRef.current)) {
+            emitSessionReset();
+          }
+          lastUserIdRef.current = userId;
           if (event === 'SIGNED_IN') setState('app');
           else if (event === 'SIGNED_OUT') setState('login');
         });

@@ -116,31 +116,31 @@ describe('apiFetch (Supabase session auth)', () => {
     const res = await apiFetch('https://x/api/process', { method: 'POST' });
     expect(res.status).toBe(403);
     expect(refreshSessionNow).not.toHaveBeenCalled();
-    expect(events).toEqual([['forbidden-toast', 'ADMIN_ONLY']]);
+    expect(events).toEqual([['forbidden-toast', { code: 'ADMIN_ONLY', status: 403 }]]);
   });
 
   it('on 403 ORIGIN_REJECTED: emits forbidden-toast (no takeover)', async () => {
     fetchMock.mockResolvedValue(forbidden('ORIGIN_REJECTED'));
     const res = await apiFetch('https://x/api/process', { method: 'POST' });
     expect(res.status).toBe(403);
-    expect(events).toEqual([['forbidden-toast', 'ORIGIN_REJECTED']]);
+    expect(events).toEqual([['forbidden-toast', { code: 'ORIGIN_REJECTED', status: 403 }]]);
   });
 
-  it('on 403 with no code: defaults to forbidden (full-screen)', async () => {
+  it('on 403 with no code: toast with status, NOT full-screen', async () => {
     fetchMock.mockResolvedValue(forbidden(null));
     await apiFetch('https://x/api/process', { method: 'POST' });
-    expect(events).toEqual([['forbidden', 'NOT_ALLOWLISTED']]);
+    expect(events).toEqual([['forbidden-toast', { code: '', status: 403 }]]);
   });
 
-  it('on 403 with unknown code: defaults to forbidden (full-screen)', async () => {
+  it('on 403 with unknown code: toast with status, NOT full-screen', async () => {
     fetchMock.mockResolvedValue(forbidden('SOMETHING_NEW'));
     await apiFetch('https://x/api/process', { method: 'POST' });
-    expect(events).toEqual([['forbidden', 'NOT_ALLOWLISTED']]);
+    expect(events).toEqual([['forbidden-toast', { code: '', status: 403 }]]);
   });
 
-  it('on 403 with non-JSON body: defaults to forbidden (full-screen)', async () => {
+  it('on 403 with non-JSON body: toast with status, NOT full-screen', async () => {
     fetchMock.mockResolvedValue(new Response('<html>proxy error</html>', { status: 403 }));
     await apiFetch('https://x/api/process', { method: 'POST' });
-    expect(events).toEqual([['forbidden', 'NOT_ALLOWLISTED']]);
+    expect(events).toEqual([['forbidden-toast', { code: '', status: 403 }]]);
   });
 });

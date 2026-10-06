@@ -6,6 +6,7 @@ import { ClipEditorView } from '../editor/clipEditor.jsx';
 import CopilotPanel from './CopilotPanel.jsx';
 import TranscriptPanel from '../editor-timeline/TranscriptPanel.jsx';
 import { createEditQueue } from '../editor-timeline/undo.js';
+import { onSessionReset } from '../api/sessionReset.js';
 import {
   clipVideoSrc,
   getClipProject,
@@ -27,6 +28,9 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
   const [project, setProject] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [toast, setToast] = useState(null);
+  // Bumped on session reset so the TranscriptPanel remounts and drops its
+  // selection / editing state along with the cleared project.
+  const [resetKey, setResetKey] = useState(0);
   const projectRef = useRef(null);
   projectRef.current = project;
 
@@ -73,6 +77,18 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
   useEffect(() => {
     refreshProject();
   }, [refreshProject]);
+
+  // Session reset (sign-out or signed-in user change): drop the undo/redo
+  // history, the cached project, and force the transcript panel to remount
+  // so selection/editing state can't leak across users.
+  useEffect(() => {
+    return onSessionReset(() => {
+      queue.clear();
+      setProject(null);
+      setLoadError(null);
+      setResetKey((k) => k + 1);
+    });
+  }, [queue]);
 
   // Global undo/redo with the inline-editor guard (condition 6):
   // never fire when focus is inside an input/textarea/select/contenteditable.
@@ -142,6 +158,7 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
             </div>
           ) : (
             <TranscriptPanel
+              key={resetKey}
               project={project}
               videoSrc={videoSrc}
               applyEdit={queue.applyEdit}

@@ -107,10 +107,17 @@ export function createEditQueue({ getProject, saveProject, onUpdate, onError }) 
     });
   }
 
+  /** Drop all undo/redo history (e.g. on sign-out or signed-in user change). */
+  function clear() {
+    undoStack.length = 0;
+    redoStack.length = 0;
+  }
+
   return {
     applyEdit,
     undo,
     redo,
+    clear,
     canUndo: () => undoStack.length > 0,
     canRedo: () => redoStack.length > 0,
     // Test seam.

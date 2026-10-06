@@ -12,19 +12,22 @@
 // still 401s (or the refresh fails) the 'signed-out' auth event fires and the
 // app shell clears the session and shows the login screen.
 //
-// 403 handling: the backend returns a machine-readable `code` in the body:
+// 403 handling: the backend returns a machine-readable `code` in the body.
 //   NOT_ALLOWLISTED -> 'forbidden' event -> full-screen "Not authorized" page.
-//   ADMIN_ONLY / ORIGIN_REJECTED -> 'forbidden-toast' event -> toast notice.
-//   Missing/unknown code -> 'forbidden' (safe default; an older backend only
-//   emits 403 for the not-allow-listed case).
+//   Everything else (ADMIN_ONLY, ORIGIN_REJECTED, unknown/missing/non-JSON
+//   code) -> 'forbidden-toast' event -> toast notice with the HTTP status.
+//   Full-screen is reserved for NOT_ALLOWLISTED only: an unknown 403 must
+//   never take over the app.
 import { getAccessToken, refreshSessionNow } from './supabase.js';
 
 let authEventHandler = null;
 
 /**
  * App shell registers a handler: (type, detail) => void.
- * Types: 'signed-out' | 'forbidden' (full-screen) | 'forbidden-toast' (toast).
- * detail carries the backend 403 code for the forbidden variants.
+ * Types: 'signed-out' | 'forbidden' (full-screen, NOT_ALLOWLISTED only) |
+ * 'forbidden-toast' (toast). For 'forbidden-toast', detail is
+ * { code: string, status: number } so the shell can show the HTTP status
+ * for unknown codes.
  */
 export function setAuthEventHandler(fn) {
   authEventHandler = typeof fn === 'function' ? fn : null;
@@ -109,10 +112,13 @@ export async function apiFetch(url, init = {}) {
 
   if (res.status === 403) {
     const code = await readForbiddenCode(res);
-    if (code === 'ADMIN_ONLY' || code === 'ORIGIN_REJECTED') {
-      emitAuthEvent('forbidden-toast', code);
+    if (code === 'NOT_ALLOWLISTED') {
+      emitAuthEvent('forbidden', code);
     } else {
-      emitAuthEvent('forbidden', code || 'NOT_ALLOWLISTED');
+      // ADMIN_ONLY, ORIGIN_REJECTED, unknown/missing/non-JSON: toast, never
+      // full-screen. The shell shows the HTTP status for codes it doesn't
+      // recognize so a future backend code can't silently take over the app.
+      emitAuthEvent('forbidden-toast', { code, status: res.status });
     }
   }
 
