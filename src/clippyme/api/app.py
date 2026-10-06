@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
-from clippyme.api.auth import AuthUser, get_current_user
+from clippyme.api.auth import AuthUser, get_current_user, is_production, require_admin
 
 from clippyme.domain.job_results import build_main_cmd, canonical_reframe_mode
 from clippyme.domain.runtime_state import (
@@ -150,6 +150,29 @@ live_monitor = LiveMonitorRegistry(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail closed in production: refuse to start without explicit auth config
+    # AND a working JWKS fetch. There is no JWT secret (ES256 via JWKS).
+    # AUTH_DISABLED_DEV=1 (dev bypass) is never allowed in production.
+    if is_production():
+        if os.environ.get("AUTH_DISABLED_DEV", "0").strip().lower() in ("1", "true", "yes", "on"):
+            raise RuntimeError(
+                "Refusing to start: AUTH_DISABLED_DEV=1 is not allowed when ENV=production."
+            )
+        _auth_on = os.environ.get("AUTH_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+        if not _auth_on:
+            raise RuntimeError(
+                "Refusing to start: ENV=production requires AUTH_ENABLED=1."
+            )
+        from clippyme.api.auth import prime_jwks_cache, supabase_url
+        if not supabase_url():
+            raise RuntimeError(
+                "Refusing to start: ENV=production requires SUPABASE_URL to be set."
+            )
+        try:
+            _n_keys = prime_jwks_cache()
+        except Exception as exc:
+            raise RuntimeError(f"Refusing to start: JWKS fetch failed: {exc}") from exc
+        logger.info("JWKS primed at startup: %d signing key(s)", _n_keys)
     logger.info("pipeline worker interpreter: %s", worker_python())
     # Recover journalled jobs from the previous server life BEFORE the
     # dispatcher starts: queued jobs are re-enqueued, interrupted ones are
@@ -268,7 +291,16 @@ async def _api_token_gate(request: Request, call_next):
     headers. HTTPException is converted here because raise inside middleware
     bypasses FastAPI's exception handlers.
     """
-    if request.url.path.startswith("/api/") and request.method != "OPTIONS":
+    _path = request.url.path
+    if (
+        _path.startswith("/api/")
+        and _path != "/api/health"
+        and request.method != "OPTIONS"
+        # Browser callers (Origin present) authenticate with JWT via
+        # get_current_user; the shared LAN token is for non-browser
+        # callers only (enforced inside enforce_api_token too).
+        and request.headers.get("origin") is None
+    ):
         try:
             enforce_api_token(request)
         except HTTPException as exc:
@@ -1541,16 +1573,22 @@ async def list_history(request: Request, user: AuthUser = Depends(get_current_us
     return {"jobs": await asyncio.to_thread(scan_history, OUTPUT_DIR, user_id=filter_user)}
 
 @app.get("/api/storage/breakdown")
-async def get_storage_stats(request: Request):
+async def get_storage_stats(request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Return categorized disk usage breakdown across output/ and uploads/."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     from clippyme.domain.job_artifacts import get_storage_breakdown
     return await asyncio.to_thread(get_storage_breakdown, OUTPUT_DIR, UPLOAD_DIR)
 
 @app.post("/api/storage/cleanup")
-async def trigger_storage_cleanup(request: Request):
+async def trigger_storage_cleanup(request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Run manual storage cleanup pass: purges partial downloads, ASR audio, uploads, and optionally source videos."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     body = {}
     if request.headers.get("content-type", "").startswith("application/json"):
         try:
@@ -2307,14 +2345,16 @@ async def export_clip_xml_endpoint(job_id: str, clip_index: int, request: Reques
 # ---------------------------------------------------------------------------
 
 @app.get("/api/analytics/summary")
-async def get_analytics_summary_endpoint():
+async def get_analytics_summary_endpoint(user: AuthUser = Depends(get_current_user)):
     """Return aggregated stats, top-performing clips, and platform breakdowns."""
     from clippyme.domain.analytics_service import get_analytics_summary
     return await asyncio.to_thread(get_analytics_summary)
 
 
 @app.post("/api/analytics/sync")
-async def sync_analytics_endpoint(request: Request):
+async def sync_analytics_endpoint(request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Sync live metrics from Zernio Analytics API."""
     require_trusted_config_request(request)
     from clippyme.domain.analytics_service import sync_zernio_analytics
@@ -2322,7 +2362,9 @@ async def sync_analytics_endpoint(request: Request):
 
 
 @app.post("/api/analytics/track")
-async def track_analytics_endpoint(payload: dict, request: Request):
+async def track_analytics_endpoint(payload: dict, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Record or update performance metrics for a specific clip."""
     require_trusted_config_request(request)
     clip_id = payload.get("clip_id")
@@ -2337,7 +2379,7 @@ async def track_analytics_endpoint(payload: dict, request: Request):
 
 
 @app.get("/api/analytics/insights")
-async def get_analytics_insights_endpoint():
+async def get_analytics_insights_endpoint(user: AuthUser = Depends(get_current_user)):
     """Return active learned performance rules and recommendations."""
     from clippyme.domain.performance_feedback import analyze_performance_patterns, get_learned_patterns_prompt
     patterns = await asyncio.to_thread(analyze_performance_patterns)
@@ -2353,19 +2395,25 @@ async def get_analytics_insights_endpoint():
 # ---------------------------------------------------------------------------
 
 @app.post("/api/live-monitor/start")
-async def live_monitor_start(req: LiveMonitorStartRequest, request: Request):
+async def live_monitor_start(req: LiveMonitorStartRequest, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Start a monitor for one platform:channel. Returns that monitor's status
     (incl. its ``id``). Starting a duplicate (platform, channel) → 409."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
     # start() raises ValidationError/ConflictError (ClippyMeError) → mapped to HTTP.
     return live_monitor.start(req.model_dump())
 
 
 @app.post("/api/live-monitor/stop")
-async def live_monitor_stop(request: Request):
+async def live_monitor_stop(request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Stop one monitor, or all monitors only when the body is truly absent."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     raw = await request.body()
     req = None
     if raw:
@@ -2382,11 +2430,14 @@ async def live_monitor_stop(request: Request):
 
 
 @app.post("/api/live-monitor/{monitor_id}/config")
-async def live_monitor_update_config(monitor_id: str, request: Request):
+async def live_monitor_update_config(monitor_id: str, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Patch selected settings on a running monitor (body: partial dict of
     updatable fields — see ``validate_monitor_partial_update``). Applies to
     FUTURE segments/publishes only, never retroactively."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
     try:
         partial = await request.json()
@@ -2396,9 +2447,12 @@ async def live_monitor_update_config(monitor_id: str, request: Request):
 
 
 @app.post("/api/live-monitor/{monitor_id}/publishing")
-async def live_monitor_set_publishing(monitor_id: str, request: Request):
+async def live_monitor_set_publishing(monitor_id: str, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Pause/resume auto-publishing with a strict boolean request body."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
     try:
         body = await request.json()
@@ -2413,24 +2467,33 @@ async def live_monitor_set_publishing(monitor_id: str, request: Request):
 
 
 @app.get("/api/live-monitor/status")
-async def live_monitor_status(request: Request, monitor_id: Optional[str] = None):
+async def live_monitor_status(request: Request, monitor_id: Optional[str] = None,
+    user: AuthUser = Depends(get_current_user)
+):
     """One monitor's status (``?monitor_id=``) or ``{"monitors": [...]}`` for all."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     return live_monitor.status(monitor_id)
 
 
 @app.get("/api/live-monitor/{monitor_id}/pending-clips")
-async def live_monitor_pending_clips(monitor_id: str, request: Request):
+async def live_monitor_pending_clips(monitor_id: str, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """List pending preview clips awaiting review/approval for a monitor."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=20, refill_per_sec=20 / 60)
     return {"pending_clips": live_monitor.get_pending_clips(monitor_id)}
 
 
 @app.post("/api/live-monitor/{monitor_id}/publish-clip/{clip_id}")
-async def live_monitor_publish_pending_clip(monitor_id: str, clip_id: str, request: Request):
+async def live_monitor_publish_pending_clip(monitor_id: str, clip_id: str, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Approve and publish an individual previewed clip with optional overrides."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
     overrides = None
     try:
@@ -2443,25 +2506,34 @@ async def live_monitor_publish_pending_clip(monitor_id: str, clip_id: str, reque
 
 
 @app.delete("/api/live-monitor/{monitor_id}/pending-clip/{clip_id}")
-async def live_monitor_dismiss_pending_clip(monitor_id: str, clip_id: str, request: Request):
+async def live_monitor_dismiss_pending_clip(monitor_id: str, clip_id: str, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Dismiss/reject a pending preview clip, cleaning up on-disk files."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=20, refill_per_sec=20 / 60)
     return live_monitor.dismiss_pending_clip(monitor_id, clip_id)
 
 
 @app.post("/api/live-monitor/{monitor_id}/publish-all")
-async def live_monitor_publish_all(monitor_id: str, request: Request):
+async def live_monitor_publish_all(monitor_id: str, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Approve and schedule publish for all pending clips of a monitor."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
     return await live_monitor.publish_all_pending(monitor_id)
 
 
 @app.post("/api/history/{job_id}/restore")
-async def restore_job(job_id: str, request: Request):
+async def restore_job(job_id: str, request: Request,
+    user: AuthUser = Depends(get_current_user)
+):
     """Restore a past job into the in-memory jobs dict so edit/hook/subtitle endpoints work."""
     require_trusted_config_request(request)
+    require_admin(request, user)
     if not is_valid_job_id(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
     job_dir = os.path.join(OUTPUT_DIR, job_id)

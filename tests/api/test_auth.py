@@ -1,76 +1,21 @@
-"""Tests for Supabase JWT decoding, user extraction, and admin authorization."""
-import base64
-import hashlib
-import hmac
-import json
-import time
+"""Tests for auth helpers: env flags, bearer extraction, admin gate, dev bypass.
 
+JWT crypto is covered in test_auth_jwks.py; route-level auth in
+test_auth_hardening.py.
+"""
 import pytest
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 
+import clippyme.api.auth as auth_mod
 from clippyme.api.auth import (
     AuthUser,
-    decode_jwt,
+    dev_bypass_enabled,
+    extract_bearer_token,
     get_current_user,
+    is_auth_enabled,
+    is_production,
     require_admin,
 )
-
-
-def _b64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def make_test_jwt(payload: dict, secret: str = "test-secret-key") -> str:
-    header = {"alg": "HS256", "typ": "JWT"}
-    header_b64 = _b64url_encode(json.dumps(header).encode("utf-8"))
-    payload_b64 = _b64url_encode(json.dumps(payload).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    sig_b64 = _b64url_encode(sig)
-    return f"{header_b64}.{payload_b64}.{sig_b64}"
-
-
-def test_decode_valid_jwt():
-    payload = {"sub": "user-123", "email": "test@example.com", "exp": time.time() + 3600}
-    token = make_test_jwt(payload, "my-secret")
-    decoded = decode_jwt(token, secret="my-secret")
-    assert decoded["sub"] == "user-123"
-    assert decoded["email"] == "test@example.com"
-
-
-def test_decode_tampered_signature_rejected():
-    payload = {"sub": "user-123", "exp": time.time() + 3600}
-    token = make_test_jwt(payload, "secret-one")
-    with pytest.raises(ValueError, match="signature verification failed"):
-        decode_jwt(token, secret="wrong-secret")
-
-
-def test_decode_expired_token_rejected():
-    payload = {"sub": "user-123", "exp": time.time() - 100}
-    token = make_test_jwt(payload, "secret")
-    with pytest.raises(ValueError, match="has expired"):
-        decode_jwt(token, secret="secret")
-
-
-def test_decode_malformed_token():
-    with pytest.raises(ValueError, match="three parts"):
-        decode_jwt("not.a.valid.jwt.token", secret="secret")
-
-
-def test_decode_jwt_requires_secret():
-    with pytest.raises(ValueError, match="valid non-empty secret is required"):
-        decode_jwt("a.b.c", secret="")
-
-
-def test_get_current_user_auth_enabled_missing_secret_fails_safely(monkeypatch):
-    monkeypatch.setenv("AUTH_ENABLED", "1")
-    monkeypatch.delenv("SUPABASE_JWT_SECRET", raising=False)
-    req = MockRequest(headers={"authorization": "Bearer any.valid.token"})
-    with pytest.raises(HTTPException) as exc:
-        get_current_user(req)
-    assert exc.value.status_code == 500
-    assert "misconfigured" in exc.value.detail
 
 
 class MockRequest:
@@ -78,43 +23,90 @@ class MockRequest:
         self.headers = headers or {}
 
 
-def test_get_current_user_auth_disabled_returns_default(monkeypatch):
-    monkeypatch.setenv("AUTH_ENABLED", "0")
-    monkeypatch.delenv("SUPABASE_JWT_SECRET", raising=False)
-    req = MockRequest()
-    user = get_current_user(req)
-    assert user.id == "default_user"
-    assert user.is_admin is True
+def test_extract_bearer_token():
+    assert extract_bearer_token(MockRequest({"authorization": "Bearer abc123"})) == "abc123"
+    assert extract_bearer_token(MockRequest({"authorization": "bearer xyz"})) == "xyz"
+    assert extract_bearer_token(MockRequest({})) is None
+    assert extract_bearer_token(MockRequest({"authorization": "Basic abc"})) is None
 
 
-def test_get_current_user_auth_enabled_requires_token(monkeypatch):
+def test_is_auth_enabled(monkeypatch):
+    monkeypatch.delenv("AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    assert not is_auth_enabled()
     monkeypatch.setenv("AUTH_ENABLED", "1")
-    monkeypatch.setenv("SUPABASE_JWT_SECRET", "secret-key")
-    req = MockRequest()
+    assert is_auth_enabled()
+    monkeypatch.delenv("AUTH_ENABLED", raising=False)
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    assert is_auth_enabled()
+
+
+def test_is_production(monkeypatch):
+    monkeypatch.delenv("ENV", raising=False)
+    assert not is_production()
+    monkeypatch.setenv("ENV", "production")
+    assert is_production()
+    monkeypatch.setenv("ENV", "Production")
+    assert is_production()
+
+
+def test_dev_bypass_enabled(monkeypatch):
+    monkeypatch.delenv("AUTH_DISABLED_DEV", raising=False)
+    assert not dev_bypass_enabled()
+    monkeypatch.setenv("AUTH_DISABLED_DEV", "1")
+    assert dev_bypass_enabled()
+
+
+def test_dev_bypass_returns_local_admin(monkeypatch):
+    monkeypatch.setenv("AUTH_DISABLED_DEV", "1")
+    monkeypatch.delenv("AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("ENV", raising=False)
+    user = get_current_user(MockRequest({}))
+    assert user.id == "default_user"
+    assert user.is_admin
+
+
+def test_dev_bypass_rejected_when_auth_explicitly_enabled(monkeypatch):
+    """AUTH_ENABLED=1 always wins over the dev bypass."""
+    monkeypatch.setenv("AUTH_DISABLED_DEV", "1")
+    monkeypatch.setenv("AUTH_ENABLED", "1")
+    monkeypatch.delenv("ENV", raising=False)
     with pytest.raises(HTTPException) as exc:
-        get_current_user(req)
+        get_current_user(MockRequest({}))
     assert exc.value.status_code == 401
 
 
-def test_get_current_user_auth_enabled_valid_token(monkeypatch):
-    monkeypatch.setenv("AUTH_ENABLED", "1")
-    monkeypatch.setenv("SUPABASE_JWT_SECRET", "secret-key")
-    payload = {"sub": "uuid-999", "email": "creator@clippyme.com", "exp": time.time() + 600}
-    token = make_test_jwt(payload, "secret-key")
-    req = MockRequest(headers={"authorization": f"Bearer {token}"})
-    user = get_current_user(req)
-    assert user.id == "uuid-999"
-    assert user.email == "creator@clippyme.com"
-    assert user.is_admin is False
-
-
-def test_require_admin_guard(monkeypatch):
-    regular_user = AuthUser(id="user1", email="user@test.com", is_admin=False)
-    admin_user = AuthUser(id="admin", email="admin@test.com", is_admin=True)
-    req = MockRequest()
-
-    assert require_admin(req, admin_user).is_admin is True
-
+def test_no_auth_no_bypass_fails_closed(monkeypatch):
+    monkeypatch.delenv("AUTH_DISABLED_DEV", raising=False)
+    monkeypatch.delenv("AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
     with pytest.raises(HTTPException) as exc:
-        require_admin(req, regular_user)
+        get_current_user(MockRequest({}))
+    assert exc.value.status_code == 401
+
+
+def test_require_admin_passes_for_admin():
+    user = AuthUser(id="boss", is_admin=True)
+    assert require_admin(MockRequest({}), user).is_admin
+
+
+def test_require_admin_rejects_non_admin():
+    with pytest.raises(HTTPException) as exc:
+        require_admin(MockRequest({}), AuthUser(id="pleb", is_admin=False))
     assert exc.value.status_code == 403
+
+
+def test_require_admin_accepts_admin_secret(monkeypatch):
+    monkeypatch.setenv("ADMIN_SECRET_KEY", "topsecret")
+    req = MockRequest({"x-admin-secret": "topsecret"})
+    user = require_admin(req, AuthUser(id="pleb", is_admin=False))
+    assert user.is_admin
+
+
+def test_admin_secret_header_grants_admin(monkeypatch):
+    monkeypatch.setenv("ADMIN_SECRET_KEY", "topsecret")
+    req = MockRequest({"x-admin-secret": "topsecret"})
+    user = get_current_user(req)
+    assert user.is_admin
+    assert user.id == "admin"

@@ -1,15 +1,40 @@
-"""Tests for multi-tenant job isolation and user-scoped status/history."""
-import os
-import time
+"""Tests for multi-tenant job isolation and user-scoped status/history.
 
+JWTs are ES256 verified against a mocked JWKS (see test_auth_jwks).
+"""
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 import clippyme.api.app as app_module
-from clippyme.api.auth import AuthUser
-from tests.api.test_auth import make_test_jwt
+import clippyme.api.auth as auth_mod
+from clippyme.api.auth import AuthUser, reset_jwks_cache
+from tests.api.test_auth_jwks import (
+    FakeJWKClient,
+    TEST_SUPABASE_URL,
+    _pub_to_jwk,
+    mint_valid,
+)
 
 ORIGIN = {"Origin": "http://localhost:5175"}
+KID = "kid-mt-1"
+
+
+@pytest.fixture
+def mt_env(monkeypatch):
+    """Auth enabled with a mocked JWKS; returns a token minter."""
+    monkeypatch.setenv("AUTH_ENABLED", "1")
+    monkeypatch.setenv("SUPABASE_URL", TEST_SUPABASE_URL)
+    monkeypatch.delenv("AUTH_DISABLED_DEV", raising=False)
+    monkeypatch.delenv("ALLOWED_USER_IDS", raising=False)
+    monkeypatch.delenv("ADMIN_USER_IDS", raising=False)
+    priv = ec.generate_private_key(ec.SECP256R1())
+    fake = FakeJWKClient([_pub_to_jwk(priv.public_key(), KID)])
+    monkeypatch.setattr(auth_mod, "_get_client", lambda: fake)
+    reset_jwks_cache()
+    auth_mod._jwks_last_refetch = 0.0
+    yield lambda sub, **kw: mint_valid(sub=sub, priv=priv, kid=KID, **kw)
+    reset_jwks_cache()
 
 
 @pytest.fixture
@@ -17,13 +42,10 @@ def client():
     return TestClient(app_module.app, headers=ORIGIN)
 
 
-def test_user_job_isolation(client, monkeypatch):
-    monkeypatch.setenv("AUTH_ENABLED", "1")
-    monkeypatch.setenv("SUPABASE_JWT_SECRET", "test-secret")
-
-    # Generate tokens for User A and User B
-    token_a = make_test_jwt({"sub": "user_a", "email": "a@example.com", "exp": time.time() + 3600}, "test-secret")
-    token_b = make_test_jwt({"sub": "user_b", "email": "b@example.com", "exp": time.time() + 3600}, "test-secret")
+def test_user_job_isolation(client, mt_env, monkeypatch):
+    mint = mt_env
+    token_a = mint("user_a")
+    token_b = mint("user_b")
     headers_a = {"Authorization": f"Bearer {token_a}", **ORIGIN}
     headers_b = {"Authorization": f"Bearer {token_b}", **ORIGIN}
 
@@ -81,12 +103,13 @@ def test_user_job_isolation(client, monkeypatch):
         app_module.jobs.pop(job_id, None)
 
 
-def test_config_endpoints_gated_by_admin(client, monkeypatch):
-    monkeypatch.setenv("AUTH_ENABLED", "1")
-    monkeypatch.setenv("SUPABASE_JWT_SECRET", "test-secret")
+def test_config_endpoints_gated_by_admin(client, mt_env, monkeypatch):
+    mint = mt_env
+    # Admin comes from ADMIN_USER_IDS (no email-based admin anymore).
+    monkeypatch.setenv("ADMIN_USER_IDS", "admin_user")
 
-    regular_token = make_test_jwt({"sub": "user_regular", "email": "reg@example.com", "role": "authenticated", "exp": time.time() + 3600}, "test-secret")
-    admin_token = make_test_jwt({"sub": "admin_user", "email": "admin@example.com", "role": "admin", "exp": time.time() + 3600}, "test-secret")
+    regular_token = mint("user_regular")
+    admin_token = mint("admin_user")
 
     # Regular user attempting to access /api/config -> 403 Forbidden
     resp = client.get("/api/config", headers={"Authorization": f"Bearer {regular_token}", **ORIGIN})

@@ -3,7 +3,9 @@ import asyncio
 import logging
 import os
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header, Request
+from clippyme.api.auth import AuthUser, get_current_user
+from clippyme.api.security import enforce_rate_limit
 from pydantic import BaseModel
 
 from clippyme.domain.errors import ValidationError, ClippyMeError
@@ -27,9 +29,11 @@ class ScriptRequest(BaseModel):
 @router.post("/api/ugc/research")
 async def research_product(
     body: ResearchRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
-):
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key")):
     """Scrape and research a product URL or description."""
+    enforce_rate_limit(request, "ugc_research", 10, 10 / 3600, user_id=user.id)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -60,9 +64,11 @@ async def research_product(
 @router.post("/api/ugc/scripts")
 async def generate_scripts_endpoint(
     body: ScriptRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
-):
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key")):
     """Generate viral short marketing scripts from research data."""
+    enforce_rate_limit(request, "ugc_scripts", 20, 20 / 3600, user_id=user.id)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:

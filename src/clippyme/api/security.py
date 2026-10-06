@@ -124,7 +124,11 @@ def is_trusted_client_host(client_host: Optional[str]) -> bool:
 
 
 def require_trusted_config_request(request: Request) -> None:
-    """Protect config + state-changing endpoints from cross-site browser access.
+    """CSRF defense for browser callers. NEVER the sole gate.
+
+    Every route using this helper must ALSO require ``get_current_user`` —
+    this function only distinguishes trustworthy browser contexts from
+    cross-site forgery; it does not authenticate anyone.
 
     Layers, checked in order:
 
@@ -138,14 +142,15 @@ def require_trusted_config_request(request: Request) -> None:
     2. ``Sec-Fetch-Site`` — a *forbidden* request header set by the browser
        and not writable from JavaScript. Any value of ``cross-site`` /
        ``same-site`` without an allow-listed ``Origin`` is rejected outright.
-       This closes the CSRF hole where a plain HTML ``<form>`` POST (which
-       omits ``Origin`` in some browser/network configs) would otherwise
-       fall through to the private-IP branch below and be trusted.
-    3. ``same-origin`` fetch metadata, trusted ``Referer``/``Host`` — local
-       same-origin traffic.
-    4. Private/loopback client IP — only reached for non-browser clients
+    3. ``same-origin`` fetch metadata — local same-origin traffic.
+    4. Private/loopback client IP — defense in depth for non-browser clients
        (curl, CLI scripts) that send neither ``Sec-Fetch-Site`` nor
-       ``Origin``.
+       ``Origin``. Through a reverse proxy/tunnel the socket peer is the
+       proxy itself, so this layer is unreliable there and must never be
+       relied on alone.
+
+    Deliberately NOT trusted: ``Referer`` and ``Host`` — both are trivially
+    spoofable by any non-browser client and must never grant access.
     """
     origin = request.headers.get("origin")
     if origin and is_trusted_origin(origin):
@@ -159,14 +164,6 @@ def require_trusted_config_request(request: Request) -> None:
 
     if origin:
         raise HTTPException(status_code=403, detail="Origin not allowed for config access.")
-
-    referer = request.headers.get("referer")
-    if referer and is_trusted_origin(referer):
-        return
-
-    host = request.headers.get("host")
-    if host and is_trusted_origin(f"http://{host}"):
-        return
 
     client_host = client_ip(request)
     if is_trusted_client_host(client_host):
@@ -197,11 +194,20 @@ def enforce_api_token(request: Request) -> None:
     """Raise HTTP 401 unless the request carries the configured token.
 
     Accepts either ``X-API-Token: <token>`` or ``Authorization: Bearer
-    <token>``. Comparison is constant-time (hmac.compare_digest) so the token
-    can't be recovered byte-by-byte via timing. No-op when no token is set.
+    <token>`` — but NEVER from browser callers: a request carrying an
+    ``Origin`` header skips the token path entirely and must authenticate
+    with a JWT via ``get_current_user``. Comparison is constant-time
+    (hmac.compare_digest) so the token can't be recovered byte-by-byte via
+    timing. No-op when no token is set.
     """
     expected = configured_api_token()
     if expected is None:
+        return
+
+    if request.headers.get("origin") is not None:
+        # Browser caller: the shared token is not accepted here; the JWT
+        # path in get_current_user decides. Skip silently so the 401 below
+        # does not mask the real JWT 401 from the auth dependency.
         return
 
     supplied = request.headers.get("x-api-token", "").strip()
@@ -277,16 +283,27 @@ def _rate_limit_allow(key: Tuple[str, str], capacity: float, refill_per_sec: flo
     return True
 
 
-def enforce_rate_limit(request: Request, bucket: str, capacity: float, refill_per_sec: float) -> None:
+def enforce_rate_limit(
+    request: Request,
+    bucket: str,
+    capacity: float,
+    refill_per_sec: float,
+    user_id: Optional[str] = None,
+) -> None:
     """Raise HTTP 429 when the per-client bucket is empty.
 
     Disabled by setting RATE_LIMIT_ENABLED=0 (e.g. for load tests). Keyed by
-    client IP + bucket name so different endpoints don't share a budget.
+    client IP + bucket name so different endpoints don't share a budget;
+    pass ``user_id`` to key per-user instead (for authenticated LLM/spend
+    routes, so one user's quota can't be exhausted by another IP).
     """
     if os.environ.get("RATE_LIMIT_ENABLED", "1") != "1":
         return
-    client_host = client_ip(request) or "unknown"
-    if not _rate_limit_allow((bucket, client_host), capacity, refill_per_sec, time.monotonic()):
+    if user_id:
+        key_id = f"user:{user_id}"
+    else:
+        key_id = client_ip(request) or "unknown"
+    if not _rate_limit_allow((bucket, key_id), capacity, refill_per_sec, time.monotonic()):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded. Please slow down and retry shortly.",

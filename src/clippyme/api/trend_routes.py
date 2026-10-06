@@ -16,9 +16,10 @@ import os
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from clippyme.api.auth import AuthUser, get_current_user
 from clippyme.api.auth import AuthUser, get_current_user
 from clippyme.api.security import require_trusted_config_request
 from clippyme.domain.errors import ValidationError
@@ -100,9 +101,9 @@ def make_trend_router(
 
     @router.get("")
     async def get_trends(
+        user: AuthUser = Depends(get_current_user),
         category: Optional[str] = Query(None, description="Category filter (all, politics, breaking_world, entertainment)"),
-        include_clipped: bool = Query(True, description="Whether to include topics that have already been clipped"),
-    ):
+        include_clipped: bool = Query(True, description="Whether to include topics that have already been clipped")):
         """Fetch latest discovered trending topics."""
         data = await asyncio.to_thread(load_trend_radar)
         topics = data.get("topics", [])
@@ -123,8 +124,8 @@ def make_trend_router(
     @router.post("/scan")
     async def trigger_scan(
         request: Request,
-        x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
-    ):
+        user: AuthUser = Depends(get_current_user),
+        x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")):
         """Trigger an on-demand trend research scan."""
         require_trusted_config_request(request)
 
@@ -155,8 +156,8 @@ def make_trend_router(
     async def clip_trending_video(
         request: Request,
         payload: TrendClipRequest,
-        x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
-    ):
+        user: AuthUser = Depends(get_current_user),
+        x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")):
         """1-Click Clip action: enqueues a trending video into the ClippyMe pipeline."""
         require_trusted_config_request(request)
 
@@ -249,12 +250,14 @@ def make_trend_router(
         }
 
     @router.get("/config")
-    async def get_config():
+    async def get_config(
+    user: AuthUser = Depends(get_current_user)):
         """Get trend configuration."""
         return load_trend_config()
 
     @router.post("/config")
-    async def update_config(request: Request, payload: TrendConfigUpdateRequest):
+    async def update_config(request: Request, payload: TrendConfigUpdateRequest,
+    user: AuthUser = Depends(get_current_user)):
         """Update trend configuration."""
         require_trusted_config_request(request)
         current = load_trend_config()

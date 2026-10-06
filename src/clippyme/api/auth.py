@@ -1,17 +1,35 @@
-"""Multi-tenant authentication and Supabase JWT verification for ClippyMe."""
-import base64
-import hashlib
-import hmac
+"""Multi-tenant authentication and Supabase JWT verification for ClippyMe.
+
+Supabase signs its JWTs asymmetrically (ES256, P-256). Verification uses the
+project's JWKS endpoint — there is NO shared JWT secret anywhere in env or
+code. The legacy HS256 dashboard secret must never be configured; even if it
+leaks, it cannot mint a valid token because HS256 is never accepted.
+"""
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
-from fastapi import Depends, HTTPException, Request
+import jwt as pyjwt
+from jwt import PyJWKClient
+from jwt.algorithms import ECAlgorithm
+from fastapi import HTTPException, Request
 
 logger = logging.getLogger("clippyme")
+
+# --- JWT verification parameters (pinned, per security review) --------------
+JWT_ALGORITHMS = ["ES256"]  # exactly ES256 — never HS256/HS384/HS512/none
+JWT_AUDIENCE = "authenticated"
+
+_TRUE_VALUES = ("1", "true", "yes", "on")
+
+# Minimum interval between JWKS refetches triggered by unknown kids. Prevents
+# an attacker from forcing a network fetch on every request by spamming
+# unknown kids; legitimate rotation still resolves within a minute.
+_JWKS_MIN_REFETCH_INTERVAL = 60.0
 
 
 @dataclass
@@ -28,80 +46,201 @@ class AuthUser:
         return self.id
 
 
-def _b64url_decode(raw: str) -> bytes:
-    """Decode a base64url-encoded string with missing padding restored."""
-    rem = len(raw) % 4
-    if rem > 0:
-        raw += "=" * (4 - rem)
-    return base64.urlsafe_b64decode(raw.encode("ascii"))
+def supabase_url() -> str:
+    """Project base URL, e.g. https://frdlpogmqnozhgyrrhgf.supabase.co."""
+    return os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 
 
-def decode_jwt(token: str, secret: str) -> Dict[str, Any]:
-    """Decode and verify an HS256 JWT using standard library hmac + hashlib.
+def jwks_url() -> Optional[str]:
+    base = supabase_url()
+    return f"{base}/auth/v1/.well-known/jwks.json" if base else None
 
-    Raises ValueError on structural malformation, invalid signature, or expired token.
+
+def jwt_issuer() -> Optional[str]:
+    base = supabase_url()
+    return f"{base}/auth/v1" if base else None
+
+
+# --- JWKS client + key cache -------------------------------------------------
+_jwks_client: Optional[PyJWKClient] = None
+_jwks_client_url: Optional[str] = None
+_jwks_keys: Dict[str, Any] = {}  # kid -> cryptography EC public key
+_jwks_last_refetch: float = 0.0
+_jwks_lock = threading.Lock()
+
+
+def _get_client() -> Optional[PyJWKClient]:
+    """PyJWKClient for the configured JWKS URL (recreated if URL changes)."""
+    global _jwks_client, _jwks_client_url
+    url = jwks_url()
+    if not url:
+        return None
+    with _jwks_lock:
+        if _jwks_client is None or _jwks_client_url != url:
+            _jwks_client = PyJWKClient(url)
+            _jwks_client_url = url
+            _jwks_keys.clear()
+        return _jwks_client
+
+
+def _fetch_jwks_keys() -> Dict[str, Any]:
+    """Fetch the JWKS document and return {kid: EC public key}.
+
+    Only keys parseable as EC keys are kept; anything else is skipped.
+    Raises on network/parse failure.
     """
-    if not secret or not secret.strip():
-        raise ValueError("A valid non-empty secret is required for JWT signature verification")
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("SUPABASE_URL is not set; cannot fetch JWKS")
+    data = client.fetch_data()
+    keys: Dict[str, Any] = {}
+    for jwk_dict in data.get("keys", []):
+        kid = jwk_dict.get("kid")
+        if not kid:
+            continue
+        try:
+            keys[kid] = ECAlgorithm.from_jwk(json.dumps(jwk_dict))
+        except Exception as exc:
+            logger.warning("Skipping unparseable JWKS key %r: %s", kid, exc)
+    return keys
 
-    parts = token.strip().split(".")
-    if len(parts) != 3:
-        raise ValueError("JWT must have exactly three parts (header.payload.signature)")
 
-    header_b64, payload_b64, sig_b64 = parts
+def prime_jwks_cache() -> int:
+    """Fetch JWKS now and populate the key cache. Raises on failure.
 
+    Called once at production startup — a failed boot fetch refuses to start.
+    """
+    global _jwks_last_refetch
+    keys = _fetch_jwks_keys()
+    if not keys:
+        raise RuntimeError("JWKS fetch returned no usable signing keys")
+    with _jwks_lock:
+        _jwks_keys.clear()
+        _jwks_keys.update(keys)
+        _jwks_last_refetch = time.monotonic()
+    return len(keys)
+
+
+def reset_jwks_cache() -> None:
+    """Clear cached keys/client (tests only)."""
+    global _jwks_client, _jwks_client_url, _jwks_last_refetch
+    with _jwks_lock:
+        _jwks_client = None
+        _jwks_client_url = None
+        _jwks_keys.clear()
+        _jwks_last_refetch = 0.0
+
+
+def _signing_key_for(kid: str) -> Any:
+    """Return the EC public key for kid, refetching at most once per minute.
+
+    Unknown kids after a fresh refetch, or a failed refetch, fail closed.
+    A failed refetch keeps serving already-cached (known) kids so transient
+    network blips after boot don't hard-crash verification.
+    """
+    global _jwks_last_refetch
+    with _jwks_lock:
+        cached = _jwks_keys.get(kid)
+    if cached is not None:
+        return cached
+    now = time.monotonic()
+    with _jwks_lock:
+        throttled = now - _jwks_last_refetch < _JWKS_MIN_REFETCH_INTERVAL
+        if not throttled:
+            _jwks_last_refetch = now
+    if throttled:
+        raise ValueError(f"Unknown JWT key id '{kid}'")
     try:
-        header_bytes = _b64url_decode(header_b64)
-        header = json.loads(header_bytes.decode("utf-8"))
+        fresh = _fetch_jwks_keys()
+    except Exception as exc:
+        raise ValueError(f"JWKS refetch failed: {exc}") from exc
+    with _jwks_lock:
+        _jwks_keys.update(fresh)
+        key = _jwks_keys.get(kid)
+    if key is None:
+        raise ValueError(f"Unknown JWT key id '{kid}'")
+    return key
+
+
+def decode_jwt(token: str) -> Dict[str, Any]:
+    """Verify a Supabase ES256 JWT via JWKS and return its claims.
+
+    - ``kid`` selects the EC public key (unknown -> refetch once/min, else fail).
+    - Algorithm pinned to ES256 (HS256/none/key-confusion fail).
+    - ``iss`` must be ``<SUPABASE_URL>/auth/v1``; ``aud`` must be
+      ``authenticated``; ``exp`` and ``sub`` are REQUIRED.
+
+    Raises ValueError on any verification problem.
+    """
+    try:
+        kid = pyjwt.get_unverified_header(token).get("kid")
     except Exception as exc:
         raise ValueError(f"Invalid JWT header: {exc}") from exc
-
-    alg = header.get("alg", "")
-    if alg != "HS256":
-        raise ValueError(f"Unsupported JWT algorithm '{alg}'. Only HS256 is supported.")
-
+    if not kid:
+        raise ValueError("JWT is missing 'kid' header")
+    key = _signing_key_for(kid)
     try:
-        payload_bytes = _b64url_decode(payload_b64)
-        payload = json.loads(payload_bytes.decode("utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Invalid JWT payload: {exc}") from exc
-
-    # Recompute expected signature
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    expected_sig = hmac.new(
-        secret.encode("utf-8"), signing_input, hashlib.sha256
-    ).digest()
-    try:
-        provided_sig = _b64url_decode(sig_b64)
-    except Exception as exc:
-        raise ValueError(f"Invalid signature encoding: {exc}") from exc
-
-    if not hmac.compare_digest(expected_sig, provided_sig):
-        raise ValueError("JWT signature verification failed")
-
-    # Expiry verification
-    exp = payload.get("exp")
-    if exp is not None:
-        try:
-            if float(exp) < time.time():
-                raise ValueError("JWT token has expired")
-        except (TypeError, ValueError) as exc:
-            if str(exc) == "JWT token has expired":
-                raise
-            raise ValueError("Invalid exp claim in JWT") from exc
-
-    return payload
+        return pyjwt.decode(
+            token,
+            key,
+            algorithms=JWT_ALGORITHMS,
+            issuer=jwt_issuer(),
+            audience=JWT_AUDIENCE,
+            options={"require": ["exp", "sub"]},
+        )
+    except pyjwt.InvalidTokenError as exc:
+        raise ValueError(f"JWT verification failed: {exc}") from exc
 
 
+# --- env helpers --------------------------------------------------------------
 def is_auth_enabled() -> bool:
     """Whether multi-tenant authentication is enforced.
 
-    Defaults to False for backward-compatible local self-hosting.
-    Set AUTH_ENABLED=1 or SUPABASE_JWT_SECRET to enable.
+    Set AUTH_ENABLED=1 (SUPABASE_URL alone also enables it, mirroring the old
+    "secret set -> enabled" contract). When disabled the server fails closed
+    (401) unless the explicit dev bypass AUTH_DISABLED_DEV=1 is present.
     """
-    if os.environ.get("AUTH_ENABLED", "0") in ("1", "true", "yes", "on"):
+    if os.environ.get("AUTH_ENABLED", "0").strip().lower() in _TRUE_VALUES:
         return True
-    return bool(os.environ.get("SUPABASE_JWT_SECRET", "").strip())
+    return bool(supabase_url())
+
+
+def is_production() -> bool:
+    """Whether the server runs in production (ENV=production)."""
+    return os.environ.get("ENV", "").strip().lower() == "production"
+
+
+def dev_bypass_enabled() -> bool:
+    """Explicit dev bypass: unauthenticated callers get the local default admin.
+
+    Must be set deliberately (AUTH_DISABLED_DEV=1). It is rejected at startup
+    when ENV=production.
+    """
+    return os.environ.get("AUTH_DISABLED_DEV", "0").strip().lower() in _TRUE_VALUES
+
+
+def _parse_id_set(env_name: str) -> Set[str]:
+    raw = os.environ.get(env_name, "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def allowed_user_ids() -> Set[str]:
+    """Supabase ``sub`` values permitted to call the API (env ALLOWED_USER_IDS)."""
+    return _parse_id_set("ALLOWED_USER_IDS")
+
+
+def admin_user_ids() -> Set[str]:
+    """Supabase ``sub`` values granted admin privileges (env ADMIN_USER_IDS)."""
+    return _parse_id_set("ADMIN_USER_IDS")
+
+
+def _default_local_admin() -> AuthUser:
+    return AuthUser(
+        id="default_user",
+        email="local@clippyme.dev",
+        role="admin",
+        is_admin=True,
+    )
 
 
 def configured_admin_secret() -> Optional[str]:
@@ -118,84 +257,100 @@ def extract_bearer_token(request: Request) -> Optional[str]:
     return None
 
 
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=401,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 def get_current_user(request: Request) -> AuthUser:
     """FastAPI dependency to extract and validate the current authenticated user.
 
-    In development / single-tenant mode (AUTH_ENABLED=0), unauthenticated requests
-    receive a default local admin user. In multi-tenant mode (AUTH_ENABLED=1),
-    valid Supabase JWT authentication is strictly required.
+    Order of checks:
+    1. ``x-admin-secret`` header matches ADMIN_SECRET_KEY -> admin.
+    2. ``CLIPPYME_API_TOKEN`` (``X-API-Token`` or ``Authorization: Bearer``)
+       -> admin, but NEVER for browser callers: a request carrying an
+       ``Origin`` header skips this path entirely and must present a JWT.
+    3. Explicit dev bypass AUTH_DISABLED_DEV=1 (never in production) ->
+       local default admin.
+    4. Supabase JWT bearer token -> verified via JWKS (ES256 pinned,
+       ``iss``/``aud`` checked, ``exp`` + ``sub`` required).
+
+    Allow-lists: ``ALLOWED_USER_IDS`` (comma-separated Supabase ``sub``
+    values). A valid JWT whose sub is not allow-listed -> 403. ``ADMIN_USER_IDS``
+    grants admin (and implies access). In production an empty allow-list
+    denies everyone (fail closed); outside production an empty allow-list
+    permits any valid JWT (dev/test flexibility).
     """
+    import hmac
+
     admin_secret = configured_admin_secret()
     req_admin_secret = request.headers.get("x-admin-secret", "").strip()
     if admin_secret and req_admin_secret and hmac.compare_digest(admin_secret, req_admin_secret):
         return AuthUser(id="admin", email="admin@clippyme.internal", role="admin", is_admin=True)
 
-    lan_token = os.environ.get("CLIPPYME_API_TOKEN", "").strip()
-    if lan_token:
-        supplied = request.headers.get("x-api-token", "").strip()
-        auth_hdr = request.headers.get("authorization", "").strip()
-        if not supplied and auth_hdr.lower().startswith("bearer "):
-            supplied = auth_hdr[7:].strip()
-        if supplied and hmac.compare_digest(lan_token, supplied):
-            return AuthUser(id="admin", email="lan_admin@clippyme.internal", role="admin", is_admin=True)
+    # Shared LAN token: non-browser callers only. Browsers always send
+    # Origin; a spoofed Origin on a non-browser client only pushes it onto
+    # the stricter JWT path, so this fails closed.
+    if request.headers.get("origin") is None:
+        lan_token = os.environ.get("CLIPPYME_API_TOKEN", "").strip()
+        if lan_token:
+            supplied = request.headers.get("x-api-token", "").strip()
+            auth_hdr = request.headers.get("authorization", "").strip()
+            if not supplied and auth_hdr.lower().startswith("bearer "):
+                supplied = auth_hdr[7:].strip()
+            if supplied and hmac.compare_digest(lan_token, supplied):
+                return AuthUser(id="admin", email="lan_admin@clippyme.internal", role="admin", is_admin=True)
+
+    # Explicit dev bypass. An explicitly enabled auth configuration
+    # (AUTH_ENABLED=1) always wins over the bypass so the two cannot be
+    # combined by accident; SUPABASE_URL alone does not block the bypass.
+    if dev_bypass_enabled() and not is_production():
+        if os.environ.get("AUTH_ENABLED", "0").strip().lower() not in _TRUE_VALUES:
+            return _default_local_admin()
 
     token = extract_bearer_token(request)
-    jwt_secret = os.environ.get("SUPABASE_JWT_SECRET", "").strip() or None
-
     if not token:
-        if not is_auth_enabled():
-            return AuthUser(
-                id="default_user",
-                email="local@clippyme.dev",
-                role="admin",
-                is_admin=True,
-            )
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required. Please sign in to continue.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise _unauthorized("Authentication required. Please sign in to continue.")
 
-    if is_auth_enabled() and not jwt_secret:
-        logger.error("Authentication is enabled but SUPABASE_JWT_SECRET is not configured.")
-        raise HTTPException(
-            status_code=500,
-            detail="Server authentication misconfigured: missing JWT secret.",
-        )
-
-    if not jwt_secret:
-        # Dev / single-tenant mode without JWT secret configured
-        return AuthUser(
-            id="default_user",
-            email="local@clippyme.dev",
-            role="admin",
-            is_admin=True,
-        )
+    if not is_auth_enabled():
+        raise _unauthorized("Authentication required. Please sign in to continue.")
 
     try:
-        claims = decode_jwt(token, secret=jwt_secret)
+        claims = decode_jwt(token)
     except ValueError as exc:
         logger.warning("Token verification failed: %s", exc)
-        raise HTTPException(
-            status_code=401,
-            detail=f"Invalid authentication token: {exc}",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        raise _unauthorized(f"Invalid authentication token: {exc}") from exc
 
-    user_id = claims.get("sub") or claims.get("user_id")
+    # decode_jwt requires the sub claim; this is a second, explicit gate.
+    user_id = claims.get("sub")
     if not user_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication token missing user identifier ('sub').",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise _unauthorized("Authentication token missing user identifier ('sub').")
+    user_id = str(user_id)
+
+    admins = admin_user_ids()
+    is_admin = user_id in admins
+    if not is_admin:
+        effective_allowed = allowed_user_ids() | admins
+        if effective_allowed:
+            if user_id not in effective_allowed:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied: user is not on the server allow-list.",
+                )
+        elif is_production():
+            # Fail closed: production with no allow-list configured admits nobody.
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: server user allow-list is empty.",
+            )
+        # Non-production with an empty allow-list: any valid JWT is accepted.
 
     email = claims.get("email")
     role = claims.get("role", "authenticated")
-    admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
-    is_admin = bool((role == "admin") or (email and admin_email and email.lower() == admin_email))
-
-    return AuthUser(id=str(user_id), email=email, role=role, is_admin=is_admin)
+    return AuthUser(id=user_id, email=email, role=role, is_admin=is_admin)
 
 
 def require_admin(
@@ -203,6 +358,8 @@ def require_admin(
     user: Optional[AuthUser] = None,
 ) -> AuthUser:
     """Require that the current caller has administrative privileges."""
+    import hmac
+
     if user is None or not isinstance(user, AuthUser):
         user = get_current_user(request)
 
@@ -218,3 +375,41 @@ def require_admin(
         status_code=403,
         detail="Administrative privileges required to access this resource.",
     )
+
+
+def verify_job_ownership_on_disk(job_id: str, user: AuthUser, output_dir: str) -> None:
+    """Ownership check for routers that lack app.py's in-memory jobs dict.
+
+    Reads ``user_id`` from the job's ``.clippyme_runtime.json`` (falling back
+    to ``*_metadata.json``), mirroring the on-disk fallback in app.py.
+    Raises 404 when the job does not exist or belongs to another user.
+    Admins always pass.
+    """
+    import glob
+    import json
+
+    if user.is_admin:
+        return
+    job_dir = os.path.join(output_dir, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_user = None
+    runtime_path = os.path.join(job_dir, ".clippyme_runtime.json")
+    if os.path.isfile(runtime_path):
+        try:
+            with open(runtime_path, "r", encoding="utf-8") as f:
+                job_user = json.load(f).get("user_id")
+        except Exception:
+            pass
+    if not job_user:
+        meta_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+        if meta_files:
+            try:
+                with open(meta_files[0], "r", encoding="utf-8") as f:
+                    job_user = json.load(f).get("user_id")
+            except Exception:
+                pass
+    job_user = job_user or "default_user"
+    if job_user != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")

@@ -3,7 +3,9 @@ import asyncio
 import logging
 import os
 from typing import Optional
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header, Request
+from clippyme.api.auth import AuthUser, get_current_user, verify_job_ownership_on_disk
+from clippyme.api.security import enforce_rate_limit
 from pydantic import BaseModel
 
 from clippyme.domain.clip_locks import clip_lock
@@ -26,7 +28,8 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 
 
 @router.get("/api/dubbing/languages")
-async def list_dubbing_languages():
+async def list_dubbing_languages(
+    user: AuthUser = Depends(get_current_user)):
     """List supported target languages for ElevenLabs dubbing."""
     return {"languages": SUPPORTED_LANGUAGES}
 
@@ -36,9 +39,12 @@ async def dub_clip(
     job_id: str,
     clip_index: int,
     body: DubbingRequest,
-    x_elevenlabs_key: Optional[str] = Header(None, alias="x-elevenlabs-key"),
-):
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    x_elevenlabs_key: Optional[str] = Header(None, alias="x-elevenlabs-key")):
     """Dub a single clip into a target language. Outputs dubbed_<lang>_<clip_name>.mp4."""
+    verify_job_ownership_on_disk(job_id, user, OUTPUT_DIR)
+    enforce_rate_limit(request, "dubbing", 5, 5 / 3600, user_id=user.id)
     resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, output_root=OUTPUT_DIR)
 
     cfg = load_persistent_config()

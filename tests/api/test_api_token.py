@@ -56,6 +56,16 @@ def test_bearer_accepted(monkeypatch):
     enforce_api_token(_FakeRequest({"authorization": "Bearer s3cret"}))
 
 
+def test_origin_present_skips_token_gate(monkeypatch):
+    """Browser callers (Origin present) never use the shared token path."""
+    monkeypatch.setenv("CLIPPYME_API_TOKEN", "s3cret")
+    # Even the correct token is ignored when Origin is present: the JWT path
+    # in get_current_user decides instead. enforce_api_token must not raise.
+    enforce_api_token(_FakeRequest({"origin": "https://tellagbe.com",
+                                    "x-api-token": "s3cret"}))
+    enforce_api_token(_FakeRequest({"origin": "https://tellagbe.com"}))
+
+
 def test_x_api_token_wins_over_bearer(monkeypatch):
     """An explicit X-API-Token is used as-is; a stale Authorization header
     doesn't rescue a wrong one."""
@@ -66,19 +76,30 @@ def test_x_api_token_wins_over_bearer(monkeypatch):
 
 # --- integration: middleware on the real app ---------------------------------
 
-def _client():
-    return TestClient(app_module.app, headers=ORIGIN)
+def _client(with_origin=True):
+    return TestClient(app_module.app, headers=ORIGIN if with_origin else {})
 
 
 def test_middleware_401s_api_without_token(monkeypatch):
+    # Non-browser caller (no Origin): token gate enforced.
     monkeypatch.setenv("CLIPPYME_API_TOKEN", "s3cret")
-    r = _client().get("/api/history")
+    r = _client(with_origin=False).get("/api/jobs/active")
     assert r.status_code == 401
 
 
 def test_middleware_passes_with_token(monkeypatch):
+    # Non-browser caller presenting the token passes the gate.
+    # (/api/jobs/active is U-only so no origin check interferes.)
     monkeypatch.setenv("CLIPPYME_API_TOKEN", "s3cret")
-    r = _client().get("/api/history", headers={"X-API-Token": "s3cret"})
+    r = _client(with_origin=False).get("/api/jobs/active", headers={"X-API-Token": "s3cret"})
+    assert r.status_code == 200
+
+
+def test_middleware_skips_token_gate_for_origin_callers(monkeypatch):
+    # Browser-like caller (Origin present): the shared token is never
+    # consulted; auth falls through to get_current_user (dev bypass -> 200).
+    monkeypatch.setenv("CLIPPYME_API_TOKEN", "s3cret")
+    r = _client(with_origin=True).get("/api/history")
     assert r.status_code == 200
 
 

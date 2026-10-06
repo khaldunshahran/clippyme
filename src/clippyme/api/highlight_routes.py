@@ -3,7 +3,9 @@ import asyncio
 import logging
 import os
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from clippyme.api.auth import AuthUser, get_current_user, verify_job_ownership_on_disk
+from clippyme.api.security import enforce_rate_limit
 from pydantic import BaseModel, Field
 
 from clippyme.domain.errors import ValidationError, NotFoundError, ClippyMeError
@@ -79,9 +81,12 @@ class HighlightRenderRequest(BaseModel):
 async def plan_highlights(
     job_id: str,
     body: HighlightPlanRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
-):
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key")):
     """Stage 1: Generate an AI narrative timeline plan for a highlight reel."""
+    verify_job_ownership_on_disk(job_id, user, OUTPUT_DIR)
+    enforce_rate_limit(request, "hl_plan", 10, 10 / 3600, user_id=user.id)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -114,9 +119,12 @@ async def plan_highlights(
 async def render_highlight_reel(
     job_id: str,
     body: HighlightRenderRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
-):
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key")):
     """Stage 2: Full multi-layer rendering of a highlight reel with aspect ratio sizing."""
+    verify_job_ownership_on_disk(job_id, user, OUTPUT_DIR)
+    enforce_rate_limit(request, "hl_render", 5, 5 / 3600, user_id=user.id)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
@@ -154,9 +162,12 @@ async def render_highlight_reel(
 async def generate_all_highlights(
     job_id: str,
     body: HighlightGenerateAllRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key"),
-):
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    x_gemini_key: Optional[str] = Header(None, alias="x-gemini-key")):
     """Analyze video and automatically generate multi-tier highlight reels (<60s, ~120s, 180s-720s)."""
+    verify_job_ownership_on_disk(job_id, user, OUTPUT_DIR)
+    enforce_rate_limit(request, "hl_generate_all", 5, 5 / 3600, user_id=user.id)
     cfg = load_persistent_config()
     api_key = x_gemini_key or cfg.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
@@ -190,8 +201,11 @@ async def apply_edit_highlight(
     job_id: str,
     highlight_id: str,
     body: HighlightApplyEditRequest,
-):
+    request: Request,
+    user: AuthUser = Depends(get_current_user)):
     """Reprocess a specific highlight reel with updated edit parameters (reframe, subtitles, grade, hook, trim)."""
+    verify_job_ownership_on_disk(job_id, user, OUTPUT_DIR)
+    enforce_rate_limit(request, "hl_apply_edit", 10, 10 / 3600, user_id=user.id)
     try:
         return await asyncio.to_thread(
             reprocess_highlight_reel_sync,
@@ -210,8 +224,11 @@ async def apply_edit_highlight(
 
 
 @router.get("/api/highlights/{job_id}")
-async def get_highlights(job_id: str):
+async def get_highlights(job_id: str,
+    request: Request,
+    user: AuthUser = Depends(get_current_user)):
     """List all generated highlight reels for a job."""
+    verify_job_ownership_on_disk(job_id, user, OUTPUT_DIR)
     try:
         _, data = await asyncio.to_thread(load_or_create_job_metadata, job_id, OUTPUT_DIR)
         return {"highlights": data.get("highlights", [])}
@@ -223,8 +240,11 @@ async def get_highlights(job_id: str):
 
 
 @router.delete("/api/highlights/{job_id}/{filename}")
-async def delete_highlight(job_id: str, filename: str):
+async def delete_highlight(job_id: str, filename: str,
+    request: Request,
+    user: AuthUser = Depends(get_current_user)):
     """Delete a generated highlight reel."""
+    verify_job_ownership_on_disk(job_id, user, OUTPUT_DIR)
     try:
         return await asyncio.to_thread(
             delete_highlight_reel_sync,

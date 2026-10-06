@@ -18,9 +18,9 @@ import struct
 import tempfile
 from typing import Optional
 
-from fastapi import APIRouter, File, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
 
-from clippyme.api.auth import is_auth_enabled, require_admin
+from clippyme.api.auth import get_current_user, require_admin
 from clippyme.api.schemas import ConfigUpdateRequest, WatchdogConfigRequest, ZernioConfigRequest
 from clippyme.api.security import require_trusted_config_request
 from clippyme.pipeline.gemini_service import list_available_models
@@ -45,13 +45,18 @@ from clippyme.domain.subtitles import (
 
 
 def enforce_config_access(request: Request) -> None:
-    """Gate configuration endpoints: requires trusted origin and admin privileges in multi-tenant mode."""
+    """Gate configuration endpoints: CSRF check + admin privileges, always.
+
+    The router already requires get_current_user (JWT), so require_admin here
+    only needs to check the admin flag / admin secret.
+    """
     require_trusted_config_request(request)
-    if is_auth_enabled():
-        require_admin(request)
+    require_admin(request)
 
 
-router = APIRouter()
+# Every config route requires an authenticated user (JWT) AND admin
+# privileges. enforce_config_access() in each body adds the CSRF layer.
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 def _atomic_write_bytes(path: str, content: bytes, mode: int) -> None:
