@@ -99,7 +99,9 @@ def _render_frame(project, at, tmp_path):
           f"color=c=black:s={W}x{H}:d={at + 2}:r=30",
           "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
           "blank.mp4"], cwd=tmp_path)
-    _run([ffmpeg, "-y", "-ss", str(at), "-i", "blank.mp4",
+    # NOTE: -ss goes AFTER -i (output seeking). Input seeking snaps to the
+    # nearest keyframe, which silently renders the wrong instant.
+    _run([ffmpeg, "-y", "-i", "blank.mp4", "-ss", str(at),
           "-vf", "subtitles=t.ass:fontsdir=fonts",
           "-frames:v", "1", "frame.png"], cwd=tmp_path)
     return os.path.join(str(tmp_path), "frame.png")
