@@ -203,3 +203,6 @@ body {
   align-items: center; justify-content: center; gap: 12px;
   color: var(--nc-text-dim); font-family: var(--nc-font);
 }
+
+/* chat composer stays flat: kill deep editor leaked global textarea focus glow */
+.nc-composer textarea:focus { box-shadow: none !important; }
