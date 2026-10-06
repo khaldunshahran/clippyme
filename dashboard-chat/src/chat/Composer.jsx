@@ -1,25 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUp, Square } from 'lucide-react';
+import { ArrowUp, Square, Plus, Settings2, ClipboardPaste } from 'lucide-react';
 
-import { DEFAULT_SETTINGS } from './useChat.js';
-import { CAPTION_OPTIONS, captionLabel } from './constants.js';
-
-const CHIP_DEFS = [
-  { key: 'aspect', label: 'Aspect', options: ['9:16', '1:1', '16:9'] },
-  { key: 'clipLength', label: 'Length', options: ['all', 'shorts', 'mid', 'long', 'custom'] },
-  { key: 'captions', label: 'Captions', options: CAPTION_OPTIONS.map((o) => o.id) },
-];
-
-const CHIP_LABELS = {
-  aspect: (v) => v,
-  clipLength: (v) => ({ all: 'Mix', shorts: '<60s', mid: '1\u20133m', long: '3\u201310m', custom: 'Custom' }[v] || v),
-  captions: (v) => captionLabel(v),
-};
-
-export default function Composer({ onSend, disabled, phase, settings, onSettingsChange, onOpenSettings }) {
+/**
+ * ChatGPT-style composer: large rounded box (~26px), textarea on top,
+ * bottom row inside the box: [+] attach on the left, gear + dark send on the right.
+ * No chip strip. Aspect/length/captions live in the settings popup + caption carousel.
+ */
+export default function Composer({ onSend, disabled, phase, onOpenSettings }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const taRef = useRef(null);
+  const menuRef = useRef(null);
 
   // autofocus the composer on mount
   useEffect(() => { taRef.current?.focus(); }, []);
@@ -32,6 +24,14 @@ export default function Composer({ onSend, disabled, phase, settings, onSettings
     el.style.height = Math.min(el.scrollHeight, 160) + 'px';
   }, [text]);
 
+  // close attach menu on outside click
+  useEffect(() => {
+    if (!menuOpen) return;
+    const h = (e) => { if (menuRef.current && !menuRef.current.contains(e.target)) setMenuOpen(false); };
+    window.addEventListener('pointerdown', h);
+    return () => window.removeEventListener('pointerdown', h);
+  }, [menuOpen]);
+
   const busy = phase === 'validating' || phase === 'submitting';
 
   const doSend = async () => {
@@ -42,16 +42,27 @@ export default function Composer({ onSend, disabled, phase, settings, onSettings
     try { await onSend(v); } finally { setSending(false); }
   };
 
-  const cycleChip = (def) => {
-    const cur = settings[def.key];
-    const idx = def.options.indexOf(cur);
-    const next = def.options[(idx + 1) % def.options.length];
-    onSettingsChange({ ...settings, [def.key]: next });
+  const pasteFromClipboard = async () => {
+    setMenuOpen(false);
+    try {
+      const t = await navigator.clipboard.readText();
+      if (t && t.trim()) setText((prev) => (prev ? `${prev} ${t.trim()}` : t.trim()));
+      taRef.current?.focus();
+    } catch { /* clipboard denied — user can paste manually */ }
   };
 
   const placeholder = phase === 'clipping'
     ? 'Prompt the AI while it clips — e.g. "focus on the funny moments"…'
     : 'Paste a YouTube, Twitch or any video link…';
+
+  const canSend = text.trim() && !disabled && !busy && !sending;
+
+  const iconBtn = {
+    width: 34, height: 34, borderRadius: '50%', flexShrink: 0,
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    background: 'transparent', border: 'none', cursor: 'pointer',
+    color: 'var(--nc-text-dim)', transition: 'background .15s ease, color .15s ease',
+  };
 
   return (
     <div className="nc-composer" style={{ padding: '10px 16px 16px', background: 'linear-gradient(to top, var(--nc-bg) 70%, transparent)' }}>
@@ -59,8 +70,9 @@ export default function Composer({ onSend, disabled, phase, settings, onSettings
         <div
           className="nc-card"
           style={{
-            borderRadius: 20, padding: '10px 10px 6px',
+            borderRadius: 26, padding: '12px 12px 8px',
             background: 'var(--nc-panel)',
+            border: '1px solid var(--nc-border)',
             boxShadow: '0 8px 32px rgba(0,0,0,0.35)',
           }}
         >
@@ -77,40 +89,77 @@ export default function Composer({ onSend, disabled, phase, settings, onSettings
             disabled={disabled}
             style={{
               width: '100%', background: 'transparent', border: 'none', outline: 'none',
-              resize: 'none', color: 'var(--nc-text)', fontSize: 15, lineHeight: 1.5,
-              padding: '8px 10px', fontFamily: 'inherit', maxHeight: 160,
+              resize: 'none', color: 'var(--nc-text)', fontSize: 15, lineHeight: 1.55,
+              padding: '8px 10px', fontFamily: 'inherit', maxHeight: 160, minHeight: 52,
             }}
           />
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '2px 4px 4px' }}>
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {CHIP_DEFS.map((def) => {
-                const val = settings[def.key];
-                const isActive = String(val) !== String(DEFAULT_SETTINGS[def.key]);
-                return (
-                  <button
-                    key={def.key}
-                    className="nc-chip"
-                    data-active={isActive}
-                    onClick={() => cycleChip(def)}
-                    title={`Tap to change ${def.label} — full options in settings`}
-                    style={{ fontSize: 12, padding: '6px 10px' }}
-                  >
-                    {CHIP_LABELS[def.key](val)}
-                  </button>
-                );
-              })}
-              <button className="nc-chip" onClick={onOpenSettings} style={{ fontSize: 12, padding: '6px 10px' }} title="All settings">
-                ⚙ Settings
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '2px 4px 2px', position: 'relative' }}>
+            <div ref={menuRef} style={{ position: 'relative' }}>
+              <button
+                style={iconBtn}
+                onClick={() => setMenuOpen((o) => !o)}
+                aria-label="Attach"
+                title="Attach"
+                onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--nc-card-hover)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+              >
+                <Plus size={19} />
               </button>
+              {menuOpen && (
+                <div
+                  className="nc-card nc-anim-fade-up"
+                  style={{
+                    position: 'absolute', bottom: 42, left: 0, zIndex: 30,
+                    borderRadius: 14, padding: 6, minWidth: 220,
+                    background: 'var(--nc-panel)', border: '1px solid var(--nc-border)',
+                    boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+                  }}
+                >
+                  <button
+                    onClick={pasteFromClipboard}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+                      background: 'transparent', border: 'none', cursor: 'pointer',
+                      color: 'var(--nc-text)', fontSize: 13.5, padding: '9px 10px', borderRadius: 9,
+                      textAlign: 'left',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--nc-card-hover)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                  >
+                    <ClipboardPaste size={16} style={{ color: 'var(--nc-text-dim)', flexShrink: 0 }} />
+                    Paste link from clipboard
+                  </button>
+                </div>
+              )}
             </div>
+            <div style={{ flex: 1 }} />
             <button
-              className="nc-btn-primary"
-              onClick={doSend}
-              disabled={!text.trim() || disabled || busy || sending}
-              aria-label="Send"
-              style={{ width: 38, height: 38, borderRadius: '50%', padding: 0, flexShrink: 0 }}
+              style={iconBtn}
+              onClick={onOpenSettings}
+              aria-label="Clip settings"
+              title="Clip settings"
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--nc-card-hover)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
             >
-              {busy ? <Square size={14} /> : <ArrowUp size={17} />}
+              <Settings2 size={18} />
+            </button>
+            <button
+              onClick={doSend}
+              disabled={!canSend}
+              aria-label="Send"
+              style={{
+                width: 34, height: 34, borderRadius: '50%', padding: 0, flexShrink: 0,
+                marginLeft: 4, border: 'none', cursor: canSend ? 'pointer' : 'default',
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                background: canSend ? '#2e2e33' : 'rgba(255,255,255,0.08)',
+                color: canSend ? '#fff' : 'var(--nc-text-faint)',
+                transition: 'background .15s ease, transform .1s ease',
+                transform: 'none',
+              }}
+              onMouseDown={(e) => { if (canSend) e.currentTarget.style.transform = 'scale(0.92)'; }}
+              onMouseUp={(e) => { e.currentTarget.style.transform = 'none'; }}
+            >
+              {busy ? <Square size={14} /> : <ArrowUp size={17} strokeWidth={2.4} />}
             </button>
           </div>
         </div>
