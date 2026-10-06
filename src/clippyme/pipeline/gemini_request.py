@@ -24,7 +24,55 @@ MODEL_PRICING = {
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
 }
 
+# ISO 639-1 code -> explicit language name for the prompt's OUTPUT LANGUAGE block.
+# Named explicitly because few-shot examples in other languages otherwise
+# drag the model into writing titles/hooks in the example language.
+_LANGUAGE_NAMES = {
+    "en": "English", "it": "Italian", "es": "Spanish", "fr": "French",
+    "de": "German", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
+    "ru": "Russian", "uk": "Ukrainian", "ja": "Japanese", "zh": "Chinese",
+    "ko": "Korean", "ar": "Arabic", "hi": "Hindi", "tr": "Turkish",
+    "sv": "Swedish", "fi": "Finnish", "da": "Danish", "no": "Norwegian",
+    "nb": "Norwegian", "ro": "Romanian", "el": "Greek", "cs": "Czech",
+    "hu": "Hungarian", "id": "Indonesian", "ms": "Malay", "th": "Thai",
+    "vi": "Vietnamese", "he": "Hebrew", "fa": "Persian",
+}
+
+
+def resolve_output_language(transcript_result, output_language=None):
+    """Return the explicit language NAME the prompt must demand.
+
+    Priority: explicit ``output_language`` param -> the transcript result's
+    ``language`` field (set by every transcription provider: Deepgram,
+    ElevenLabs, Faster-Whisper) -> English default. ISO codes are normalized
+    ("en-US" -> "en") and mapped to full names so the model sees "English",
+    not "en".
+    """
+    raw = (output_language or "").strip().lower()
+    if not raw:
+        raw = str((transcript_result or {}).get("language") or "").strip().lower()
+    code = raw.replace("_", "-").split("-")[0]
+    return _LANGUAGE_NAMES.get(code, "English")
+
+
+def build_output_language_block(language_name):
+    """The explicit OUTPUT LANGUAGE block - injected at the TOP of the prompt.
+
+    Naming the target language explicitly is what stops the model from
+    following the language of the few-shot examples instead.
+    """
+    return (
+        f"## OUTPUT LANGUAGE: {language_name}\n"
+        f"Every text field you emit (viral_reason, descriptions, titles, "
+        f"hook_text) MUST be written in {language_name}. This overrides any "
+        f"language suggested by the examples below - the examples demonstrate "
+        f"patterns and structure, never the target language."
+    )
+
+
 GEMINI_PROMPT_TEMPLATE = """
+{output_language_block}
+
 You are a senior video editor specialized in social media virality across YouTube Shorts, TikTok, IG Reels, and YouTube Highlights. Read the ENTIRE transcript + word-level timestamps and select {target_moments_instruction} MOST COMPELLING {duration_descriptor} moments.
 {clip_type_focus_block}
 {audience_intel_block}
@@ -114,19 +162,19 @@ normally on the words alone.
   the first word of a sentence and close on the last word of a sentence.
 - viral_reason MUST be at least 20 characters and cite the specific hook, payoff or quote
 - viral_hook_text is REQUIRED, NEVER empty: 3-8 words, written AS A SCROLL-STOPPING OVERLAY — NOT a transcript quote, NOT the first words the speaker says. It is standalone copywriting designed to make someone stop scrolling on TikTok/Reels. Use one of these proven patterns:
-    * Curiosity gap: "Nessuno ti dice questo", "What they don't want you to know"
-    * POV / relatable: "POV: sei il primo a scoprirlo", "POV: you just realized…"
-    * Counter-intuitive claim: "Stavo sbagliando tutto", "I was doing it wrong"
-    * Direct question: "E se fosse tutto falso?", "What if you're wrong?"
-    * Number / stakes: "3 cose che nessuno dice", "3 things nobody tells you"
-    * Warning / callout: "Non guardare se…", "Stop scrolling if…"
-    * Stakes / consequence: "Dopo questo può smettere", "This ends his career"
-    * Prediction bait: "Indovina quanto vale", "Guess the number"
+    * Curiosity gap: "What they don't want you to know", "Nessuno ti dice questo"
+    * POV / relatable: "POV: you just realized…", "POV: sei il primo a scoprirlo"
+    * Counter-intuitive claim: "I was doing it wrong", "Stavo sbagliando tutto"
+    * Direct question: "What if you're wrong?", "E se fosse tutto falso?"
+    * Number / stakes: "3 things nobody tells you", "3 cose che nessuno dice"
+    * Warning / callout: "Stop scrolling if…", "Non guardare se…"
+    * Stakes / consequence: "This ends his career", "Dopo questo può smettere"
+    * Prediction bait: "Guess the number", "Indovina quanto vale"
   The hook must TEASE the content of the clip without spoiling the payoff. Same language as the transcript. Title Case or Sentence case, never ALL CAPS.
 - No generic intros/outros or pure sponsorship unless they ARE the hook
 
 ## LANGUAGE RULE
-Every text field (viral_reason, descriptions, titles, hook_text) MUST be in the SAME LANGUAGE as the transcript.
+Every text field (viral_reason, descriptions, titles, hook_text) MUST be in the SAME LANGUAGE as the transcript - see ## OUTPUT LANGUAGE at the top of this prompt for the exact target language. When in doubt, match the transcript's language, never the examples'.
 
 ## SPEAKER ATTRIBUTION RULE (CRITICAL)
 The transcript carries NO reliable speaker identity — you cannot tell who is
@@ -359,11 +407,16 @@ def build_viral_prompt(
     duration_mode=None,
     audience_intel=None,
     learned_patterns=None,
+    output_language=None,
 ):
     """Return ``(prompt, words)`` for the primary Gemini call.
 
     ``words`` is also what ``gemini_parser.backfill_hook_text`` needs later,
     so it is returned alongside instead of being recomputed.
+
+    ``output_language`` optionally overrides the target language for all
+    emitted text; when unset it is taken from ``transcript_result["language"]``
+    (set by every transcription provider) and falls back to English.
 
     ``creator`` is the stream owner's channel name (live monitor only): it lets
     titles name the subject of the clip. It is NOT evidence of who is speaking
@@ -495,7 +548,13 @@ def build_viral_prompt(
             "Curate a diverse selection covering viral hot takes, educational insights, funny moments, and deep stories."
         )
 
+    # Explicit output language: named target language at the TOP of the
+    # prompt so the model cannot follow the few-shot examples' language.
+    output_language_name = resolve_output_language(transcript_result, output_language)
+    output_language_block = build_output_language_block(output_language_name)
+
     prompt = GEMINI_PROMPT_TEMPLATE.format(
+        output_language_block=output_language_block,
         video_duration=video_duration,
         target_moments_instruction=target_moments_instruction,
         duration_descriptor=duration_descriptor,
