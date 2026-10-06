@@ -9,6 +9,7 @@ import SettingsPopup from './chat/SettingsPopup.jsx';
 import ClipGrid from './chat/ClipGrid.jsx';
 import ClipPopup from './chat/ClipPopup.jsx';
 import EditorView from './chat/EditorView.jsx';
+import AuthGate from './chat/AuthGate.jsx';
 import { scheduleClipPost, getZernioAccounts, zernioTargets, getJobClips, normClip } from './api/chatApi.js';
 
 const DEPLOY_SHA = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_DEPLOY_SHA) || '';
@@ -33,7 +34,7 @@ function DeployBadge() {
   );
 }
 
-export default function App() {
+function AppShell() {
   const chat = useChat();
   const {
     threads, active, activeId,
@@ -280,5 +281,13 @@ export default function App() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthGate>
+      <AppShell />
+    </AuthGate>
   );
 }

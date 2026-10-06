@@ -1,73 +1,73 @@
-// Optional API token for deliberate LAN deployments (CLIPPYME_API_TOKEN)
-// and multi-tenant Bearer JWT authentication for Supabase SaaS accounts.
-// Tokens live in localStorage so the static frontend needs no build-time secrets.
+// Authenticated fetch for the Nugget backend.
+//
+// Browser callers ALWAYS use the user's Supabase session JWT:
+//   Authorization: Bearer <supabase access_token>
+//
+// The old X-API-Token / clippyme_api_token path was removed (2026-10-07):
+// CLIPPYME_API_TOKEN is non-browser-only on the backend and must never ship
+// in the frontend bundle.
+//
+// 401 handling: one silent token refresh, then a single retry; if the retry
+// still 401s (or the refresh fails) the 'signed-out' auth event fires and the
+// app shell clears the session and shows the login screen.
+// 403 handling: the token is valid but the user is not on the access
+// allow-list — the 'forbidden' auth event fires and the app shows a
+// "Not authorized" screen (it must NOT loop back to login).
+import { getAccessToken, refreshSessionNow } from './supabase.js';
 
-const API_TOKEN_KEY = 'clippyme_api_token';
-const AUTH_TOKEN_KEY = 'clippyme_auth_token';
+let authEventHandler = null;
 
-function storage() {
-  // Node (unit tests) has no localStorage; browsers can throw on access in
-  // hardened privacy modes. Either way we degrade to "no token".
+/** App shell registers a handler: (type: 'signed-out' | 'forbidden') => void */
+export function setAuthEventHandler(fn) {
+  authEventHandler = typeof fn === 'function' ? fn : null;
+}
+
+function emitAuthEvent(type) {
   try {
-    return typeof localStorage !== 'undefined' ? localStorage : null;
+    if (authEventHandler) authEventHandler(type);
   } catch {
-    return null;
+    // A throwing handler must not break the fetch chain.
   }
 }
 
-export function getApiToken() {
-  try {
-    return storage()?.getItem(API_TOKEN_KEY) || '';
-  } catch {
-    return '';
-  }
-}
-
-export function setApiToken(token) {
-  try {
-    const s = storage();
-    if (!s) return;
-    const trimmed = (token || '').trim();
-    if (trimmed) s.setItem(API_TOKEN_KEY, trimmed);
-    else s.removeItem(API_TOKEN_KEY);
-  } catch {
-    // Persist failure just means the user re-enters the token next session.
-  }
-}
-
-export function getAuthToken() {
-  try {
-    return storage()?.getItem(AUTH_TOKEN_KEY) || '';
-  } catch {
-    return '';
-  }
-}
-
-export function setAuthToken(token) {
-  try {
-    const s = storage();
-    if (!s) return;
-    const trimmed = (token || '').trim();
-    if (trimmed) s.setItem(AUTH_TOKEN_KEY, trimmed);
-    else s.removeItem(AUTH_TOKEN_KEY);
-  } catch {
-    // Persist failure
-  }
-}
-
-/** fetch() that attaches Authorization: Bearer and/or X-API-Token when configured. */
-export function apiFetch(url, init = {}) {
-  const authToken = getAuthToken();
-  const apiToken = getApiToken();
-
-  if (!authToken && !apiToken) return fetch(url, init);
-
+function withToken(url, init, token) {
   const headers = { ...(init.headers || {}) };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const { _authRetried, ...rest } = init; // internal flag, never sent on the wire
+  return fetch(url, { ...rest, headers });
+}
+
+/** fetch() that attaches the current Supabase session token. */
+export async function apiFetch(url, init = {}) {
+  let token = '';
+  try {
+    token = await getAccessToken();
+  } catch {
+    token = '';
   }
-  if (apiToken) {
-    headers['X-API-Token'] = apiToken;
+
+  let res = await withToken(url, init, token);
+
+  if (res.status === 401 && !init._authRetried) {
+    // Exactly one silent refresh, then one retry with the fresh token.
+    let fresh = '';
+    try {
+      fresh = await refreshSessionNow();
+    } catch {
+      fresh = '';
+    }
+    if (fresh) {
+      res = await withToken(url, { ...init, _authRetried: true }, fresh);
+    }
+    if (res.status === 401) {
+      emitAuthEvent('signed-out');
+    }
+    return res;
   }
-  return fetch(url, { ...init, headers });
+
+  if (res.status === 403) {
+    emitAuthEvent('forbidden');
+  }
+
+  return res;
 }
