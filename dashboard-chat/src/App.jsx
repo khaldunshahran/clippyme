@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import { Menu } from 'lucide-react';
+import { Menu, CalendarClock, Loader2, X, Check } from 'lucide-react';
 import { useChat } from './chat/useChat.js';
 import Sidebar from './chat/Sidebar.jsx';
 import WelcomeView from './chat/WelcomeView.jsx';
@@ -9,6 +9,29 @@ import SettingsPopup from './chat/SettingsPopup.jsx';
 import ClipGrid from './chat/ClipGrid.jsx';
 import ClipPopup from './chat/ClipPopup.jsx';
 import EditorView from './chat/EditorView.jsx';
+import { scheduleClipPost, getZernioAccounts, zernioTargets, getJobClips, normClip } from './api/chatApi.js';
+
+const DEPLOY_SHA = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_DEPLOY_SHA) || '';
+const DEPLOY_TIME = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_DEPLOY_TIME) || '';
+
+function DeployBadge() {
+  if (!DEPLOY_SHA) return null;
+  const short = DEPLOY_SHA.slice(0, 7);
+  const title = `nugget-chat deploy\n${DEPLOY_SHA}${DEPLOY_TIME ? `\nBuilt ${DEPLOY_TIME}` : ''}`;
+  return (
+    <span
+      title={title}
+      style={{
+        fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4,
+        color: 'var(--nc-text-faint)', background: 'rgba(255,255,255,0.05)',
+        border: '1px solid var(--nc-border)', borderRadius: 99, padding: '3px 9px',
+        fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', cursor: 'default',
+      }}
+    >
+      DEPLOY {short}
+    </span>
+  );
+}
 
 export default function App() {
   const chat = useChat();
@@ -24,7 +47,10 @@ export default function App() {
   } = chat;
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [scheduling, setScheduling] = useState(null); // clip index being "scheduled" (Phase D)
+  const [schedTarget, setSchedTarget] = useState(null); // { threadId, jobId, index } — schedule dialog open
+  const [schedWhen, setSchedWhen] = useState('');
+  const [schedBusy, setSchedBusy] = useState(false);
+  const [schedMsg, setSchedMsg] = useState(null);
 
   const ensureThread = useCallback(() => {
     if (activeId) return activeId;
@@ -52,11 +78,50 @@ export default function App() {
     setEditorTarget({ threadId, jobId: t.jobId, clipIndex: index, clip: t.clips[index] });
   }, [threads, setEditorTarget, setPopupClip]);
 
-  const scheduleClip = useCallback((threadId, index) => {
-    // No schedule endpoint exists yet (Phase D gap) — honest placeholder.
-    setScheduling({ threadId, index });
-    setTimeout(() => setScheduling(null), 2600);
-  }, []);
+  const refreshClips = useCallback(async (threadId, jobId) => {
+    try {
+      const raw = await getJobClips(jobId);
+      patchThread(threadId, { clips: raw.map((c, i) => normClip(c, i)) });
+    } catch { /* keep existing clips on refresh failure */ }
+  }, [patchThread]);
+
+  const handleDuplicate = useCallback((threadId, jobId) => {
+    refreshClips(threadId, jobId);
+  }, [refreshClips]);
+
+  const openSchedule = useCallback((threadId, index) => {
+    const t = threads.find((x) => x.id === threadId);
+    if (!t?.jobId) return;
+    // default: tomorrow 18:00 local
+    const d = new Date();
+    d.setDate(d.getDate() + 1); d.setHours(18, 0, 0, 0);
+    const pad = (n) => String(n).padStart(2, '0');
+    setSchedWhen(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`);
+    setSchedMsg(null);
+    setSchedTarget({ threadId, jobId: t.jobId, index });
+  }, [threads]);
+
+  const doSchedule = useCallback(async () => {
+    if (!schedTarget || schedBusy) return;
+    if (!schedWhen) { setSchedMsg({ ok: false, text: 'Pick a date & time.' }); return; }
+    setSchedBusy(true); setSchedMsg(null);
+    try {
+      const r = await getZernioAccounts();
+      const targets = zernioTargets(r?.accounts || r);
+      if (!targets.length) throw new Error('No connected social accounts found in Zernio.');
+      const res = await scheduleClipPost(schedTarget.jobId, schedTarget.index, {
+        scheduled_for: new Date(schedWhen).toISOString(),
+        platforms: targets,
+        schedule_mode: 'manual',
+      });
+      setSchedMsg({ ok: true, text: `Scheduled for ${res.scheduled_for || schedWhen}.` });
+      setTimeout(() => { setSchedTarget(null); setSchedMsg(null); }, 2200);
+    } catch (e) {
+      setSchedMsg({ ok: false, text: `Schedule failed: ${e.message}` });
+    } finally {
+      setSchedBusy(false);
+    }
+  }, [schedTarget, schedWhen, schedBusy]);
 
   const showWelcome = !active || (active.messages.length === 0 && active.phase === 'idle');
   const popupThread = popupClip ? threads.find((t) => t.id === popupClip.threadId) : null;
@@ -94,6 +159,9 @@ export default function App() {
               CLIPPING
             </span>
           )}
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+            <DeployBadge />
+          </div>
         </header>
 
         {showWelcome ? (
@@ -103,7 +171,7 @@ export default function App() {
             thread={active}
             onOpenClip={(i) => openClip(activeId, i)}
             onEditClip={(i) => openEditor(activeId, i)}
-            onScheduleClip={(i) => scheduleClip(activeId, i)}
+            onScheduleClip={(i) => openSchedule(activeId, i)}
             onViewAll={() => setGridOpen(true)}
           />
         )}
@@ -143,7 +211,7 @@ export default function App() {
           onClose={() => setGridOpen(false)}
           onOpenClip={(i) => { setGridOpen(false); openClip(activeId, i); }}
           onEditClip={(i) => { setGridOpen(false); openEditor(activeId, i); }}
-          onScheduleClip={(i) => scheduleClip(activeId, i)}
+          onScheduleClip={(i) => openSchedule(activeId, i)}
         />
       )}
 
@@ -157,6 +225,7 @@ export default function App() {
           onPrev={() => stepClip(-1)}
           onNext={() => stepClip(1)}
           onEdit={(i) => openEditor(popupThread.id, i)}
+          onDuplicate={() => handleDuplicate(popupThread.id, popupThread.jobId)}
         />
       )}
 
@@ -170,15 +239,42 @@ export default function App() {
         />
       )}
 
-      {/* schedule placeholder toast */}
-      {scheduling && (
-        <div className="nc-anim-pop-in" style={{
-          position: 'fixed', bottom: 90, left: '50%', transform: 'translateX(-50%)', zIndex: 80,
-          background: 'var(--nc-panel)', border: '1px solid var(--nc-border-strong)',
-          borderRadius: 12, padding: '10px 16px', fontSize: 13,
-          boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
-        }}>
-          📅 Scheduling arrives in Phase D — clip saved for now.
+      {/* schedule dialog */}
+      {schedTarget && (
+        <div className="nc-modal-backdrop" onClick={() => { if (!schedBusy) setSchedTarget(null); }} style={{ zIndex: 70 }}>
+          <div
+            className="nc-modal nc-card nc-anim-pop-in"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog" aria-label="Schedule clip"
+            style={{ width: 'min(380px, calc(100vw - 40px))', background: 'var(--nc-bg-soft)', borderRadius: 16, padding: 18 }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <CalendarClock size={16} />
+              <div style={{ fontSize: 14, fontWeight: 700 }}>Schedule clip {schedTarget.index + 1}</div>
+              <button className="nc-icon-btn" onClick={() => setSchedTarget(null)} aria-label="Close" style={{ marginLeft: 'auto' }}>
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--nc-text-dim)', marginBottom: 12 }}>
+              Posts to your connected accounts at this time via Zernio.
+            </div>
+            <input
+              type="datetime-local"
+              className="nc-input"
+              value={schedWhen}
+              onChange={(e) => setSchedWhen(e.target.value)}
+              style={{ width: '100%', marginBottom: 12 }}
+            />
+            <button className="nc-btn-primary" style={{ width: '100%' }} disabled={schedBusy} onClick={doSchedule}>
+              {schedBusy ? <Loader2 size={15} style={{ animation: 'nc-spin 1s linear infinite' }} /> : <CalendarClock size={15} />}
+              {schedBusy ? 'Scheduling…' : 'Confirm schedule'}
+            </button>
+            {schedMsg && (
+              <div style={{ marginTop: 8, fontSize: 12.5, color: schedMsg.ok ? 'var(--nc-green)' : 'var(--nc-red)', display: 'flex', gap: 6, alignItems: 'center' }}>
+                {schedMsg.ok && <Check size={13} />}{schedMsg.text}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

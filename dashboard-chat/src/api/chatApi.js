@@ -86,6 +86,56 @@ export const getJobTitle = async (jobId) => {
 export const publishClip = (jobId, clipIndex, body = {}) =>
   req('POST', `/api/publish/${encodeURIComponent(jobId)}/${encodeURIComponent(clipIndex)}`, body, { timeoutMs: 120000 });
 
+/** Phase D: duplicate a clip → returns { new_index }. */
+export const duplicateClip = (jobId, clipIndex) =>
+  req('POST', `/api/clips/${encodeURIComponent(jobId)}/${encodeURIComponent(clipIndex)}/duplicate`, {}, { timeoutMs: 60000 });
+
+/** Phase D: schedule a clip as a timed Zernio post. */
+export const scheduleClipPost = (jobId, clipIndex, body) =>
+  req('POST', `/api/clips/${encodeURIComponent(jobId)}/${encodeURIComponent(clipIndex)}/schedule`, body, { timeoutMs: 120000 });
+
+export const getClipSchedule = (jobId, clipIndex) =>
+  req('GET', `/api/clips/${encodeURIComponent(jobId)}/${encodeURIComponent(clipIndex)}/schedule`, undefined, { timeoutMs: 15000 });
+
+/** Phase D: upscale a clip 2x (lanczos + NVENC). Long operation — returns { download_url }. */
+export const upscaleClip = (jobId, clipIndex) =>
+  req('POST', `/api/clips/${encodeURIComponent(jobId)}/${encodeURIComponent(clipIndex)}/upscale`, {}, { timeoutMs: 600000 });
+
+/** Phase D: download the FCP7 XML timeline for a clip. */
+export const exportClipXml = async (jobId, clipIndex) => {
+  const res = await apiFetch(getApiUrl(`/api/clips/${encodeURIComponent(jobId)}/${encodeURIComponent(clipIndex)}/export-xml`));
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Export failed: HTTP ${res.status}${t ? ` — ${t.slice(0, 140)}` : ''}`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `clip_${clipIndex + 1}_timeline.xml`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 8000);
+  return true;
+};
+
+/** Connected Zernio accounts (for building publish targets). */
+export const getZernioAccounts = () =>
+  req('GET', '/api/zernio/accounts', undefined, { timeoutMs: 15000 });
+
+/** Map a Zernio accounts list → [{ platform, accountId }] publish targets. Defensive: skips unknowns. */
+export function zernioTargets(accounts) {
+  const list = Array.isArray(accounts) ? accounts : (accounts?.accounts || []);
+  return (Array.isArray(list) ? list : [])
+    .map((a) => {
+      if (!a || typeof a !== 'object') return null;
+      const platform = String(a.platform || a.provider || a.type || a.network || '').toLowerCase();
+      const accountId = a.id ?? a.accountId ?? a.account_id ?? a.uuid ?? a.external_id;
+      if (!platform || accountId == null || accountId === '') return null;
+      return { platform, accountId: String(accountId) };
+    })
+    .filter(Boolean);
+}
+
 /** Normalize a clip object defensively — backend shapes vary. */
 export function normClip(clip, index) {
   const c = clip || {};

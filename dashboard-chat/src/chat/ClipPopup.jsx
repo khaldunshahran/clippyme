@@ -5,13 +5,13 @@ import {
   Loader2, Check,
 } from 'lucide-react';
 import { safeResolveUrl, downloadClip, getClipTranscript } from '../api/realApi.js';
-import { publishClip, editAiTrim, fmtDur } from '../api/chatApi.js';
+import {
+  publishClip, editAiTrim, fmtDur, duplicateClip, upscaleClip,
+  exportClipXml, getZernioAccounts, zernioTargets,
+} from '../api/chatApi.js';
+import { getApiUrl } from '../api/config.js';
 
-// Backend gaps (Phase D): these actions have no endpoint yet. Rendered
-// visibly disabled with an honest "soon" state — never faked.
-const COMING_SOON = new Set(['xml', 'upscale', 'duplicate']);
-
-export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext, onEdit }) {
+export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext, onEdit, onDuplicate }) {
   const clip = clips[index];
   const [transcript, setTranscript] = useState(null);
   const [txLoading, setTxLoading] = useState(false);
@@ -22,7 +22,10 @@ export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext
   const [aiBusy, setAiBusy] = useState(false);
   const [aiResult, setAiResult] = useState(null);
   const [scheduleMode, setScheduleMode] = useState('now');
+  const [manualWhen, setManualWhen] = useState('');
   const [showPublish, setShowPublish] = useState(false);
+  const [busy, setBusy] = useState(null); // 'xml' | 'upscale' | 'duplicate'
+  const [actMsg, setActMsg] = useState(null); // { ok, text }
   const videoRef = useRef(null);
 
   // keyboard: arrows flip, esc closes
@@ -46,6 +49,11 @@ export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext
       .finally(() => setTxLoading(false));
   }, [jobId, clip?.index]);
 
+  // reset per-clip action state when flipping
+  useEffect(() => {
+    setBusy(null); setActMsg(null); setPublishDone(null);
+  }, [clip?.index]);
+
   const videoSrc = useMemo(
     () => (clip?.videoUrl ? safeResolveUrl(clip.videoUrl) : ''),
     [clip],
@@ -62,15 +70,78 @@ export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext
     }
   };
 
+  const resolveTargets = async () => {
+    const r = await getZernioAccounts();
+    const targets = zernioTargets(r?.accounts || r);
+    if (!targets.length) throw new Error('No connected social accounts found in Zernio.');
+    return targets;
+  };
+
   const doPublish = async () => {
     setPublishing(true); setPublishDone(null);
     try {
-      const r = await publishClip(jobId, clip.index, { schedule_mode: scheduleMode });
-      setPublishDone({ ok: true, text: r?.message || 'Published — check your connected accounts.' });
+      const targets = await resolveTargets();
+      const body = {
+        title: (clip.title || '').slice(0, 100),
+        caption: clip.hook || clip.title || '',
+        platforms: targets,
+        schedule_mode: scheduleMode,
+      };
+      if (scheduleMode === 'manual') {
+        if (!manualWhen) throw new Error('Pick a date & time for the scheduled post.');
+        body.scheduled_for = new Date(manualWhen).toISOString();
+      }
+      const r = await publishClip(jobId, clip.index, body);
+      const when = r?.scheduled_for ? ` — scheduled for ${r.scheduled_for}` : '';
+      setPublishDone({ ok: true, text: (r?.message || 'Published — check your connected accounts.') + when });
     } catch (e) {
       setPublishDone({ ok: false, text: `Publish failed: ${e.message}` });
     } finally {
       setPublishing(false);
+    }
+  };
+
+  const doXml = async () => {
+    if (busy) return;
+    setBusy('xml'); setActMsg(null);
+    try {
+      await exportClipXml(jobId, clip.index);
+      setActMsg({ ok: true, text: 'Timeline XML downloaded.' });
+    } catch (e) {
+      setActMsg({ ok: false, text: `Export failed: ${e.message}` });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doUpscale = async () => {
+    if (busy) return;
+    setBusy('upscale'); setActMsg(null);
+    try {
+      const r = await upscaleClip(jobId, clip.index);
+      const url = getApiUrl(r.download_url || r.file || '');
+      const a = document.createElement('a');
+      a.href = url; a.download = (r.file || `upscaled_clip_${clip.index + 1}.mp4`).split('/').pop();
+      document.body.appendChild(a); a.click(); a.remove();
+      setActMsg({ ok: true, text: 'Upscaled — download started.' });
+    } catch (e) {
+      setActMsg({ ok: false, text: `Upscale failed: ${e.message}` });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doDuplicate = async () => {
+    if (busy) return;
+    setBusy('duplicate'); setActMsg(null);
+    try {
+      const r = await duplicateClip(jobId, clip.index);
+      setActMsg({ ok: true, text: `Duplicated as clip ${Number(r.new_index) + 1}.` });
+      if (onDuplicate) onDuplicate(r.new_index);
+    } catch (e) {
+      setActMsg({ ok: false, text: `Duplicate failed: ${e.message}` });
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -87,15 +158,34 @@ export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext
     }
   };
 
+  const actBtn = (id, Icon, label, fn) => {
+    const isBusy = busy === id;
+    return (
+      <button
+        key={id}
+        className="nc-btn-ghost"
+        disabled={!!busy}
+        onClick={fn}
+        title={label}
+        style={{ justifyContent: 'flex-start', fontSize: 12.5, padding: '9px 12px', opacity: busy && !isBusy ? 0.55 : 1 }}
+      >
+        {isBusy ? <Loader2 size={14} style={{ animation: 'nc-spin 1s linear infinite' }} /> : <Icon size={14} />}
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {isBusy ? 'Working…' : label}
+        </span>
+      </button>
+    );
+  };
+
   const ACTIONS = [
-    { id: 'publish', icon: Share2, label: 'Publish on Social', fn: () => setShowPublish((v) => !v) },
-    { id: 'xml', icon: FileCode2, label: 'Export XML' },
-    { id: 'download', icon: Download, label: 'Download HD', fn: doDownload },
-    { id: 'upscale', icon: ArrowUpFromLine, label: 'Upscale & download' },
-    { id: 'edit', icon: Scissors, label: 'Edit clip', fn: () => onEdit(clip.index) },
-    { id: 'ai', icon: WandSparkles, label: 'AI tools', fn: () => setAiOpen((v) => !v) },
-    { id: 'aspect', icon: Crop, label: 'Aspect ratio', fn: () => onEdit(clip.index) },
-    { id: 'duplicate', icon: Copy, label: 'Duplicate' },
+    { id: 'publish', icon: Share2, label: 'Publish on Social', fn: () => setShowPublish((v) => !v), custom: true },
+    { id: 'xml', icon: FileCode2, label: 'Export XML', fn: doXml },
+    { id: 'download', icon: Download, label: 'Download HD', fn: doDownload, custom: true },
+    { id: 'upscale', icon: ArrowUpFromLine, label: 'Upscale & download', fn: doUpscale },
+    { id: 'edit', icon: Scissors, label: 'Edit clip', fn: () => onEdit(clip.index), custom: true },
+    { id: 'ai', icon: WandSparkles, label: 'AI tools', fn: () => setAiOpen((v) => !v), custom: true },
+    { id: 'aspect', icon: Crop, label: 'Aspect ratio', fn: () => onEdit(clip.index), custom: true },
+    { id: 'duplicate', icon: Copy, label: 'Duplicate', fn: doDuplicate },
   ];
 
   const segments = transcript?.segments || [];
@@ -206,34 +296,26 @@ export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext
             <div>
               <div className="nc-label">Actions</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                {ACTIONS.map(({ id, icon: Icon, label, fn }) => {
-                  const soon = COMING_SOON.has(id);
-                  return (
+                {ACTIONS.map(({ id, icon: Icon, label, fn, custom }) => (
+                  custom ? (
                     <button
                       key={id}
                       className="nc-btn-ghost"
-                      disabled={soon}
                       onClick={fn}
-                      title={soon ? 'Coming in Phase D' : label}
-                      style={{
-                        justifyContent: 'flex-start', fontSize: 12.5, padding: '9px 12px',
-                        opacity: soon ? 0.45 : 1, position: 'relative',
-                      }}
+                      title={label}
+                      style={{ justifyContent: 'flex-start', fontSize: 12.5, padding: '9px 12px' }}
                     >
                       <Icon size={14} />
                       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
-                      {soon && (
-                        <span style={{
-                          fontSize: 9.5, fontWeight: 700, background: 'rgba(245,165,36,0.16)',
-                          color: 'var(--nc-amber)', borderRadius: 99, padding: '2px 7px', marginLeft: 'auto',
-                        }}>
-                          SOON
-                        </span>
-                      )}
                     </button>
-                  );
-                })}
+                  ) : actBtn(id, Icon, label, fn)
+                ))}
               </div>
+              {actMsg && (
+                <div style={{ marginTop: 8, fontSize: 12.5, color: actMsg.ok ? 'var(--nc-green)' : 'var(--nc-red)', display: 'flex', gap: 6, alignItems: 'center' }}>
+                  {actMsg.ok && <Check size={13} />}{actMsg.text}
+                </div>
+              )}
 
               {showPublish && (
                 <div className="nc-anim-fade-in" style={{ marginTop: 10, padding: 12, border: '1px solid var(--nc-border)', borderRadius: 12, background: 'var(--nc-card)' }}>
@@ -241,8 +323,17 @@ export default function ClipPopup({ clips, index, jobId, onClose, onPrev, onNext
                   <select className="nc-select" value={scheduleMode} onChange={(e) => setScheduleMode(e.target.value)} style={{ width: '100%', marginBottom: 10 }}>
                     <option value="now">Publish now</option>
                     <option value="auto">Auto-schedule (best time)</option>
-                    <option value="manual">Save as draft</option>
+                    <option value="manual">Schedule for a specific time</option>
                   </select>
+                  {scheduleMode === 'manual' && (
+                    <input
+                      type="datetime-local"
+                      className="nc-input"
+                      value={manualWhen}
+                      onChange={(e) => setManualWhen(e.target.value)}
+                      style={{ width: '100%', marginBottom: 10 }}
+                    />
+                  )}
                   <button className="nc-btn-primary" style={{ width: '100%' }} disabled={publishing} onClick={doPublish}>
                     {publishing ? <Loader2 size={15} style={{ animation: 'nc-spin 1s linear infinite' }} /> : <Share2 size={15} />}
                     {publishing ? 'Publishing…' : 'Confirm publish'}
