@@ -133,7 +133,8 @@ def test_committed_framing_regression_detects_disabled_production_reuse(monkeypa
     import runpy
     suite = runpy.run_path("tests/domain/test_task05_ffmpeg.py")
     fixture = suite["synth_job"].__wrapped__(tmp_path)
-    monkeypatch.setattr(pr, "check_lineage_eligible",
+    # Patch the actual lookup (project_lineage), not the stale alias.
+    monkeypatch.setattr(pl, "check_lineage_eligible",
                         lambda *args, **kwargs: ("geometry_edit", None, "disabled by review mutation"))
     # The committed production-framing gate must fail when the actual
     # render selector is disabled. It currently never reaches that selector.

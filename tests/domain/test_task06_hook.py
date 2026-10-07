@@ -962,3 +962,129 @@ def test_mutation_disabled_reuse_wrong_framing(monkeypatch, tmp_path):
     r, g, b = (int(v) for v in arr[130, 45])
     is_red = r > 100 and r > g + 30
     assert not is_red, "disabled reuse should not have red framing"
+
+
+# --- Duration validation regressions (review6) ---
+# Invoke real render selector with matching lineage.
+
+def _duration_setup(monkeypatch, tmp_path, segments, base_duration):
+    """Create source/base/project for duration validation tests."""
+    from clippyme.domain import project_lineage as pl
+    from clippyme.domain import project_render as pr_mod
+    from clippyme.domain.clip_project import validate_project
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js = str(tmp_path / "job")
+    os.makedirs(js, exist_ok=True)
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    src_path = os.path.join(js, "source.mp4")
+    base_path = os.path.join(js, "clip_final_0.mp4")
+    # 12s source for multi-segment tests.
+    _run(["ffmpeg", "-y", "-v", "error",
+          "-f", "lavfi", "-i", "color=blue:s=320x180:r=30:d=12",
+          "-f", "lavfi", "-i", "sine=frequency=880:duration=12",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", "-shortest", src_path])
+    # Base with given duration (from source start).
+    _run(["ffmpeg", "-y", "-v", "error",
+          "-t", str(base_duration), "-i", src_path,
+          "-vf", "crop=90:160:0:10",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", base_path])
+
+    seg_dicts = []
+    for i, (s, e, tr) in enumerate(segments):
+        seg_dicts.append({
+            "id": f"seg-{i}", "start": s, "end": e,
+            "crop": {"x": 0.0, "y": 10.0, "w": 90.0, "h": 160.0},
+            "transition_in": tr,
+        })
+
+    d = {
+        "schema": "nugget.clip-project/1",
+        "job_id": "dur", "clip_index": 0,
+        "source": {"file": "source.mp4", "width": 320, "height": 180,
+                   "duration": 12.0},
+        "segments": seg_dicts,
+        "captions": {"style": "classic_white", "position": "bottom",
+                     "words": [], "edits": {}},
+        "overlays": [],
+        "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
+        "grade": {"preset": "default"},
+        "render": {"width": 90, "height": 160, "fps": 30,
+                   "encoder": "libx264"},
+    }
+    d["reframed_base"] = pl.build_lineage(
+        clip_final=base_path, job_dir=js,
+        source=d["source"], segments=d["segments"],
+        render=d["render"], source_path=src_path)
+    project = validate_project(d)
+
+    def render():
+        coro = pr_mod.render_project(
+            job_id="dur", clip_index=0, project=project,
+            job_dir=js, metadata={},
+            clip_info={"clip_filename": "clip_final_0.mp4"})
+        return _drive(coro)
+
+    return render
+
+
+def test_duration_two_cut_segments_accepts_8s(monkeypatch, tmp_path):
+    """[1,5)+[7,11) cut: 8s timeline accepts 8s base."""
+    from clippyme.domain.project_render import ProjectRenderError
+    render = _duration_setup(
+        monkeypatch, tmp_path,
+        segments=[(1.0, 5.0, "cut"), (7.0, 11.0, "cut")],
+        base_duration=8.0)
+    # Should not raise.
+    result = render()
+    assert os.path.isfile(result.output_path)
+
+
+def test_duration_two_cut_segments_rejects_4s(monkeypatch, tmp_path):
+    """[1,5)+[7,11) cut: 8s timeline rejects 4s (truncated) base."""
+    from clippyme.domain.project_render import ProjectRenderError
+    render = _duration_setup(
+        monkeypatch, tmp_path,
+        segments=[(1.0, 5.0, "cut"), (7.0, 11.0, "cut")],
+        base_duration=4.0)
+    try:
+        render()
+        assert False, "should have raised ProjectRenderError"
+    except ProjectRenderError as e:
+        assert "does not match timeline" in str(e)
+
+
+def test_duration_fade_accepts_layout_total(monkeypatch, tmp_path):
+    """Fade segments: accepts _timeline_layout total."""
+    from clippyme.domain.project_render import _timeline_layout
+    segs = [(0.0, 4.0, "cut"), (4.0, 8.0, "fade")]
+    _, expected = _timeline_layout([
+        {"start": s, "end": e, "transition_in": tr}
+        for s, e, tr in segs])
+    render = _duration_setup(
+        monkeypatch, tmp_path, segments=segs, base_duration=expected)
+    result = render()
+    assert os.path.isfile(result.output_path)
+
+
+def test_duration_fade_rejects_truncated(monkeypatch, tmp_path):
+    """Fade segments: rejects materially truncated base."""
+    from clippyme.domain.project_render import _timeline_layout, ProjectRenderError
+    segs = [(0.0, 4.0, "cut"), (4.0, 8.0, "fade")]
+    _, expected = _timeline_layout([
+        {"start": s, "end": e, "transition_in": tr}
+        for s, e, tr in segs])
+    # Truncated by 2s (beyond tolerance).
+    render = _duration_setup(
+        monkeypatch, tmp_path, segments=segs,
+        base_duration=expected - 2.0)
+    try:
+        render()
+        assert False, "should have raised"
+    except ProjectRenderError as e:
+        assert "does not match timeline" in str(e)

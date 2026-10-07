@@ -36,8 +36,6 @@ import uuid
 
 from clippyme.domain.clip_project import ClipProject, project_to_json
 from clippyme.domain import project_lineage as _pl
-# Backward-compat: tests patch pr_mod.check_lineage_eligible.
-check_lineage_eligible = _pl.check_lineage_eligible
 from clippyme.domain.compose import compose_layers, validate_layer_order
 from clippyme.domain.encode import x264_video_args
 from clippyme.domain.errors import ConflictError, ValidationError
@@ -748,12 +746,11 @@ async def render_project(*, job_id: str, clip_index: int,
                         # Duration must match timeline within tolerance.
                         # Use existing timeline-layout calculation (handles
                         # multiple segments and fade overlaps).
-                        _tl_dur = (lambda segs: __import__(
-                            "clippyme.domain.project_render",
-                            fromlist=["_timeline_layout"])._timeline_layout(
-                            [{"start": float(s.start), "end": float(s.end),
-                              "transition_in": s.transition_in}
-                             for s in segs])[1])(project.segments)
+                        _seg_dicts = [
+                            {"start": float(s.start), "end": float(s.end),
+                             "transition_in": s.transition_in}
+                            for s in project.segments]
+                        _tl_dur = _timeline_layout(_seg_dicts)[1]
                         # Tolerance: 0.5s or 5% of timeline, whichever larger.
                         _dur_tol = max(0.5, _tl_dur * 0.05)
                         if abs(float(_bdur) - _tl_dur) > _dur_tol:
