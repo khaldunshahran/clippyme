@@ -115,6 +115,21 @@
       "warnings": [],
       "width": 320
     },
+    "source:invalid_demo": {
+      "critical": true,
+      "duration": 1.0,
+      "errors": [
+        "output has no audio stream"
+      ],
+      "height": 180,
+      "invocation_error": null,
+      "issues": [
+        "output has no audio stream"
+      ],
+      "ok": false,
+      "warnings": [],
+      "width": 320
+    },
     "source:syn1": {
       "critical": false,
       "duration": 3.0,

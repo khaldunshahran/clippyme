@@ -73,6 +73,12 @@ def main():
             {"id": "syn2", "file": "syn2.mp4", "duration": 3.0,
              "genre": "reaction/comedy", "synthetic": True,
              "fingerprint": sha256(assets / "syn2.mp4")},
+            # Invalid QA demonstration: silent static clip.
+            # Not in any run's source_ids, so excluded from human
+            # editorial metrics; media_checks will flag it.
+            {"id": "invalid_demo", "file": "invalid.mp4", "duration": 1.0,
+             "genre": "interview/podcast", "synthetic": True,
+             "fingerprint": sha256(assets / "invalid.mp4")},
         ],
         "runs": [
             {"run_id": "baseline", "commit": "abc123",

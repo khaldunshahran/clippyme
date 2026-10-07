@@ -227,8 +227,15 @@ def test_generate_demo_clean_checkout(tmp_path):
     assert data["version"] == eb.MANIFEST_VERSION
     assert "media_checks" in data
     assert any(v["ok"] for v in data["media_checks"].values())
+    invalid = [v for k, v in data["media_checks"].items() if "invalid" in k]
+    assert invalid
+    for v in invalid:
+        assert v["invocation_error"] is None
+        assert v["critical"] is True
+        assert any("audio" in i for i in v["issues"])
     text = text_out.read_text()
     assert "baseline" in text and "candidate" in text
+    assert "FAIL" in text
     # Rerun deterministically.
     subprocess.run(
         [sys.executable, str(iso / "generate_demo.py"), str(iso)],

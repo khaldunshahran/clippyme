@@ -17,6 +17,14 @@
       "genre": "reaction/comedy",
       "synthetic": true,
       "fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
+    },
+    {
+      "id": "invalid_demo",
+      "file": "invalid.mp4",
+      "duration": 1.0,
+      "genre": "interview/podcast",
+      "synthetic": true,
+      "fingerprint": "sha256:f5a5530a0cc13cd764049f2137ead5f0bc2818252fb5ca168b16b765e2b7ef87"
     }
   ],
   "runs": [

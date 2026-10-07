@@ -29,6 +29,7 @@ Paired sources:
 Media checks (objective):
   source:syn1: ok
   source:syn2: ok
+  source:invalid_demo: FAIL
   clip:c1: ok
   clip:c2: ok
   clip:c3: ok
