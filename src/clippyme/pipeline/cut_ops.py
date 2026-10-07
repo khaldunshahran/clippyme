@@ -267,7 +267,7 @@ def snap_clip_to_sentences(
     fwd_budget: float = DEFAULT_SENTENCE_FWD,
     pre_pad: float = DEFAULT_PRE_PAD,
     post_pad: float = DEFAULT_POST_PAD,
-    max_duration: float | None = None,
+    max_duration: float = DEFAULT_MAX_CLIP_DURATION,
     source_duration: float | None = None,
     neighbor_start: float | None = None,
     neighbor_end: float | None = None,
@@ -295,11 +295,6 @@ def snap_clip_to_sentences(
     ``"sentence_end"`` (one edge), or ``"word"`` (no sentence snap applied —
     identical to the word-snap input). The path is logged by the caller.
     """
-    if max_duration is None:
-        # Backward compat: fall back to legacy default, but callers
-        # should pass the resolved policy max explicitly.
-        from clippyme.pipeline.duration_policy import resolve_duration_policy
-        max_duration = resolve_duration_policy().max_duration
     onsets, ends = sentence_boundaries(words) if words else ([], [])
 
     # When the transcript has NO sentence terminators at all (unpunctuated
@@ -561,14 +556,70 @@ def compute_neighbor_bounds(raw_intervals, idx):
             max(preceding) if preceding else None)
 
 
+def _enforce_duration_cap(new_start, new_end, words, max_duration,
+                            min_duration=None):
+    """Enforce max_duration after all repair stages, word-safely.
+
+    Returns (final_start, final_end, conflict) where conflict is None
+    on success or a dict describing the unresolved policy conflict.
+
+    - If duration <= max: no change, no conflict.
+    - If duration > max: shrink the end to the latest word boundary
+      at or before start+max (never mid-word). If no such boundary
+      exists (words themselves exceed max), return conflict.
+    - Never truncates arbitrarily at start+max (could cut mid-word).
+    - Already over-limit intervals are not grown; if unchanged, the
+      caller emits a diagnostic.
+    """
+    duration = new_end - new_start
+    if duration <= max_duration:
+        # Check minimum conflict.
+        if min_duration is not None and duration < min_duration:
+            return (new_start, new_end, {
+                "type": "minimum_conflict",
+                "duration": duration,
+                "min_duration": min_duration,
+                "message": (
+                    f"Clip duration {duration:.2f}s below minimum "
+                    f"{min_duration:.2f}s; edges unchanged."
+                ),
+            })
+        return (new_start, new_end, None)
+    # Over max: find latest word end <= start+max.
+    cap = new_start + max_duration
+    best_end = None
+    for w in words:
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if we <= cap and we > new_start:
+            if best_end is None or we > best_end:
+                best_end = we
+    if best_end is not None and best_end > new_start:
+        return (new_start, best_end, None)
+    # No word-safe shrink available: honest conflict.
+    return (new_start, new_end, {
+        "type": "maximum_conflict",
+        "duration": duration,
+        "max_duration": max_duration,
+        "message": (
+            f"Clip duration {duration:.2f}s exceeds maximum "
+            f"{max_duration:.2f}s; no word-safe shrink available."
+        ),
+    })
+
+
 def snap_clips_to_transcript(shorts, words, *, source_duration=None,
                              silences=None, default_reframe_mode="auto",
-                             max_duration=None):
+                             max_duration=None, min_duration=None):
     """Three-stage edge repair for every clip, in place.
 
     ``max_duration`` is the hard limit for optional expansion (sentence,
     silence, waveform). If None, resolved from the shared duration policy.
     Enforced after ALL stages, not just sentence-snap.
+    ``min_duration`` enables minimum-conflict detection; conflicts are
+    surfaced as diagnostics, not silent.
 
     Per clip: word-snap (never open/close mid-word) → sentence-snap (never
     mid-sentence; forward extension clamped by duration cap and time-adjacent
@@ -579,11 +630,14 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
 
     Returns the list of :class:`SnapEvent` for clips whose edges moved.
     """
-    # Resolve max_duration via shared policy if not provided.
-    if max_duration is None:
+    # Resolve via shared policy if not provided.
+    if max_duration is None or min_duration is None:
         from clippyme.pipeline.duration_policy import resolve_duration_policy
-        max_duration = resolve_duration_policy(
-            source_duration=source_duration).max_duration
+        _pol = resolve_duration_policy(source_duration=source_duration)
+        if max_duration is None:
+            max_duration = _pol.max_duration
+        if min_duration is None:
+            min_duration = _pol.min_duration
 
     raw_intervals = []
     for clip in shorts:
@@ -617,8 +671,20 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
             )
             if silence_path != "none":
                 path = f"{path}+{silence_path}"
+        # Enforce duration cap after ALL stages (word, sentence, silence).
+        # Word-safe: shrink to latest word boundary, never mid-word.
+        new_start, new_end, _conflict = _enforce_duration_cap(
+            new_start, new_end, words, max_duration, min_duration)
+        if _conflict is not None:
+            # Surface conflict as diagnostic, even if edges unchanged.
+            clip["duration_conflict"] = _conflict["type"]
+            clip["duration_conflict_detail"] = _conflict["message"]
         if (new_start, new_end) != (raw_start, raw_end):
             clip["start"] = new_start
             clip["end"] = new_end
             events.append(SnapEvent(idx, path, raw_start, raw_end, new_start, new_end))
+        elif "duration_conflict" in clip:
+            # Unchanged edges with conflict: emit diagnostic event.
+            events.append(SnapEvent(idx, "duration_conflict",
+                                    raw_start, raw_end, new_start, new_end))
     return events

@@ -1032,6 +1032,7 @@ if __name__ == '__main__':
                 silences=_silences,
                 default_reframe_mode=args.reframe_mode,
                 max_duration=_policy.max_duration,
+                min_duration=_policy.min_duration,
             ):
                 print(f"   🎯 snap[{_ev.path}]: [{_ev.old_start:.2f},{_ev.old_end:.2f}] "
                       f"→ [{_ev.new_start:.2f},{_ev.new_end:.2f}]")

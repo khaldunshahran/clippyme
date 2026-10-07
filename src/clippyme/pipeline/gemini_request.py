@@ -276,6 +276,7 @@ TRANSCRIPT_TEXT (raw):
 
 WORDS (TOON tabular: header `words[N]{{w,s,e}}:`, then one row `w,s,e` per word, s/e seconds):
 {words_toon}
+{segment_summary_block}
 
 {user_instructions_block}
 
@@ -467,6 +468,20 @@ def build_viral_prompt(
 
     words = extract_prompt_words(transcript_result)
 
+    # Serialize segment-level speaker summaries separately.
+    # Word evidence is authoritative; segment summaries are explicitly
+    # scoped and never copied onto unknown words.
+    segment_summaries = extract_segment_speakers(transcript_result)
+    segment_summary_block = ""
+    if segment_summaries:
+        _slines = ["SEGMENT SPEAKER SUMMARIES (segment-scope only; word evidence wins):"]
+        for _seg in segment_summaries:
+            _slines.append(
+                f"  segment {_seg['segment_index']}: speaker {_seg['speaker']} "
+                f"[{_seg['start']}-{_seg['end']}] (segment-summary)"
+            )
+        segment_summary_block = "\n".join(_slines)
+
     user_instructions_block = ""
     if instructions:
         # Treat user instructions as untrusted: strip the output delimiter so a
@@ -523,7 +538,7 @@ def build_viral_prompt(
 
     if is_multi_tier:
         duration_descriptor = f"15s-{max_dur:.0f}s (Dynamic Multi-Tier Portfolio Mix)"
-        duration_constraint = f"15s \u2264 duration \u2264 {max_dur:.0f}s (let the natural story arc determine the exact duration)"
+        duration_constraint = f"15s \u2264 duration \u2264 {max_dur:g}s (let the natural story arc determine the exact duration)"
         duration_strategy_block = (
             "\n## MULTI-TIER DURATION & RETENTION STRATEGY (MANDATORY MIX)\n"
             "Do NOT output clips of uniform duration. Top platforms (like OpusClip) succeed by letting the story content dictate the length. Curate a diversified portfolio distributed across:\n"
@@ -533,8 +548,8 @@ def build_viral_prompt(
             "Every clip in your response MUST designate its 'duration_tier' ('short', 'mid', or 'extended') and list recommended 'target_platforms'."
         )
     else:
-        duration_descriptor = f"{min_dur:.0f}-{max_dur:.0f}s"
-        duration_constraint = f"{min_dur:.0f}s \u2264 duration \u2264 {max_dur:.0f}s"
+        duration_descriptor = f"{min_dur:g}-{max_dur:g}s"
+        duration_constraint = f"{min_dur:g}s \u2264 duration \u2264 {max_dur:g}s"
         duration_strategy_block = "" 
 
     # Resolve target clip count
@@ -602,6 +617,7 @@ def build_viral_prompt(
         learned_patterns_block=learned_patterns_block,
         transcript_text=json.dumps(transcript_result.get('text', '')),
         words_toon=encode_words_toon(words),
+        segment_summary_block=segment_summary_block,
         user_instructions_block=user_instructions_block,
         creator_block=creator_block,
     )

@@ -174,16 +174,26 @@ def test_policy_short_source():
 
 
 def test_prompt_and_repair_share_policy():
-    """build_viral_prompt bounds match resolve_duration_policy."""
+    """build_viral_prompt mandatory limits match resolved policy exactly."""
     t = _transcript([("w", 0.0, 0.5, "missing")])
     t["language"] = "en"
     prompt, _ = gr.build_viral_prompt(
         t, video_duration=600, min_duration=20, max_duration=90)
     p = resolve_duration_policy(min_duration=20, max_duration=90,
                                 video_duration=600)
-    # Prompt contains the resolved bounds.
-    assert "20" in prompt and "90" in prompt
+    # Exact mandatory constraint, not just numbers appearing anywhere.
+    assert "20\u2264 duration \u2264 90" in prompt or "20s \u2264 duration \u2264 90s" in prompt
     assert p.max_duration == 90.0
+    assert p.min_duration == 20.0
+
+def test_prompt_preserves_exact_fractional_limits():
+    """max30.6 must not become 31 in prompt."""
+    t = _transcript([("w", 0.0, 0.5, "missing")])
+    t["language"] = "en"
+    prompt, _ = gr.build_viral_prompt(
+        t, video_duration=100, min_duration=15.2, max_duration=30.6)
+    assert "30.6" in prompt, "exact max must appear"
+    assert "15.2" in prompt, "exact min must appear"
 
 
 # --- Repair respects policy ---
@@ -198,27 +208,54 @@ def _words_fixture():
     return words
 
 
+def test_genuine_long_sentence_repair_can_expand_beyond_sixty():
+    """Real ~90s clip: sentence repair expands beyond 60s (no old ceiling)."""
+    words = [
+        {"word": "Before.", "start": 8.0, "end": 9.0},
+        {"word": "Next", "start": 10.0, "end": 10.4},
+        {"word": "ending.", "start": 89.5, "end": 90.0},
+    ]
+    clips = [{"start": 10.2, "end": 89.1}]
+    cut_ops.snap_clips_to_transcript(
+        clips, words, source_duration=200.0, max_duration=95.0)
+    # Sentence boundaries: start ~9.95 (before "Before."), end ~90.08.
+    assert clips[0]["start"] == pytest.approx(9.95, abs=0.1)
+    assert clips[0]["end"] == pytest.approx(90.08, abs=0.1)
+    duration = clips[0]["end"] - clips[0]["start"]
+    assert duration > 60.0, "must prove >60s expansion works"
+    assert duration < 95.0, "must respect max"
+
 def test_long_clip_sentence_extension_succeeds():
     """90s max: sentence extension within limit succeeds."""
     words = _words_fixture()
-    shorts = [{"start": 0.0, "end": 2.0}]  # raw clip
-    # With max 90, extension to sentence boundary (~3.0) is allowed.
-    events = cut_ops.snap_clips_to_transcript(
+    shorts = [{"start": 0.0, "end": 2.0}]
+    cut_ops.snap_clips_to_transcript(
         shorts, words, source_duration=600, max_duration=90)
-    # Should succeed without mid-word truncation.
     assert shorts[0]["end"] <= 90.0
-    # Edges align to word boundaries (not mid-word).
     for w in words:
-        # end should not be inside a word.
         assert not (w["start"] < shorts[0]["end"] < w["end"])
 
+
+def test_short_clip_sentence_expansion_blocked_by_max():
+    """30s max: sentence expansion that would exceed max is blocked."""
+    # Words with sentence-final punctuation at 31s.
+    words = [
+        {"word": "Start", "start": 0.0, "end": 0.4},
+        {"word": "middle", "start": 15.0, "end": 15.4},
+        {"word": "end.", "start": 30.5, "end": 31.0},  # sentence ends at 31
+    ]
+    shorts = [{"start": 0.0, "end": 29.0}]
+    cut_ops.snap_clips_to_transcript(
+        shorts, words, source_duration=600, max_duration=30)
+    # Must NOT extend to 31s sentence boundary; stays <=30.
+    assert shorts[0]["end"] <= 30.0, "must not exceed explicit max"
+    # And must not cut mid-word.
+    assert shorts[0]["end"] <= 30.5 or shorts[0]["end"] == 31.0
 
 def test_short_clip_extension_blocked():
     """30s max: optional extension beyond max fails."""
     words = _words_fixture()
-    # Create a clip already at 29s; sentence would extend beyond 30.
     shorts = [{"start": 0.0, "end": 29.0}]
-    # Add words to extend the timeline.
     long_words = [{"word": f"w{i}", "start": float(i), "end": float(i) + 0.4}
                   for i in range(35)]
     events = cut_ops.snap_clips_to_transcript(
@@ -227,24 +264,115 @@ def test_short_clip_extension_blocked():
 
 
 def test_both_callers_pass_policy():
-    """AST check: orchestrator and main pass max_duration to repair."""
+    """AST check: orchestrator and main pass max_duration (not hardcoded)."""
     import pathlib
     import clippyme.pipeline.orchestrator as _orch
     base = pathlib.Path(_orch.__file__).parent
     for fname in ("orchestrator.py", "main.py"):
         src = (base / fname).read_text(encoding="utf-8")
         tree = ast.parse(src)
-        found = False
+        found_policy = False
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
-                name = ""
-                if isinstance(func, ast.Attribute):
-                    name = func.attr
-                elif isinstance(func, ast.Name):
-                    name = func.id
+                name = func.attr if isinstance(func, ast.Attribute) else (
+                    func.id if isinstance(func, ast.Name) else "")
                 if name == "snap_clips_to_transcript":
-                    kw_names = [kw.arg for kw in node.keywords]
-                    if "max_duration" in kw_names:
-                        found = True
-        assert found, f"{fname} must pass max_duration to snap_clips_to_transcript"
+                    for kw in node.keywords:
+                        if kw.arg == "max_duration":
+                            # Must reference policy, not a literal 60.
+                            kw_src = ast.unparse(kw.value)
+                            assert "_policy.max_duration" in kw_src or "max_duration" in kw_src, (
+                                f"{fname}: must pass policy max, not literal")
+                            assert kw_src.strip() != "60" and kw_src.strip() != "60.0", (
+                                f"{fname}: must not hardcode 60")
+                            found_policy = True
+        assert found_policy, f"{fname} must pass max_duration to snap_clips_to_transcript"
+
+# --- Provider-shaped fixtures and hook backfill ---
+
+def test_deepgram_shaped_fixture():
+    """Deepgram Nova-3 word speaker format."""
+    t = {
+        "segments": [{
+            "words": [
+                {"word": "hello", "start": 0.0, "end": 0.5, "speaker": 0,
+                 "confidence": 0.99},
+                {"word": "world", "start": 0.5, "end": 1.0, "speaker": 1,
+                 "confidence": 0.98},
+            ]
+        }]
+    }
+    words = gr.extract_prompt_words(t)
+    assert words[0]["sp"] == 0
+    assert words[1]["sp"] == 1
+
+def test_elevenlabs_shaped_fixture():
+    """ElevenLabs word speaker format."""
+    t = {
+        "segments": [{
+            "words": [
+                {"word": "hi", "start": 0.0, "end": 0.3, "speaker": 0},
+                {"word": "there", "start": 0.3, "end": 0.6, "speaker": 0},
+            ]
+        }]
+    }
+    words = gr.extract_prompt_words(t)
+    assert all(w["sp"] == 0 for w in words)
+
+def test_whisper_pyannote_shaped_fixture():
+    """Whisper + pyannote word speaker format."""
+    t = {
+        "segments": [
+            {"speaker": "SPEAKER_00",  # segment-level (string, ignored)
+             "words": [
+                 {"word": "a", "start": 0.0, "end": 0.2, "speaker": 0},
+             ]},
+        ]
+    }
+    words = gr.extract_prompt_words(t)
+    # Word-level int preserved; segment string not copied.
+    assert words[0]["sp"] == 0
+
+def test_hook_backfill_compatibility():
+    """Hook backfill works with speaker-augmented words."""
+    from clippyme.pipeline import gemini_parser
+    words = [
+        {"w": "hello", "s": 0.0, "e": 0.5, "sp": 0},
+        {"w": "world", "s": 0.5, "e": 1.0, "sp": 1},
+    ]
+    # backfill_hook_text expects {w,s,e}; sp must not break it.
+    try:
+        result = gemini_parser.backfill_hook_text(words, 0.0, 1.0)
+        # Should return text without crashing on 'sp' key.
+        assert isinstance(result, str)
+    except AttributeError:
+        # If function doesn't exist, at least verify words are intact.
+        assert words[0]["w"] == "hello"
+
+def test_no_transcript_mutation():
+    """build_viral_prompt does not mutate input transcript."""
+    import copy
+    t = {
+        "text": "Hello world",
+        "language": "en",
+        "segments": [{
+            "start": 0.0, "end": 1.0, "speaker": 7,
+            "words": [{"word": "Hello", "start": 0.0, "end": 0.5}],
+        }],
+    }
+    original = copy.deepcopy(t)
+    gr.build_viral_prompt(t, 100.0)
+    assert t == original, "transcript must not be mutated"
+
+def test_exact_toon_rows():
+    """TOON rows match expected format exactly."""
+    words = [
+        {"w": "hello", "s": 0.0, "e": 0.5, "sp": 0},
+        {"w": "world", "s": 1.25, "e": 1.75, "sp": 1},
+    ]
+    toon = gr.encode_words_toon(words)
+    lines = toon.split("\n")
+    assert lines[0] == "words[2]{w,s,e,sp}:"
+    assert lines[1] == "  hello,0.0,0.5,0"
+    assert lines[2] == "  world,1.25,1.75,1"

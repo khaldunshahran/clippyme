@@ -88,13 +88,27 @@ def resolve_duration_policy(
     )
 
     if is_multi_tier:
-        min_dur = 15.0
-        # Multi-tier allows up to 300s, bounded by source.
-        max_dur = min(src_dur if src_dur else 300.0, 300.0)
-        if max_dur < 30.0:
-            max_dur = max(min_dur + 10.0, src_dur if src_dur else 30.0)
         mode = "multi-tier"
-        max_clamped = src_dur is not None and max_dur < 300.0
+        max_clamped = False
+        if src_dur is not None:
+            # Short source: bounds must satisfy 0 < min <= max <= source.
+            # Use source length directly; don't demand unavailable tiers.
+            if src_dur < 15.0:
+                min_dur = min(5.0, src_dur / 2.0)
+                max_dur = src_dur
+            elif src_dur < 30.0:
+                min_dur = 10.0
+                max_dur = src_dur
+            else:
+                min_dur = 15.0
+                max_dur = min(src_dur, 300.0)
+                max_clamped = max_dur < 300.0
+            # Ensure min <= max.
+            if min_dur > max_dur:
+                min_dur = max_dur / 2.0
+        else:
+            min_dur = 15.0
+            max_dur = 300.0
     else:
         min_dur = explicit_min or 15.0
         max_dur = explicit_max or 120.0

@@ -625,6 +625,7 @@ def _load_or_analyze(
             silences=silences,
             default_reframe_mode=args.reframe_mode,
             max_duration=_policy.max_duration,
+            min_duration=_policy.min_duration,
         ):
             print(
                 f"🎯 snap[{event.path}]: [{event.old_start:.2f},{event.old_end:.2f}] "
