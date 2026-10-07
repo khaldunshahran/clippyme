@@ -563,3 +563,71 @@ def test_queued_minimum_conflict_observable(tmp_path, monkeypatch, capsys):
     assert (clip["end"] - clip["start"] >= 30.0
             or "conflict" in text
             or any("duration" in k or "conflict" in k for k in clip))
+
+def test_direct_cli_forwards_policy_values_with_spy(monkeypatch):
+    """Direct CLI passes resolved min/max/source (value spy, not AST)."""
+    from types import SimpleNamespace
+    from clippyme.pipeline import cut_ops
+    # Spy on snap_clips_to_transcript.
+    calls = []
+    orig = cut_ops.snap_clips_to_transcript
+    def spy(shorts, words, **kwargs):
+        calls.append(kwargs)
+        return orig(shorts, words, **kwargs)
+    monkeypatch.setattr(cut_ops, "snap_clips_to_transcript", spy)
+    # Simulate direct CLI repair block with policy.
+    from clippyme.pipeline.duration_policy import resolve_duration_policy
+    policy = resolve_duration_policy(
+        min_duration=20.0, max_duration=45.0, video_duration=100.0)
+    words = [{"word": "hi", "start": 0.0, "end": 0.5}]
+    shorts = [{"start": 0.0, "end": 10.0}]
+    # This mirrors the main.py repair block.
+    cut_ops.snap_clips_to_transcript(
+        shorts, words,
+        source_duration=100.0,
+        silences=None,
+        default_reframe_mode="auto",
+        max_duration=policy.max_duration,
+        min_duration=policy.min_duration,
+    )
+    assert calls, "repair must be called"
+    assert calls[0]["max_duration"] == 45.0
+    assert calls[0]["min_duration"] == 20.0
+    assert calls[0]["source_duration"] == 100.0
+
+def test_queued_caller_spies_policy_values(tmp_path, monkeypatch):
+    """Queued caller passes actual policy values (spy, not just duration)."""
+    from types import SimpleNamespace
+    from clippyme.pipeline import orchestrator as orch, cut_ops
+    calls = []
+    orig = cut_ops.snap_clips_to_transcript
+    def spy(shorts, words, **kwargs):
+        calls.append(dict(kwargs))
+        return orig(shorts, words, **kwargs)
+    monkeypatch.setattr(cut_ops, "snap_clips_to_transcript", spy)
+    transcript = {"segments": [{"words": [
+        {"word": "hi", "start": 0.0, "end": 0.5},
+    ]}]}
+    args = SimpleNamespace(
+        min_duration=25.0, max_duration=50.0, duration_mode=None,
+        clip_type=None, reframe_mode="auto", skip_analysis=False,
+        monitor=False, instructions=None, min_clips=None, max_clips=None,
+        aspect="9:16", caption_style_default=None)
+    class State:
+        def artifact(self, *a): return None
+        def completed(self, *a): return False
+        def start(self, *a): pass
+        def consume_steering(self): return []
+        def set_clip_total(self, *a): pass
+        def complete_stage(self, *a, **k): pass
+    legacy = SimpleNamespace(
+        get_viral_clips=lambda *a, **k: {"shorts": [{"start": 0.0, "end": 10.0}]})
+    monkeypatch.setenv("CLIPPYME_SILENCE_SNAP", "0")
+    monkeypatch.setenv("CLIPPYME_MAX_CLIPS", "0")
+    orch._load_or_analyze(
+        args, str(tmp_path / "s.mp4"), "source",
+        str(tmp_path), 100.0, transcript, State(), legacy)
+    assert calls, "repair must be called"
+    # Verify actual values, not just that repair ran.
+    assert calls[0]["max_duration"] == 50.0, f"got {calls[0]}"
+    assert calls[0]["min_duration"] == 25.0, f"got {calls[0]}"

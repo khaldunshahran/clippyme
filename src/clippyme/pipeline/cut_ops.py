@@ -556,39 +556,102 @@ def compute_neighbor_bounds(raw_intervals, idx):
             max(preceding) if preceding else None)
 
 
-def _word_safe_interval(start, end, words):
-    """Snap to word boundaries without cutting through any word.
+def _word_safe_interval(start, end, words, source_duration=None,
+                        neighbor_start=None, neighbor_end=None):
+    """Snap to word boundaries with overlap-chain closure.
 
-    Returns (safe_start, safe_end). If no words overlap the interval,
-    returns the original. Ensures boundaries don't split overlapping
-    speech: a boundary is only safe if no word straddles it.
+    A boundary is safe only if no word straddles it. Uses fixed-point
+    iteration: if edge falls inside word B, extend to B's end; if that
+    falls inside C, extend to C's end, etc. Handles chains like
+    A[9,11], B[10.5,12], C[11.5,13] where end=10 must become 13.
+
+    Applies source/neighbor guards to the result: never exceeds
+    source_duration or neighbor bounds. If guards prevent completing
+    a word chain, the interval is clamped and the caller reports
+    the conflict.
+
+    Returns (safe_start, safe_end, guard_conflict) where guard_conflict
+    is None or a dict describing source/neighbor prevention.
     """
-    safe_start, safe_end = start, end
-    # Find first word start >= start (don't cut a word at the beginning).
+    # Collect valid word intervals, sorted by start.
+    intervals = []
     for w in words:
         try:
             ws, we = float(w["start"]), float(w["end"])
+            if we > ws:
+                intervals.append((ws, we))
         except (KeyError, TypeError, ValueError):
             continue
-        if ws <= start < we:
-            # Start is inside this word: move to word start.
-            safe_start = ws
+    intervals.sort()
+
+    def _edge_inside(edge):
+        """Return the word containing edge, or None."""
+        for ws, we in intervals:
+            if ws < edge < we:
+                return (ws, we)
+        return None
+
+    safe_start, safe_end = start, end
+    # Fixed-point: start edge. If inside a word, move to word start.
+    # Then check if new start is inside another word (chain).
+    for _ in range(len(intervals) + 1):
+        hit = _edge_inside(safe_start)
+        if hit is None:
             break
-    # Find last word end <= end (don't cut a word at the end).
-    for w in reversed(words):
-        try:
-            ws, we = float(w["start"]), float(w["end"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if ws < end <= we:
-            # End is inside this word: move to word end.
-            safe_end = we
+        safe_start = hit[0]
+    # Fixed-point: end edge. If inside a word, move to word end.
+    # Chain: new end may be inside another word.
+    for _ in range(len(intervals) + 1):
+        hit = _edge_inside(safe_end)
+        if hit is None:
             break
-    return (safe_start, safe_end)
+        safe_end = hit[1]
+
+    guard_conflict = None
+    # Apply source guard.
+    if source_duration is not None:
+        if safe_end > source_duration:
+            # Clamp; if this cuts a word, report.
+            clamped = source_duration
+            hit = _edge_inside(clamped)
+            if hit is not None:
+                guard_conflict = {
+                    "type": "source_conflict",
+                    "message": (
+                        f"Word chain extends to {safe_end:.2f}s but source "
+                        f"ends at {source_duration:.2f}s; clamped."
+                    ),
+                }
+            safe_end = clamped
+        if safe_start < 0:
+            safe_start = 0.0
+    # Apply neighbor guards.
+    if neighbor_start is not None and safe_start < neighbor_start:
+        safe_start = neighbor_start
+    if neighbor_end is not None and safe_end > neighbor_end:
+        hit = _edge_inside(neighbor_end)
+        if hit is not None:
+            guard_conflict = {
+                "type": "neighbor_conflict",
+                "message": (
+                    f"Word chain extends to {safe_end:.2f}s but neighbor "
+                    f"bounds at {neighbor_end:.2f}s; clamped."
+                ),
+            }
+        safe_end = neighbor_end
+
+    # Ensure valid interval.
+    if safe_end <= safe_start:
+        safe_end = safe_start + 0.01
+
+    return (safe_start, safe_end, guard_conflict)
 
 
 def _enforce_duration_cap(new_start, new_end, words, max_duration,
-                          min_duration=None, baseline=None):
+                          min_duration=None, baseline=None,
+                          source_duration=None,
+                          neighbor_start=None, neighbor_end=None,
+                          baseline_guard=None):
     """Enforce max_duration after all repair stages, preserving content.
 
     Args:
@@ -607,19 +670,40 @@ def _enforce_duration_cap(new_start, new_end, words, max_duration,
         - Never removes selected words to manufacture an in-policy clip.
         - Never truncates arbitrarily at start+max (could cut mid-word).
     """
+    # Validate final proposal for overlapping speech, even when in-budget.
+    # Apply source/neighbor guards to every chosen interval.
+    _vs, _ve, _vguard = _word_safe_interval(
+        new_start, new_end, words,
+        source_duration=source_duration,
+        neighbor_start=neighbor_start, neighbor_end=neighbor_end)
+    if (_vs, _ve) != (new_start, new_end):
+        # Proposal cuts through words: use safe version.
+        new_start, new_end = _vs, _ve
+    # Surface guard conflict if guards prevented word completion.
+    _guard_conflict = _vguard or baseline_guard
     duration = new_end - new_start
-    if duration <= max_duration:
-        # Within max: check minimum.
-        if min_duration is not None and duration < min_duration:
-            return (new_start, new_end, {
+
+    def _check_min(s, e):
+        d = e - s
+        if min_duration is not None and d < min_duration:
+            return {
                 "type": "minimum_conflict",
-                "duration": duration,
+                "duration": d,
                 "min_duration": min_duration,
                 "message": (
-                    f"Clip duration {duration:.2f}s below minimum "
+                    f"Clip duration {d:.2f}s below minimum "
                     f"{min_duration:.2f}s; edges unchanged."
                 ),
-            })
+            }
+        return None
+
+    if duration <= max_duration:
+        # Within max: check minimum, then guard.
+        _min_c = _check_min(new_start, new_end)
+        if _min_c is not None:
+            return (new_start, new_end, _min_c)
+        if _guard_conflict is not None:
+            return (new_start, new_end, _guard_conflict)
         return (new_start, new_end, None)
     # Over max. If we have a baseline (pre-optional), decline the optional
     # moves and revert to it — this preserves selected content.
@@ -628,8 +712,8 @@ def _enforce_duration_cap(new_start, new_end, words, max_duration,
         b_duration = b_end - b_start
         if b_duration <= max_duration:
             # Baseline fits: optional stages caused the overflow.
-            # Revert, preserving content.
-            return (b_start, b_end, None)
+            # Revert, preserving content. Recheck minimum (Gate 2).
+            return (b_start, b_end, _check_min(b_start, b_end))
         # Baseline itself over max: keep it, report honest conflict.
         # Do NOT greedy-shrink to first word (removes payoff/content).
         return (b_start, b_end, {
@@ -702,11 +786,16 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
         word_start, word_end = snap_clip_to_words(
             raw_start, raw_end, words, source_duration=source_duration,
         )
-        # Baseline: word-safe interval from RAW proposal, before ANY
-        # padding/optional stages. Used to decline moves that exceed limits
-        # while preserving selected content.
-        _baseline = _word_safe_interval(raw_start, raw_end, words)
         neighbor_start, neighbor_end = compute_neighbor_bounds(raw_intervals, idx)
+        # Baseline: word-safe interval from RAW proposal, before ANY
+        # padding/optional stages. Overlap-chain closure + source/neighbor
+        # guards applied. Used to decline moves that exceed limits.
+        _baseline, _bl_end, _bl_guard = _word_safe_interval(
+            raw_start, raw_end, words,
+            source_duration=source_duration,
+            neighbor_start=neighbor_start, neighbor_end=neighbor_end)
+        _baseline = (_baseline, _bl_end)
+        _baseline_guard = _bl_guard
         new_start, new_end, path = snap_clip_to_sentences(
             raw_start, raw_end, words,
             word_start=word_start, word_end=word_end,
@@ -727,7 +816,10 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
         # retain baseline with honest conflict if baseline itself over.
         new_start, new_end, _conflict = _enforce_duration_cap(
             new_start, new_end, words, max_duration, min_duration,
-            baseline=_baseline)
+            baseline=_baseline,
+            source_duration=source_duration,
+            neighbor_start=neighbor_start, neighbor_end=neighbor_end,
+            baseline_guard=_baseline_guard)
         if _conflict is not None:
             # Surface conflict as diagnostic, even if edges unchanged.
             clip["duration_conflict"] = _conflict["type"]

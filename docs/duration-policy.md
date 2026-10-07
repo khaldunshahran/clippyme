@@ -41,19 +41,31 @@ Enforced after ALL stages via `_enforce_duration_cap()`:
 - Silence refinement
 - Waveform polish
 
-Word-safe: when over max, shrink to latest word boundary at or before
-`start+max` (never mid-word). Already over-limit intervals are not grown
-for optional reasons.
+Content-preserving fallback (not greedy shrink):
+- Baseline = word-safe interval from RAW proposal, before any optional
+  stages, with overlap-chain closure and source/neighbor guards.
+- If optional stages exceed max: DECLINE them, revert to baseline.
+  Selected words are never removed to manufacture an in-policy clip.
+- If baseline itself exceeds max: retain baseline, report
+  `maximum_conflict` honestly for selection validation.
+- Never truncates arbitrarily at `start+max` (could cut mid-word).
 
-Conflicts are surfaced, not hidden:
-- `maximum_conflict`: duration exceeds max and no word-safe shrink exists.
-- `minimum_conflict`: duration below min after repair.
-- Diagnostics stored as `clip["duration_conflict"]` and emitted as events
-  even when edges don't move. Both callers surface these.
+Overlap safety:
+- `_word_safe_interval()` uses fixed-point iteration through overlapping
+  word chains (e.g. A[9,11], B[10.5,12], C[11.5,13]: end=10 → 13).
+- Every final proposal validated, even when within budget.
+- Source/neighbor guards applied to all baselines, proposals, fallbacks.
+- If guards prevent word completion: clamp and report `source_conflict`
+  or `neighbor_conflict`.
 
-Mandatory word-boundary repair is distinct from optional expansion:
-if an interval cannot preserve words AND meet duration, the conflict is
-signaled honestly (not silent truncation through a word).
+Conflicts surfaced (not hidden):
+- `maximum_conflict`: interval exceeds max; retained with diagnostic.
+- `minimum_conflict`: interval below min after repair (checked after
+  every branch, including baseline fallback).
+- `source_conflict` / `neighbor_conflict`: guards prevented completion.
+- Stored as `clip["duration_conflict"]` + `clip["duration_conflict_detail"]`,
+  emitted as events even when edges don't move. Stale diagnostics cleared
+  each invocation. Both callers surface these in logs/metadata.
 
 ## Short sources
 

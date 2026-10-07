@@ -1,3 +1,4 @@
+﻿import re
 """Host tests for pipeline.gemini_request — the pure request-building half of
 get_viral_clips (which itself lives in the non-host-importable main.py)."""
 import pytest
@@ -325,7 +326,10 @@ def test_build_viral_prompt_multi_tier_duration_mode():
     assert "TIER 1 - SHORTS / REELS" in prompt
     assert "TIER 2 - MID-LENGTH SOCIAL" in prompt
     assert "TIER 3 - EXTENDED DEEP DIVE" in prompt
-    assert "15s ≤ duration ≤ 300s" in prompt
+    m = re.search(r"([\d.eE+-]+)s\s*\u2264 duration \u2264\s*([\d.eE+-]+)s", prompt)
+    assert m, "mandatory duration constraint must be parseable"
+    assert float(m.group(1)) == 15.0
+    assert float(m.group(2)) == 300.0
 
 
 def test_build_viral_prompt_with_audience_intel():

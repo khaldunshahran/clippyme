@@ -539,19 +539,50 @@ def build_viral_prompt(
     if is_multi_tier:
         duration_descriptor = f"{min_dur!r}-{max_dur!r}s (Dynamic Multi-Tier Portfolio Mix)"
         duration_constraint = f"{min_dur!r}s \u2264 duration \u2264 {max_dur!r}s (let the natural story arc determine the exact duration)"
-        # Only demand tier mix if source can actually support the tiers.
-        # Short sources (max < 60s) cannot provide 60-120s or 120-300s clips.
+        # Adapt tiers to resolved bounds. Each tier only included if
+        # its range fits within max_dur.
+        _tiers = []
+        # Tier 1: 20-60s, needs max >= 20.
+        if max_dur >= 20.0:
+            _t1_hi = min(60.0, max_dur)
+            _tiers.append(
+                f"1. TIER 1 - SHORTS / REELS (20s - {_t1_hi:g}s): Fast-paced, "
+                "instant hook in first 0-3s, quick punchy payoff. Perfect for "
+                "rapid-scroll YouTube Shorts / IG Reels.\n")
+        # Tier 2: 60-120s, needs max >= 60.
         if max_dur >= 60.0:
+            _t2_hi = min(120.0, max_dur)
+            _tiers.append(
+                f"2. TIER 2 - MID-LENGTH SOCIAL (60s - {_t2_hi:g}s): Complete "
+                "narrative arc, escalating argument, or storytelling anecdote "
+                "with thorough setup and payoff. Crucial for high-retention "
+                "TikTok watch time and Reels.\n")
+        # Tier 3: 120-300s, needs max >= 120.
+        if max_dur >= 120.0:
+            _t3_hi = min(300.0, max_dur)
+            _tiers.append(
+                f"3. TIER 3 - EXTENDED DEEP DIVE (120s - {_t3_hi:g}s): "
+                "High-value masterclass breakdown, intense debate, or deep "
+                "dramatic story with multiple beats.\n")
+        if len(_tiers) >= 2:
             duration_strategy_block = (
                 "\n## MULTI-TIER DURATION & RETENTION STRATEGY (MANDATORY MIX)\n"
-                "Do NOT output clips of uniform duration. Top platforms (like OpusClip) succeed by letting the story content dictate the length. Curate a diversified portfolio distributed across:\n"
-                "1. TIER 1 - SHORTS / REELS (20s - 60s): Fast-paced, instant hook in first 0-3s, quick punchy payoff. Perfect for rapid-scroll YouTube Shorts / IG Reels.\n"
-                "2. TIER 2 - MID-LENGTH SOCIAL (60s - 120s / 1m - 2m): Complete narrative arc, escalating argument, or storytelling anecdote with thorough setup and payoff. Crucial for high-retention TikTok watch time and Reels.\n"
-                "3. TIER 3 - EXTENDED DEEP DIVE (120s - 300s / 2m - 5m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
-                "Every clip in your response MUST designate its 'duration_tier' ('short', 'mid', or 'extended') and list recommended 'target_platforms'."
+                "Do NOT output clips of uniform duration. Top platforms (like OpusClip) "
+                "succeed by letting the story content dictate the length. "
+                "Curate a diversified portfolio distributed across:\n"
+                + "".join(_tiers) +
+                "Every clip in your response MUST designate its 'duration_tier' "
+                "and list recommended 'target_platforms'."
+            )
+        elif len(_tiers) == 1:
+            # Single available tier: no mandatory mix.
+            duration_strategy_block = (
+                "\n## DURATION STRATEGY (SINGLE TIER)\n"
+                "Select clips within the available tier:\n"
+                + "".join(_tiers)
             )
         else:
-            # Short source: single-tier, no mandatory mix.
+            # Source too short for any tier: single range.
             duration_strategy_block = (
                 "\n## DURATION STRATEGY (SHORT SOURCE)\n"
                 f"Source is {max_dur!r}s. Select clips within the mandatory "
