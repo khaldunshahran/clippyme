@@ -117,7 +117,7 @@ matplotlib==3.11.0
     #   ultralytics
 mdurl==0.1.2
     # via markdown-it-py
-mediapipe==0.10.14
+mediapipe==0.10.35
     # via -r requirements.txt
 ml-dtypes==0.5.4
     # via
