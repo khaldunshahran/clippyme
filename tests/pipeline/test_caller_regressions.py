@@ -1,149 +1,272 @@
-"""Task 01 rev5: caller-level preservation/publication regressions.
+"""Task 01 reference regressions for production caller control flow.
 
-Exercises the actual orchestrator control flow with injected encoder
-outcomes (no real ffmpeg for caller logic; media tests cover the cutter).
-- v3 stamp rejected; queued caller regenerates and writes v4
-- Archived-only v8 preserved through both emission paths
-- Working user project preserved through both emission paths
-- Source mutation rejects publication (queued path)
+Media boundary/content tests live separately. These tests inject the media
+probe, encoder, and CV renderer while retaining the real provenance, metadata,
+project emission, and publication decisions. The direct CLI's exact per-clip
+loop is compiled from its AST so the unavailable CV stack is not imported.
 """
-
+import argparse
+import ast
+import copy
 import json
 import os
-import shutil
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from clippyme.domain.project_render import get_project_path, latest_project_version
 from clippyme.pipeline import orchestrator as orch
+from clippyme.pipeline import project_emit
 from clippyme.pipeline import run_ops as ops
 
 
-@pytest.fixture
-def job_dir(tmp_path):
-    d = tmp_path / "job"
-    d.mkdir()
-    return str(d)
+SOURCE_BYTES = b"source media" * 2000
+OLD_SLICE_BYTES = b"previous source slice" * 2000
+OLD_FINAL_BYTES = b"previous finished clip" * 2000
+NEW_SLICE_BYTES = b"newly encoded source slice" * 2000
+NEW_FINAL_BYTES = b"newly rendered finished clip" * 2000
 
 
-def _write_project(path, version=1, origin="auto", caption_edits=None):
-    data = {
-        "version": version,
-        "origin": origin,
-        "captions": {"edits": caption_edits or {}},
-        "segments": [],
+def _project(**kwargs):
+    """A valid project document, matching the actual emitter's inputs/schema."""
+    return {
+        "schema": "nugget.clip-project/1", "version": 1, "origin": "auto",
+        "job_id": kwargs.get("job_id", "test"), "clip_index": kwargs.get("index", 0),
+        "source": {"file": os.path.basename(kwargs.get("clip_source", "source_clip.mp4")),
+                   "width": 1920, "height": 1080, "duration": 2.0},
+        "segments": [{"id": "seg-1", "start": 0.0, "end": 2.0,
+                      "crop": {"x": 656.0, "y": 0.0, "w": 608.0, "h": 1080.0},
+                      "transition_in": "cut"}],
+        "captions": {"style": "classic_white", "position": "bottom",
+                     "words": [{"id": "w0", "w": "original", "start": 0.1, "end": 0.3}],
+                     "edits": {}},
+        "overlays": [], "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
+        "grade": {"preset": "default"},
+        "render": {"width": 608, "height": 1080, "fps": 30, "encoder": "libx264"},
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
 
 
-def test_queued_regenerates_v3_writes_v4(job_dir):
-    """v3 stamp rejected; caller re-cuts and writes v4."""
-    src = os.path.join(job_dir, "input.mp4")
-    with open(src, "wb") as f:
-        f.write(b"x" * 5000)
-    sl = os.path.join(job_dir, "source_clip.mp4")
-    with open(sl, "wb") as f:
-        f.write(b"y" * 8000)
-
-    # Write a v3 stamp via production writer, then downgrade version
-    fp = ops.source_fingerprint(src)
-    ops.write_slice_provenance(sl, start=0.0, end=2.0, source_fp=fp)
-    sidecar = ops.slice_provenance_path(sl)
-    with open(sidecar, encoding="utf-8") as f:
-        rec = json.load(f)
-    rec["version"] = 3
-    with open(sidecar, "w", encoding="utf-8") as f:
-        json.dump(rec, f)
-
-    # Validator rejects v3
-    assert not ops.slice_provenance_valid(sl, start=0.0, end=2.0, source_path=src)
-
-    # Simulate the queued reuse decision: invalid -> re-cut (mock) -> v4
-    # The actual caller checks slice_provenance_valid before reuse.
-    # Here we prove the contract: after re-cut, v4 validates.
-    with open(sl, "wb") as f:
-        f.write(b"z" * 8000)  # "re-cut"
-    ops.write_slice_provenance(sl, start=0.0, end=2.0, source_fp=fp)
-    assert ops.slice_provenance_valid(sl, start=0.0, end=2.0, source_path=src)
-    with open(sidecar, encoding="utf-8") as f:
-        assert json.load(f)["version"] == 4
+def _write_json(path, value):
+    Path(path).write_text(json.dumps(value), encoding="utf8")
 
 
-def test_archived_v8_preserved_on_resume(job_dir):
-    """Archived-only v8 remains active; no working v1 is created."""
-    from clippyme.domain.project_render import get_project_path
-
-    # Archived v8, no working file
-    archived = os.path.join(job_dir, "clip-project-0.v8.json")
-    _write_project(archived, version=8, origin="user")
-    # Version map points to 8
-    with open(os.path.join(job_dir, "project-versions.json"), "w") as f:
-        json.dump({"0": {"latest": 8}}, f)
-
-    resolved_before = get_project_path(job_dir, 0)
-    assert resolved_before == archived
-
-    # _maybe_emit_clip_project must preserve, not emit new
-    result = orch._maybe_emit_clip_project(
-        output_dir=job_dir, index=0, job_id="test", clip_index=0,
-        clip_source="x.mp4", src_w=1920, src_h=1080, duration=10.0,
-        clips_data={}, render_w=1080, render_h=1920, render_fps=30,
-        overlays=[], words=[],
-    )
-    assert result == archived, "must return the archived v8, not a new file"
-    working = os.path.join(job_dir, "clip-project-0.json")
-    assert not os.path.exists(working), "must not create a working v1"
-    assert get_project_path(job_dir, 0) == archived
+def _downgrade_to_v3(slice_path):
+    sidecar = Path(ops.slice_provenance_path(str(slice_path)))
+    record = json.loads(sidecar.read_text(encoding="utf8"))
+    record["version"] = 3
+    _write_json(sidecar, record)
 
 
-def test_working_user_project_preserved_on_rerender(job_dir):
-    """Working v8 with user edits survives the successful-render path."""
-    working = os.path.join(job_dir, "clip-project-0.json")
-    _write_project(working, version=8, origin="user",
-                   caption_edits={"w3": "edited"})
-    with open(working, "rb") as f:
-        before = f.read()
+class _State:
+    def mark_clip(self, *args):
+        pass
 
-    result = orch._maybe_emit_clip_project(
-        output_dir=job_dir, index=0, job_id="test", clip_index=0,
-        clip_source="x.mp4", src_w=1920, src_h=1080, duration=10.0,
-        clips_data={}, render_w=1080, render_h=1920, render_fps=30,
-        overlays=[], words=[],
-    )
-    assert result == working
-    with open(working, "rb") as f:
-        assert f.read() == before, "working project bytes must be unchanged"
+    def start(self, *args, **kwargs):
+        pass
 
 
-def test_mutation_rejects_publication(job_dir):
-    """Source changed mid-cut: temp discarded, old slice/stamp kept."""
-    src = os.path.join(job_dir, "input.mp4")
-    with open(src, "wb") as f:
-        f.write(b"x" * 5000)
-    sl = os.path.join(job_dir, "source_clip.mp4")
-    with open(sl, "wb") as f:
-        f.write(b"old" * 2000)
-    fp_before = ops.source_fingerprint(src)
-    ops.write_slice_provenance(sl, start=0.0, end=2.0, source_fp=fp_before)
-    with open(ops.slice_provenance_path(sl), "rb") as f:
-        stamp_before = f.read()
+@pytest.fixture
+def queued_job(tmp_path, monkeypatch):
+    root = tmp_path / "job"
+    root.mkdir()
+    source = root / "input.mp4"
+    source.write_bytes(SOURCE_BYTES)
+    sl = root / "source_clip.mp4"
+    sl.write_bytes(OLD_SLICE_BYTES)
+    ops.write_slice_provenance(str(sl), start=0.0, end=2.0,
+                               source_fp=ops.source_fingerprint(str(source)))
+    control = SimpleNamespace(cut_calls=[], render_calls=[], mutate_source=False)
 
-    # Simulate: temp slice produced, then source mutates before swap
-    tmp = sl + ".tmp.mp4"
-    with open(tmp, "wb") as f:
-        f.write(b"new" * 2000)
-    with open(src, "ab") as f:
-        f.write(b"MUTATED")
+    def encode(command, **kwargs):
+        control.cut_calls.append(command)
+        Path(command[-1]).write_bytes(NEW_SLICE_BYTES)
+        if control.mutate_source:
+            source.write_bytes(SOURCE_BYTES + b" changed during encoder run")
+        return SimpleNamespace(returncode=0, stderr=b"")
 
-    # The caller's pre-swap check:
-    if ops.source_fingerprint(src) != fp_before:
-        os.remove(tmp)  # discard temp
-        # old slice + stamp untouched
+    def render(source_path, dest, **kwargs):
+        control.render_calls.append((source_path, dest))
+        Path(dest).write_bytes(NEW_FINAL_BYTES)
+        return True
+
+    def valid_media(path, minimum=1):
+        return bool(path and Path(path).is_file() and Path(path).stat().st_size >= minimum)
+
+    # Keep the actual reuse/publish/project decisions. Only impure outcomes
+    # are injected; using the real emitter means bypassing its guard clobbers
+    # project bytes and makes the preservation assertions fail.
+    monkeypatch.setattr(orch, "_valid_media_file", valid_media)
+    monkeypatch.setattr(orch.subprocess, "run", encode)
+    monkeypatch.setattr(orch, "inspect_clip", lambda *args, **kw: {"critical": False, "warnings": []})
+    monkeypatch.setattr(orch, "validate_cut_output", lambda *args, **kw: (True, ""))
+    monkeypatch.setattr(project_emit, "_build_project", lambda **kw: _project(**kw))
+    legacy = SimpleNamespace(process_video_to_vertical=render,
+                             normalize_audio=lambda *a: None,
+                             select_cover_frame=lambda *a: None)
+    clip = {"start": 0.0, "end": 2.0, "clip_filename": "clip.mp4"}
+    data = {"shorts": [clip], "transcript": {"segments": []}}
+    args = argparse.Namespace(reframe_mode="auto", no_zoom=True, letterbox_zoom=0.0)
+    kwargs = dict(index=0, total=1, clip=clip, input_video=str(source),
+                  video_title="clip", output_dir=str(root),
+                  metadata_file=str(root / "metadata.json"), clips_data=data,
+                  args=args, aspect_ratio=9 / 16, state=_State(), legacy=legacy)
+    return SimpleNamespace(root=root, source=source, sl=sl, final=root / "clip.mp4",
+                           stamp=Path(ops.slice_provenance_path(str(sl))),
+                           control=control, kwargs=kwargs)
+
+
+def test_queued_rejects_v3_regenerates_v4_then_reuses_v4(queued_job):
+    job = queued_job
+    assert ops.slice_provenance_valid(str(job.sl), start=0, end=2, source_path=str(job.source))
+    _downgrade_to_v3(job.sl)
+    assert not ops.slice_provenance_valid(str(job.sl), start=0, end=2, source_path=str(job.source))
+
+    assert orch._render_one_clip(**job.kwargs)
+    assert len(job.control.cut_calls) == 1, "queued caller must regenerate the old contract"
+    assert job.sl.read_bytes() == NEW_SLICE_BYTES
+    assert ops.read_slice_provenance(str(job.sl))["version"] == 4
+    assert ops.slice_provenance_valid(str(job.sl), start=0, end=2, source_path=str(job.source))
+
+    # Force the source-slice reuse path, not the existing-final early return.
+    job.final.unlink()
+    assert orch._render_one_clip(**job.kwargs)
+    assert len(job.control.cut_calls) == 1, "current v4 must be reused, not regenerated"
+    assert len(job.control.render_calls) == 2
+
+
+@pytest.mark.parametrize("completed_final", [False, True], ids=["successful-render", "completed-resume"])
+@pytest.mark.parametrize("project_kind", ["working-v8", "working-origin-user", "working-caption-edit",
+                                         "working-malformed", "archived-v8"])
+def test_queued_preserves_active_project_on_both_paths(queued_job, completed_final, project_kind):
+    job = queued_job
+    if completed_final:
+        job.final.write_bytes(OLD_FINAL_BYTES)
+    working = job.root / "clip-project-0.json"
+    project = _project()
+    if project_kind == "archived-v8":
+        active = job.root / "clip-project-0.v8.json"
+        project.update(version=8, origin="user")
+        _write_json(job.root / "project-versions.json", {"0": {"latest": 8, "versions": {
+            "8": {"version": 8, "project_file": active.name, "origin": "user",
+                  "output_file": "clip.edited_v8.mp4"}}}})
     else:
-        raise AssertionError("mutation must be detected")
+        active = working
+        if project_kind == "working-v8":
+            project.update(version=8, origin="user")
+        elif project_kind == "working-origin-user":
+            project["origin"] = "user"
+        elif project_kind == "working-caption-edit":
+            project["captions"]["edits"] = {"w0": "user correction"}
+    if project_kind == "working-malformed":
+        active.write_text("malformed existing user file{", encoding="utf8")
+    else:
+        _write_json(active, project)
+    before = active.read_bytes()
+    assert get_project_path(str(job.root), 0) == str(active)
 
-    assert not os.path.exists(tmp)
-    with open(sl, "rb") as f:
-        assert f.read() == b"old" * 2000
-    with open(ops.slice_provenance_path(sl), "rb") as f:
-        assert f.read() == stamp_before
+    assert orch._render_one_clip(**job.kwargs)
+    assert active.read_bytes() == before
+    assert get_project_path(str(job.root), 0) == str(active)
+    assert len(job.control.cut_calls) == 0
+    assert len(job.control.render_calls) == (0 if completed_final else 1)
+    if project_kind == "archived-v8":
+        assert not working.exists(), "a new default would hide the active archived edit"
+        assert latest_project_version(str(job.root), 0) == 8
+        assert json.loads(active.read_text(encoding="utf8"))["version"] == 8
+
+
+def test_queued_source_mutation_rejects_before_publication(queued_job):
+    job = queued_job
+    _downgrade_to_v3(job.sl)  # Require a cut while retaining the old valid media.
+    old_slice, old_stamp = job.sl.read_bytes(), job.stamp.read_bytes()
+    job.control.mutate_source = True
+    with pytest.raises(RuntimeError, match="source changed during cut"):
+        orch._render_one_clip(**job.kwargs)
+    assert len(job.control.cut_calls) == 1
+    assert len(job.control.render_calls) == 0
+    assert job.sl.read_bytes() == old_slice
+    assert job.stamp.read_bytes() == old_stamp
+    assert not Path(str(job.sl) + ".tmp.mp4").exists()
+    assert not job.final.exists()
+
+
+@pytest.fixture(scope="module")
+def direct_clip_loop():
+    main_path = Path(orch.__file__).with_name("main.py")
+    tree = ast.parse(main_path.read_text(encoding="utf8"))
+    loops = [node for node in ast.walk(tree) if isinstance(node, ast.For)
+             and ast.unparse(node.iter) == "enumerate(clips_data['shorts'])"]
+    assert len(loops) == 1, "locate the actual legacy CLI loop, not a copied implementation"
+    return compile(ast.Module(body=[loops[0]], type_ignores=[]), str(main_path), "exec")
+
+
+@pytest.mark.parametrize("mode", ["source-mutation", "render-failure", "render-invalid", "render-success"])
+def test_direct_cli_publication_preserves_previous_artifacts(tmp_path, direct_clip_loop, mode):
+    source = tmp_path / "input.mp4"
+    sl = tmp_path / "source_clip_clip_1.mp4"
+    final = tmp_path / "clip_clip_1.mp4"
+    source.write_bytes(SOURCE_BYTES)
+    sl.write_bytes(OLD_SLICE_BYTES)
+    final.write_bytes(OLD_FINAL_BYTES)
+    ops.write_slice_provenance(str(sl), start=0, end=2,
+                               source_fp=ops.source_fingerprint(str(source)))
+    stamp = Path(ops.slice_provenance_path(str(sl)))
+    old_stamp = stamp.read_bytes()
+    renders, normalizations, covers = [], [], []
+
+    def encode(command, **kwargs):
+        Path(command[-1]).write_bytes(NEW_SLICE_BYTES)
+        if mode == "source-mutation":
+            source.write_bytes(SOURCE_BYTES + b" changed during encoder run")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    def render(source_path, output_path, **kwargs):
+        renders.append(output_path)
+        Path(output_path).write_bytes(NEW_FINAL_BYTES)
+        return mode != "render-failure"
+
+    def validate(path, duration):
+        if mode == "render-invalid" and path.endswith(".render.tmp.mp4"):
+            return False, "injected invalid successful render"
+        return True, ""
+
+    # This is the exact direct caller AST with small injected dependencies.
+    # Removing its fingerprint check, stable-to-temp routing, validation, or
+    # replace-on-success gate changes the observed artifacts below.
+    import subprocess
+    subprocess_stub = SimpleNamespace(run=encode, DEVNULL=subprocess.DEVNULL,
+                                      PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
+    clip = {"start": 0.0, "end": 2.0}
+    env = dict(os=os, json=json, subprocess=subprocess_stub, clips_data={"shorts": [clip]},
+               video_title="clip", output_dir=str(tmp_path), input_video=str(source),
+               metadata_tmp=str(tmp_path / "metadata.json.tmp"),
+               metadata_file=str(tmp_path / "metadata.json"),
+               args=argparse.Namespace(reframe_mode="auto", no_zoom=True),
+               aspect_ratio=9 / 16, letterbox_zoom=0,
+               clip_output_basename=ops.clip_output_basename,
+               source_fingerprint=ops.source_fingerprint,
+               build_cut_command=ops.build_cut_command,
+               write_slice_provenance=ops.write_slice_provenance,
+               validate_cut_output=validate, process_video_to_vertical=render,
+               normalize_audio=lambda path: normalizations.append(path),
+               select_cover_frame=lambda path: covers.append(path))
+    exec(direct_clip_loop, env)
+
+    if mode == "source-mutation":
+        assert renders == []
+        assert sl.read_bytes() == OLD_SLICE_BYTES
+        assert stamp.read_bytes() == old_stamp
+        assert not Path(str(sl) + ".tmp.mp4").exists()
+    else:
+        assert renders == [str(final) + ".render.tmp.mp4"]
+        assert sl.read_bytes() == NEW_SLICE_BYTES
+    if mode == "render-success":
+        assert final.read_bytes() == NEW_FINAL_BYTES
+        assert normalizations == [str(final)]
+        assert covers == [str(final)]
+    else:
+        assert final.read_bytes() == OLD_FINAL_BYTES
+        assert normalizations == covers == []
+    if mode == "render-invalid":
+        assert not Path(str(final) + ".render.tmp.mp4").exists()
