@@ -380,11 +380,17 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
 
 
 def _enable_suffix(enable_end, enable_start=None):
-    """Return an ffmpeg overlay enable clause, or an empty string."""
+    """Return an ffmpeg overlay enable clause, or an empty string.
+
+    Explicit timing uses half-open [start, end). FFmpeg between() is
+    inclusive, so explicit intervals use gte(t,start)*lt(t,end).
+    Legacy (enable_start=None) keeps between(t,0,end).
+    """
     if enable_end is None:
         return ""
-    _s = 0 if enable_start is None else enable_start
-    return f":enable='between(t,{_s},{enable_end})'"
+    if enable_start is None:
+        return f":enable='between(t,0,{enable_end})'"
+    return f":enable='gte(t,{enable_start})*lt(t,{enable_end})'"
 
 
 def build_hook_overlay_filter(x, y0, animate=False, dur=0.4, slide_px=40, enable_end=None, enable_start=None, anim_start=None):
@@ -443,30 +449,26 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
     # PID + basename was not unique inside one backend process: two concurrent
     # jobs commonly both render `clip_1.mp4` and could overwrite/delete each
     # other's hook PNG. mkstemp provides an exclusive path for every render.
-    fd, hook_filename = tempfile.mkstemp(prefix="clippyme-hook-", suffix=".png")
-    os.close(fd)
-
-    # Task 06: inactive hook (zero/outside interval).
+    # Task 06 rev2: inactive hook before PNG allocation (no leak).
     if hook_inactive:
         if logo and logo.get("path") and os.path.exists(logo["path"]):
-            # Apply logo only (no hook). Use a simple overlay.
-            from clippyme.domain.logo import logo_filter_chain
+            from clippyme.domain.logo import (
+                DEFAULT_POSITION, logo_filter_chain)
             try:
                 _dims = subprocess.check_output(
                     ["ffprobe", "-v", "error", "-show_entries",
-                     "stream=width,height", "-of", "csv=s=x:p=0", video_path],
+                     "stream=width,height", "-of", "csv=s=x:p=0",
+                     video_path],
                     timeout=30).decode().strip().split("\n")[0].split("x")
-                _vw, _vh = int(_dims[0]), int(_dims[1])
+                _vw = int(_dims[0])
             except Exception:
-                _vw, _vh = 1080, 1920
-            from clippyme.domain.logo import DEFAULT_POSITION
+                _vw = 1080
             _chain, _lx, _ly = logo_filter_chain(
                 _vw, scale=logo.get("scale", 0.18),
                 opacity=logo.get("opacity", 1.0),
                 margin=logo.get("margin", 0.04),
                 position=logo.get("position", DEFAULT_POSITION))
-            _fc = f"[0:v][1:v]{_chain}[lg];[0:v][lg]overlay={_lx}:{_ly}"
-            # Note: logo input is [1:v] here (no hook image).
+            _fc = f"[1:v]{_chain}[lg];[0:v][lg]overlay={_lx}:{_ly}"
             subprocess.run(
                 ["ffmpeg", "-y", "-i", video_path, "-i", logo["path"],
                  "-filter_complex", _fc, "-c:a", "copy",
@@ -475,10 +477,12 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
                 stderr=subprocess.PIPE, timeout=ffmpeg_timeout())
             return True
         else:
-            # No hook, no logo: copy through.
             import shutil
             shutil.copy(video_path, output_path)
             return True
+
+    fd, hook_filename = tempfile.mkstemp(prefix="clippyme-hook-", suffix=".png")
+    os.close(fd)
 
     try:
         img_path, box_w, box_h = create_hook_image(

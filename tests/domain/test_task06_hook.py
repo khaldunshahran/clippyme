@@ -90,7 +90,9 @@ def hook_job(tmp_path):
 
 
 def _project_with_hook(js, hook_start, hook_end, animate=False):
-    style = "viral_animate" if animate else "viral"
+    # Note: animate flag is set via hook_params, not style name.
+    # This helper is for static hooks; animation tested directly.
+    style = "viral"
     return {
         "schema": "nugget.clip-project/1",
         "job_id": "hooktest", "clip_index": 0,
@@ -190,27 +192,45 @@ def test_hook_interval_respected(monkeypatch, hook_job, start, end):
 
 
 def test_delayed_animation_relative_to_start(monkeypatch, hook_job):
-    """Animated hook: fade starts at hook_start, not t=0."""
+    """Animated hook with REAL animate flag: fade starts at hook_start.
+
+    Uses style={"animate": True} (not a style name) so the existing
+    animate flag is genuinely enabled. Verifies via spy that animation
+    was requested, and via pixels that the delayed hook appears.
+    """
+    from clippyme.domain import hooks as hk_mod
     monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
-    js, src = hook_job
-    d = _project_with_hook(js, 2.0, 5.0, animate=True)
+    js, src_path = hook_job
 
     async def inline_thread(func, *args, **kwargs):
         return func(*args, **kwargs)
     monkeypatch.setattr(asyncio, "to_thread", inline_thread)
 
-    project = validate_project(d)
-    coro = pr.render_project(
-        job_id="hooktest", clip_index=0, project=project,
-        job_dir=js, metadata={}, clip_info={})
-    result = _drive(coro)
-    out = result.output_path
+    # Spy to verify animate=True reaches add_hook_to_video.
+    styles = []
+    original = hk_mod.add_hook_to_video
+    def spy(*a, **kw):
+        style = kw.get("style", a[6] if len(a) > 6 else None)
+        styles.append(bool((style or {}).get("animate")))
+        return original(*a, **kw)
+    monkeypatch.setattr(hk_mod, "add_hook_to_video", spy)
 
-    # At t=0.5 (before hook): no hook.
+    # Direct _apply_hook with real animate flag and delayed timing.
+    from clippyme.domain import compose as comp_mod
+    coro = comp_mod._apply_hook(
+        src_path, js, 0,
+        {"text": "ANIM", "animate": True,
+         "hook_start": 2.0, "hook_end": 5.0},
+        [], timeline_duration=6.0)
+    out = _drive(coro)
+
+    assert styles and all(styles), "animation flag not enabled"
+    # Before start: no hook.
     assert not _hook_visible(out, 0.5)
-    # At t=2.5 (just after start, during fade-in): hook appearing.
-    # At t=4.0 (well after start): fully visible.
+    # After start: hook visible (animation completed).
     assert _hook_visible(out, 4.0)
+    # At exclusive end: no hook.
+    assert not _hook_visible(out, 5.0)
 
 
 def test_legacy_no_timing_uses_default(monkeypatch, hook_job):
@@ -240,3 +260,202 @@ def test_invalid_timing_rejected(monkeypatch, hook_job):
         # We test the helper directly since model blocks invalid.
         with pytest.raises(ht.HookTimingError):
             ht.validate_hook_interval(bad_start, bad_end)
+
+
+# --- Extended coverage (review item 5) ---
+
+def test_fused_logo_independent_of_hook_window(monkeypatch, hook_job, tmp_path):
+    """Fused logo visible before, during, and after hook interval."""
+    from clippyme.domain import hooks as hk_mod
+    from clippyme.domain import compose as comp_mod
+    from PIL import Image
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    # Green logo.
+    logo_path = os.path.join(js, "logo.png")
+    Image.new("RGBA", (20, 20), (0, 255, 0, 255)).save(logo_path)
+    monkeypatch.setattr(comp_mod, "LOGO_PATH", logo_path, raising=False)
+
+    # Deterministic red hook image.
+    def red_image(text, width, output_path, **kw):
+        Image.new("RGBA", (40, 24), (255, 0, 0, 255)).save(output_path)
+        return output_path, 40, 24
+    monkeypatch.setattr(hk_mod, "create_hook_image", red_image)
+
+    coro = comp_mod._apply_hook(
+        src_path, js, 0,
+        {"text": "hook", "hook_start": 2.0, "hook_end": 4.0},
+        [], logo_params={"scale": 0.1},
+        timeline_duration=6.0)
+    out = _drive(coro)
+
+    def has_green(path, t):
+        import numpy as np
+        rgb = _run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                    "-frames:v", "1", "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "-"])
+        arr = np.frombuffer(rgb, dtype=np.uint8).reshape(180, 320, 3)
+        # Logo is 20x20 green; sample whole frame for green pixels.
+        # (Position varies by DEFAULT_POSITION; be robust.)
+        green = ((arr[:, :, 1] > 150) &
+                 (arr[:, :, 0] < 100) &
+                 (arr[:, :, 2] < 100)).sum()
+        return green > 50
+
+    def has_red(path, t):
+        import numpy as np
+        rgb = _run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                    "-frames:v", "1", "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "-"])
+        arr = np.frombuffer(rgb, dtype=np.uint8).reshape(180, 320, 3)
+        region = arr[30:120, 80:240]
+        red = ((region[:, :, 0] > 150) &
+               (region[:, :, 1] < 100)).sum()
+        return red > 50
+
+    # Logo visible at all times (before/during/after hook).
+    assert has_green(out, 0.5), "logo not visible before hook"
+    assert has_green(out, 3.0), "logo not visible during hook"
+    assert has_green(out, 5.0), "logo not visible after hook"
+    # Hook only during [2,4).
+    assert not has_red(out, 0.5), "hook visible before start"
+    assert has_red(out, 3.0), "hook not visible during interval"
+    assert not has_red(out, 5.0), "hook visible after end"
+
+
+def test_inactive_interval_no_hook(monkeypatch, hook_job):
+    """Zero-length and outside intervals produce no hook."""
+    from clippyme.domain import compose as comp_mod
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    # Zero-length.
+    coro = comp_mod._apply_hook(
+        src_path, js, 0,
+        {"text": "hook", "hook_start": 2.0, "hook_end": 2.0},
+        [], timeline_duration=6.0)
+    out = _drive(coro)
+    assert not _hook_visible(out, 2.0)
+    assert not _hook_visible(out, 3.0)
+
+    # Wholly outside.
+    coro2 = comp_mod._apply_hook(
+        src_path, js, 1,
+        {"text": "hook", "hook_start": 10.0, "hook_end": 12.0},
+        [], timeline_duration=6.0)
+    out2 = _drive(coro2)
+    assert not _hook_visible(out2, 1.0)
+
+
+def test_clipped_end(monkeypatch, hook_job):
+    """End beyond duration is clipped; hook visible until end."""
+    from clippyme.domain import compose as comp_mod
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    coro = comp_mod._apply_hook(
+        src_path, js, 0,
+        {"text": "hook", "hook_start": 4.0, "hook_end": 20.0},
+        [], timeline_duration=6.0)
+    out = _drive(coro)
+    # Visible at 5s (clipped to 6.0).
+    assert _hook_visible(out, 5.0)
+    # Output duration intact (6s).
+    import json
+    r = _run(["ffprobe", "-v", "error", "-show_entries",
+              "format=duration", "-of", "json", out])
+    dur = float(json.loads(r)["format"]["duration"])
+    assert 5.5 < dur < 6.5, f"duration {dur} not preserved"
+
+
+def test_output_media_intact(monkeypatch, hook_job):
+    """Duration, FPS, frame count, audio preserved."""
+    from clippyme.domain import compose as comp_mod
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    coro = comp_mod._apply_hook(
+        src_path, js, 0,
+        {"text": "hook", "hook_start": 1.0, "hook_end": 3.0},
+        [], timeline_duration=6.0)
+    out = _drive(coro)
+
+    import json
+    # Duration.
+    r = _run(["ffprobe", "-v", "error", "-show_entries",
+              "format=duration", "-of", "json", out])
+    dur = float(json.loads(r)["format"]["duration"])
+    assert 5.5 < dur < 6.5
+    # FPS and frame count.
+    r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+              "-show_entries", "stream=r_frame_rate,nb_frames",
+              "-of", "json", out])
+    vs = json.loads(r)["streams"][0]
+    assert vs["r_frame_rate"] == "30/1"
+    assert int(vs["nb_frames"]) == 180  # 6s * 30fps
+    # Audio stream exists.
+    r = _run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+              "-show_entries", "stream=codec_type", "-of", "csv", out])
+    assert b"audio" in r
+
+
+def test_half_specified_rejected_in_production(monkeypatch, hook_job):
+    """Production _apply_hook rejects half-specified timing."""
+    from clippyme.domain import compose as comp_mod
+    from clippyme.domain.errors import ValidationError
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    for params in [{"hook_start": 1.0}, {"hook_end": 2.0}]:
+        with pytest.raises(ValidationError):
+            _drive(comp_mod._apply_hook(
+                src_path, js, 0, {"text": "hook", **params}, [],
+                timeline_duration=6.0))
+
+
+def test_smartcut_with_timing_rejected(monkeypatch, hook_job):
+    """Explicit timing + Smart Cut rejected before cutting."""
+    from clippyme.domain import compose as comp_mod
+    from clippyme.domain.errors import ValidationError
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    calls = []
+    async def fake_cut(*a, **kw):
+        calls.append("cut")
+        return src_path
+    monkeypatch.setattr(comp_mod, "_apply_smartcut", fake_cut)
+
+    with pytest.raises(ValidationError):
+        _drive(comp_mod.compose_layers(
+            base_clip=src_path, job_dir=js, clip_index=0,
+            metadata={}, clip_info={},
+            toggles={"hook": True, "smartcut": True},
+            hook_params={"text": "hook", "hook_start": 1.0, "hook_end": 2.0},
+            subtitle_params={}, timeline_duration=6.0))
+    assert not calls, "Smart Cut ran despite rejection"

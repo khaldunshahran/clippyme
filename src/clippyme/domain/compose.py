@@ -270,6 +270,9 @@ async def _apply_hook(
     from clippyme.domain.hooks import add_hook_to_video
     from clippyme.domain import hook_timing as ht
 
+    # Task 06 rev2: half-specified timing is rejected (not legacy).
+    ht.reject_half_specified(hook_params)
+
     # Task 06: explicit timing overrides legacy policy.
     _hook_start = None
     _hook_end = None
@@ -323,21 +326,37 @@ async def _apply_hook(
     # overlay but the fused logo (if any) is still applied independently.
     if _hook_inactive and logo is None:
         return current_input
-    await asyncio.to_thread(
-        add_hook_to_video,
-        current_input,
-        hook_params["text"],
-        hook_output,
-        position,
-        font_scale,
-        offset_y,
-        style or None,
-        logo,
-        hook_duration,
-        _hook_start,
-        _hook_end,
-        _hook_inactive,
-    )
+    # Task 06 rev2: legacy callers get exactly 9 positional args.
+    # Explicit timing passes the 3 new args.
+    if _has_explicit:
+        await asyncio.to_thread(
+            add_hook_to_video,
+            current_input,
+            hook_params["text"],
+            hook_output,
+            position,
+            font_scale,
+            offset_y,
+            style or None,
+            logo,
+            hook_duration,
+            _hook_start,
+            _hook_end,
+            _hook_inactive,
+        )
+    else:
+        await asyncio.to_thread(
+            add_hook_to_video,
+            current_input,
+            hook_params["text"],
+            hook_output,
+            position,
+            font_scale,
+            offset_y,
+            style or None,
+            logo,
+            hook_duration,
+        )
     return hook_output
 
 
@@ -623,6 +642,16 @@ async def _compose_layers_impl(
     drop_ranges=None,
     timeline_duration: float | None = None,
 ) -> str:
+    # Task 06 rev2: explicit hook timing + Smart Cut is unsupported.
+    # Smart Cut changes the timeline; explicit timing refers to the
+    # output clock. Reject before any time-changing work.
+    from clippyme.domain import hook_timing as _ht
+    from clippyme.domain.errors import ValidationError as _VE
+    if _ht.has_explicit_timing(hook_params) and toggles.get("smartcut"):
+        raise _VE(
+            "explicit hook timing (hook_start/hook_end) is not supported "
+            "with Smart Cut enabled; disable Smart Cut or omit hook timing")
+
     active = {k: v for k, v in toggles.items() if v}
     # The banner can be enabled via its own params.enabled (frontend convention)
     # without a toggles entry — fold it in so the no-active short-circuit and the

@@ -99,7 +99,7 @@ def _run_compose(tmp_path, monkeypatch, toggles, **kwargs):
         return out
 
     async def fake_hook(current_input, job_dir, clip_index, hook_params, files,
-                        logo_params=None, reframe_mode=None):
+                        logo_params=None, reframe_mode=None, timeline_duration=None):
         calls["hook_logo_params"] = logo_params
         out = os.path.join(job_dir, "hooked.mp4")
         with open(out, "wb") as f:
@@ -207,7 +207,8 @@ def test_apply_hook_duration_by_reframe_mode(tmp_path, monkeypatch):
     captured = []
 
     def fake_add_hook_to_video(video_path, text, output_path, position,
-                               font_scale, offset_y, style, logo, hook_duration):
+                               font_scale, offset_y, style, logo, hook_duration,
+                               *args):
         captured.append(hook_duration)
         with open(output_path, "wb") as f:
             f.write(b"h")

@@ -77,9 +77,25 @@ def effective_hook_interval(
 def has_explicit_timing(hook_params: dict[str, Any]) -> bool:
     """Check for explicit start/end presence (not truthiness).
 
-    start=0 is explicit. Both must be present; half-specified does not
-    activate timed mode (documented, not silent full-clip).
+    start=0 is explicit. Both must be present for timed mode.
     """
     if not isinstance(hook_params, dict):
         return False
     return "hook_start" in hook_params and "hook_end" in hook_params
+
+
+def reject_half_specified(hook_params: dict[str, Any]) -> None:
+    """Raise if exactly one of hook_start/hook_end is present.
+
+    Half-specified timing is a caller error, not legacy mode.
+    Fully omitted (neither key) remains legacy.
+    """
+    if not isinstance(hook_params, dict):
+        return
+    _s = "hook_start" in hook_params
+    _e = "hook_end" in hook_params
+    if _s != _e:
+        from clippyme.domain.errors import ValidationError
+        raise ValidationError(
+            "hook timing requires both hook_start and hook_end; "
+            f"got start present={_s}, end present={_e}")
