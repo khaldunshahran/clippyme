@@ -611,7 +611,6 @@ def _word_safe_interval(start, end, words, source_duration=None,
     # Apply source guard.
     if source_duration is not None:
         if safe_end > source_duration:
-            # Clamp; if this cuts a word, report.
             clamped = source_duration
             hit = _edge_inside(clamped)
             if hit is not None:
@@ -625,24 +624,51 @@ def _word_safe_interval(start, end, words, source_duration=None,
             safe_end = clamped
         if safe_start < 0:
             safe_start = 0.0
-    # Apply neighbor guards.
-    if neighbor_start is not None and safe_start < neighbor_start:
-        safe_start = neighbor_start
-    if neighbor_end is not None and safe_end > neighbor_end:
-        hit = _edge_inside(neighbor_end)
+    # Apply neighbor guards with CORRECT meanings:
+    # - neighbor_start = FOLLOWING clip's start -> upper bound on THIS END.
+    # - neighbor_end = PRECEDING clip's end -> lower bound on THIS START.
+    # Clamp only when the interval would cross the guard.
+    if neighbor_start is not None and safe_end > neighbor_start:
+        # Would cross into following clip: clamp end.
+        hit = _edge_inside(neighbor_start)
         if hit is not None:
             guard_conflict = {
                 "type": "neighbor_conflict",
                 "message": (
-                    f"Word chain extends to {safe_end:.2f}s but neighbor "
-                    f"bounds at {neighbor_end:.2f}s; clamped."
+                    f"Word chain extends to {safe_end:.2f}s but following "
+                    f"clip starts at {neighbor_start:.2f}s; clamped."
                 ),
             }
-        safe_end = neighbor_end
+        safe_end = neighbor_start
+    if neighbor_end is not None and safe_start < neighbor_end:
+        # Would cross into preceding clip: clamp start.
+        # Check if clamping cuts a word (start-side conflict).
+        hit = _edge_inside(neighbor_end)
+        # Also check if safe_start itself was inside a word that got cut.
+        if hit is not None or _edge_inside(safe_start) is not None:
+            guard_conflict = {
+                "type": "neighbor_conflict",
+                "message": (
+                    f"Interval start {safe_start:.2f}s precedes previous "
+                    f"clip end {neighbor_end:.2f}s; clamped."
+                ),
+            }
+        safe_start = neighbor_end
 
-    # Ensure valid interval.
+    # Ensure valid interval WITHOUT synthetic escape beyond guards.
+    # If guards make the interval invalid, report conflict; do not
+    # create end = start + 0.01 which can violate source/neighbor.
     if safe_end <= safe_start:
-        safe_end = safe_start + 0.01
+        guard_conflict = {
+            "type": "interval_conflict",
+            "message": (
+                f"Guards produce invalid interval [{safe_start:.2f}, "
+                f"{safe_end:.2f}]; retaining start, reporting conflict."
+            ),
+        }
+        # Keep start, set end to start (zero duration, honest).
+        # Caller will surface the conflict.
+        safe_end = safe_start
 
     return (safe_start, safe_end, guard_conflict)
 
@@ -712,8 +738,13 @@ def _enforce_duration_cap(new_start, new_end, words, max_duration,
         b_duration = b_end - b_start
         if b_duration <= max_duration:
             # Baseline fits: optional stages caused the overflow.
-            # Revert, preserving content. Recheck minimum (Gate 2).
-            return (b_start, b_end, _check_min(b_start, b_end))
+            # Revert, preserving content. Recheck minimum, preserve guard.
+            _min_c = _check_min(b_start, b_end)
+            if _min_c is not None:
+                return (b_start, b_end, _min_c)
+            if baseline_guard is not None:
+                return (b_start, b_end, baseline_guard)
+            return (b_start, b_end, None)
         # Baseline itself over max: keep it, report honest conflict.
         # Do NOT greedy-shrink to first word (removes payoff/content).
         return (b_start, b_end, {

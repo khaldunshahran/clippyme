@@ -564,36 +564,59 @@ def test_queued_minimum_conflict_observable(tmp_path, monkeypatch, capsys):
             or "conflict" in text
             or any("duration" in k or "conflict" in k for k in clip))
 
-def test_direct_cli_forwards_policy_values_with_spy(monkeypatch):
-    """Direct CLI passes resolved min/max/source (value spy, not AST)."""
+def test_direct_cli_forwards_policy_values_with_spy(monkeypatch, tmp_path=None):
+    """Execute the EXACT production main.py repair block (AST, not a copy)."""
+    import ast, copy, os
+    from pathlib import Path
     from types import SimpleNamespace
-    from clippyme.pipeline import cut_ops
-    # Spy on snap_clips_to_transcript.
+    from clippyme.pipeline import cut_ops, orchestrator as orch
+    transcript = {"segments": [{"words": [
+        {"word": "First", "start": 0.0, "end": 0.4},
+        {"word": "last.", "start": 29.5, "end": 29.92},
+    ]}]}
+    clips = {"shorts": [{"start": 0.0, "end": 29.92}]}
+    args = SimpleNamespace(
+        min_duration=15.0, max_duration=30.0, duration_mode="mixed",
+        clip_type=None, reframe_mode="auto", skip_analysis=False,
+        monitor=False, instructions=None, min_clips=None, max_clips=None,
+        aspect="9:16", caption_style_default=None)
     calls = []
-    orig = cut_ops.snap_clips_to_transcript
-    def spy(shorts, words, **kwargs):
+    actual_snap = cut_ops.snap_clips_to_transcript
+    def record(shorts, words, **kwargs):
         calls.append(kwargs)
-        return orig(shorts, words, **kwargs)
-    monkeypatch.setattr(cut_ops, "snap_clips_to_transcript", spy)
-    # Simulate direct CLI repair block with policy.
-    from clippyme.pipeline.duration_policy import resolve_duration_policy
-    policy = resolve_duration_policy(
-        min_duration=20.0, max_duration=45.0, video_duration=100.0)
-    words = [{"word": "hi", "start": 0.0, "end": 0.5}]
-    shorts = [{"start": 0.0, "end": 10.0}]
-    # This mirrors the main.py repair block.
-    cut_ops.snap_clips_to_transcript(
-        shorts, words,
-        source_duration=100.0,
-        silences=None,
-        default_reframe_mode="auto",
-        max_duration=policy.max_duration,
-        min_duration=policy.min_duration,
-    )
-    assert calls, "repair must be called"
-    assert calls[0]["max_duration"] == 45.0
-    assert calls[0]["min_duration"] == 20.0
-    assert calls[0]["source_duration"] == 100.0
+        return actual_snap(shorts, words, **kwargs)
+    monkeypatch.setattr(cut_ops, "snap_clips_to_transcript", record)
+    # Parse main.py, find the exact production repair block.
+    tree = ast.parse(
+        (Path(orch.__file__).parent / "main.py").read_text(encoding="utf8"))
+    entry = next(n for n in tree.body if isinstance(n, ast.If)
+                 and "__name__" in ast.unparse(n.test))
+    node = next(n for n in ast.walk(entry)
+                if isinstance(n, ast.ImportFrom)
+                and n.module == "clippyme.pipeline.cut_ops"
+                and any(a.name == "snap_clips_to_transcript" for a in n.names))
+    body = next(getattr(n, field) for n in ast.walk(entry)
+                for field in ("body", "orelse", "finalbody")
+                if isinstance(getattr(n, field, None), list)
+                and node in getattr(n, field))
+    start = body.index(node)
+    end = next(i for i, n in enumerate(body[start:], start)
+               if isinstance(n, ast.For)
+               and "snap_clips_to_transcript" in ast.unparse(n.iter))
+    exact = ast.Module(body=body[start:end+1], type_ignores=[])
+    import tempfile
+    _tmp = tmp_path if tmp_path is not None else Path(tempfile.mkdtemp())
+    env = {"args": args, "duration": 100.0,
+           "transcript": transcript,
+           "clips_data": copy.deepcopy(clips),
+           "input_video": str(_tmp / "source.mp4"),
+           "os": os}
+    exec(compile(ast.fix_missing_locations(exact),
+                 "production repair block", "exec"), env)
+    assert len(calls) == 1, "production block must call repair once"
+    assert calls[0]["max_duration"] == 30.0, f"got {calls[0]}"
+    assert calls[0]["min_duration"] == 15.0, f"got {calls[0]}"
+    assert calls[0]["source_duration"] == 100.0, f"got {calls[0]}"
 
 def test_queued_caller_spies_policy_values(tmp_path, monkeypatch):
     """Queued caller passes actual policy values (spy, not just duration)."""

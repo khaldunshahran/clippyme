@@ -546,14 +546,14 @@ def build_viral_prompt(
         if max_dur >= 20.0:
             _t1_hi = min(60.0, max_dur)
             _tiers.append(
-                f"1. TIER 1 - SHORTS / REELS (20s - {_t1_hi:g}s): Fast-paced, "
+                f"1. TIER 1 - SHORTS / REELS (20s - {_t1_hi!r}s): Fast-paced, "
                 "instant hook in first 0-3s, quick punchy payoff. Perfect for "
                 "rapid-scroll YouTube Shorts / IG Reels.\n")
         # Tier 2: 60-120s, needs max >= 60.
         if max_dur >= 60.0:
             _t2_hi = min(120.0, max_dur)
             _tiers.append(
-                f"2. TIER 2 - MID-LENGTH SOCIAL (60s - {_t2_hi:g}s): Complete "
+                f"2. TIER 2 - MID-LENGTH SOCIAL (60s - {_t2_hi!r}s): Complete "
                 "narrative arc, escalating argument, or storytelling anecdote "
                 "with thorough setup and payoff. Crucial for high-retention "
                 "TikTok watch time and Reels.\n")
@@ -561,7 +561,7 @@ def build_viral_prompt(
         if max_dur >= 120.0:
             _t3_hi = min(300.0, max_dur)
             _tiers.append(
-                f"3. TIER 3 - EXTENDED DEEP DIVE (120s - {_t3_hi:g}s): "
+                f"3. TIER 3 - EXTENDED DEEP DIVE (120s - {_t3_hi!r}s): "
                 "High-value masterclass breakdown, intense debate, or deep "
                 "dramatic story with multiple beats.\n")
         if len(_tiers) >= 2:
