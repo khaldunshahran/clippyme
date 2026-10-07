@@ -11,6 +11,8 @@ const MOCK_SUMMARY = {
   total_shares: 6310,
   total_comments: 2530,
   avg_retention: 0.42, // (0.84 + 0.0) / 2, unmarked zero excluded
+  retention_sample_count: 2,
+  retention_averaging: 'unweighted',
   clips: [
     {
       clip_id: 'clip-recorded',
@@ -50,8 +52,50 @@ const MOCK_INSIGHTS = {
     avg_completion_rate: null,
     top_hook_patterns: [],
     recommendations: [],
-    totals: { views: 230900, likes: 19000, shares: 6310, comments: 2530 },
-    retention: { average_recorded: 0.42, recorded_count: 2, measured_count: 3 },
+    totals: {
+      views: 230900, likes: 19000, shares: 6310, comments: 2530,
+      integrity: {
+        views: { overflow: false, inexact: false, status: 'exact' },
+        likes: { overflow: false, inexact: false, status: 'exact' },
+        shares: { overflow: false, inexact: false, status: 'exact' },
+        comments: { overflow: false, inexact: false, status: 'exact' },
+      },
+    },
+    retention: {
+      average_recorded: 0.42,
+      recorded_count: 2,
+      explicit_count: 2,
+      legacy_positive_count: 0,
+      measured_count: 3,
+      averaging: 'unweighted',
+    },
+  },
+  prompt_snippet: '',
+};
+
+// Mixed explicit + legacy provenance fixture.
+const MIXED_INSIGHTS = {
+  patterns: {
+    has_data: true,
+    sample_size: 3,
+    status: 'descriptive_observations',
+    totals: {
+      views: 230900, likes: 19000, shares: 6310, comments: 2530,
+      integrity: {
+        views: { overflow: false, inexact: false, status: 'exact' },
+        likes: { overflow: false, inexact: false, status: 'exact' },
+        shares: { overflow: false, inexact: false, status: 'exact' },
+        comments: { overflow: false, inexact: false, status: 'exact' },
+      },
+    },
+    retention: {
+      average_recorded: 0.4,
+      recorded_count: 2,
+      explicit_count: 1,
+      legacy_positive_count: 1,
+      measured_count: 3,
+      averaging: 'unweighted',
+    },
   },
   prompt_snippet: '',
 };
@@ -100,7 +144,9 @@ test('renders honest evidence state, no invented learning claims', async () => {
   expect(screen.queryByText(/Viral \(80%\+\)/i)).not.toBeInTheDocument();
 
   expect(screen.getByText(/3 clips with recorded views/i)).toBeInTheDocument();
-  expect(screen.getByText(/Average of 2 explicitly recorded values/i)).toBeInTheDocument();
+  // Actual observed-average wording with provenance, not "explicitly recorded".
+  expect(screen.getByText(/Observed avg of 2 values/i)).toBeInTheDocument();
+  expect(screen.getByText(/2 explicit \+ 0 legacy, unweighted/i)).toBeInTheDocument();
 });
 
 test('leaderboard distinguishes recorded zero from unknown', async () => {
@@ -198,7 +244,10 @@ test('empty insights show honest inactive state', async () => {
   render(<AnalyticsView pushToast={vi.fn()} />);
 
   await waitFor(() => {
-    expect(screen.getByText(/audience-based selection rules are not active yet/i)).toBeInTheDocument();
+    // Phrase appears in banner and observations panel; assert all match.
+    const matches = screen.getAllByText(/audience-based selection rules are not active yet/i);
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+    matches.forEach(el => expect(el).toBeInTheDocument());
   });
 });
 
@@ -211,8 +260,9 @@ test('malformed insights handled defensively', async () => {
   await waitFor(() => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
-  // No crash, honest fallback.
-  expect(screen.getByText(/audience-based selection rules are not active yet/i)).toBeInTheDocument();
+  // No crash, honest fallback. Multiple matches expected.
+  const matches = screen.getAllByText(/audience-based selection rules are not active yet/i);
+  expect(matches.length).toBeGreaterThanOrEqual(1);
 });
 
 test('modal initializes unknown as empty', async () => {
@@ -273,4 +323,161 @@ test('saves metrics with honest wording, preserves untouched retention', async (
   // Untouched unknown retention is omitted, not fabricated.
   expect('retention_rate' in sent).toBe(false);
   expect(pushToast).toHaveBeenCalledWith('success', 'Performance metrics saved.');
+});
+
+// --- Totals integrity: unavailable, null-without-metadata, genuine zero ---
+
+test('overflow-unavailable totals show Unavailable, valid neighbors preserved', async () => {
+  const overflowInsights = {
+    patterns: {
+      has_data: true,
+      sample_size: 2,
+      status: 'descriptive_observations',
+      totals: {
+        views: null,  // overflow unavailable
+        likes: 150,   // valid neighbor
+        shares: 30,   // valid neighbor
+        comments: 0,  // genuine zero neighbor
+        integrity: {
+          views: { overflow: true, inexact: false, status: 'overflow_unavailable' },
+          likes: { overflow: false, inexact: false, status: 'exact' },
+          shares: { overflow: false, inexact: false, status: 'exact' },
+          comments: { overflow: false, inexact: false, status: 'exact' },
+        },
+      },
+      retention: {
+        average_recorded: null, recorded_count: 0,
+        explicit_count: 0, legacy_positive_count: 0,
+        measured_count: 2, averaging: 'unweighted',
+      },
+    },
+    prompt_snippet: '',
+  };
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(overflowInsights);
+
+  const { container } = render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+
+  // Find the totals area (contains "Recorded Totals").
+  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div').parentElement;
+  
+  // Unavailable views shows "Unavailable", not "0".
+  expect(within(totalsArea).getByText(/Unavailable.*overflow/i)).toBeInTheDocument();
+  expect(within(totalsArea).queryByText(/^0 views$/i)).not.toBeInTheDocument();
+  
+  // Valid neighbors preserved exactly.
+  expect(within(totalsArea).getByText(/150 likes/i)).toBeInTheDocument();
+  expect(within(totalsArea).getByText(/30 shares/i)).toBeInTheDocument();
+  
+  // Genuine zero shows as "0", not "Unavailable".
+  // (comments 0 is exact, not overflow)
+  const commentsText = within(totalsArea).getByText(/0.*comments|comments.*0/i);
+  expect(commentsText).toBeInTheDocument();
+});
+
+test('null totals without integrity metadata show Unavailable, not zero', async () => {
+  const nullInsights = {
+    patterns: {
+      has_data: true,
+      sample_size: 1,
+      status: 'descriptive_observations',
+      totals: {
+        views: null,
+        likes: null,
+        shares: 10,
+        comments: 5,
+        // No integrity metadata (malformed/future shape).
+      },
+      retention: {
+        average_recorded: null, recorded_count: 0,
+        explicit_count: 0, legacy_positive_count: 0,
+        measured_count: 1, averaging: 'unweighted',
+      },
+    },
+    prompt_snippet: '',
+  };
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(nullInsights);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+
+  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div').parentElement;
+  
+  // Null without metadata -> "Unavailable", not "0".
+  const unavailable = within(totalsArea).getAllByText(/Unavailable/i);
+  expect(unavailable.length).toBeGreaterThanOrEqual(2); // views and likes
+  
+  // Valid shares preserved.
+  expect(within(totalsArea).getByText(/10 shares/i)).toBeInTheDocument();
+});
+
+test('genuine recorded zero totals display as zero, not Unavailable', async () => {
+  const zeroInsights = {
+    patterns: {
+      has_data: true,
+      sample_size: 1,
+      status: 'descriptive_observations',
+      totals: {
+        views: 100,
+        likes: 0,  // genuine zero
+        shares: 0, // genuine zero
+        comments: 5,
+        integrity: {
+          views: { overflow: false, inexact: false, status: 'exact' },
+          likes: { overflow: false, inexact: false, status: 'exact' },
+          shares: { overflow: false, inexact: false, status: 'exact' },
+          comments: { overflow: false, inexact: false, status: 'exact' },
+        },
+      },
+      retention: {
+        average_recorded: null, recorded_count: 0,
+        explicit_count: 0, legacy_positive_count: 0,
+        measured_count: 1, averaging: 'unweighted',
+      },
+    },
+    prompt_snippet: '',
+  };
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(zeroInsights);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+
+  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div').parentElement;
+  
+  // Genuine zeros display as "0", not "Unavailable".
+  expect(within(totalsArea).getByText(/0 likes/i)).toBeInTheDocument();
+  expect(within(totalsArea).getByText(/0 shares/i)).toBeInTheDocument();
+  expect(within(totalsArea).queryByText(/Unavailable/i)).not.toBeInTheDocument();
+  
+  // Valid views preserved.
+  expect(within(totalsArea).getByText(/100 views/i)).toBeInTheDocument();
+});
+
+test('mixed explicit/legacy retention shows honest provenance', async () => {
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MIXED_INSIGHTS);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+
+  // Observed wording, not "explicitly recorded".
+  expect(screen.getByText(/Observed avg of 2 values/i)).toBeInTheDocument();
+  expect(screen.getByText(/1 explicit \+ 1 legacy, unweighted/i)).toBeInTheDocument();
+  // Must NOT claim "2 explicitly recorded".
+  expect(screen.queryByText(/2 explicitly recorded/i)).not.toBeInTheDocument();
 });
