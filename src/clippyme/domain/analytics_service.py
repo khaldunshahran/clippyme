@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -143,21 +144,25 @@ def update_clip_metrics(clip_id: str, metrics: Dict[str, Any]) -> Optional[Dict[
     likes = int(metrics.get("likes", current.get("likes", 0)))
     shares = int(metrics.get("shares", current.get("shares", 0)))
     comments = int(metrics.get("comments", current.get("comments", 0)))
-    retention = float(metrics.get("retention_rate", current.get("retention_rate", 0.0)))
 
-    # Presence marker: True only when retention_rate was explicitly
-    # provided and valid in THIS update. Distinguishes a real recorded
-    # zero from legacy default unknown zero. Additive only; absent means
-    # unknown. Existing files remain usable without migration.
+    # Validate retention BEFORE conversion/mutation. An explicit value
+    # must be a finite number in [0, 1] and not a boolean. Rejected or
+    # absent input preserves the prior value and presence marker; a
+    # views-only update never manufactures a measurement.
     _explicit = metrics.get("retention_rate", None)
-    if _explicit is not None:
+    _valid_retention = None
+    if _explicit is not None and not isinstance(_explicit, bool):
         try:
             _rv = float(_explicit)
-            import math as _math
-            if _math.isfinite(_rv) and 0.0 <= _rv <= 1.0:
-                current["retention_recorded"] = True
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError, OverflowError):
+            _rv = None
+        if _rv is not None and math.isfinite(_rv) and 0.0 <= _rv <= 1.0:
+            _valid_retention = round(_rv, 4)
+    if _valid_retention is not None:
+        current["retention_rate"] = _valid_retention
+        # Presence marker: True only on explicit valid input.
+        current["retention_recorded"] = True
+    # else: preserve current["retention_rate"] and marker untouched.
 
     # Engagement rate: (likes + comments + shares) / max(views, 1)
     eng_rate = round((likes + comments + shares) / max(views, 1), 4) if views > 0 else 0.0
@@ -166,7 +171,6 @@ def update_clip_metrics(clip_id: str, metrics: Dict[str, Any]) -> Optional[Dict[
     current["likes"] = likes
     current["shares"] = shares
     current["comments"] = comments
-    current["retention_rate"] = round(retention, 4)
     current["engagement_rate"] = eng_rate
 
     clip["last_synced"] = datetime.now(timezone.utc).isoformat()
@@ -210,16 +214,19 @@ def sync_zernio_analytics(api_key: Optional[str] = None) -> Dict[str, Any]:
 
             if isinstance(resp, dict):
                 metrics = resp.get("analytics") or resp.get("metrics") or resp
-                update_clip_metrics(
-                    clip_id,
-                    {
-                        "views": metrics.get("views") or metrics.get("impressions") or 0,
-                        "likes": metrics.get("likes") or metrics.get("reactions") or 0,
-                        "shares": metrics.get("shares") or metrics.get("reposts") or 0,
-                        "comments": metrics.get("comments") or 0,
-                        "retention_rate": metrics.get("retentionRate") or metrics.get("completionRate") or 0.0,
-                    },
-                )
+                _payload = {
+                    "views": metrics.get("views") or metrics.get("impressions") or 0,
+                    "likes": metrics.get("likes") or metrics.get("reactions") or 0,
+                    "shares": metrics.get("shares") or metrics.get("reposts") or 0,
+                    "comments": metrics.get("comments") or 0,
+                }
+                # Only include retention when genuinely present. Do not
+                # relabel completionRate as retention; omit when absent so
+                # a views-only sync never fabricates a recorded zero.
+                _rr = metrics.get("retentionRate", None)
+                if _rr is not None:
+                    _payload["retention_rate"] = _rr
+                update_clip_metrics(clip_id, _payload)
                 synced_count += 1
         except ZernioError as ze:
             logger.debug("analytics_service: Zernio analytics call for post %s failed: %s", post_id, ze)
@@ -246,11 +253,33 @@ def get_analytics_summary() -> Dict[str, Any]:
     total_shares = sum(c.get("metrics", {}).get("shares", 0) for c in clips)
     total_comments = sum(c.get("metrics", {}).get("comments", 0) for c in clips)
 
-    clips_with_retention = [c for c in clips if c.get("metrics", {}).get("retention_rate", 0) > 0]
+    # Evidence rule: boolean True marker = explicitly recorded (zero
+    # counts). Positive finite legacy fractions without a marker remain
+    # usable observations. Malformed markers never create evidence.
+    # Unknown retention is None, not 0.0.
+    def _known_retention(c):
+        m = c.get("metrics", {}) if isinstance(c.get("metrics", {}), dict) else {}
+        r = m.get("retention_rate")
+        if isinstance(r, bool):
+            return None
+        try:
+            rv = float(r)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(rv) or not (0.0 <= rv <= 1.0):
+            return None
+        if m.get("retention_recorded") is True:
+            return rv
+        # Legacy: positive finite fractions are usable observations.
+        if rv > 0:
+            return rv
+        return None
+
+    _known = [(_known_retention(c), c) for c in clips]
+    clips_with_retention = [rv for rv, _ in _known if rv is not None]
     avg_retention = (
-        round(sum(c["metrics"]["retention_rate"] for c in clips_with_retention) / len(clips_with_retention), 4)
-        if clips_with_retention
-        else 0.0
+        round(sum(clips_with_retention) / len(clips_with_retention), 4)
+        if clips_with_retention else None
     )
 
     # Sort top clips by viral impact (weighted: shares * 5 + comments * 3 + likes)

@@ -28,7 +28,7 @@ function UpdateMetricsModal({
   const [likes, setLikes] = useState(clip?.metrics?.likes ?? clip?.likes ?? 0);
   const [shares, setShares] = useState(clip?.metrics?.shares ?? clip?.shares ?? 0);
   const [comments, setComments] = useState(clip?.metrics?.comments ?? clip?.comments ?? 0);
-  const _initialRetention = clip?.metrics?.retention_rate ?? clip?.retention_rate;
+  const _initialRetention = ((m, r) => ((m?.retention_recorded === true || (typeof r === 'number' && Number.isFinite(r) && r > 0 && r <= 1)) && (typeof r === 'number' && Number.isFinite(r) && r >= 0 && r <= 1) ? r : null))(clip?.metrics, clip?.metrics?.retention_rate ?? clip?.retention_rate);
   const [retentionPct, setRetentionPct] = useState(
     _initialRetention != null ? String(Math.round(_initialRetention * 100)) : ''
   );
@@ -221,8 +221,8 @@ function UpdateMetricsModal({
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--ink-dim)', marginTop: 2 }}>
               <span>Low (Dropoff)</span>
-              <span>Average (60-70%)</span>
-              <span>Viral (80%+)</span>
+              <span>Typical range varies</span>
+              <span>High</span>
             </div>
           </div>
 
@@ -293,7 +293,7 @@ export function AnalyticsView({ pushToast }) {
   const totalLikes = summary?.total_likes || 0;
   const totalComments = summary?.total_comments || 0;
   const totalPublished = summary?.total_published || 0;
-  const avgRetention = summary?.avg_retention ? Math.round(summary.avg_retention * 100) : 0;
+  const avgRetention = ((v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1) ? Math.round(v * 100) : null)(summary?.avg_retention);
   const clips = summary?.clips || summary?.all_clips || [];
   const patterns = insights?.patterns || {};
   const hasLearningData = patterns?.has_data;
@@ -385,7 +385,7 @@ export function AnalyticsView({ pushToast }) {
             <Icon n="flame" />
           </div>
           <div style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--ink)' }}>
-            {avgRetention}%
+            {avgRetention != null ? `${avgRetention}%` : 'Unknown'}
           </div>
           <div style={{ fontSize: '0.75rem', color: avgRetention >= 75 ? '#2e7d32' : 'var(--ink-dim)' }}>
             {summary?.avg_retention != null ? 'Average of recorded values' : 'No retention recorded yet'}
@@ -528,8 +528,10 @@ export function AnalyticsView({ pushToast }) {
               const platforms = clip.platforms || (clip.platform ? [clip.platform] : ['tiktok']);
               const durationFormatted = clip.duration ? `${clip.duration.toFixed(1)}s` : '—';
               const rawRetention = clip.metrics?.retention_rate ?? clip.retention_rate;
-              const retentionKnown = clip.metrics?.retention_recorded ?? rawRetention != null;
-              const retentionDisplay = (retentionKnown && rawRetention != null)
+              const retentionKnown = ((m, r) => (typeof r === 'number' && Number.isFinite(r) && r >= 0 && r <= 1) && (m?.retention_recorded === true || (typeof r === 'number' && Number.isFinite(r) && r > 0 && r <= 1)))(clip.metrics, clip.metrics?.retention_rate ?? clip.retention_rate);
+              const retentionDisplay = retentionKnown
+                ? `${Math.round((clip.metrics?.retention_rate ?? clip.retention_rate) * 100)}%`
+                : 'Unknown';
                               ? `${Math.round(rawRetention * 100)}%` : 'Unknown';
               const viewsCount = (clip.metrics?.views ?? clip.views) || 0;
               const likesCount = (clip.metrics?.likes ?? clip.likes) || 0;

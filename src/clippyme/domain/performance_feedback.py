@@ -23,22 +23,32 @@ from clippyme.domain.analytics_service import load_analytics_data
 logger = logging.getLogger(__name__)
 
 
-def _is_valid_count(value: Any) -> bool:
-    """Finite non-negative number, not a boolean."""
+def _safe_float(value: Any) -> Optional[float]:
+    """Convert to float safely; None on any failure (incl. OverflowError)."""
     if isinstance(value, bool):
-        return False
-    if isinstance(value, (int, float)):
-        return math.isfinite(value) and value >= 0
-    return False
+        return None
+    try:
+        fv = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        if not math.isfinite(fv):
+            return None
+    except OverflowError:
+        return None
+    return fv
+
+
+def _is_valid_count(value: Any) -> bool:
+    """Finite non-negative number, not a boolean. Never raises."""
+    fv = _safe_float(value)
+    return fv is not None and fv >= 0
 
 
 def _is_valid_retention(value: Any) -> bool:
-    """Finite fraction in [0, 1], not a boolean."""
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, (int, float)):
-        return math.isfinite(value) and 0.0 <= value <= 1.0
-    return False
+    """Finite fraction in [0, 1], not a boolean. Never raises."""
+    fv = _safe_float(value)
+    return fv is not None and 0.0 <= fv <= 1.0
 
 
 def _validate_metrics(raw: Any) -> Optional[Dict[str, Any]]:
@@ -55,14 +65,20 @@ def _validate_metrics(raw: Any) -> Optional[Dict[str, Any]]:
         else:
             return None
     r = raw.get("retention_rate")
+    # Presence requires boolean True. Malformed markers ("false", 1, [],
+    # dicts) never create evidence.
+    marked = raw.get("retention_recorded") is True
     if r is None:
-        out["retention_rate"] = None  # unknown, distinct from recorded zero
-        out["retention_recorded"] = bool(raw.get("retention_recorded", False))
+        out["retention_rate"] = None
+        out["retention_recorded"] = False
+        out["retention_legacy_positive"] = False
     elif _is_valid_retention(r):
-        out["retention_rate"] = float(r)
-        # Presence: only from an explicit stored marker. A bare value
-        # without the marker is unknown, not a recorded zero.
-        out["retention_recorded"] = bool(raw.get("retention_recorded", False))
+        fv = _safe_float(r)
+        out["retention_rate"] = fv
+        out["retention_recorded"] = marked
+        # Legacy compatibility: positive finite fractions remain usable
+        # observations even without a marker; explicit zero requires it.
+        out["retention_legacy_positive"] = (not marked) and fv > 0
     else:
         return None
     return out
@@ -165,9 +181,12 @@ def analyze_performance_patterns() -> Dict[str, Any]:
         },
     ]
 
-    # Retention: only from explicitly recorded values; unknown != zero.
+    # Retention: explicitly recorded values (zero counts) plus positive
+    # finite legacy fractions. Unknown stays unknown. Unweighted average
+    # with explicit sample counts.
     recorded = [v[1]["retention_rate"] for v in measured
-                if v[1].get("retention_recorded") and v[1]["retention_rate"] is not None]
+                if (v[1].get("retention_recorded") or v[1].get("retention_legacy_positive"))
+                and v[1]["retention_rate"] is not None]
     avg_retention: Optional[float] = None
     if recorded:
         avg_retention = round(sum(recorded) / len(recorded), 4)

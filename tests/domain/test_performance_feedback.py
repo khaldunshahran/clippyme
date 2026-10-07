@@ -200,29 +200,130 @@ def test_build_viral_prompt_explicit_override_preserved(registry):
     assert "CUSTOM OVERRIDE BLOCK" in prompt
 
 
-def test_rescore_no_empirical_block(registry, monkeypatch):
-    """Rescore prompt construction has no invented patterns block."""
+def test_rescore_no_empirical_block(registry, monkeypatch, tmp_path):
+    """Actual rescore_job with injected SDK: no fabricated block, updates score/hook."""
+    import importlib
+    import sys
+    import types
+    import json as _json
     _write(registry, _clip("a", views=9000, shares=400))
-    try:
-        from clippyme.domain import rescore_service as rs
-    except ImportError:
-        pytest.skip("rescore_service requires google.genai (not installed)")
-    # build_rescore_prompt or similar; find the prompt builder.
-    fn = getattr(rs, "build_rescore_prompt", None)
-    if fn is None:
-        pytest.skip("no build_rescore_prompt found")
-    import inspect
-    sig = inspect.signature(fn)
-    kwargs = {}
-    for name, p in sig.parameters.items():
-        if p.default is inspect.Parameter.empty and name != "self":
-            kwargs[name] = "" if p.annotation in (str, "str") else None
-    try:
-        prompt = fn(**kwargs)
-    except TypeError:
-        pytest.skip("rescore signature incompatible")
-    assert "WHOLE-STORY ARCS DOMINATE" not in prompt
+    # Inject fake google.genai (no installed SDK needed).
+    fake_genai = types.ModuleType("google.genai")
+    fake_genai.Client = lambda **kwargs: object()
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    import google
+    monkeypatch.setattr(google, "genai", fake_genai, raising=False)
+    rs = importlib.import_module("clippyme.domain.rescore_service")
+    metadata = {"video_title": "Fixture",
+                "shorts": [{"start": 0, "end": 10}],
+                "transcript": {"segments": [{"start": 0, "end": 10, "text": "Fixture words."}]}}
+    monkeypatch.setattr(rs, "load_job_metadata",
+                        lambda *a: (str(tmp_path / "metadata.json"), metadata))
+    monkeypatch.setattr(rs, "load_persistent_config", lambda: {})
+    captured = []
+    def generate(client, prompt, *a, **k):
+        captured.append(prompt)
+        response = {"clips": [{"clip_index": 1, "viral_score": 91,
+                               "viral_reason": "Fixture",
+                               "video_title_for_youtube_short": "New title",
+                               "hook": "New hook"}]}
+        return types.SimpleNamespace(text=_json.dumps(response)), "injected-model"
+    monkeypatch.setattr(rs, "generate_with_model_fallback", generate)
+    saved = []
+    monkeypatch.setattr(rs, "save_job_metadata", lambda *a: saved.append(a))
+    fake_metadata = types.ModuleType("clippyme.domain.metadata_generator")
+    fake_metadata.generate_all_clips_metadata = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, fake_metadata.__name__, fake_metadata)
+    result = rs.rescore_job("fixture", output_dir=str(tmp_path),
+                            api_key="injected-unused-key")
+    assert len(captured) == 1
+    assert "Fixture words." in captured[0]
+    for fabricated in ("LEARNED AUDIENCE PERFORMANCE PATTERNS",
+                       "WHOLE-STORY ARCS DOMINATE", "2.8x", "3.2x"):
+        assert fabricated not in captured[0]
+    assert result["success"] is True
+    assert result["clips"][0]["viral_score"] == 91
+    assert saved and metadata["shorts"][0]["viral_hook_text"] == "New hook"
 
+
+
+
+
+def test_invalid_retention_preserves_value_and_marker(registry):
+    """Invalid update preserves BOTH value and marker (not just marker)."""
+    _write(registry, {"id": {"metrics": {"views": 100, "retention_rate": 0.65,
+                                         "retention_recorded": True}}})
+    # Invalid 9.9 must not overwrite.
+    analytics.update_clip_metrics("id", {"retention_rate": 9.9})
+    stored = analytics.load_analytics_data()["clips"]["id"]["metrics"]
+    assert stored["retention_rate"] == 0.65, f"value overwritten: {stored}"
+    assert stored["retention_recorded"] is True
+    # Boolean True must not become 1.0.
+    analytics.update_clip_metrics("id", {"retention_rate": True})
+    stored = analytics.load_analytics_data()["clips"]["id"]["metrics"]
+    assert stored["retention_rate"] == 0.65
+    assert stored["retention_recorded"] is True
+
+
+def test_views_only_update_preserves_retention(registry):
+    """A views-only sync never manufactures or overwrites retention."""
+    _write(registry, {"id": {"metrics": {"views": 50, "retention_rate": 0.65,
+                                         "retention_recorded": True}}})
+    analytics.update_clip_metrics("id", {"views": 200, "likes": 10})
+    stored = analytics.load_analytics_data()["clips"]["id"]["metrics"]
+    assert stored["views"] == 200
+    assert stored["retention_rate"] == 0.65
+    assert stored["retention_recorded"] is True
+
+
+def test_sync_without_retention_preserves(registry, monkeypatch):
+    """Zernio sync without retentionRate preserves prior value/marker."""
+    import sys, types
+    _write(registry, {"id": {"metrics": {"views": 50, "retention_rate": 0.65,
+                                         "retention_recorded": True},
+                             "post_id": "p1"}})
+    fake_module = types.ModuleType("clippyme.integrations.social_publisher")
+    class FakeClient:
+        def __init__(self, key): pass
+        def _request(self, *a, **k):
+            return {"analytics": {"views": 200, "likes": 10}}  # no retention
+    fake_module.ZernioClient = FakeClient
+    fake_module.ZernioError = type("ZernioError", (Exception,), {})
+    monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
+    from clippyme.storage import config_store
+    monkeypatch.setattr(config_store, "load_zernio_config", lambda: {})
+    analytics.sync_zernio_analytics(api_key="x")
+    stored = analytics.load_analytics_data()["clips"]["id"]["metrics"]
+    assert stored["views"] == 200
+    assert stored["retention_rate"] == 0.65
+    assert stored["retention_recorded"] is True
+
+
+def test_republish_preserves_marker(registry):
+    """Republish preserves retention value and marker."""
+    analytics.record_published_clip(
+        job_id="j9", clip_index=0, clip_info={}, publish_result={}, platforms=[])
+    analytics.update_clip_metrics("j9:0", {"retention_rate": 0.0})  # explicit zero
+    # Republish same clip.
+    analytics.record_published_clip(
+        job_id="j9", clip_index=0, clip_info={}, publish_result={}, platforms=[])
+    stored = analytics.load_analytics_data()["clips"]["j9:0"]["metrics"]
+    assert stored["retention_rate"] == 0.0
+    assert stored["retention_recorded"] is True
+
+
+def test_oversized_int_isolated(registry):
+    """Oversized JSON int doesn't kill valid neighbors."""
+    _write(registry, {
+        "good": {"metrics": {"views": 100, "retention_rate": 0.5,
+                             "retention_recorded": True}},
+        "bad": {"metrics": {"views": 10**400, "likes": 1}},
+    })
+    out = pf.analyze_performance_patterns()
+    assert out["has_data"] is True
+    assert out["sample_size"] == 1
+    assert out["totals"]["views"] == 100
+    assert out["retention"]["average_recorded"] == 0.5
 
 # --- analytics_service presence marker ---
 

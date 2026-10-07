@@ -1,15 +1,16 @@
 import { test, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { AnalyticsView } from './analyticsView.jsx';
 import * as realApi from './realApi.js';
 
+// Real summary shape from get_analytics_summary (backend).
 const MOCK_SUMMARY = {
   total_published: 3,
   total_views: 230900,
   total_likes: 19000,
   total_shares: 6310,
   total_comments: 2530,
-  avg_retention: 0.815,
+  avg_retention: 0.42, // (0.84 + 0.0) / 2, unmarked zero excluded
   clips: [
     {
       clip_id: 'clip-recorded',
@@ -32,13 +33,13 @@ const MOCK_SUMMARY = {
       title: 'Unknown retention clip',
       duration: 30.0,
       platforms: ['tiktok'],
+      // Legacy unmarked zero: retention_rate 0.0, no marker -> Unknown.
       metrics: { views: 1000, likes: 10, shares: 2, comments: 1,
                  retention_rate: 0.0 },
     },
   ],
 };
 
-// Honest insights: null/empty causal fields, explicit observations.
 const MOCK_INSIGHTS = {
   patterns: {
     has_data: true,
@@ -69,6 +70,11 @@ const EMPTY_INSIGHTS = {
   prompt_snippet: '',
 };
 
+const MALFORMED_INSIGHTS = {
+  patterns: null,
+  prompt_snippet: null,
+};
+
 beforeEach(() => {
   vi.restoreAllMocks();
 });
@@ -83,37 +89,66 @@ test('renders honest evidence state, no invented learning claims', async () => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
 
-  // Honest banner, not "AI Continuous Learning Engine / Active".
   expect(screen.getByText(/Performance Observations/i)).toBeInTheDocument();
   expect(screen.getByText(/Not Active in Selection/i)).toBeInTheDocument();
   expect(screen.queryByText(/AI Continuous Learning Engine/i)).not.toBeInTheDocument();
   expect(screen.queryByText(/Active in Pipeline/i)).not.toBeInTheDocument();
-
-  // No invented multiplier / hook archetypes / completion claims.
   expect(screen.queryByText(/higher retention on complete arcs/i)).not.toBeInTheDocument();
   expect(screen.queryByText(/Winning Duration Tier/i)).not.toBeInTheDocument();
-  expect(screen.queryByText(/84%.*completion/i)).not.toBeInTheDocument();
+  // No universal benchmark labels.
+  expect(screen.queryByText(/Average \(60-70%\)/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/Viral \(80%\+\)/i)).not.toBeInTheDocument();
 
-  // Honest observations with denominators.
   expect(screen.getByText(/3 clips with recorded views/i)).toBeInTheDocument();
   expect(screen.getByText(/Average of 2 explicitly recorded values/i)).toBeInTheDocument();
 });
 
-test('distinguishes recorded zero from unknown retention', async () => {
+test('leaderboard distinguishes recorded zero from unknown', async () => {
   vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
   vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
 
-  render(<AnalyticsView pushToast={vi.fn()} />);
+  const { container } = render(<AnalyticsView pushToast={vi.fn()} />);
 
   await waitFor(() => {
     expect(screen.getByText('Explicit zero retention clip')).toBeInTheDocument();
   });
 
-  // Recorded 0% shows as 0%, unknown shows as Unknown (not a fallback %).
-  const zeroRow = screen.getByText('Explicit zero retention clip').closest('div');
-  expect(zeroRow.textContent).toMatch(/0%/);
-  const unknownRow = screen.getByText('Unknown retention clip').closest('div');
-  expect(unknownRow.textContent).toMatch(/Unknown/);
+  // Find each clip row by its title, then check the retention field within.
+  const rows = container.querySelectorAll('[data-clip-row]');
+  // Fallback: find by title text and traverse to row container.
+  const findRow = (title) => {
+    const el = screen.getByText(title);
+    // Climb to the row container (grid with clip_id key).
+    let node = el;
+    while (node && node !== container) {
+      if (node.getAttribute && node.getAttribute('data-clip-id')) return node;
+      node = node.parentElement;
+    }
+    return el.closest('div[style*="grid"]') || el.parentElement;
+  };
+
+  const zeroRow = findRow('Explicit zero retention clip');
+  expect(within(zeroRow).getByText('0%')).toBeInTheDocument();
+
+  const unknownRow = findRow('Unknown retention clip');
+  expect(within(unknownRow).getByText('Unknown')).toBeInTheDocument();
+
+  const recordedRow = findRow('Recorded retention clip');
+  expect(within(recordedRow).getByText('84%')).toBeInTheDocument();
+});
+
+test('KPI shows null average as Unknown, not 0%', async () => {
+  const summaryNoRetention = { ...MOCK_SUMMARY, avg_retention: null };
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(summaryNoRetention);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+  // Avg Retention card shows Unknown, not 0%.
+  expect(screen.getByText('Unknown')).toBeInTheDocument();
 });
 
 test('empty insights show honest inactive state', async () => {
@@ -125,10 +160,42 @@ test('empty insights show honest inactive state', async () => {
   await waitFor(() => {
     expect(screen.getByText(/audience-based selection rules are not active yet/i)).toBeInTheDocument();
   });
-  expect(screen.queryByText(/WHOLE-STORY/i)).not.toBeInTheDocument();
 });
 
-test('saves metrics with honest wording, no learning claim', async () => {
+test('malformed insights handled defensively', async () => {
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MALFORMED_INSIGHTS);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+  // No crash, honest fallback.
+  expect(screen.getByText(/audience-based selection rules are not active yet/i)).toBeInTheDocument();
+});
+
+test('modal initializes unknown as empty, explicit zero as 0', async () => {
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
+  vi.spyOn(realApi, 'trackClipAnalytics').mockResolvedValue({ success: true });
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Unknown retention clip')).toBeInTheDocument();
+  });
+
+  // Open modal for unknown clip.
+  const updateButtons = screen.getAllByRole('button', { name: /update/i });
+  fireEvent.click(updateButtons[2]); // third clip = unknown
+
+  const retentionInput = screen.getByLabelText(/audience retention rate/i);
+  expect(retentionInput.value).toBe(''); // unknown -> empty, not 0
+  expect(screen.getByText('Unknown')).toBeInTheDocument();
+});
+
+test('saves metrics with honest wording, preserves untouched retention', async () => {
   vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
   vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
   const trackSpy = vi.spyOn(realApi, 'trackClipAnalytics').mockResolvedValue({ success: true });
@@ -137,50 +204,17 @@ test('saves metrics with honest wording, no learning claim', async () => {
   render(<AnalyticsView pushToast={pushToast} />);
 
   await waitFor(() => {
-    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
-  });
-
-  const updateButtons = screen.getAllByRole('button', { name: /update/i });
-  expect(updateButtons.length).toBeGreaterThan(0);
-  fireEvent.click(updateButtons[0]);
-
-  expect(screen.getByRole('heading', { name: /update clip metrics/i })).toBeInTheDocument();
-  const saveBtn = screen.getByRole('button', { name: /save metrics/i });
-  fireEvent.click(saveBtn);
-
-  await waitFor(() => {
-    expect(trackSpy).toHaveBeenCalledWith(
-      'clip-recorded',
-      expect.objectContaining({ views: 185500, likes: 15400, shares: 5120 })
-    );
-    // Honest wording: saved, not "learning updated".
-    expect(pushToast).toHaveBeenCalledWith('success', 'Performance metrics saved.');
-    expect(pushToast).not.toHaveBeenCalledWith('success', expect.stringContaining('learning'));
-  });
-});
-
-test('unknown retention not sent when untouched', async () => {
-  const summaryUnknown = {
-    ...MOCK_SUMMARY,
-    clips: [MOCK_SUMMARY.clips[2]], // only the unknown-retention clip
-  };
-  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(summaryUnknown);
-  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
-  const trackSpy = vi.spyOn(realApi, 'trackClipAnalytics').mockResolvedValue({ success: true });
-
-  render(<AnalyticsView pushToast={vi.fn()} />);
-
-  await waitFor(() => {
     expect(screen.getByText('Unknown retention clip')).toBeInTheDocument();
   });
 
-  fireEvent.click(screen.getAllByRole('button', { name: /update/i })[0]);
+  fireEvent.click(screen.getAllByRole('button', { name: /update/i })[2]);
   fireEvent.click(screen.getByRole('button', { name: /save metrics/i }));
 
   await waitFor(() => {
     expect(trackSpy).toHaveBeenCalled();
   });
   const sent = trackSpy.mock.calls[0][1];
-  // Unknown retention must not be fabricated as a value.
+  // Untouched unknown retention is omitted, not fabricated.
   expect('retention_rate' in sent).toBe(false);
+  expect(pushToast).toHaveBeenCalledWith('success', 'Performance metrics saved.');
 });
