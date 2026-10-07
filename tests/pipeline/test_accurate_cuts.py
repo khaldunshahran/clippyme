@@ -629,29 +629,42 @@ def test_source_mutation_rejected_before_swap(tmp_path):
 
 
 def test_v3_slice_rejected_by_v4_contract(tmp_path):
-    """A revision-2 (v3) slice/stamp must NOT be reused under v4.
+    """A v3 stamp at the REAL sidecar path must be rejected.
 
-    The timing contract changed (normalized shared-clock trim); v3 slices
-    used incorrect content selection. The reuse validator must reject them
-    so they are re-cut, not silently reused.
+    Uses the production writer to create a valid v4 stamp, proves it
+    validates, then changes ONLY the version to 3 and proves rejection.
+    This fails if the version comparison is removed from the validator.
     """
     from clippyme.pipeline import run_ops
+    import json
 
     assert run_ops._SLICE_PROVENANCE_VERSION == 4
     src = tmp_path / "src.mp4"
     src.write_bytes(b"x" * 5000)
-    dest = tmp_path / "slice.mp4"
-    dest.write_bytes(b"y" * 8000)
-    # Write a v3 stamp (simulating a revision-2 slice)
-    import json, time
-    stamp = {
-        "version": 3,
-        "start": 1.0, "end": 3.0,
-        "source_fingerprint": run_ops.source_fingerprint(str(src)),
-        "size": 8000, "mtime": dest.stat().st_mtime,
-    }
-    (tmp_path / "slice.provenance.json").write_text(json.dumps(stamp))
-    # v4 validator must reject v3
+    dest = str(tmp_path / "slice.mp4")
+    with open(dest, "wb") as f:
+        f.write(b"y" * 8000)
+
+    # 1. Production writer creates a valid v4 stamp
+    fp = run_ops.source_fingerprint(str(src))
+    run_ops.write_slice_provenance(dest, start=1.0, end=3.0, source_fp=fp)
+    sidecar = run_ops.slice_provenance_path(dest)
+    assert sidecar == dest + ".slice.json"
+    assert run_ops.slice_provenance_valid(
+        dest, start=1.0, end=3.0, source_path=str(src)
+    ), "fresh v4 stamp must validate"
+
+    # 2. Change ONLY the version to 3 at the real path
+    with open(sidecar, encoding="utf-8") as f:
+        record = json.load(f)
+    assert record["version"] == 4
+    record["version"] = 3
+    with open(sidecar, "w", encoding="utf-8") as f:
+        json.dump(record, f)
+
+    # 3. v3 must now be rejected
     assert not run_ops.slice_provenance_valid(
-        str(dest), start=1.0, end=3.0, source_path=str(src)
-    ), "v3 stamp must be invalid under v4 contract"
+        dest, start=1.0, end=3.0, source_path=str(src)
+    ), "v3 stamp must be rejected under v4 contract"
+
+

@@ -112,14 +112,15 @@ _SLICE_PROVENANCE_VERSION = 4
 # re-based so the slice's own presentation timeline starts at exactly 0.
 #
 # START policy: the first retained frame is the first decoded source frame
-#   whose presentation timestamp is >= the requested start (ceil to frame
-#   boundary). ``-ss`` is placed AFTER ``-i`` (output seeking): ffmpeg
-#   decodes from the nearest seek point and discards everything before
-#   ``start``. Head offset is in [0, 1/fps) -- sub-frame, never a GOP.
+#   whose presentation timestamp is >= the requested start. The ``trim``
+#   filter selects the interval directly on the source timeline (no input
+#   or output -ss; seeking would change the clock the trim filters see).
+#   Head offset is sub-frame, never a GOP.
 # END policy: the last retained frame is the last frame with presentation
-#   timestamp < the requested end. Callers pass ``frames`` (computed from
-#   probed source fps as floor((end - start) * fps)) so the frame count is
-#   deterministic; a frame exactly AT ``end`` is NOT retained.
+#   timestamp < the requested end (half-open [start, end)). The ``trim``
+#   filter enforces the end by presentation timestamp -- correct for VFR
+#   sources with no frame-count arithmetic. A frame exactly AT ``end`` is
+#   NOT retained.
 # PRESENTATION ORIGIN (normalized shared-clock baseline):
 #   ``-i source -vf trim=start=S:end=E,setpts=PTS-S/TB
 #     -af atrim=start=S:end=E,asetpts=PTS-S/TB -fps_mode passthrough``
@@ -233,8 +234,9 @@ def write_slice_provenance(
     """Persist the provenance sidecar atomically, bound to the slice file.
 
     The record is written to a temp file and atomically renamed, and it
-    captures the slice file's own identity -- so the stamp always describes
-    the exact bytes on disk, never a previous generation. Call AFTER the
+    captures the slice file's own size/mtime fingerprint -- so the stamp
+    always describes the current generation on disk, never a previous one.
+    (Size/mtime is a fingerprint, not a byte-identity hash.) Call AFTER the
     media swap (``os.replace``) has completed.
     """
     import json
