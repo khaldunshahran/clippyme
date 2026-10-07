@@ -84,8 +84,16 @@ def test_performance_feedback_extracts_learned_patterns():
     patterns = pf.analyze_performance_patterns()
     assert patterns["has_data"] is True
     assert patterns["sample_size"] == 2
-    assert patterns["story_duration_multiplier"] >= 1.0
+    # Honest: no invented causal fields.
+    assert patterns["story_duration_multiplier"] is None
+    assert patterns["top_duration_tier"] is None
+    assert patterns["avg_completion_rate"] is None
+    assert patterns["top_hook_patterns"] == []
+    # Honest observations with explicit denominators.
+    assert patterns["totals"]["views"] == 105000
+    assert patterns["totals"]["shares"] == 3520
+    # Both clips recorded retention explicitly via update_clip_metrics.
+    assert patterns["retention"]["recorded_count"] == 2
 
     prompt_snippet = pf.get_learned_patterns_prompt()
-    assert "LEARNED AUDIENCE PERFORMANCE PATTERNS" in prompt_snippet
-    assert "WHOLE-STORY ARCS DOMINATE" in prompt_snippet
+    assert prompt_snippet == ""

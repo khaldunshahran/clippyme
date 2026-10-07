@@ -145,6 +145,20 @@ def update_clip_metrics(clip_id: str, metrics: Dict[str, Any]) -> Optional[Dict[
     comments = int(metrics.get("comments", current.get("comments", 0)))
     retention = float(metrics.get("retention_rate", current.get("retention_rate", 0.0)))
 
+    # Presence marker: True only when retention_rate was explicitly
+    # provided and valid in THIS update. Distinguishes a real recorded
+    # zero from legacy default unknown zero. Additive only; absent means
+    # unknown. Existing files remain usable without migration.
+    _explicit = metrics.get("retention_rate", None)
+    if _explicit is not None:
+        try:
+            _rv = float(_explicit)
+            import math as _math
+            if _math.isfinite(_rv) and 0.0 <= _rv <= 1.0:
+                current["retention_recorded"] = True
+        except (TypeError, ValueError):
+            pass
+
     # Engagement rate: (likes + comments + shares) / max(views, 1)
     eng_rate = round((likes + comments + shares) / max(views, 1), 4) if views > 0 else 0.0
 

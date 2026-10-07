@@ -1,7 +1,7 @@
 // ClippyMe redesign — Analytics: Published Clip Performance & AI Continuous Learning Loop.
 // Tracks real-world views, likes, shares, and retention across TikTok, Instagram,
-// and YouTube Shorts. Winning narrative patterns and hook archetypes are automatically
-// extracted and fed directly into Gemini's prompt for future clip generation.
+// and YouTube Shorts. Shows recorded measurements honestly; audience-based
+// selection rules are not active yet.
 import { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Hero } from './chrome';
@@ -28,11 +28,11 @@ function UpdateMetricsModal({
   const [likes, setLikes] = useState(clip?.metrics?.likes ?? clip?.likes ?? 0);
   const [shares, setShares] = useState(clip?.metrics?.shares ?? clip?.shares ?? 0);
   const [comments, setComments] = useState(clip?.metrics?.comments ?? clip?.comments ?? 0);
+  const _initialRetention = clip?.metrics?.retention_rate ?? clip?.retention_rate;
   const [retentionPct, setRetentionPct] = useState(
-    clip?.metrics?.retention_rate != null
-      ? Math.round(clip.metrics.retention_rate * 100)
-      : (clip?.retention_rate != null ? Math.round(clip.retention_rate * 100) : 75)
+    _initialRetention != null ? String(Math.round(_initialRetention * 100)) : ''
   );
+  const [retentionTouched, setRetentionTouched] = useState(false);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -45,11 +45,13 @@ function UpdateMetricsModal({
         likes: Number(likes) || 0,
         shares: Number(shares) || 0,
         comments: Number(comments) || 0,
-        retention_rate: Math.min(1, Math.max(0, (Number(retentionPct) || 0) / 100)),
       };
+      if (retentionTouched && retentionPct !== '') {
+        metrics.retention_rate = Math.min(1, Math.max(0, Number(retentionPct) / 100));
+      }
 
       await trackClipAnalytics(clip.clip_id, metrics);
-      pushToast?.('success', 'Performance metrics updated! AI continuous learning updated.');
+      pushToast?.('success', 'Performance metrics saved.');
       onSaved?.();
       onClose?.();
     } catch (err) {
@@ -106,7 +108,7 @@ function UpdateMetricsModal({
         </div>
 
         <p style={{ fontSize: '0.875rem', color: 'var(--ink-dim)', marginBottom: 20, lineHeight: 1.4 }}>
-          Updating performance metrics updates the AI continuous learning engine, teaching Gemini which narrative styles win real audience engagement.
+          Saved metrics are stored as recorded measurements. They do not change clip selection rules; audience-based learning is not active yet.
         </p>
 
         <div style={{ background: 'var(--bg-subtle, rgba(0,0,0,0.04))', padding: '12px 14px', borderRadius: 8, marginBottom: 16 }}>
@@ -204,17 +206,18 @@ function UpdateMetricsModal({
                 Audience Retention Rate
               </label>
               <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--rust, #bb5a3c)' }}>
-                {retentionPct}%
+                {retentionPct === '' ? 'Unknown' : `${retentionPct}%`}
               </span>
             </div>
             <input
               id="m-retention"
-              type="range"
-              min="10"
+              type="number"
+              min="0"
               max="100"
+              placeholder="Unknown"
               value={retentionPct}
-              onChange={(e) => setRetentionPct(Number(e.target.value))}
-              style={{ width: '100%', cursor: 'pointer' }}
+              onChange={(e) => { setRetentionPct(e.target.value); setRetentionTouched(true); }}
+              style={{ width: '100%' }}
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--ink-dim)', marginTop: 2 }}>
               <span>Low (Dropoff)</span>
@@ -300,14 +303,14 @@ export function AnalyticsView({ pushToast }) {
       <Hero
         eyebrow="Performance Intelligence"
         title={<span>Published Clip <em>Analytics & Learning</em></span>}
-        desc="Track real-world views, likes, shares, and retention across platforms. High-performing narrative patterns are automatically synthesized and fed into Gemini's viral prompt for future clipping."
+        desc="Track real-world views, likes, shares, and retention across platforms. Recorded measurements are shown as observed; audience-based selection rules are not active yet."
       />
 
       {/* Top Action Bar */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <Badge tone="rust" icon="bar-chart">
-            Continuous Feedback Loop Active
+            Metrics Tracking
           </Badge>
           <span style={{ fontSize: '0.8rem', color: 'var(--ink-dim)' }}>
             Zernio Analytics API Auto-Sync Enabled
@@ -385,7 +388,7 @@ export function AnalyticsView({ pushToast }) {
             {avgRetention}%
           </div>
           <div style={{ fontSize: '0.75rem', color: avgRetention >= 75 ? '#2e7d32' : 'var(--ink-dim)' }}>
-            {avgRetention >= 75 ? '★ Elite Watch-Through' : 'Normal Watch-Through'}
+            {summary?.avg_retention != null ? 'Average of recorded values' : 'No retention recorded yet'}
           </div>
         </Panel>
       </div>
@@ -404,15 +407,14 @@ export function AnalyticsView({ pushToast }) {
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
               <span style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--ink)' }}>
-                🧠 AI Continuous Learning Engine
+                🧠 Performance Observations
               </span>
               <Badge tone="rust">
-                Active in Pipeline
+                Not Active in Selection
               </Badge>
             </div>
             <p style={{ fontSize: '0.875rem', color: 'var(--ink-dim)', margin: 0, maxWidth: 720, lineHeight: 1.4 }}>
-              ClippyMe correlates real-world views and retention against clip narrative structure. These learned insights are automatically injected into Gemini’s clipping prompt so future jobs favor your highest-converting formats.
-            </p>
+              Recorded measurements from your published clips, shown as observed. Audience-based selection rules are not active yet; generic editorial policy still applies to new clips.</p>
           </div>
 
           <Btn
@@ -429,44 +431,48 @@ export function AnalyticsView({ pushToast }) {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14, marginTop: 14, paddingTop: 14, borderTop: '1px solid rgba(0,0,0,0.06)' }}>
             <div>
               <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 700, color: 'var(--ink-dim)', display: 'block', marginBottom: 2 }}>
-                Winning Duration Tier
+                Measured Clips
               </span>
-              <span style={{ fontSize: '0.95rem', fontWeight: 700, color: 'var(--rust, #bb5a3c)' }}>
-                {patterns.top_duration_tier || 'mid (60s–120s)'}
+              <span style={{ fontSize: '0.95rem', fontWeight: 700, color: 'var(--ink)' }}>
+                {patterns.sample_size || 0} clips with recorded views
               </span>
               <span style={{ fontSize: '0.75rem', color: 'var(--ink-dim)', display: 'block' }}>
-                {patterns.story_duration_multiplier}x higher retention on complete arcs vs fragments
+                Descriptive observations only; no causal rules inferred.
               </span>
             </div>
 
             <div>
               <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 700, color: 'var(--ink-dim)', display: 'block', marginBottom: 2 }}>
-                Top Hook Archetypes
+                Recorded Totals
               </span>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                {(patterns.top_hook_patterns || []).slice(0, 2).map((h, i) => (
-                  <span key={i} style={{ fontSize: '0.82rem', fontWeight: 600 }}>
-                    • {h}
-                  </span>
-                ))}
-              </div>
+              <span style={{ fontSize: '0.95rem', fontWeight: 700, color: 'var(--ink)' }}>
+                {(patterns.totals?.views ?? 0).toLocaleString()} views
+              </span>
+              <span style={{ fontSize: '0.75rem', color: 'var(--ink-dim)', display: 'block' }}>
+                {(patterns.totals?.shares ?? 0).toLocaleString()} shares / {(patterns.totals?.likes ?? 0).toLocaleString()} likes recorded
+              </span>
             </div>
 
             <div>
               <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 700, color: 'var(--ink-dim)', display: 'block', marginBottom: 2 }}>
-                Audience Completion Rate
+                Retention
               </span>
-              <span style={{ fontSize: '0.95rem', fontWeight: 700, color: '#2e7d32' }}>
-                {patterns.avg_completion_rate ? `${Math.round(patterns.avg_completion_rate * 100)}%` : '84%'} completion
+              <span style={{ fontSize: '0.95rem', fontWeight: 700, color: 'var(--ink)' }}>
+                {patterns.retention?.average_recorded != null
+                  ? `${Math.round(patterns.retention.average_recorded * 100)}% avg`
+                  : 'Unknown'}
               </span>
               <span style={{ fontSize: '0.75rem', color: 'var(--ink-dim)', display: 'block' }}>
-                Based on {patterns.sample_size || 0} published stories
+                {patterns.retention?.recorded_count
+                  ? `Average of ${patterns.retention.recorded_count} explicitly recorded values`
+                  : 'No retention values recorded yet'}
               </span>
             </div>
           </div>
         ) : (
+
           <div style={{ fontSize: '0.85rem', color: 'var(--ink-dim)', marginTop: 8 }}>
-            Publish clips to gather performance data. ClippyMe will automatically build custom viral heuristics for your channel.
+            Publish clips to gather performance data. Recorded measurements will appear here as observed; audience-based selection rules are not active yet.
           </div>
         )}
 
@@ -522,7 +528,9 @@ export function AnalyticsView({ pushToast }) {
               const platforms = clip.platforms || (clip.platform ? [clip.platform] : ['tiktok']);
               const durationFormatted = clip.duration ? `${clip.duration.toFixed(1)}s` : '—';
               const rawRetention = clip.metrics?.retention_rate ?? clip.retention_rate;
-              const retentionDisplay = rawRetention != null ? `${Math.round(rawRetention * 100)}%` : '—';
+              const retentionKnown = clip.metrics?.retention_recorded ?? rawRetention != null;
+              const retentionDisplay = (retentionKnown && rawRetention != null)
+                              ? `${Math.round(rawRetention * 100)}%` : 'Unknown';
               const viewsCount = (clip.metrics?.views ?? clip.views) || 0;
               const likesCount = (clip.metrics?.likes ?? clip.likes) || 0;
               const sharesCount = (clip.metrics?.shares ?? clip.shares) || 0;
