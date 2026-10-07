@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import subprocess
 import time
@@ -161,10 +162,12 @@ def latest_project_version(job_dir: str, clip_index: int) -> int:
     # Pipeline-created projects predate the version map: fall back to the
     # working copy's version field so optimistic concurrency (expected_version)
     # works on first save instead of spuriously 409ing.
-    path = get_project_path(job_dir, clip_index)
-    if path:
+    # Check the working-copy file directly (not via get_project_path,
+    # which would recurse through this function).
+    latest_file = os.path.join(job_dir, _project_filename(clip_index))
+    if os.path.isfile(latest_file):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(latest_file, "r", encoding="utf-8") as f:
                 return int(json.load(f).get("version") or 0)
         except (OSError, ValueError):
             pass
@@ -697,31 +700,53 @@ async def render_project(*, job_id: str, clip_index: int,
                     _outcome, _base_path, _reason = check_lineage_eligible(
                         _lineage, _proj_dict, job_dir)
                     if _outcome == "eligible":
-                        # Validate base media geometry before reuse.
+                        # Validate base media before reuse. All numeric
+                        # metadata must be finite; missing/NaN/inf is a
+                        # clean error, not permission to reuse.
                         _probe = probe_media(_base_path)
+                        if not _probe.get("has_video", True):
+                            raise ProjectRenderError(
+                                "lineage base has no video stream")
                         _bw = _probe.get("width")
                         _bh = _probe.get("height")
-                        _bdur = float(_probe.get("duration") or 0)
+                        _bdur = _probe.get("duration")
                         _bfps = _probe.get("fps")
+                        def _finite_pos(v):
+                            return (isinstance(v, (int, float))
+                                    and math.isfinite(v) and v > 0)
+                        if not _finite_pos(_bdur):
+                            raise ProjectRenderError(
+                                f"lineage base duration invalid: {_bdur!r}")
+                        if not _finite_pos(_bfps):
+                            raise ProjectRenderError(
+                                f"lineage base FPS invalid: {_bfps!r}")
                         _rw, _rh = project.render.width, project.render.height
                         # Dimensions must match project render spec.
-                        if not (_bw and _bh and _bw == _rw and _bh == _rh):
+                        if not (_bw == _rw and _bh == _rh):
                             raise ProjectRenderError(
                                 f"lineage base dimensions {_bw}x{_bh} do not "
                                 f"match project render {_rw}x{_rh}")
-                        if not (_bdur > 0):
+                        # FPS tolerance: 0.1 (fractional rates like 29.97).
+                        if abs(float(_bfps) - float(project.render.fps)) > 0.1:
                             raise ProjectRenderError(
-                                "cannot probe duration of lineage base")
-                        # FPS tolerance: allow small rounding differences.
-                        if _bfps and project.render.fps:
-                            if abs(float(_bfps) - float(project.render.fps)) > 1.0:
-                                raise ProjectRenderError(
-                                    f"lineage base FPS {_bfps} mismatches "
-                                    f"project {project.render.fps}")
+                                f"lineage base FPS {_bfps} mismatches "
+                                f"project {project.render.fps}")
+                        # Duration must match timeline within tolerance.
+                        # Timeline duration from segments.
+                        _tl_dur = max(
+                            (float(s.end) for s in project.segments),
+                            default=0.0)
+                        # Tolerance: 0.5s or 5% of timeline, whichever larger.
+                        _dur_tol = max(0.5, _tl_dur * 0.05)
+                        if abs(float(_bdur) - _tl_dur) > _dur_tol:
+                            raise ProjectRenderError(
+                                f"lineage base duration {_bdur:.2f}s does not "
+                                f"match timeline {_tl_dur:.2f}s "
+                                f"(tolerance {_dur_tol:.2f}s)")
                         # Reuse validated reframed base; apply CURRENT
                         # composition/music from the project.
                         base_path = _base_path
-                        timeline_duration = _bdur
+                        timeline_duration = float(_bdur)
                         _used_lineage_base = True
                         logger.info(
                             "project_render: reusing reframed base for "

@@ -43,6 +43,11 @@ def base_clip(job_dir):
 
 
 def _lineage_dict(base_clip, job_dir):
+    # Create source file for identity (required by build_lineage).
+    src_path = os.path.join(job_dir, "source_0.mp4")
+    if not os.path.exists(src_path):
+        with open(src_path, "wb") as f:
+            f.write(b"source content for identity")
     return pl.build_lineage(
         clip_final=base_clip,
         job_dir=job_dir,
@@ -53,6 +58,7 @@ def _lineage_dict(base_clip, job_dir):
             "transition_in": "cut",
         }],
         render={"width": 608, "height": 1080, "fps": 30},
+        source_path=src_path,
     )
 
 
@@ -301,32 +307,72 @@ def test_segment_id_is_metadata(job_dir, base_clip):
 
 
 def test_versioned_save_load_preserves_lineage(tmp_path):
-    """Versioned save/load round-trip keeps lineage."""
+    """Real save_project_version/load/undo keeps lineage."""
+    from clippyme.domain import project_render as pr
     from clippyme.domain.clip_project import validate_project
     job_dir = str(tmp_path / "job")
     os.makedirs(job_dir, exist_ok=True)
-    base = os.path.join(job_dir, "base.mp4")
+    base = os.path.join(job_dir, "clip_final_0.mp4")
     with open(base, "wb") as f:
-        f.write(b"base content")
+        f.write(b"base content for identity")
+    src_file = os.path.join(job_dir, "source_0.mp4")
+    with open(src_file, "wb") as f:
+        f.write(b"source content for identity")
+
+    # Build lineage with real source identity.
+    lin = pl.build_lineage(
+        clip_final=base, job_dir=job_dir,
+        source={"file": "source_0.mp4", "width": 1920, "height": 1080},
+        segments=[{
+            "id": "seg-1", "start": 0.0, "end": 10.0,
+            "crop": {"x": 660.0, "y": 0.0, "w": 600.0, "h": 1080.0},
+            "transition_in": "cut",
+        }],
+        render={"width": 608, "height": 1080, "fps": 30},
+        source_path=src_file,
+    )
+    assert lin is not None
     proj_dict = _project_dict(base, job_dir)
-    # Simulate version bump (user save).
-    proj_dict["version"] = 2
-    proj_dict["origin"] = "user"
-    validated = validate_project(proj_dict)
-    # Save.
-    save_path = os.path.join(job_dir, "clip-project-0.json")
-    with open(save_path, "w", encoding="utf-8") as f:
-        f.write(project_to_json(validated))
-    # Load.
-    with open(save_path, encoding="utf-8") as f:
-        loaded = json.load(f)
-    restored = validate_project(loaded)
+    proj_dict["reframed_base"] = lin
+    project = validate_project(proj_dict)
+
+    # Real versioned save (v1).
+    ver1, saved1 = pr.save_project_version(
+        job_dir=job_dir, clip_index=0, project=project)
+    assert ver1 >= 1
+    assert saved1.reframed_base is not None
+    assert saved1.reframed_base.base_ref == "clip_final_0.mp4"
+
+    # User edit: change caption, save as v2 with optimistic concurrency.
+    proj_dict2 = saved1.model_dump()
+    proj_dict2["captions"]["edits"] = {"w1": "fixed"}
+    proj_dict2["origin"] = "user"
+    project2 = validate_project(proj_dict2)
+    ver2, saved2 = pr.save_project_version(
+        job_dir=job_dir, clip_index=0, project=project2,
+        expected_version=ver1)
+    assert ver2 == ver1 + 1
+    assert saved2.reframed_base.base_ref == "clip_final_0.mp4"
+
+    # Load latest via real path.
+    latest_path = pr.get_project_path(job_dir, 0)
+    assert latest_path is not None
+    with open(latest_path, encoding="utf-8") as f:
+        loaded_data = json.load(f)
+    restored = validate_project(loaded_data)
     assert restored.reframed_base is not None
-    assert restored.reframed_base.base_ref == "base.mp4"
-    # Eligibility still holds after version bump.
+
+    # Eligibility holds after versioned saves (caption-only edit).
     outcome, _, _ = pl.check_lineage_eligible(
-        loaded["reframed_base"], loaded, job_dir)
-    assert outcome == "eligible"
+        loaded_data["reframed_base"], loaded_data, job_dir)
+    assert outcome == "eligible", "caption edit must not invalidate"
+
+    # Optimistic concurrency: stale version rejected.
+    from clippyme.domain.project_render import ConflictError
+    with pytest.raises(ConflictError):
+        pr.save_project_version(
+            job_dir=job_dir, clip_index=0, project=project2,
+            expected_version=ver1)  # stale; latest is ver2
 
 
 def test_schema_twin_has_lineage():

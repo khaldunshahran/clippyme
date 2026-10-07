@@ -50,6 +50,26 @@ Old projects without lineage: existing routes unchanged.
 
 ## QA
 
-Selected base must match project's output aspect/dimensions. Duration/FPS/
-encoder tolerances documented; audio preserved; no byte-identity promise
-across encoders.
+Selected base must match project's output aspect/dimensions.
+`inspect_clip` receives `expected_aspect = render.width / render.height`.
+
+## Tolerances and fingerprints
+
+- **FPS**: base FPS must be within 0.1 of project FPS (covers 29.97 vs 30).
+- **Duration**: base duration must be within max(0.5s, 5% of timeline)
+  of the timeline duration (max segment end).
+- **Dimensions**: exact match required (no tolerance).
+- **File identity**: size + mtime (not a content hash). A same-size,
+  same-mtime replacement is not detected; documented limitation.
+- **Video stream**: `has_video` must be true; missing/NaN/inf duration/FPS
+  raises `ProjectRenderError`.
+
+## Baseline validation order
+
+1. Baseline structure validated (incomplete -> invalid_asset).
+2. Geometry compared (differences -> geometry_edit, even if base missing).
+3. Base assets checked (problems -> invalid_asset).
+4. Source identity checked (mismatch -> invalid_asset).
+
+A genuine geometry edit with a missing/stale old base returns
+geometry_edit and uses the source renderer.

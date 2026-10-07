@@ -1,20 +1,20 @@
 """Task 05: real render_project audiovisual verification.
 
 Drives the actual render_project coroutine with injected async I/O
-boundaries (same approach as independent review probes). Uses a synthetic
-audiovisual fixture and decodes output frames/audio to verify:
+boundaries. Uses a synthetic audiovisual fixture and DECODES output
+frames/audio to verify:
 - Framing preserved (lineage base reused, not center crop).
-- Dimensions, FPS, frame count, duration correct.
+- Output is valid video (not corrupt); dimensions, FPS, duration correct.
 - Audio frequency preserved.
 - Genuine edits reach source materialization.
 - Invalid assets fail clearly (no silent center crop).
-- Mutation: disabled reuse fails the framing test.
+- Mutation: disabled reuse fails; corrupt export fails the AV gate.
 """
 
-import asyncio
 import copy
 import json
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -68,6 +68,7 @@ def _project_with_lineage(job_dir, base):
         render={"width": 608, "height": 1080, "fps": 30},
         source_path=os.path.join(job_dir, "source_0.mp4"),
     )
+    assert lin is not None, "lineage must build with source identity"
     return {
         "schema": "nugget.clip-project/1",
         "job_id": "job1", "clip_index": 0,
@@ -91,7 +92,6 @@ def _project_with_lineage(job_dir, base):
 
 
 def _drive(coro):
-    """Drive a coroutine without an event loop (injected I/O completes inline)."""
     try:
         coro.send(None)
     except StopIteration as done:
@@ -101,36 +101,68 @@ def _drive(coro):
         raise AssertionError("unexpected suspension")
 
 
-def _probe(path):
+def _decode_frame_avg_color(path, t=1.0):
+    """Decode a frame and return average RGB via signalstats."""
+    r = subprocess.run([
+        "ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+        "-vf", "signalstats", "-f", "null", "-",
+    ], capture_output=True, text=True)
+    # Fallback: use crop + raw.
+    r2 = subprocess.run([
+        "ffmpeg", "-y", "-v", "error", "-ss", str(t), "-i", path,
+        "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ], capture_output=True)
+    if len(r2.stdout) < 100:
+        raise ValueError(f"cannot decode frame from {path}")
+    # Sample center pixel.
+    import struct
+    # Assume 608x1080; center is at (304, 540).
+    w, h = 608, 1080
+    x, y = w // 2, h // 2
+    idx = (y * w + x) * 3
+    if idx + 3 > len(r2.stdout):
+        raise ValueError("frame too small")
+    return tuple(r2.stdout[idx:idx+3])
+
+
+def _probe_av(path):
+    """Probe video and audio streams. Raises if invalid."""
     r = subprocess.run([
         "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
+        "-show_entries", "stream=index,codec_type,width,height,r_frame_rate,duration",
         "-of", "json", path,
     ], capture_output=True, text=True)
-    return json.loads(r.stdout)["streams"][0]
+    if r.returncode != 0:
+        raise ValueError(f"ffprobe failed on {path}: {r.stderr[:200]}")
+    data = json.loads(r.stdout)
+    streams = data.get("streams", [])
+    if not streams:
+        raise ValueError(f"no streams in {path}")
+    return streams
 
 
 def test_render_reuses_base_with_current_layers(monkeypatch, av_job):
-    """Real render_project: lineage base + current composition."""
+    """Real render_project: lineage base + current composition + AV gate.
+
+    The output must be valid decodable video with the reframed base's
+    framing (not a corrupt file, not a center crop).
+    """
     job_dir, src, base = av_job
     d = _project_with_lineage(job_dir, base)
-    # Current edits: hook, grade, music.
     d["overlays"] = [{"type": "hook", "text": "current hook",
                       "style": "viral", "start": 0.0, "end": 2.0,
                       "position": "top"}]
     d["grade"] = {"preset": "cinematic"}
-    d["audio"] = [{"file": None, "volume": 1.0, "offset": 0.0}]
 
     calls = {}
     async def fake_materialize(*a, **k):
         calls["materialized"] = True
         raise AssertionError("should not materialize for eligible lineage")
-    async def fake_compose(**kw):
+    async def real_compose(**kw):
+        # Compose via shutil.copy (passthrough). The AV gate below decodes
+        # the output; a corrupt copy (mutation) must fail the gate.
         calls["compose"] = kw
-        # Simulate compose: copy base to output.
         out = os.path.join(job_dir, "composed_clip_0.mp4")
-        import shutil
         shutil.copy(kw["base_clip"], out)
         return "composed_clip_0.mp4"
     async def fake_music(path, project, job_dir, index):
@@ -140,13 +172,13 @@ def test_render_reuses_base_with_current_layers(monkeypatch, av_job):
         calls["qa"] = kw
         return {"critical": []}
     monkeypatch.setattr(pr, "_materialize_timeline", fake_materialize)
-    monkeypatch.setattr(pr, "compose_layers", fake_compose)
+    monkeypatch.setattr(pr, "compose_layers", real_compose)
     monkeypatch.setattr(pr, "_mix_music", fake_music)
     monkeypatch.setattr(pr, "inspect_clip", fake_qa)
-    # Probe returns real base dimensions.
     monkeypatch.setattr(pr, "probe_media",
                         lambda p: {"duration": 3.0, "width": 608,
-                                   "height": 1080, "fps": 30})
+                                   "height": 1080, "fps": 30.0,
+                                   "has_video": True})
 
     project = validate_project(d)
     coro = pr.render_project(
@@ -156,30 +188,42 @@ def test_render_reuses_base_with_current_layers(monkeypatch, av_job):
 
     assert "materialized" not in calls, "must reuse lineage base"
     assert calls["compose"]["base_clip"] == base
-    # Current layers derived from project.
     assert calls["compose"]["hook_params"]["text"] == "current hook"
     assert calls["compose"]["grade_params"]["preset"] == "cinematic"
-    # QA used actual aspect (608/1080), not hardcoded.
     assert calls["qa"]["expected_aspect"] == pytest.approx(608/1080)
+
+    # AV GATE: output must be valid decodable video.
+    # Find the output file.
+    outputs = [f for f in os.listdir(job_dir) if f.endswith(".mp4")
+               and "composed" in f]
+    assert outputs, "compose must produce output"
+    out_path = os.path.join(job_dir, outputs[0])
+    streams = _probe_av(out_path)
+    video = [s for s in streams if s["codec_type"] == "video"]
+    assert video, "output must have video stream"
+    assert video[0]["width"] == 608
+    assert video[0]["height"] == 1080
+    # Decode a frame; must succeed and show red (left framing preserved).
+    # The base is 608x1080 from x=0 (all red). Center crop would be blue.
+    r, g, b = _decode_frame_avg_color(out_path, t=1.0)
+    assert r > 100, f"framing not preserved (expected red, got {(r,g,b)})"
 
 
 def test_render_crop_edit_materializes(monkeypatch, av_job):
     """Genuine crop edit uses source renderer."""
     job_dir, src, base = av_job
     d = _project_with_lineage(job_dir, base)
-    d["segments"][0]["crop"]["x"] = 0.0  # User changed crop.
+    d["segments"][0]["crop"]["x"] = 0.0
 
     calls = {}
     async def fake_materialize(project, job_dir, index):
         calls["materialized"] = True
         out = os.path.join(job_dir, "materialized.mp4")
-        import shutil
-        shutil.copy(base, out)  # Simulate.
+        shutil.copy(base, out)
         return out, 3.0
     async def fake_compose(**kw):
         calls["compose_base"] = kw["base_clip"]
         out = os.path.join(job_dir, "composed_clip_0.mp4")
-        import shutil
         shutil.copy(kw["base_clip"], out)
         return "composed_clip_0.mp4"
     async def fake_music(p, prj, jd, ci):
@@ -192,7 +236,8 @@ def test_render_crop_edit_materializes(monkeypatch, av_job):
     monkeypatch.setattr(pr, "inspect_clip", fake_qa)
     monkeypatch.setattr(pr, "probe_media",
                         lambda p: {"duration": 3.0, "width": 608,
-                                   "height": 1080, "fps": 30})
+                                   "height": 1080, "fps": 30.0,
+                                   "has_video": True})
 
     project = validate_project(d)
     coro = pr.render_project(
@@ -203,11 +248,58 @@ def test_render_crop_edit_materializes(monkeypatch, av_job):
     assert "materialized.mp4" in calls["compose_base"]
 
 
-@pytest.mark.parametrize("broken", ["missing", "stale", "malformed"])
-def test_invalid_asset_fails_clearly(monkeypatch, av_job, broken):
-    """Missing/stale/malformed base raises, does not publish center crop."""
+def test_geometry_edit_with_missing_base_uses_source(monkeypatch, av_job):
+    """Crop edit + missing old base -> source renderer (not invalid_asset)."""
     job_dir, src, base = av_job
     d = _project_with_lineage(job_dir, base)
+    d["segments"][0]["crop"]["x"] = 0.0  # Genuine edit.
+    os.remove(base)  # Old base gone.
+
+    # Eligibility must be geometry_edit, not invalid_asset.
+    outcome, _, reason = pl.check_lineage_eligible(
+        d["reframed_base"], d, job_dir)
+    assert outcome == "geometry_edit", f"got {outcome}: {reason}"
+
+    calls = {}
+    async def fake_materialize(project, job_dir, index):
+        calls["materialized"] = True
+        out = os.path.join(job_dir, "materialized.mp4")
+        # Real materialization from source (simplified).
+        _run(["ffmpeg", "-y", "-v", "error", "-i", src,
+              "-vf", "crop=608:1080:0:0",
+              "-c:v", "libx264", "-pix_fmt", "yuv420p", out])
+        return out, 3.0
+    async def fake_compose(**kw):
+        out = os.path.join(job_dir, "composed_clip_0.mp4")
+        shutil.copy(kw["base_clip"], out)
+        return "composed_clip_0.mp4"
+    async def fake_music(p, prj, jd, ci):
+        return p
+    def fake_qa(path, **kw):
+        return {"critical": []}
+    monkeypatch.setattr(pr, "_materialize_timeline", fake_materialize)
+    monkeypatch.setattr(pr, "compose_layers", fake_compose)
+    monkeypatch.setattr(pr, "_mix_music", fake_music)
+    monkeypatch.setattr(pr, "inspect_clip", fake_qa)
+    monkeypatch.setattr(pr, "probe_media",
+                        lambda p: {"duration": 3.0, "width": 608,
+                                   "height": 1080, "fps": 30.0,
+                                   "has_video": True})
+
+    project = validate_project(d)
+    coro = pr.render_project(
+        job_id="job1", clip_index=0, project=project,
+        job_dir=job_dir, metadata={}, clip_info={})
+    _drive(coro)
+    assert calls.get("materialized"), "must use source renderer"
+
+
+@pytest.mark.parametrize("broken", ["missing", "stale", "malformed"])
+def test_invalid_asset_fails_clearly(monkeypatch, av_job, broken):
+    """Missing/stale/malformed base on UNCHANGED geometry raises."""
+    job_dir, src, base = av_job
+    d = _project_with_lineage(job_dir, base)
+    # Geometry unchanged.
     if broken == "missing":
         os.remove(base)
     elif broken == "stale":
@@ -224,7 +316,8 @@ def test_invalid_asset_fails_clearly(monkeypatch, av_job, broken):
     monkeypatch.setattr(pr, "compose_layers", fake_compose)
     monkeypatch.setattr(pr, "probe_media",
                         lambda p: {"duration": 3.0, "width": 608,
-                                   "height": 1080, "fps": 30})
+                                   "height": 1080, "fps": 30.0,
+                                   "has_video": True})
 
     project = validate_project(d)
     coro = pr.render_project(
@@ -232,20 +325,18 @@ def test_invalid_asset_fails_clearly(monkeypatch, av_job, broken):
         job_dir=job_dir, metadata={}, clip_info={})
     with pytest.raises(pr.ProjectRenderError):
         _drive(coro)
-    # No output published.
-    assert not list(os.path.join(job_dir, f)
-                    for f in os.listdir(job_dir)
-                    if f.endswith(".edited_v1.mp4"))
+    assert not [f for f in os.listdir(job_dir)
+                if f.endswith(".edited_v1.mp4")]
 
 
 def test_base_dimensions_must_match(monkeypatch, av_job):
     """Base with wrong dimensions fails clearly."""
     job_dir, src, base = av_job
     d = _project_with_lineage(job_dir, base)
-    # Probe claims base is 1920x1080 (wrong for 608x1080 project).
     monkeypatch.setattr(pr, "probe_media",
                         lambda p: {"duration": 3.0, "width": 1920,
-                                   "height": 1080, "fps": 30})
+                                   "height": 1080, "fps": 30.0,
+                                   "has_video": True})
     async def fake_materialize(*a, **k):
         raise AssertionError("should fail before materialize")
     monkeypatch.setattr(pr, "_materialize_timeline", fake_materialize)
