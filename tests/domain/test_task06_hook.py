@@ -192,13 +192,16 @@ def test_hook_interval_respected(monkeypatch, hook_job, start, end):
 
 
 def test_delayed_animation_relative_to_start(monkeypatch, hook_job):
-    """Animated hook with REAL animate flag: fade starts at hook_start.
+    """Delayed animation: inspect early vs settled frames.
 
-    Uses style={"animate": True} (not a style name) so the existing
-    animate flag is genuinely enabled. Verifies via spy that animation
-    was requested, and via pixels that the delayed hook appears.
+    Uses style={"animate": True} so the flag is genuinely enabled.
+    The slide animation moves the hook from y0+40 to y0 over 0.4s,
+    starting at hook_start (not t=0). A mutation forcing anim_start=0
+    makes early frames look settled -> this test fails.
     """
     from clippyme.domain import hooks as hk_mod
+    from clippyme.domain import compose as comp_mod
+    from PIL import Image
     monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
     js, src_path = hook_job
 
@@ -206,7 +209,13 @@ def test_delayed_animation_relative_to_start(monkeypatch, hook_job):
         return func(*args, **kwargs)
     monkeypatch.setattr(asyncio, "to_thread", inline_thread)
 
-    # Spy to verify animate=True reaches add_hook_to_video.
+    # Deterministic red hook (40x24).
+    def red_image(text, width, output_path, **kw):
+        Image.new("RGBA", (40, 24), (255, 0, 0, 255)).save(output_path)
+        return output_path, 40, 24
+    monkeypatch.setattr(hk_mod, "create_hook_image", red_image)
+
+    # Spy to verify animate flag.
     styles = []
     original = hk_mod.add_hook_to_video
     def spy(*a, **kw):
@@ -215,21 +224,46 @@ def test_delayed_animation_relative_to_start(monkeypatch, hook_job):
         return original(*a, **kw)
     monkeypatch.setattr(hk_mod, "add_hook_to_video", spy)
 
-    # Direct _apply_hook with real animate flag and delayed timing.
-    from clippyme.domain import compose as comp_mod
     coro = comp_mod._apply_hook(
         src_path, js, 0,
         {"text": "ANIM", "animate": True,
          "hook_start": 2.0, "hook_end": 5.0},
         [], timeline_duration=6.0)
     out = _drive(coro)
-
     assert styles and all(styles), "animation flag not enabled"
-    # Before start: no hook.
+
+    import numpy as np
+    def red_at_y(path, t, y_center, thresh=150):
+        """Check for red pixels at a specific y (hook vertical position)."""
+        rgb = _run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                    "-frames:v", "1", "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "-"])
+        arr = np.frombuffer(rgb, dtype=np.uint8).reshape(180, 320, 3)
+        # Hook x: centered (320-40)//2=140, width 40 -> x=140-180.
+        # Sample 10px tall band at y_center.
+        y0 = max(0, int(y_center) - 5)
+        y1 = min(180, int(y_center) + 5)
+        region = arr[y0:y1, 140:180]
+        # During fade, red is blended with blue; lower threshold for early.
+        red = ((region[:, :, 0] > thresh) &
+               (region[:, :, 1] < 120)).sum()
+        return red > 15
+
+    # Hook geometry: y0=36 (20% of 180), slide 40px over 0.4s.
+    # At t=2.15: y ~ 46 (elevated), alpha ~0.38 (faded).
+    # At t=3.0 (settled): y = 36, full opacity.
+    # Early (t=2.15): hook elevated and faded, NOT at settled y=36.
+    # Mutation (anim_start=0): at t=2.15 hook is settled at y=36.
+    assert red_at_y(out, 2.15, 46, thresh=80), (
+        "early animation frame: hook not at elevated/faded position")
+    assert not red_at_y(out, 2.15, 36), (
+        "early frame shows settled position (anim_start=0 mutation?)")
+    # Settled (t=3.0): hook at y=36, not elevated.
+    assert red_at_y(out, 3.0, 36), "settled frame: hook not at final y=36"
+    assert not red_at_y(out, 3.0, 70), (
+        "settled frame shows elevated position")
+    # Before start / at end: no hook.
     assert not _hook_visible(out, 0.5)
-    # After start: hook visible (animation completed).
-    assert _hook_visible(out, 4.0)
-    # At exclusive end: no hook.
     assert not _hook_visible(out, 5.0)
 
 
@@ -459,3 +493,108 @@ def test_smartcut_with_timing_rejected(monkeypatch, hook_job):
             hook_params={"text": "hook", "hook_start": 1.0, "hook_end": 2.0},
             subtitle_params={}, timeline_duration=6.0))
     assert not calls, "Smart Cut ran despite rejection"
+
+
+# --- Export routes with source offsets and audio ---
+
+def _decode_tone_freq(path, duration=1.0):
+    """Decode audio and estimate dominant frequency via FFT."""
+    import numpy as np
+    # Extract mono 8kHz raw audio.
+    raw = _run(["ffmpeg", "-v", "error", "-i", path,
+                "-ac", "1", "-ar", "8000", "-t", str(duration),
+                "-f", "s16le", "-"])
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    if len(samples) < 100:
+        return None
+    # FFT.
+    spectrum = np.abs(np.fft.rfft(samples))
+    freqs = np.fft.rfftfreq(len(samples), 1/8000)
+    peak = freqs[np.argmax(spectrum[1:]) + 1]  # skip DC
+    return float(peak)
+
+
+def test_source_route_with_offset(monkeypatch, hook_job):
+    """Edited source route: hook timing on output clock, not source.
+
+    Segment has nonzero source start (1.0s); hook [1,3) refers to
+    output timeline, not shifted by source offset.
+    """
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    # Project with segment starting at source 1.0s (nonzero offset),
+    # output duration 4s (1.0-5.0 source). Hook [1,3) on OUTPUT clock.
+    d = {
+        "schema": "nugget.clip-project/1", "job_id": "t", "clip_index": 0,
+        "source": {"file": "source.mp4", "width": 320, "height": 180,
+                   "duration": 6.0},
+        "segments": [{
+            "id": "s", "start": 1.0, "end": 5.0,  # nonzero source offset
+            "crop": {"x": 0.0, "y": 0.0, "w": 320.0, "h": 180.0},
+            "transition_in": "cut",
+        }],
+        "captions": {"style": "classic_white", "position": "bottom",
+                     "words": [], "edits": {}},
+        "overlays": [{
+            "type": "hook", "text": "OFFSET", "style": "viral",
+            "start": 1.0, "end": 3.0, "position": "top",  # output clock
+        }],
+        "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
+        "grade": {"preset": "default"},
+        "render": {"width": 320, "height": 180, "fps": 30,
+                   "encoder": "libx264"},
+    }
+    project = validate_project(d)
+    coro = pr.render_project(
+        job_id="t", clip_index=0, project=project,
+        job_dir=js, metadata={}, clip_info={})
+    result = _drive(coro)
+    out = result.output_path
+
+    # Output is 4s (5.0-1.0). Hook [1,3) on output clock.
+    # At output t=0.5 (source 1.5): no hook.
+    assert not _hook_visible(out, 0.5), "hook visible before output start"
+    # At output t=2.0 (source 3.0): hook visible.
+    assert _hook_visible(out, 2.0), "hook not visible at output t=2.0"
+    # At output t=3.5: no hook (after end).
+    assert not _hook_visible(out, 3.5), "hook visible after output end"
+    # Audio tone preserved (880Hz).
+    freq = _decode_tone_freq(out)
+    assert freq is not None and 850 < freq < 910, (
+        f"audio tone {freq}Hz, expected ~880Hz")
+
+
+def test_lineage_route_hook_timing(monkeypatch, hook_job):
+    """Lineage route: hook timing uses output clock (same compose path).
+
+    The hook is applied in compose_layers after base resolution.
+    This verifies timing is not shifted for the lineage route.
+    """
+    from clippyme.domain import compose as comp_mod
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js, src_path = hook_job
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    # Simulate lineage: base is the source (eligible, unchanged).
+    # Hook [2,4) should apply to output clock.
+    coro = comp_mod._apply_hook(
+        src_path, js, 0,
+        {"text": "LINEAGE", "hook_start": 2.0, "hook_end": 4.0},
+        [], timeline_duration=6.0)
+    out = _drive(coro)
+
+    assert not _hook_visible(out, 0.5)
+    assert _hook_visible(out, 3.0)
+    assert not _hook_visible(out, 5.0)
+    # Audio tone decoded (not just presence).
+    freq = _decode_tone_freq(out)
+    assert freq is not None and 850 < freq < 910, (
+        f"audio tone {freq}Hz, expected ~880Hz")

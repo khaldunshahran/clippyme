@@ -642,15 +642,31 @@ async def _compose_layers_impl(
     drop_ranges=None,
     timeline_duration: float | None = None,
 ) -> str:
-    # Task 06 rev2: explicit hook timing + Smart Cut is unsupported.
-    # Smart Cut changes the timeline; explicit timing refers to the
-    # output clock. Reject before any time-changing work.
+    # Task 06 rev3: preflight hook timing validation BEFORE any
+    # composition or time-changing work.
     from clippyme.domain import hook_timing as _ht
     from clippyme.domain.errors import ValidationError as _VE
-    if _ht.has_explicit_timing(hook_params) and toggles.get("smartcut"):
-        raise _VE(
-            "explicit hook timing (hook_start/hook_end) is not supported "
-            "with Smart Cut enabled; disable Smart Cut or omit hook timing")
+    # Effective active hook: same rule as downstream (toggle + non-empty text).
+    _hook_text = (hook_params or {}).get("text", "")
+    if isinstance(_hook_text, str):
+        _hook_text = _hook_text.strip()
+    _eff_hook_active = bool(toggles.get("hook")) and bool(_hook_text)
+    if _eff_hook_active:
+        # Partial timing rejected before Smart Cut or any composition.
+        _ht.reject_half_specified(hook_params)
+        if _ht.has_explicit_timing(hook_params):
+            # Validate values now (not in _apply_hook after cutting).
+            try:
+                _ht.validate_hook_interval(
+                    hook_params["hook_start"], hook_params["hook_end"])
+            except _ht.HookTimingError as e:
+                raise _VE(f"invalid hook timing: {e}")
+            # Explicit timing + Smart Cut: unsupported (timeline changes).
+            if toggles.get("smartcut"):
+                raise _VE(
+                    "explicit hook timing (hook_start/hook_end) is not "
+                    "supported with Smart Cut enabled; disable Smart Cut "
+                    "or omit hook timing")
 
     active = {k: v for k, v in toggles.items() if v}
     # The banner can be enabled via its own params.enabled (frontend convention)

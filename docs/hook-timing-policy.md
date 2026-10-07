@@ -6,11 +6,20 @@ Exports honor the stored interval; legacy callers without timing keep defaults.
 ## Timing contract
 
 - **Explicit presence**: `hook_start`/`hook_end` keys in `hook_params`.
-  `start=0` is explicit, not missing. Both must be present; half-specified
-  does not activate timed mode.
-- **Validation** (`domain/hook_timing.py`): finite numeric, no bool/string
-  coercion. Negative, NaN/inf, or `end < start` raises `HookTimingError`
-  -> `ProjectRenderError` before publishing.
+  `start=0` is explicit, not missing. Both must be present for timed mode.
+- **Half-open interval**: explicit timing uses `[start, end)`.
+  FFmpeg `between()` is inclusive, so the filter uses
+  `gte(t,start)*lt(t,end)` for a true exclusive end.
+  Legacy (no start) keeps `between(t,0,end)`.
+- **Preflight validation** (`_compose_layers_impl` start, before any
+  composition or Smart Cut):
+  - Effective active hook = `toggles["hook"]` AND non-empty `hook_params.text`
+    (same rule as downstream).
+  - If active: `reject_half_specified` raises `ValidationError` for partial
+    timing. `validate_hook_interval` checks values (finite, non-negative,
+    `end >= start`).
+  - If active with explicit timing + Smart Cut: `ValidationError`.
+    Disabled hooks or empty text do not block Smart Cut.
 - **Effective interval**: intersection of `[start, end)` with
   `[0, timeline_duration)`. End beyond duration is clipped.
   Zero-length or wholly-outside intervals are **inactive** (no hook),
@@ -26,13 +35,15 @@ Exports honor the stored interval; legacy callers without timing keep defaults.
    `hook_params["hook_start"]`/`hook_params["hook_end"]`.
 2. `compose_layers(..., timeline_duration=...)` threads the duration through
    `_compose_layers_impl` to `_apply_hook`.
-3. `_apply_hook`: if explicit timing, validate and compute effective interval.
+3. Preflight (above) validates before composition.
+4. `_apply_hook`: if explicit timing, compute effective interval.
    Inactive -> skip hook (logo still applied if present).
    Otherwise legacy: 4s, or full clip for `reframe_mode="disabled"`.
-4. `add_hook_to_video(..., hook_start, hook_end, hook_inactive)`:
-   builds FFmpeg filter with `enable='between(t,start,end)'`.
-   Animation (`fade`, slide) uses `st=hook_start` and `(t-hook_start)`
-   clock, so delayed animation starts on appearance.
+   Legacy path passes exactly 9 positional args to `add_hook_to_video`.
+5. `add_hook_to_video(..., hook_start, hook_end, hook_inactive)`:
+   builds FFmpeg filter with half-open enable. Animation (`fade`,
+   slide) uses `st=hook_start` and `(t-hook_start)` clock, so delayed
+   animation starts on appearance. Inactive handled before PNG allocation.
 
 ## Fused Hook+Logo
 
@@ -46,12 +57,12 @@ fusion preserved; z-order unchanged (hook below, logo topmost).
   letterbox). `add_hook_to_video` positional args unchanged; new kwargs
   are optional and default to legacy behavior.
 - `build_hook_overlay_filter` / `build_hook_logo_filter` keep old signatures
-  working; `enable_start`/`anim_start` default to legacy (start=0).
+  working; `enable_start`/`anim_start` default to legacy.
+  Animation filter string identical when `anim_start` is None/0.
 - No schema changes: `Overlay.start`/`end` already exist.
 
 ## Limits
 
 - First-supported-hook only; no multi-hook system.
-- Explicit timing + time-changing legacy ops (e.g. Smart Cut) is
-  unsupported; project composition disables Smart Cut.
+- Explicit timing + Smart Cut is rejected (no timeline remap).
 - Frame quantization tolerance: 1e-6s (explicit).
