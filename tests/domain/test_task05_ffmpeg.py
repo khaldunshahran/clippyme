@@ -66,90 +66,93 @@ def synth_job(tmp_path):
 
 
 def test_lineage_base_preserves_framing(synth_job, monkeypatch=None):
-    # Allow direct invocation (review mutation test) without pytest fixtures.
-    if monkeypatch is None:
-        class _MP:
-            def __init__(self):
-                self._orig = []
-            def setattr(self, obj, name, value):
-                self._orig.append((obj, name, getattr(obj, name)))
-                setattr(obj, name, value)
-            def undo(self):
-                for obj, name, val in reversed(self._orig):
-                    setattr(obj, name, val)
-        monkeypatch = _MP()
-    """Production render selector reuses lineage base (not center crop)."""
-    job_dir, src, base = synth_job
-    from clippyme.domain import project_lineage as pl
-    from clippyme.domain import project_render as pr
-    lin = pl.build_lineage(
-        clip_final=base, job_dir=job_dir,
-        source={"file": "source_0.mp4", "width": 1920, "height": 1080},
-        segments=[{
-            "id": "seg-1", "start": 0.0, "end": 2.0,
-            "crop": {"x": 660.0, "y": 0.0, "w": 608.0, "h": 1080.0},
-            "transition_in": "cut",
-        }],
-        render={"width": 608, "height": 1080, "fps": 30},
-        source_path=src,
-    )
-    assert lin is not None
-    proj_dict = {
-        "schema": "nugget.clip-project/1",
-        "job_id": "job1", "clip_index": 0,
-        "version": 1, "origin": "auto",
-        "source": {"file": "source_0.mp4", "width": 1920, "height": 1080,
-                   "duration": 2.0},
-        "segments": [{
-            "id": "seg-1", "start": 0.0, "end": 2.0,
-            "crop": {"x": 660.0, "y": 0.0, "w": 608.0, "h": 1080.0},
-            "transition_in": "cut",
-        }],
-        "captions": {"style": "classic_white", "position": "bottom",
-                     "words": [], "edits": {}},
-        "overlays": [],
-        "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
-        "grade": {"preset": "default"},
-        "render": {"width": 608, "height": 1080, "fps": 30,
-                   "encoder": "libx264"},
-        "reframed_base": lin,
-    }
-    project = validate_project(proj_dict)
-    # Drive the real render_project selector with injected I/O.
-    used_base = {}
-    async def fake_materialize(*a, **k):
-        raise AssertionError("eligible lineage must not materialize")
-    async def fake_compose(**kw):
-        used_base["path"] = kw["base_clip"]
-        out = os.path.join(job_dir, "composed_clip_0.mp4")
-        import shutil
-        shutil.copy(kw["base_clip"], out)
-        return "composed_clip_0.mp4"
-    async def fake_music(p, prj, jd, ci):
-        return p
-    def fake_qa(path, **kw):
-        return {"critical": []}
-    monkeypatch.setattr(pr, "_materialize_timeline", fake_materialize)
-    monkeypatch.setattr(pr, "compose_layers", fake_compose)
-    monkeypatch.setattr(pr, "_mix_music", fake_music)
-    monkeypatch.setattr(pr, "inspect_clip", fake_qa)
-    monkeypatch.setattr(pr, "probe_media",
-                        lambda p: {"duration": 2.0, "width": 608,
-                                   "height": 1080, "fps": 30})
-    coro = pr.render_project(
-        job_id="job1", clip_index=0, project=project,
-        job_dir=job_dir, metadata={}, clip_info={})
-    try:
-        coro.send(None)
-    except StopIteration:
-        pass
-    else:
-        coro.close()
-        raise AssertionError("unexpected suspension")
-    # The production selector must have reused the lineage base.
-    assert used_base.get("path") == base, (
-        f"render selector must reuse lineage base, got {used_base.get('path')}")
+    """Production render selector reuses lineage base.
 
+    Uses pytest.MonkeyPatch.context for isolation; patches are restored
+    on every exit (including exceptions) via context manager.
+    """
+    import pytest as _pytest
+    # Allow direct invocation (review mutation test) without pytest fixtures.
+    _ctx = _pytest.MonkeyPatch.context() if monkeypatch is None else None
+    _mp = _ctx.__enter__() if _ctx else monkeypatch
+    try:
+        """Production render selector reuses lineage base (not center crop)."""
+        job_dir, src, base = synth_job
+        from clippyme.domain import project_lineage as pl
+        from clippyme.domain import project_render as pr
+        lin = pl.build_lineage(
+            clip_final=base, job_dir=job_dir,
+            source={"file": "source_0.mp4", "width": 1920, "height": 1080},
+            segments=[{
+                "id": "seg-1", "start": 0.0, "end": 2.0,
+                "crop": {"x": 660.0, "y": 0.0, "w": 608.0, "h": 1080.0},
+                "transition_in": "cut",
+            }],
+            render={"width": 608, "height": 1080, "fps": 30},
+            source_path=src,
+        )
+        assert lin is not None
+        proj_dict = {
+            "schema": "nugget.clip-project/1",
+            "job_id": "job1", "clip_index": 0,
+            "version": 1, "origin": "auto",
+            "source": {"file": "source_0.mp4", "width": 1920, "height": 1080,
+                       "duration": 2.0},
+            "segments": [{
+                "id": "seg-1", "start": 0.0, "end": 2.0,
+                "crop": {"x": 660.0, "y": 0.0, "w": 608.0, "h": 1080.0},
+                "transition_in": "cut",
+            }],
+            "captions": {"style": "classic_white", "position": "bottom",
+                         "words": [], "edits": {}},
+            "overlays": [],
+            "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
+            "grade": {"preset": "default"},
+            "render": {"width": 608, "height": 1080, "fps": 30,
+                       "encoder": "libx264"},
+            "reframed_base": lin,
+        }
+        project = validate_project(proj_dict)
+        # Drive the real render_project selector with injected I/O.
+        used_base = {}
+        async def fake_materialize(*a, **k):
+            raise AssertionError("eligible lineage must not materialize")
+        async def fake_compose(**kw):
+            used_base["path"] = kw["base_clip"]
+            out = os.path.join(job_dir, "composed_clip_0.mp4")
+            import shutil
+            shutil.copy(kw["base_clip"], out)
+            return "composed_clip_0.mp4"
+        async def fake_music(p, prj, jd, ci):
+            return p
+        def fake_qa(path, **kw):
+            return {"critical": []}
+        _mp.setattr(pr, "_materialize_timeline", fake_materialize)
+        _mp.setattr(pr, "compose_layers", fake_compose)
+        _mp.setattr(pr, "_mix_music", fake_music)
+        _mp.setattr(pr, "inspect_clip", fake_qa)
+        _mp.setattr(pr, "probe_media",
+                            lambda p: {"duration": 2.0, "width": 608,
+                                       "height": 1080, "fps": 30.0,
+                                       "has_video": True})
+        coro = pr.render_project(
+            job_id="job1", clip_index=0, project=project,
+            job_dir=job_dir, metadata={}, clip_info={})
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
+        else:
+            coro.close()
+            raise AssertionError("unexpected suspension")
+        # The production selector must have reused the lineage base.
+        assert used_base.get("path") == base, (
+            f"render selector must reuse lineage base, got {used_base.get('path')}")
+
+
+    finally:
+        if _ctx:
+            _ctx.__exit__(None, None, None)
 
 def test_center_crop_would_lose_subject(synth_job):
     """Sanity: static center crop vs reframed base have different framing."""

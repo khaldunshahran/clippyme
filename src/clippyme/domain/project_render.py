@@ -704,7 +704,9 @@ async def render_project(*, job_id: str, clip_index: int,
                         # metadata must be finite; missing/NaN/inf is a
                         # clean error, not permission to reuse.
                         _probe = probe_media(_base_path)
-                        if not _probe.get("has_video", True):
+                        # Explicit video evidence required; missing flag
+                        # is not treated as positive.
+                        if _probe.get("has_video") is not True:
                             raise ProjectRenderError(
                                 "lineage base has no video stream")
                         _bw = _probe.get("width")

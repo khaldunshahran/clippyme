@@ -374,6 +374,36 @@ def test_versioned_save_load_preserves_lineage(tmp_path):
             job_dir=job_dir, clip_index=0, project=project2,
             expected_version=ver1)  # stale; latest is ver2
 
+    # Undo: archived v1 can be restored. The version map records it.
+    vmap = pr._load_version_map(job_dir)
+    versions = vmap.get("0", {}).get("versions", {})
+    assert str(ver1) in versions, f"v{ver1} not archived: {versions}"
+    # Load archived v1 directly (version entry is a dict).
+    ver_entry = versions[str(ver1)]
+    ver_file = ver_entry.get("project_file") if isinstance(ver_entry, dict) else ver_entry
+    arch_path = os.path.join(job_dir, ver_file)
+    assert os.path.isfile(arch_path), "archived v1 file missing"
+    with open(arch_path, encoding="utf-8") as f:
+        arch_data = json.load(f)
+    arch_restored = validate_project(arch_data)
+    assert arch_restored.reframed_base is not None
+    assert arch_restored.reframed_base.base_ref == "clip_final_0.mp4"
+    # Archived v1 has no caption edits (undo restores pre-edit state).
+    assert arch_restored.captions.edits == {}
+
+    # Idempotency: saving identical content bumps version but preserves lineage.
+    # (The system versions every save; idempotency is about no data loss.)
+    ver3, saved3 = pr.save_project_version(
+        job_dir=job_dir, clip_index=0, project=project2,
+        expected_version=ver2)
+    assert ver3 == ver2 + 1
+    assert saved3.reframed_base.base_ref == "clip_final_0.mp4"
+    # Latest still has the caption edit.
+    latest_path = pr.get_project_path(job_dir, 0)
+    with open(latest_path, encoding="utf-8") as f:
+        latest_data = json.load(f)
+    assert latest_data["captions"]["edits"] == {"w1": "fixed"}
+
 
 def test_schema_twin_has_lineage():
     """Generated schema twin includes reframed_base."""

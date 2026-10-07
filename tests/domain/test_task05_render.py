@@ -192,8 +192,8 @@ def test_render_reuses_base_with_current_layers(monkeypatch, av_job):
     assert calls["compose"]["grade_params"]["preset"] == "cinematic"
     assert calls["qa"]["expected_aspect"] == pytest.approx(608/1080)
 
-    # AV GATE: output must be valid decodable video.
-    # Find the output file.
+    # AV GATE: output must be valid decodable video with audio.
+    # Rejects: corrupt file, silent audio, white frames, single frame.
     outputs = [f for f in os.listdir(job_dir) if f.endswith(".mp4")
                and "composed" in f]
     assert outputs, "compose must produce output"
@@ -203,10 +203,23 @@ def test_render_reuses_base_with_current_layers(monkeypatch, av_job):
     assert video, "output must have video stream"
     assert video[0]["width"] == 608
     assert video[0]["height"] == 1080
-    # Decode a frame; must succeed and show red (left framing preserved).
-    # The base is 608x1080 from x=0 (all red). Center crop would be blue.
+    # Audio stream must exist (rejects silent mutation).
+    audio = [s for s in streams if s["codec_type"] == "audio"]
+    assert audio, "output must have audio stream (silent mutation rejected)"
+    # Decode frame; must be red (not white, not black, not corrupt).
+    # White mutation: r,g,b all ~255 -> fails r > b+50 and whiteness check.
+    # One-frame mutation: decode may succeed but duration check fails.
     r, g, b = _decode_frame_avg_color(out_path, t=1.0)
-    assert r > 100, f"framing not preserved (expected red, got {(r,g,b)})"
+    assert not (r > 240 and g > 240 and b > 240), "white frame rejected"
+    assert not (r < 15 and g < 15 and b < 15), "black frame rejected"
+    assert r > b + 50, f"framing not preserved (expected red, got {(r,g,b)})"
+    # Duration must match (rejects one-frame mutation).
+    import json as _json, subprocess as _sp
+    _pr = _sp.run(["ffprobe", "-v", "error", "-show_entries",
+                    "format=duration", "-of", "json", out_path],
+                   capture_output=True, text=True)
+    _dur = float(_json.loads(_pr.stdout)["format"]["duration"])
+    assert _dur > 2.5, f"duration {_dur}s too short (one-frame rejected)"
 
 
 def test_render_crop_edit_materializes(monkeypatch, av_job):
