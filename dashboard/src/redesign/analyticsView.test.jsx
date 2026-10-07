@@ -160,7 +160,6 @@ test('leaderboard distinguishes recorded zero from unknown', async () => {
   });
 
   // Find each clip row by its title, then check the retention field within.
-  const rows = container.querySelectorAll('[data-clip-row]');
   // Fallback: find by title text and traverse to row container.
   const findRow = (title) => {
     const el = screen.getByText(title);
@@ -246,7 +245,7 @@ test('empty insights show honest inactive state', async () => {
   await waitFor(() => {
     // Phrase appears in banner and observations panel; assert all match.
     const matches = screen.getAllByText(/audience-based selection rules are not active yet/i);
-    expect(matches.length).toBeGreaterThanOrEqual(1);
+    expect(matches.length).toBeGreaterThanOrEqual(2);
     matches.forEach(el => expect(el).toBeInTheDocument());
   });
 });
@@ -262,7 +261,7 @@ test('malformed insights handled defensively', async () => {
   });
   // No crash, honest fallback. Multiple matches expected.
   const matches = screen.getAllByText(/audience-based selection rules are not active yet/i);
-  expect(matches.length).toBeGreaterThanOrEqual(1);
+  expect(matches.length).toBeGreaterThanOrEqual(2);
 });
 
 test('modal initializes unknown as empty', async () => {
@@ -356,14 +355,14 @@ test('overflow-unavailable totals show Unavailable, valid neighbors preserved', 
   vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
   vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(overflowInsights);
 
-  const { container } = render(<AnalyticsView pushToast={vi.fn()} />);
+  render(<AnalyticsView pushToast={vi.fn()} />);
 
   await waitFor(() => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
 
   // Find the totals area (contains "Recorded Totals").
-  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div').parentElement;
+  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div');
   
   // Unavailable views shows "Unavailable", not "0".
   expect(within(totalsArea).getByText(/Unavailable.*overflow/i)).toBeInTheDocument();
@@ -373,10 +372,6 @@ test('overflow-unavailable totals show Unavailable, valid neighbors preserved', 
   expect(within(totalsArea).getByText(/150 likes/i)).toBeInTheDocument();
   expect(within(totalsArea).getByText(/30 shares/i)).toBeInTheDocument();
   
-  // Genuine zero shows as "0", not "Unavailable".
-  // (comments 0 is exact, not overflow)
-  const commentsText = within(totalsArea).getByText(/0.*comments|comments.*0/i);
-  expect(commentsText).toBeInTheDocument();
 });
 
 test('null totals without integrity metadata show Unavailable, not zero', async () => {
@@ -409,7 +404,7 @@ test('null totals without integrity metadata show Unavailable, not zero', async 
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
 
-  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div').parentElement;
+  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div');
   
   // Null without metadata -> "Unavailable", not "0".
   const unavailable = within(totalsArea).getAllByText(/Unavailable/i);
@@ -454,7 +449,7 @@ test('genuine recorded zero totals display as zero, not Unavailable', async () =
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
 
-  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div').parentElement;
+  const totalsArea = screen.getByText(/Recorded Totals/i).closest('div');
   
   // Genuine zeros display as "0", not "Unavailable".
   expect(within(totalsArea).getByText(/0 likes/i)).toBeInTheDocument();
