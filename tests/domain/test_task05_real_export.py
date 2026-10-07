@@ -233,13 +233,9 @@ def test_real_export_disabled_reuse_fails(monkeypatch, tmp_path):
     d = _project_dict(js, src, base, edited=False)
 
     # Disable reuse: force geometry_edit by changing crop in lineage check.
-    orig_check = pl.check_lineage_eligible
     def disabled(*a, **k):
         return ("geometry_edit", None, "disabled by mutation")
     monkeypatch.setattr(pl, "check_lineage_eligible", disabled)
-    # Also patch the reference in project_render.
-    import clippyme.domain.project_render as pr_mod
-    monkeypatch.setattr(pr_mod, "check_lineage_eligible", disabled)
 
     async def inline_thread(func, *args, **kwargs):
         return func(*args, **kwargs)
