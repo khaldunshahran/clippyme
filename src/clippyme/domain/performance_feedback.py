@@ -236,13 +236,28 @@ def analyze_performance_patterns() -> Dict[str, Any]:
             "metric": "views",
             "count": total_views,
             "denominator": f"{n} clips with recorded views",
-            "note": "Total recorded views across measured clips.",
+            "note": (
+                "Total recorded views across measured clips."
+                if total_views is not None
+                else "Total views unavailable: sum exceeds representable "
+                     "range (overflow). Not shown as zero."
+            ),
         },
         {
             "metric": "shares",
             "count": total_shares,
-            "denominator": f"{total_views} recorded views" if total_views else "0 recorded views",
-            "note": "Total recorded shares; share rate = shares / recorded views.",
+            # Unavailable (None) is NOT zero. Genuine zero stays zero.
+            "denominator": (
+                "total views unavailable (overflow; exceeds representable range)"
+                if total_views is None
+                else f"{total_views} recorded views"
+            ),
+            "note": (
+                "Total recorded shares."
+                + (" Share rate cannot be calculated: total views unavailable."
+                   if total_views is None or total_shares is None
+                   else " Share rate = shares / recorded views.")
+            ),
         },
     ]
 

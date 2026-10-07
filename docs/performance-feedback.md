@@ -69,6 +69,10 @@ benchmarks remain unverified.
   overflowed total is `None` (unavailable with a reason), never zero and
   never presented as an exact "Recorded Total". The dashboard must show
   this state honestly, not as 0 or an exact number.
+- Unavailable totals propagate: the share observation shows
+  "total views unavailable (overflow)" as denominator, not "0 recorded
+  views". Share rate is not implied when numerator or denominator is
+  unavailable. Genuine zero totals remain zero with exact integrity.
 - All API output stays strict-JSON serializable (`allow_nan=False`).
   Totals never become `Infinity`.
 

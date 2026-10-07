@@ -412,6 +412,43 @@ def test_exact_totals_unchanged(registry):
     assert out["totals"]["likes"] == 125
     assert out["totals"]["integrity"]["views"]["status"] == "exact"
 
+
+
+def test_overflow_views_not_zero_share_denominator(registry):
+    """Overflowed views: share denominator shows unavailable, not '0 recorded views'."""
+    _write(registry, {"a": {"metrics": {"views": 1e308, "shares": 10}},
+                      "b": {"metrics": {"views": 1e308, "shares": 20}}})
+    out = pf.analyze_performance_patterns()
+    assert out["totals"]["views"] is None
+    assert out["totals"]["shares"] == 30  # valid neighbor preserved
+    obs = next(o for o in out["observations"] if o["metric"] == "shares")
+    assert obs["denominator"] != "0 recorded views"
+    assert "unavailable" in obs["denominator"].lower()
+    assert "cannot be calculated" in obs["note"].lower()
+
+
+def test_genuine_zero_share_total_preserved(registry):
+    """Genuine zero shares: total is 0 (not None), integrity exact."""
+    _write(registry, {"a": {"metrics": {"views": 100, "shares": 0}}})
+    out = pf.analyze_performance_patterns()
+    assert out["totals"]["shares"] == 0
+    assert out["totals"]["shares"] is not None
+    assert out["totals"]["integrity"]["shares"]["overflow"] is False
+    assert out["totals"]["integrity"]["shares"]["status"] == "exact"
+
+
+def test_mixed_valid_overflow_preserves_neighbors(registry):
+    """One overflowed metric doesn't corrupt valid neighbors."""
+    # Two 1e308 views overflow; likes stay exact.
+    _write(registry, {"a": {"metrics": {"views": 1e308, "likes": 100}},
+                      "b": {"metrics": {"views": 1e308, "likes": 50}}})
+    out = pf.analyze_performance_patterns()
+    assert out["totals"]["views"] is None
+    assert out["totals"]["integrity"]["views"]["overflow"] is True
+    # Likes: 100 + 50 = 150 exact, preserved
+    assert out["totals"]["likes"] == 150
+    assert out["totals"]["integrity"]["likes"]["overflow"] is False
+
 # --- analytics_service presence marker ---
 
 def test_retention_marker_only_on_explicit_valid(registry):

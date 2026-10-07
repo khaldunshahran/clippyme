@@ -148,7 +148,7 @@ test('KPI shows null average as Unknown, not 0%', async () => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
   // Full card via stable test id (not title.closest which misses siblings).
-  const kpiCard = screen.getByTestId('kpi-avg-retention');
+  const kpiCard = screen.getByText('Avg Retention').closest('section');
   expect(within(kpiCard).getByText('Unknown')).toBeInTheDocument();
   expect(within(kpiCard).queryByText('0%')).not.toBeInTheDocument();
 });
@@ -165,7 +165,7 @@ test('KPI shows known average with count and unweighted', async () => {
   await waitFor(() => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
-  const kpiCard = screen.getByTestId('kpi-avg-retention');
+  const kpiCard = screen.getByText('Avg Retention').closest('section');
   expect(within(kpiCard).getByText('40%')).toBeInTheDocument();
   // Denominator and averaging semantics in the actual card.
   expect(within(kpiCard).getByText(/Average of 2 known values/)).toBeInTheDocument();
@@ -185,7 +185,7 @@ test('KPI handles legacy summary without count fields', async () => {
   await waitFor(() => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
-  const kpiCard = screen.getByTestId('kpi-avg-retention');
+  const kpiCard = screen.getByText('Avg Retention').closest('section');
   expect(within(kpiCard).getByText('60%')).toBeInTheDocument();
   // Falls back to '?' for unknown count, still honest.
   expect(within(kpiCard).getByText(/Average of \? known values/)).toBeInTheDocument();

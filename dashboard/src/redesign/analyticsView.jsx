@@ -379,7 +379,7 @@ export function AnalyticsView({ pushToast }) {
           </div>
         </Panel>
 
-        <Panel pad className="raised" data-testid="kpi-avg-retention" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <Panel pad className="raised" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: 'var(--ink-dim)', fontSize: '0.85rem' }}>
             <span>Avg Retention</span>
             <Icon n="flame" />
@@ -446,10 +446,10 @@ export function AnalyticsView({ pushToast }) {
                 Recorded Totals
               </span>
               <span style={{ fontSize: '0.95rem', fontWeight: 700, color: 'var(--ink)' }}>
-                {(patterns.totals?.views ?? 0).toLocaleString()} views
+                {patterns.totals?.integrity?.views?.overflow ? 'Unavailable (overflow)' : patterns.totals?.views != null ? `${patterns.totals.views.toLocaleString()} views` : 'Unavailable'}
               </span>
               <span style={{ fontSize: '0.75rem', color: 'var(--ink-dim)', display: 'block' }}>
-                {(patterns.totals?.shares ?? 0).toLocaleString()} shares / {(patterns.totals?.likes ?? 0).toLocaleString()} likes recorded
+                {patterns.totals?.integrity?.shares?.overflow ? 'Unavailable (overflow)' : patterns.totals?.shares != null ? `${patterns.totals.shares.toLocaleString()} shares` : 'Unavailable'} / {patterns.totals?.integrity?.likes?.overflow ? 'Unavailable (overflow)' : patterns.totals?.likes != null ? `${patterns.totals.likes.toLocaleString()} likes` : 'Unavailable'} recorded
               </span>
             </div>
 
