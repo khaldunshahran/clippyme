@@ -1,0 +1,15 @@
+Editorial Benchmark Report
+==============================
+
+Source hours: 0.033
+Accepted per source hour: 60.0
+
+Per run:
+  baseline: 1/2 accepted (50.0%), distinct moments: 1
+  candidate: 1/2 accepted (50.0%), distinct moments: 1
+
+Per genre:
+  interview/podcast: 2/3 (66.7%)
+  reaction/comedy: 0/1 (0.0%)
+
+Real-footage benchmark has not run; synthetic fixtures only.

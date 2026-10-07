@@ -1,0 +1,61 @@
+{
+  "accepted_per_source_hour": 60.0,
+  "genre_stats": {
+    "interview/podcast": {
+      "acceptance_rate": 0.6666666666666666,
+      "accepted_count": 2,
+      "candidate_count": 3,
+      "distinct_accepted_moments": 1,
+      "reviewed_count": 3
+    },
+    "reaction/comedy": {
+      "acceptance_rate": 0.0,
+      "accepted_count": 0,
+      "candidate_count": 2,
+      "distinct_accepted_moments": null,
+      "reviewed_count": 1
+    }
+  },
+  "note": "Real-footage benchmark has not run; synthetic fixtures only.",
+  "paired_sources": {
+    "syn1": {
+      "baseline": [
+        "c1",
+        "c2"
+      ],
+      "candidate": [
+        "c4"
+      ]
+    },
+    "syn2": {
+      "baseline": [
+        "c3"
+      ],
+      "candidate": [
+        "c5"
+      ]
+    }
+  },
+  "run_stats": [
+    {
+      "acceptance_rate": 0.5,
+      "accepted_count": 1,
+      "candidate_count": 3,
+      "distinct_accepted_moments": 1,
+      "moment_label_coverage": 1.0,
+      "reviewed_count": 2,
+      "run_id": "baseline"
+    },
+    {
+      "acceptance_rate": 0.5,
+      "accepted_count": 1,
+      "candidate_count": 2,
+      "distinct_accepted_moments": 1,
+      "moment_label_coverage": 1.0,
+      "reviewed_count": 2,
+      "run_id": "candidate"
+    }
+  ],
+  "total_source_hours": 0.033,
+  "version": 1
+}
