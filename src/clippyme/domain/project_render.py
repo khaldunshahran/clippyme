@@ -35,7 +35,9 @@ import time
 import uuid
 
 from clippyme.domain.clip_project import ClipProject, project_to_json
-from clippyme.domain.project_lineage import check_lineage_eligible
+from clippyme.domain import project_lineage as _pl
+# Backward-compat: tests patch pr_mod.check_lineage_eligible.
+check_lineage_eligible = _pl.check_lineage_eligible
 from clippyme.domain.compose import compose_layers, validate_layer_order
 from clippyme.domain.encode import x264_video_args
 from clippyme.domain.errors import ConflictError, ValidationError
@@ -707,7 +709,7 @@ async def render_project(*, job_id: str, clip_index: int,
                             if project.reframed_base else None)
                 if _lineage:
                     _proj_dict = project.model_dump()
-                    _outcome, _base_path, _reason = check_lineage_eligible(
+                    _outcome, _base_path, _reason = _pl.check_lineage_eligible(
                         _lineage, _proj_dict, job_dir)
                     if _outcome == "eligible":
                         # Validate base media before reuse. All numeric
@@ -744,12 +746,14 @@ async def render_project(*, job_id: str, clip_index: int,
                                 f"lineage base FPS {_bfps} mismatches "
                                 f"project {project.render.fps}")
                         # Duration must match timeline within tolerance.
-                        # Timeline duration from segments (end - start for
-                        # nonzero source offsets).
-                        _tl_dur = max(
-                            (float(s.end) - float(s.start)
-                             for s in project.segments),
-                            default=0.0)
+                        # Use existing timeline-layout calculation (handles
+                        # multiple segments and fade overlaps).
+                        _tl_dur = (lambda segs: __import__(
+                            "clippyme.domain.project_render",
+                            fromlist=["_timeline_layout"])._timeline_layout(
+                            [{"start": float(s.start), "end": float(s.end),
+                              "transition_in": s.transition_in}
+                             for s in segs])[1])(project.segments)
                         # Tolerance: 0.5s or 5% of timeline, whichever larger.
                         _dur_tol = max(0.5, _tl_dur * 0.05)
                         if abs(float(_bdur) - _tl_dur) > _dur_tol:

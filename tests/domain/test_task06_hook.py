@@ -622,7 +622,10 @@ def test_lineage_route_hook_timing(monkeypatch, tmp_path):
     src_mtime = os.stat(src_path).st_mtime
     base_mtime = os.stat(base_path).st_mtime
 
-    def make_project(hs, he, crop_x=0.0):
+    def make_project(hs, he, crop_x=115.0):
+        # Project crop CENTER (x=115): fallback renders center (not red).
+        # Base file is LEFT (x=0, red): lineage reuses red framing.
+        # Disabling lineage -> fallback center -> framing check fails.
         d = {
             "schema": "nugget.clip-project/1",
             "job_id": "lin6", "clip_index": 0,
@@ -830,3 +833,132 @@ def test_active_legacy_allows_smartcut(monkeypatch, tmp_path):
     assert err is None, f"unexpected error: {err}"
     assert "smartcut" in calls
     assert "hook" in calls
+
+
+def _lineage_gate_setup(monkeypatch, tmp_path):
+    """Shared 6s/4s lineage fixture for mutation tests."""
+    from clippyme.domain import project_lineage as pl
+    from clippyme.domain import project_render as pr_mod
+    from clippyme.domain.clip_project import validate_project
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js = str(tmp_path / "job")
+    os.makedirs(js, exist_ok=True)
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    from clippyme.domain import hooks as hk_mod
+    from PIL import Image
+    def blue_image(text, width, output_path, **kw):
+        Image.new("RGBA", (40, 24), (0, 0, 255, 255)).save(output_path)
+        return output_path, 40, 24
+    monkeypatch.setattr(hk_mod, "create_hook_image", blue_image)
+
+    src_path = os.path.join(js, "source.mp4")
+    base_path = os.path.join(js, "clip_final_0.mp4")
+    _run(["ffmpeg", "-y", "-v", "error",
+          "-f", "lavfi", "-i", "color=blue:s=320x180:r=30:d=6",
+          "-f", "lavfi", "-i",
+          "sine=frequency=880:sample_rate=48000:duration=6",
+          "-vf", ("drawbox=x=0:y=0:w=100:h=180:color=red:t=fill,"
+                   "drawbox=x=220:y=0:w=100:h=180:color=green:t=fill"),
+          "-c:v", "libx264", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", "-shortest", src_path])
+    _run(["ffmpeg", "-y", "-v", "error",
+          "-ss", "1.0", "-t", "4.0", "-i", src_path,
+          "-vf", "crop=90:160:0:10",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", base_path])
+
+    def make_project(hs, he):
+        d = {
+            "schema": "nugget.clip-project/1",
+            "job_id": "lin6", "clip_index": 0,
+            "source": {"file": "source.mp4", "width": 320, "height": 180,
+                       "duration": 6.0},
+            "segments": [{
+                "id": "seg-1", "start": 1.0, "end": 5.0,
+                "crop": {"x": 115.0, "y": 10.0, "w": 90.0, "h": 160.0},
+                "transition_in": "cut",
+            }],
+            "captions": {"style": "classic_white", "position": "bottom",
+                         "words": [], "edits": {}},
+            "overlays": [{
+                "type": "hook", "text": "HOOK", "style": "viral",
+                "start": hs, "end": he, "position": "top",
+            }],
+            "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
+            "grade": {"preset": "default"},
+            "render": {"width": 90, "height": 160, "fps": 30,
+                       "encoder": "libx264"},
+        }
+        d["reframed_base"] = pl.build_lineage(
+            clip_final=base_path, job_dir=js,
+            source=d["source"], segments=d["segments"],
+            render=d["render"], source_path=src_path)
+        return validate_project(d)
+
+    def render(project):
+        coro = pr_mod.render_project(
+            job_id="lin6", clip_index=0, project=project,
+            job_dir=js, metadata={},
+            clip_info={"clip_filename": "clip_final_0.mp4"})
+        return _drive(coro).output_path
+
+    def has_blue_hook(path, t):
+        import numpy as np
+        rgb = _run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                    "-frames:v", "1", "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "-"])
+        arr = np.frombuffer(rgb, dtype=np.uint8).reshape(160, 90, 3)
+        region = arr[32:56, 25:65]
+        blue = ((region[:, :, 2] > 150) &
+                (region[:, :, 0] < 100)).sum()
+        return blue > 50
+
+    return js, make_project, render, has_blue_hook
+
+
+# --- Timing mutation evidence (review5) ---
+# These verify the gate is sensitive: mutated timing produces
+# output that FAILS the gate's assertions.
+
+def test_mutation_zeroed_timing_no_hook(monkeypatch, tmp_path):
+    """Zeroed [2,2): inactive, no hook pixels at 2.0."""
+    js, make_project, render, has_blue_hook = _lineage_gate_setup(
+        monkeypatch, tmp_path)
+    out = render(make_project(2.0, 2.0))
+    # Gate requires present at 2.0; zeroed is absent -> gate would fail.
+    assert not has_blue_hook(out, 2.0)
+
+
+def test_mutation_shifted_timing_wrong_boundary(monkeypatch, tmp_path):
+    """Shifted [2,4): hook present at 3.0 (gate requires absent)."""
+    js, make_project, render, has_blue_hook = _lineage_gate_setup(
+        monkeypatch, tmp_path)
+    out = render(make_project(2.0, 4.0))
+    # Gate requires absent at 3.0 (exclusive end of [1,3));
+    # shifted [2,4) is present at 3.0 -> gate would fail.
+    assert has_blue_hook(out, 3.0)
+
+
+def test_mutation_disabled_reuse_wrong_framing(monkeypatch, tmp_path):
+    """Disabled lineage: fallback center crop, not red -> gate fails."""
+    from clippyme.domain import project_lineage as pl
+    js, make_project, render, has_blue_hook = _lineage_gate_setup(
+        monkeypatch, tmp_path)
+    # Force lineage ineligible (patch the module).
+    monkeypatch.setattr(
+        pl, "check_lineage_eligible",
+        lambda *a, **k: ("geometry_edit", None, "mutation"))
+    out = render(make_project(1.0, 3.0))
+    # Gate requires red framing; fallback is center (not red) -> fails.
+    import numpy as np
+    rgb = _run(["ffmpeg", "-v", "error", "-ss", "0.5", "-i", out,
+                "-frames:v", "1", "-pix_fmt", "rgb24",
+                "-f", "rawvideo", "-"])
+    arr = np.frombuffer(rgb, dtype=np.uint8).reshape(160, 90, 3)
+    r, g, b = (int(v) for v in arr[130, 45])
+    is_red = r > 100 and r > g + 30
+    assert not is_red, "disabled reuse should not have red framing"
