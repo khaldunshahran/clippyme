@@ -1002,6 +1002,15 @@ if __name__ == '__main__':
             # (snap_clips_to_transcript / compute_neighbor_bounds) — here we
             # only probe the silences and print the returned events.
             from clippyme.pipeline.cut_ops import flatten_words, snap_clips_to_transcript
+            from clippyme.pipeline.duration_policy import resolve_duration_policy
+            # Same shared policy as prompt generation and queued orchestrator.
+            _policy = resolve_duration_policy(
+                min_duration=getattr(args, "min_duration", None),
+                max_duration=getattr(args, "max_duration", None),
+                duration_mode=getattr(args, "duration_mode", None),
+                clip_type=getattr(args, "clip_type", None),
+                video_duration=duration,
+            )
             _words = flatten_words(transcript)
             # Audio-aware final polish: detect the WAVEFORM silence troughs once
             # for the whole source, then nudge each transcript-snapped edge into
@@ -1022,6 +1031,7 @@ if __name__ == '__main__':
                 source_duration=duration or None,
                 silences=_silences,
                 default_reframe_mode=args.reframe_mode,
+                max_duration=_policy.max_duration,
             ):
                 print(f"   🎯 snap[{_ev.path}]: [{_ev.old_start:.2f},{_ev.old_end:.2f}] "
                       f"→ [{_ev.new_start:.2f},{_ev.new_end:.2f}]")

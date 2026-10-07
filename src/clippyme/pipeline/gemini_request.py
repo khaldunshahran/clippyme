@@ -100,16 +100,21 @@ Score each axis from 1 to 20 and sum (cap at 100):
   but NEVER cut away essential story context, premise setup, or punchlines.
 
 ## SPEAKER SIGNAL (when available)
-Each segment may carry a ``speaker`` integer (0, 1, 2…) from speaker
-diarization. When present, use it as a boundary hint:
-- Prefer cutting on speaker TURN CHANGES for dialogues / interviews — a
-  turn change is a natural editing beat and resets viewer attention.
+Words may carry a ``sp`` integer (0, 1, 2...) from speaker diarization,
+serialized as a fourth TOON column ``words[N]{{w,s,e,sp}}``. Unknown speakers
+serialize as ``-`` (never 0; 0 is a valid speaker ID). When present, use
+speaker turns as a boundary hint:
+- Prefer cutting on speaker TURN CHANGES for dialogues / interviews --
+  a turn change is a natural editing beat and resets viewer attention.
 - For monologues, prefer clips where ONE speaker dominates (less context
   switching = higher SELF_CONTAINED score).
 - Never start a clip mid-turn of speaker A if the hook actually belongs
   to speaker B's next utterance.
-Diarization is optional — absence of ``speaker`` fields means single
-speaker or Whisper fallback path, score normally.
+These are anonymous voice labels (0, 1, 2), NOT real names, NOT visual
+face identity, NOT verified diarization, and NOT permission to fabricate
+attribution. Never invent a speaker label for a word marked ``-``.
+Diarization is optional -- absence of ``sp`` fields means single speaker
+or Whisper fallback path; score normally.
 
 ## AUDIO CUES (when available)
 The transcript may contain bracketed non-speech markers such as ``(laughter)``,
@@ -312,17 +317,64 @@ Output schema:
 """
 
 
+def _canonical_speaker(value):
+    """Return a valid speaker ID int, or None if absent/invalid.
+
+    Preserves ID 0 (falsy but valid). Rejects bool, negative,
+    non-integer, and non-numeric values. Missing evidence stays unknown
+    (None); unknown is never mapped to speaker 0.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    # Floats that are exact integers (e.g. 1.0 from JSON) are accepted.
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
+
+
 def extract_prompt_words(transcript_result):
-    """Flatten the transcript into the compact {w,s,e} list the prompt embeds."""
+    """Flatten the transcript into the compact word list the prompt embeds.
+
+    Each word has {w, s, e} plus optional 'sp' (speaker ID int) when the
+    provider supplied valid word-level speaker evidence. Word evidence
+    wins: segment-level speaker labels are NOT copied onto words.
+    """
     words = []
-    for segment in transcript_result['segments']:
+    for segment in transcript_result.get('segments', []):
         for word in segment.get('words', []):
-            words.append({
+            entry = {
                 'w': word['word'],
                 's': word['start'],
                 'e': word['end'],
-            })
+            }
+            sp = _canonical_speaker(word.get('speaker'))
+            if sp is not None:
+                entry['sp'] = sp
+            words.append(entry)
     return words
+
+
+def extract_segment_speakers(transcript_result):
+    """Extract segment-level speaker summaries separately.
+
+    Segment labels may be majority summaries spanning multiple speakers;
+    they are returned with explicit segment scope, never merged into
+    word-level evidence.
+    """
+    summaries = []
+    for idx, segment in enumerate(transcript_result.get('segments', [])):
+        sp = _canonical_speaker(segment.get('speaker'))
+        if sp is not None:
+            summaries.append({
+                'segment_index': idx,
+                'speaker': sp,
+                'start': segment.get('start'),
+                'end': segment.get('end'),
+                'scope': 'segment-summary',
+            })
+    return summaries
 
 
 def _toon_quote_word(text):
@@ -354,15 +406,31 @@ def _looks_numeric(text):
 
 
 def encode_words_toon(words):
-    """Encode the {w,s,e} word list as a TOON tabular block — same data as
+    """Encode the word list as a TOON tabular block — same data as
     ``json.dumps(words)`` at a fraction of the tokens (no repeated key names,
     no braces per row). ``s``/``e`` are emitted with ``str()`` so their exact
     rounding is preserved unchanged (response timestamps are copied back).
+
+    When any word carries speaker evidence ('sp'), a fourth column is
+    added: ``words[N]{w,s,e,sp}``. Unknown speakers serialize as ``-``
+    (unambiguous; never 0, since 0 is a valid speaker ID). When no word
+    has speaker evidence, the compact three-column form is retained for
+    backward compatibility with word/timestamp consumers.
     """
-    lines = [f"words[{len(words)}]{{w,s,e}}:"]
+    has_speaker = any('sp' in word for word in words)
+    if not has_speaker:
+        lines = [f"words[{len(words)}]{{w,s,e}}:"]
+        for word in words:
+            w = _toon_quote_word(word['w'])
+            lines.append(f"  {w},{word['s']},{word['e']}")
+        return "\n".join(lines)
+    lines = [f"words[{len(words)}]{{w,s,e,sp}}:"]
     for word in words:
         w = _toon_quote_word(word['w'])
-        lines.append(f"  {w},{word['s']},{word['e']}")
+        sp = word.get('sp')
+        # '-' for unknown; never 0 (0 is a valid speaker).
+        sp_str = str(sp) if isinstance(sp, int) and sp >= 0 else '-'
+        lines.append(f"  {w},{word['s']},{word['e']},{sp_str}")
     return "\n".join(lines)
 
 
@@ -439,38 +507,35 @@ def build_viral_prompt(
         except Exception:
             learned_patterns_block = ""
 
-    # Resolve multi-tier duration bounds vs fixed bounds
-    dmode = (duration_mode or "").strip().lower()
-    ctype = (clip_type or "").strip().lower()
-    is_multi_tier = (
-        dmode in ("all", "auto", "mixed", "portfolio")
-        or (min_duration is None and max_duration is None)
+    # Resolve duration via shared policy (same as edge repair).
+    from clippyme.pipeline.duration_policy import resolve_duration_policy
+    _policy = resolve_duration_policy(
+        min_duration=min_duration,
+        max_duration=max_duration,
+        duration_mode=duration_mode,
+        clip_type=clip_type,
+        video_duration=video_duration,
     )
+    min_dur = _policy.min_duration
+    max_dur = _policy.max_duration
+    is_multi_tier = _policy.mode == "multi-tier"
+    ctype = (clip_type or "").strip().lower()
 
     if is_multi_tier:
-        min_dur = 15.0
-        # Allow extended social clips up to 300s (5m), bounded by actual video duration
-        max_dur = min(float(video_duration or 300.0), 300.0)
-        if max_dur < 30.0:
-            max_dur = max(min_dur + 10.0, float(video_duration or 30.0))
-        duration_descriptor = f"15s–{max_dur:.0f}s (Dynamic Multi-Tier Portfolio Mix)"
-        duration_constraint = f"15s ≤ duration ≤ {max_dur:.0f}s (let the natural story arc determine the exact duration)"
+        duration_descriptor = f"15s-{max_dur:.0f}s (Dynamic Multi-Tier Portfolio Mix)"
+        duration_constraint = f"15s \u2264 duration \u2264 {max_dur:.0f}s (let the natural story arc determine the exact duration)"
         duration_strategy_block = (
             "\n## MULTI-TIER DURATION & RETENTION STRATEGY (MANDATORY MIX)\n"
             "Do NOT output clips of uniform duration. Top platforms (like OpusClip) succeed by letting the story content dictate the length. Curate a diversified portfolio distributed across:\n"
-            "1. TIER 1 - SHORTS / REELS (20s – 60s): Fast-paced, instant hook in first 0-3s, quick punchy payoff. Perfect for rapid-scroll YouTube Shorts / IG Reels.\n"
-            "2. TIER 2 - MID-LENGTH SOCIAL (60s – 120s / 1m – 2m): Complete narrative arc, escalating argument, or storytelling anecdote with thorough setup and payoff. Crucial for high-retention TikTok watch time and Reels.\n"
-            "3. TIER 3 - EXTENDED DEEP DIVE (120s – 300s / 2m – 5m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
+            "1. TIER 1 - SHORTS / REELS (20s - 60s): Fast-paced, instant hook in first 0-3s, quick punchy payoff. Perfect for rapid-scroll YouTube Shorts / IG Reels.\n"
+            "2. TIER 2 - MID-LENGTH SOCIAL (60s - 120s / 1m - 2m): Complete narrative arc, escalating argument, or storytelling anecdote with thorough setup and payoff. Crucial for high-retention TikTok watch time and Reels.\n"
+            "3. TIER 3 - EXTENDED DEEP DIVE (120s - 300s / 2m - 5m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
             "Every clip in your response MUST designate its 'duration_tier' ('short', 'mid', or 'extended') and list recommended 'target_platforms'."
         )
     else:
-        min_dur = float(min_duration) if min_duration is not None and min_duration > 0 else 15.0
-        max_dur = float(max_duration) if max_duration is not None and max_duration > 0 else 120.0
-        if max_dur < min_dur:
-            max_dur = max(min_dur + 15.0, 120.0)
-        duration_descriptor = f"{min_dur:.0f}–{max_dur:.0f}s"
-        duration_constraint = f"{min_dur:.0f}s ≤ duration ≤ {max_dur:.0f}s"
-        duration_strategy_block = ""
+        duration_descriptor = f"{min_dur:.0f}-{max_dur:.0f}s"
+        duration_constraint = f"{min_dur:.0f}s \u2264 duration \u2264 {max_dur:.0f}s"
+        duration_strategy_block = "" 
 
     # Resolve target clip count
     if min_clips is not None and max_clips is not None and min_clips > 0 and max_clips >= min_clips:

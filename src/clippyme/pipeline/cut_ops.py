@@ -267,7 +267,7 @@ def snap_clip_to_sentences(
     fwd_budget: float = DEFAULT_SENTENCE_FWD,
     pre_pad: float = DEFAULT_PRE_PAD,
     post_pad: float = DEFAULT_POST_PAD,
-    max_duration: float = DEFAULT_MAX_CLIP_DURATION,
+    max_duration: float | None = None,
     source_duration: float | None = None,
     neighbor_start: float | None = None,
     neighbor_end: float | None = None,
@@ -295,6 +295,11 @@ def snap_clip_to_sentences(
     ``"sentence_end"`` (one edge), or ``"word"`` (no sentence snap applied —
     identical to the word-snap input). The path is logged by the caller.
     """
+    if max_duration is None:
+        # Backward compat: fall back to legacy default, but callers
+        # should pass the resolved policy max explicitly.
+        from clippyme.pipeline.duration_policy import resolve_duration_policy
+        max_duration = resolve_duration_policy().max_duration
     onsets, ends = sentence_boundaries(words) if words else ([], [])
 
     # When the transcript has NO sentence terminators at all (unpunctuated
@@ -557,8 +562,13 @@ def compute_neighbor_bounds(raw_intervals, idx):
 
 
 def snap_clips_to_transcript(shorts, words, *, source_duration=None,
-                             silences=None, default_reframe_mode="auto"):
+                             silences=None, default_reframe_mode="auto",
+                             max_duration=None):
     """Three-stage edge repair for every clip, in place.
+
+    ``max_duration`` is the hard limit for optional expansion (sentence,
+    silence, waveform). If None, resolved from the shared duration policy.
+    Enforced after ALL stages, not just sentence-snap.
 
     Per clip: word-snap (never open/close mid-word) → sentence-snap (never
     mid-sentence; forward extension clamped by duration cap and time-adjacent
@@ -569,6 +579,12 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
 
     Returns the list of :class:`SnapEvent` for clips whose edges moved.
     """
+    # Resolve max_duration via shared policy if not provided.
+    if max_duration is None:
+        from clippyme.pipeline.duration_policy import resolve_duration_policy
+        max_duration = resolve_duration_policy(
+            source_duration=source_duration).max_duration
+
     raw_intervals = []
     for clip in shorts:
         try:
@@ -591,6 +607,7 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
             word_start=word_start, word_end=word_end,
             source_duration=source_duration,
             neighbor_start=neighbor_start, neighbor_end=neighbor_end,
+            max_duration=max_duration,
         )
         if silences:
             new_start, new_end, silence_path = refine_edges_to_silence(

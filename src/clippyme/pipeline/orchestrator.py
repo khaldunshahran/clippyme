@@ -599,7 +599,16 @@ def _load_or_analyze(
 
     if shorts and not args.skip_analysis:
         from clippyme.pipeline.cut_ops import flatten_words, snap_clips_to_transcript
+        from clippyme.pipeline.duration_policy import resolve_duration_policy
 
+        # Resolve once via shared policy; same bounds as prompt generation.
+        _policy = resolve_duration_policy(
+            min_duration=getattr(args, "min_duration", None),
+            max_duration=getattr(args, "max_duration", None),
+            duration_mode=getattr(args, "duration_mode", None),
+            clip_type=getattr(args, "clip_type", None),
+            video_duration=duration,
+        )
         words = flatten_words(transcript)
         silences: list = []
         if _enabled("CLIPPYME_SILENCE_SNAP"):
@@ -615,6 +624,7 @@ def _load_or_analyze(
             source_duration=duration or None,
             silences=silences,
             default_reframe_mode=args.reframe_mode,
+            max_duration=_policy.max_duration,
         ):
             print(
                 f"🎯 snap[{event.path}]: [{event.old_start:.2f},{event.old_end:.2f}] "
