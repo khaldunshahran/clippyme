@@ -744,9 +744,11 @@ async def render_project(*, job_id: str, clip_index: int,
                                 f"lineage base FPS {_bfps} mismatches "
                                 f"project {project.render.fps}")
                         # Duration must match timeline within tolerance.
-                        # Timeline duration from segments.
+                        # Timeline duration from segments (end - start for
+                        # nonzero source offsets).
                         _tl_dur = max(
-                            (float(s.end) for s in project.segments),
+                            (float(s.end) - float(s.start)
+                             for s in project.segments),
                             default=0.0)
                         # Tolerance: 0.5s or 5% of timeline, whichever larger.
                         _dur_tol = max(0.5, _tl_dur * 0.05)

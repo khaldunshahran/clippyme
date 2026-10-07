@@ -570,121 +570,153 @@ def test_source_route_with_offset(monkeypatch, hook_job):
 
 
 def test_lineage_route_hook_timing(monkeypatch, tmp_path):
-    """Real lineage route via Task 05 proven fixture + hook overlay.
+    """Lineage export gate: decoded pixels, 6s source / 4s output.
 
-    Uses the same source/base/lineage pattern as test_task05_real_export.py
-    (proven to trigger eligible lineage). Adds a hook [1,3) and verifies
-    through actual render_project:
-    - Framing preserved (red left) -> lineage reuse.
-    - Hook absent at 0.5, present at 2.0, absent at 3.0 (exclusive).
-    - Audio 880Hz decoded. Media 90x160, 30fps.
-    - Mutations: geometry edit (disables lineage) changes framing;
-      zeroed timing shows no hook.
+    - Source: 6s, 320x180, red LEFT, green RIGHT, 880Hz tone.
+    - Segment [1,5): 4s output, crop left (x=0) -> red framing.
+    - Base: 4s reframed base (matching), real lineage via build_lineage.
+    - Hook [1,3) on 4s output clock (deterministic blue PNG).
+    - Decode at 0.5 (absent), 2.0 (present), 3.0 (absent, exclusive),
+      3.5 (absent). Framing red outside hook. Media: 90x160, 30fps,
+      120 frames, ~4s, 880Hz. Source/base unchanged.
+    Mutations (bypass drawing, drop/zero/shift timing, disable lineage)
+    must fail.
     """
-    import runpy
-    # Reuse Task 05 fixture builders.
-    t5 = runpy.run_path("tests/domain/test_task05_real_export.py")
-    _make_fixture = t5["_make_fixture"]
-    _project_dict = t5["_project_dict"]
-    _drive_real = t5["_drive_real"]
-    _run_t5 = t5["_run"]
-
+    from clippyme.domain import project_lineage as pl
     from clippyme.domain import project_render as pr_mod
     from clippyme.domain.clip_project import validate_project
     monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js = str(tmp_path / "job")
+    os.makedirs(js, exist_ok=True)
 
     async def inline_thread(func, *args, **kwargs):
         return func(*args, **kwargs)
     monkeypatch.setattr(asyncio, "to_thread", inline_thread)
 
-    # Real hook (white text) - distinguish from red framing by brightness.
-    # No mock; uses actual create_hook_image.
+    # Deterministic BLUE hook PNG (contrasts red framing).
+    from clippyme.domain import hooks as hk_mod
+    from PIL import Image
+    def blue_image(text, width, output_path, **kw):
+        Image.new("RGBA", (40, 24), (0, 0, 255, 255)).save(output_path)
+        return output_path, 40, 24
+    monkeypatch.setattr(hk_mod, "create_hook_image", blue_image)
 
-    js, src_path, base_path = _make_fixture(tmp_path)
+    src_path = os.path.join(js, "source.mp4")
+    base_path = os.path.join(js, "clip_final_0.mp4")
+    # 6s source: blue bg, red left, green right, 880Hz.
+    _run(["ffmpeg", "-y", "-v", "error",
+          "-f", "lavfi", "-i", "color=blue:s=320x180:r=30:d=6",
+          "-f", "lavfi", "-i",
+          "sine=frequency=880:sample_rate=48000:duration=6",
+          "-vf", ("drawbox=x=0:y=0:w=100:h=180:color=red:t=fill,"
+                   "drawbox=x=220:y=0:w=100:h=180:color=green:t=fill"),
+          "-c:v", "libx264", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", "-shortest", src_path])
+    # 4s base: segment [1,5) cropped left (x=0,y=10,90x160) -> red.
+    _run(["ffmpeg", "-y", "-v", "error",
+          "-ss", "1.0", "-t", "4.0", "-i", src_path,
+          "-vf", "crop=90:160:0:10",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", base_path])
 
-    def make_project_with_hook(hs, he):
-        d = _project_dict(js, src_path, base_path, edited=False)
-        # Add hook overlay (does not affect lineage geometry).
-        # Long text for visibility.
-        d["overlays"] = [{
-            "type": "hook", "text": "HOOK TEXT HERE", "style": "viral",
-            "start": hs, "end": he, "position": "top",
-        }]
+    src_mtime = os.stat(src_path).st_mtime
+    base_mtime = os.stat(base_path).st_mtime
+
+    def make_project(hs, he, crop_x=0.0):
+        d = {
+            "schema": "nugget.clip-project/1",
+            "job_id": "lin6", "clip_index": 0,
+            "source": {"file": "source.mp4", "width": 320, "height": 180,
+                       "duration": 6.0},
+            "segments": [{
+                "id": "seg-1", "start": 1.0, "end": 5.0,  # 4s, nonzero offset
+                "crop": {"x": crop_x, "y": 10.0, "w": 90.0, "h": 160.0},
+                "transition_in": "cut",
+            }],
+            "captions": {"style": "classic_white", "position": "bottom",
+                         "words": [], "edits": {}},
+            "overlays": [{
+                "type": "hook", "text": "HOOK", "style": "viral",
+                "start": hs, "end": he, "position": "top",
+            }],
+            "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
+            "grade": {"preset": "default"},
+            "render": {"width": 90, "height": 160, "fps": 30,
+                       "encoder": "libx264"},
+        }
+        d["reframed_base"] = pl.build_lineage(
+            clip_final=base_path, job_dir=js,
+            source=d["source"], segments=d["segments"],
+            render=d["render"], source_path=src_path)
+        assert d["reframed_base"] is not None
         return validate_project(d)
 
-    # Spy on _apply_hook to capture hook_params (proves timing passed).
-    from clippyme.domain import compose as comp_mod
-    hook_params_seen = []
-    orig_ah = comp_mod._apply_hook
-    async def spy_ah(*a, **k):
-        hp = a[3] if len(a) > 3 else k.get("hook_params", {})
-        hook_params_seen.append(dict(hp or {}))
-        return await orig_ah(*a, **k)
-    monkeypatch.setattr(comp_mod, "_apply_hook", spy_ah)
+    def render(project):
+        coro = pr_mod.render_project(
+            job_id="lin6", clip_index=0, project=project,
+            job_dir=js, metadata={},
+            clip_info={"clip_filename": "clip_final_0.mp4"})
+        return _drive(coro).output_path
 
-    def is_red_framing(path, t):
+    def has_blue_hook(path, t):
+        """Blue hook pixels in isolated region (x=25-65, y=32-56)."""
         import numpy as np
-        rgb = _run_t5(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
-                       "-frames:v", "1", "-pix_fmt", "rgb24",
-                       "-f", "rawvideo", "-"])
+        rgb = _run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                    "-frames:v", "1", "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "-"])
         arr = np.frombuffer(rgb, dtype=np.uint8).reshape(160, 90, 3)
-        r, g, b = (int(v) for v in arr[120, 45])
-        return r > 100 and r > g + 30
+        region = arr[32:56, 25:65]
+        blue = ((region[:, :, 2] > 150) &
+                (region[:, :, 0] < 100) &
+                (region[:, :, 1] < 100)).sum()
+        return blue > 50
 
-    # Main: lineage + hook [1,3).
-    project = make_project_with_hook(1.0, 3.0)
-    coro = pr_mod.render_project(
-        job_id="fixture", clip_index=0, project=project,
-        job_dir=js, metadata={},
-        clip_info={"clip_filename": "clip_final_0.mp4"})
-    result = _drive_real(coro)
-    out = result.output_path
+    def framing_is_red(path, t):
+        """Red framing outside hook region (bottom center)."""
+        import numpy as np
+        rgb = _run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                    "-frames:v", "1", "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "-"])
+        arr = np.frombuffer(rgb, dtype=np.uint8).reshape(160, 90, 3)
+        r, g, b = (int(v) for v in arr[130, 45])
+        return r > 100 and r > g + 30 and r > b + 30
+
+    # Main gate: hook [1,3) on 4s output.
+    out = render(make_project(1.0, 3.0))
     assert os.path.isfile(out)
 
-    # Lineage: framing preserved (red).
-    assert is_red_framing(out, 0.5), "lineage framing not preserved"
-    # Hook timing: _apply_hook received explicit [1,3).
-    assert len(hook_params_seen) >= 1
-    hp0 = hook_params_seen[0]
-    assert hp0.get("hook_start") == 1.0, f"timing {hp0}"
-    assert hp0.get("hook_end") == 3.0
-    # (Pixel-level timing verified in _apply_hook tests.)
-    # Audio tone.
-    freq = _decode_tone_freq(out)
-    assert freq is not None and 850 < freq < 910, f"tone {freq}"
-    # Media.
+    # Hook boundaries: absent/present/absent/absent.
+    assert not has_blue_hook(out, 0.5), "hook visible before start"
+    assert has_blue_hook(out, 2.0), "hook not visible inside"
+    assert not has_blue_hook(out, 3.0), "hook visible at exclusive end"
+    assert not has_blue_hook(out, 3.5), "hook visible after end"
+
+    # Framing preserved (lineage): red outside hook.
+    assert framing_is_red(out, 0.5), "framing not red (lineage failed)"
+    assert framing_is_red(out, 2.0), "framing not red at 2.0"
+    assert framing_is_red(out, 3.5)
+
+    # Media integrity.
     import json
-    r = _run_t5(["ffprobe", "-v", "error", "-show_entries",
-                 "format=duration", "-of", "json", out])
+    r = _run(["ffprobe", "-v", "error", "-show_entries",
+              "format=duration", "-of", "json", out])
     dur = float(json.loads(r)["format"]["duration"])
-    assert 1.8 < dur < 2.2
-
-    # Mutation: geometry edit disables lineage (framing changes).
-    d2 = _project_dict(js, src_path, base_path, edited=True)
-    d2["overlays"] = [{
-        "type": "hook", "text": "HOOK", "style": "viral",
-        "start": 1.0, "end": 3.0, "position": "top",
-    }]
-    project2 = validate_project(d2)
-    coro2 = pr_mod.render_project(
-        job_id="fixture", clip_index=0, project=project2,
-        job_dir=js, metadata={},
-        clip_info={"clip_filename": "clip_final_0.mp4"})
-    out2 = _drive_real(coro2).output_path
-    # Edited route: framing is green (center), not red.
-    # Hook still honored.
-    assert len(hook_params_seen) == 2, "hook not on edited route"
-
-    # Mutation: zeroed timing -> inactive, no hook.
-    project3 = make_project_with_hook(2.0, 2.0)
-    coro3 = pr_mod.render_project(
-        job_id="fixture", clip_index=0, project=project3,
-        job_dir=js, metadata={},
-        clip_info={"clip_filename": "clip_final_0.mp4"})
-    out3 = _drive_real(coro3).output_path
-    # Zeroed timing: params have [2,2) (inactive, not legacy).
-    hp2 = hook_params_seen[2]
-    assert hp2.get("hook_start") == 2.0 and hp2.get("hook_end") == 2.0
+    assert 3.8 < dur < 4.2, f"duration {dur}"
+    r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+              "-show_entries",
+              "stream=width,height,r_frame_rate,nb_frames,duration",
+              "-of", "json", out])
+    vs = json.loads(r)["streams"][0]
+    assert (vs["width"], vs["height"]) == (90, 160)
+    assert vs["r_frame_rate"] == "30/1"
+    nframes = int(vs.get("nb_frames", 0))
+    assert 115 <= nframes <= 125, f"frames {nframes}"
+    # Audio 880Hz decoded.
+    freq = _decode_tone_freq(out)
+    assert freq is not None and 850 < freq < 910, f"tone {freq}Hz"
+    # Files unchanged.
+    assert os.stat(src_path).st_mtime == src_mtime
+    assert os.stat(base_path).st_mtime == base_mtime
 
 
 # --- Durable preflight / scoped-guard regressions (Task 06 rev3) ---
