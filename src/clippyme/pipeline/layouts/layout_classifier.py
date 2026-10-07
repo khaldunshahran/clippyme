@@ -359,10 +359,16 @@ def _gemini_classify(frames, api_key=None, model_name=None,
             print(f"[LayoutClassifier] client creation failed: {e}")
             return None
 
-        parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
-                 for b in frames]
         last_err = None
         try:
+            # Part serialization is inside the owning try/finally: a setup
+            # error closes the already-allocated client exactly once.
+            try:
+                parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
+                         for b in frames]
+            except Exception as e:
+                print(f"[LayoutClassifier] part setup failed: {e}")
+                return None
             for attempt in range(max_retries + 1):
                 if _budget is not None:
                     if not _budget.take_attempt():
@@ -373,8 +379,11 @@ def _gemini_classify(frames, api_key=None, model_name=None,
                     if cur_ms <= 0:
                         break
                     if cur_ms != timeout_ms:
-                        # Close old before replacing (no leak on refresh).
-                        _close_client(client)
+                        # Detach and close old before replacing. If the
+                        # replacement allocation raises, the finally must
+                        # not close the already-closed client a second time.
+                        old_client, client = client, None
+                        _close_client(old_client)
                         timeout_ms = cur_ms
                         client = _make_client(timeout_ms)
                 except Exception as e:

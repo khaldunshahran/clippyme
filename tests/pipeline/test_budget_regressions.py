@@ -205,3 +205,42 @@ def test_client_closed_on_all_exits(monkeypatch, fail):
                         _budget=_budget(3, 120))
     assert state["created"] >= 1
     assert state["closed"] == state["created"], state
+
+
+@pytest.mark.parametrize("error", ["part", "replacement"])
+def test_setup_and_replacement_errors_close_once(monkeypatch, error):
+    """Part setup failure must not leak a client; failed replacement must
+    not double-close. Every created client closed exactly once."""
+    state = {"time": 0., "calls": 0, "options": [],
+             "clients": [], "creates": 0}
+    _sdk(monkeypatch, state)
+    sdk = sys.modules["google.genai"]
+    sdk_types = sys.modules["google.genai.types"]
+    orig = sdk.Client
+
+    def client(**kw):
+        state["creates"] += 1
+        if error == "replacement" and state["creates"] == 2:
+            raise RuntimeError("injected replacement creation failure")
+        c = orig(**kw)
+        record = {"closed": 0}
+        state["clients"].append(record)
+        c.close = lambda: record.__setitem__("closed", record["closed"] + 1)
+        return c
+
+    def part(**kw):
+        if error == "part":
+            raise ValueError("injected Part setup failure")
+        state["time"] = 91.
+        return kw
+
+    monkeypatch.setattr(sdk, "Client", client)
+    monkeypatch.setattr(sdk_types, "Part",
+                        types.SimpleNamespace(from_bytes=part))
+    result = lc._gemini_classify(
+        [b"image"] * 3, api_key="fake",
+        _budget=sl._InvocationBudget(3, 120, lambda: state["time"]))
+    assert result is None
+    assert state["calls"] == 0
+    assert state["clients"], "expected at least one client record"
+    assert all(c["closed"] == 1 for c in state["clients"]), state
