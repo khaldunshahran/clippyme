@@ -46,6 +46,8 @@ from clippyme.pipeline.run_ops import (
     resolve_output_dir,
     sanitize_windows_basename,
     should_use_fallback,
+    slice_provenance_valid,
+    write_slice_provenance,
 )
 
 logger = logging.getLogger("clippyme")
@@ -708,12 +710,21 @@ def _render_one_clip(
         f"cutting clip {index + 1}/{total}",
         progress=62 + int(index / max(1, total) * 8),
     )
-    if not _valid_media_file(clip_source, 10_000):
-        try:
-            if os.path.exists(clip_source):
+    slice_reusable = _valid_media_file(clip_source, 10_000) and slice_provenance_valid(
+        clip_source, start=start, end=end, source_path=input_video
+    )
+    if not slice_reusable:
+        if os.path.exists(clip_source) and not _valid_media_file(clip_source, 10_000):
+            # Corrupt/partial slice: safe to drop, it was never valid.
+            try:
                 os.remove(clip_source)
-        except OSError:
-            pass
+            except OSError:
+                pass
+        elif os.path.exists(clip_source):
+            # Valid file but stale provenance (legacy stream-copy slice,
+            # changed interval, or changed source): re-cut. The old file
+            # stays until the replacement is verified (atomic os.replace).
+            print(f"Resume: source slice provenance mismatch for clip {index + 1}/{total} -- re-cutting", flush=True)
         if not _valid_media_file(input_video, 10_000):
             candidate = find_source_video_candidate(output_dir, min_size=10_000)
             if candidate and _valid_media_file(candidate, 10_000):
@@ -744,6 +755,7 @@ def _render_one_clip(
                 pass
             raise RuntimeError(f"ffmpeg cut failed for clip {index + 1}: {tail}")
         os.replace(temp_dest, clip_source)
+        write_slice_provenance(clip_source, start=start, end=end, source_path=input_video)
     else:
         print(f"♻️ Resume: reusing source slice for clip {index + 1}", flush=True)
 

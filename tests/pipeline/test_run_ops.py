@@ -55,40 +55,39 @@ def test_existing_directory_passthrough(tmp_path):
 def test_cut_command_shape_and_precision():
     cmd = build_cut_command("/in/video.mp4", 12.3456, 47.9, "/out/source_clip.mp4")
     assert cmd[0] == "ffmpeg" and cmd[1] == "-y"
-    # Fast input seek: -ss must come BEFORE -i.
-    assert cmd.index("-ss") < cmd.index("-i")
+    # Accurate output seek: -ss must come AFTER -i (decodes + discards).
+    assert cmd.index("-ss") > cmd.index("-i")
     assert cmd[cmd.index("-ss") + 1] == "12.346"          # 3-decimal rounding
     assert cmd[cmd.index("-t") + 1] == f"{47.9 - 12.3456:.3f}"
     assert cmd[-1] == "/out/source_clip.mp4"
-    # Stream-copy contract: no re-encode flags ride along.
-    assert cmd[cmd.index("-c:v") + 1] == "copy"
-    assert cmd[cmd.index("-c:a") + 1] == "copy"
-    assert "-vsync" not in cmd
-    assert "libx264" not in cmd
+    # Accurate-cut contract: video re-encoded via the shared x264 policy,
+    # audio re-encoded to AAC, audio stream optional (absent audio is fine).
+    assert "copy" not in cmd
+    assert "0:a?" in cmd
 
 
-def test_cut_command_is_stream_copy_not_reencode():
-    """build_cut_command must NOT re-encode the source slice.
+def test_cut_command_is_accurate_reencode_not_stream_copy():
+    """build_cut_command MUST re-encode the source slice (Task 01).
 
-    The slice is a fast, lossless stream copy; the old test asserting shared
-    x264 settings encoded the pre-stream-copy contract.
+    Accurate timing has priority over stream-copy speed: the slice starts
+    at the first frame at/after the requested start, with no keyframe
+    preroll. Video uses the shared x264 encode policy; audio is re-encoded
+    to AAC for matching trim accuracy.
     """
     cmd = build_cut_command("/in.mp4", 0, 10, "/out.mp4")
-    assert cmd[cmd.index("-c:v") + 1] == "copy"
-    assert cmd[cmd.index("-c:a") + 1] == "copy"
-    assert "libx264" not in cmd
-    assert "-crf" not in cmd
+    assert "copy" not in cmd
+    assert "libx264" in cmd or "h264_nvenc" in cmd
 
 def test_stream_copy_cut_keyframe_granularity(tmp_path):
-    """Quantify stream-copy seek granularity on a real file.
+    """Verify the accurate cut has ~zero seek offset on a real file.
 
-    build_cut_command seeks with ``-ss`` BEFORE ``-i`` and copies the stream,
-    so the slice really starts at the keyframe at/before the requested start
-    (up to ~one GOP early). This measures that offset instead of theorizing:
-    it runs the command's seek flags WITHOUT the ``-avoid_negative_ts``
-    rebase and reads the first packet's DTS via ffprobe, so
-    ``requested_start - actual_start`` IS the keyframe offset. Skips when
-    ffmpeg/ffprobe are unavailable.
+    (Historical name: this test used to quantify the old stream-copy
+    keyframe granularity.) build_cut_command now seeks accurately (``-ss``
+    AFTER ``-i``) and re-encodes, so the slice starts at the first frame
+    at/after the requested start. This runs the command's seek flags WITHOUT
+    the ``-avoid_negative_ts`` rebase and reads the first packet's DTS via
+    ffprobe: ``requested_start - actual_start`` must now be ~0 (sub-frame),
+    not up to one GOP. Skips when ffmpeg/ffprobe are unavailable.
     """
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")

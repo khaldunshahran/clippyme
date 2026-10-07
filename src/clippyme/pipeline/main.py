@@ -886,6 +886,7 @@ if __name__ == '__main__':
 
     from clippyme.pipeline.run_ops import (
         build_cut_command, clip_output_basename, resolve_output_dir, should_use_fallback,
+    write_slice_provenance,
     )
 
     # 1. Get Input Video
@@ -1106,6 +1107,7 @@ if __name__ == '__main__':
                         continue
                     else:
                         print(f"   ✅ ffmpeg cut done", flush=True)
+                        write_slice_provenance(clip_source_path, start=start, end=end, source_path=input_video)
                 except subprocess.TimeoutExpired:
                     print(f"   ❌ ffmpeg cut TIMED OUT after 10 min — skipping this clip. Input may be corrupt or seek is stuck.", flush=True)
                     continue
