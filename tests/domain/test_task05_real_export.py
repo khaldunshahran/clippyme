@@ -210,7 +210,7 @@ def test_real_export_edit_changes_content(monkeypatch, tmp_path):
     out1, _, _, _ = _run_real_export(monkeypatch, tmp_path, edited=False)
     # Fresh fixture for edited (avoid cross-contamination).
     import tempfile
-    with tempfile.TemporaryDirectory() as td2:
+    with tempfile.TemporaryDirectory(dir=tmp_path) as td2:
         from pathlib import Path
         p2 = Path(td2)
         out2, _, _, _ = _run_real_export(monkeypatch, p2, edited=True)
