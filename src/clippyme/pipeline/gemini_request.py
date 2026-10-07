@@ -274,7 +274,7 @@ VIDEO_DURATION_SECONDS: {video_duration}
 TRANSCRIPT_TEXT (raw):
 {transcript_text}
 
-WORDS (TOON tabular: header `words[N]{{w,s,e}}:`, then one row `w,s,e` per word, s/e seconds):
+WORDS (TOON tabular: header `words[N]{{w,s,e}}:` without speaker evidence, or `words[N]{{w,s,e,sp}}:` with speaker IDs. One row per word: `w,s,e` or `w,s,e,sp`. s/e are seconds. sp is anonymous speaker ID; `-` means unknown. Absent speaker evidence leaves speaker count unknown.):
 {words_toon}
 {segment_summary_block}
 
@@ -537,19 +537,30 @@ def build_viral_prompt(
     ctype = (clip_type or "").strip().lower()
 
     if is_multi_tier:
-        duration_descriptor = f"15s-{max_dur:.0f}s (Dynamic Multi-Tier Portfolio Mix)"
-        duration_constraint = f"15s \u2264 duration \u2264 {max_dur:g}s (let the natural story arc determine the exact duration)"
-        duration_strategy_block = (
-            "\n## MULTI-TIER DURATION & RETENTION STRATEGY (MANDATORY MIX)\n"
-            "Do NOT output clips of uniform duration. Top platforms (like OpusClip) succeed by letting the story content dictate the length. Curate a diversified portfolio distributed across:\n"
-            "1. TIER 1 - SHORTS / REELS (20s - 60s): Fast-paced, instant hook in first 0-3s, quick punchy payoff. Perfect for rapid-scroll YouTube Shorts / IG Reels.\n"
-            "2. TIER 2 - MID-LENGTH SOCIAL (60s - 120s / 1m - 2m): Complete narrative arc, escalating argument, or storytelling anecdote with thorough setup and payoff. Crucial for high-retention TikTok watch time and Reels.\n"
-            "3. TIER 3 - EXTENDED DEEP DIVE (120s - 300s / 2m - 5m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
-            "Every clip in your response MUST designate its 'duration_tier' ('short', 'mid', or 'extended') and list recommended 'target_platforms'."
-        )
+        duration_descriptor = f"{min_dur!r}-{max_dur!r}s (Dynamic Multi-Tier Portfolio Mix)"
+        duration_constraint = f"{min_dur!r}s \u2264 duration \u2264 {max_dur!r}s (let the natural story arc determine the exact duration)"
+        # Only demand tier mix if source can actually support the tiers.
+        # Short sources (max < 60s) cannot provide 60-120s or 120-300s clips.
+        if max_dur >= 60.0:
+            duration_strategy_block = (
+                "\n## MULTI-TIER DURATION & RETENTION STRATEGY (MANDATORY MIX)\n"
+                "Do NOT output clips of uniform duration. Top platforms (like OpusClip) succeed by letting the story content dictate the length. Curate a diversified portfolio distributed across:\n"
+                "1. TIER 1 - SHORTS / REELS (20s - 60s): Fast-paced, instant hook in first 0-3s, quick punchy payoff. Perfect for rapid-scroll YouTube Shorts / IG Reels.\n"
+                "2. TIER 2 - MID-LENGTH SOCIAL (60s - 120s / 1m - 2m): Complete narrative arc, escalating argument, or storytelling anecdote with thorough setup and payoff. Crucial for high-retention TikTok watch time and Reels.\n"
+                "3. TIER 3 - EXTENDED DEEP DIVE (120s - 300s / 2m - 5m): High-value masterclass breakdown, intense debate, or deep dramatic story with multiple beats.\n"
+                "Every clip in your response MUST designate its 'duration_tier' ('short', 'mid', or 'extended') and list recommended 'target_platforms'."
+            )
+        else:
+            # Short source: single-tier, no mandatory mix.
+            duration_strategy_block = (
+                "\n## DURATION STRATEGY (SHORT SOURCE)\n"
+                f"Source is {max_dur!r}s. Select clips within the mandatory "
+                f"{min_dur!r}s to {max_dur!r}s range. Do not demand tiers "
+                "that exceed the source length."
+            )
     else:
-        duration_descriptor = f"{min_dur:g}-{max_dur:g}s"
-        duration_constraint = f"{min_dur:g}s \u2264 duration \u2264 {max_dur:g}s"
+        duration_descriptor = f"{min_dur!r}-{max_dur!r}s"
+        duration_constraint = f"{min_dur!r}s \u2264 duration \u2264 {max_dur!r}s"
         duration_strategy_block = "" 
 
     # Resolve target clip count

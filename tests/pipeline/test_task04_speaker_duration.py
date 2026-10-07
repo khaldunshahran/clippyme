@@ -182,7 +182,7 @@ def test_prompt_and_repair_share_policy():
     p = resolve_duration_policy(min_duration=20, max_duration=90,
                                 video_duration=600)
     # Exact mandatory constraint, not just numbers appearing anywhere.
-    assert "20\u2264 duration \u2264 90" in prompt or "20s \u2264 duration \u2264 90s" in prompt
+    assert "20.0s \u2264 duration \u2264 90.0s" in prompt
     assert p.max_duration == 90.0
     assert p.min_duration == 20.0
 
@@ -335,20 +335,19 @@ def test_whisper_pyannote_shaped_fixture():
     assert words[0]["sp"] == 0
 
 def test_hook_backfill_compatibility():
-    """Hook backfill works with speaker-augmented words."""
-    from clippyme.pipeline import gemini_parser
-    words = [
-        {"w": "hello", "s": 0.0, "e": 0.5, "sp": 0},
-        {"w": "world", "s": 0.5, "e": 1.0, "sp": 1},
-    ]
-    # backfill_hook_text expects {w,s,e}; sp must not break it.
-    try:
-        result = gemini_parser.backfill_hook_text(words, 0.0, 1.0)
-        # Should return text without crashing on 'sp' key.
-        assert isinstance(result, str)
-    except AttributeError:
-        # If function doesn't exist, at least verify words are intact.
-        assert words[0]["w"] == "hello"
+    """Real hook backfill accepts speaker-augmented words."""
+    from clippyme.pipeline import gemini_parser as gp
+    _, words = gr.build_viral_prompt({"segments": [{"words": [
+        {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": 0},
+        {"word": "world", "start": 0.5, "end": 1.0, "speaker": 1},
+    ]}]}, 100.0)
+    clips = [{"start": 0.0, "end": 1.0, "viral_hook_text": "",
+              "video_title_for_youtube_short": "The payoff is surprising"}]
+    result = gp.backfill_hook_text(clips, words)
+    assert result is clips
+    assert clips[0]["viral_hook_text"] == "The payoff is surprising"
+    # Speaker evidence preserved through the pipeline.
+    assert [w["sp"] for w in words] == [0, 1]
 
 def test_no_transcript_mutation():
     """build_viral_prompt does not mutate input transcript."""
@@ -376,3 +375,191 @@ def test_exact_toon_rows():
     assert lines[0] == "words[2]{w,s,e,sp}:"
     assert lines[1] == "  hello,0.0,0.5,0"
     assert lines[2] == "  world,1.25,1.75,1"
+
+# --- Content preservation (review2) ---
+
+def test_padding_conflict_keeps_selected_words():
+    """Optional padding that exceeds max is declined; content preserved."""
+    words = [
+        {"word": "First", "start": 10.0, "end": 10.4},
+        {"word": "payoff.", "start": 39.5, "end": 40.0},
+    ]
+    clips = [{"start": 10.0, "end": 40.0}]
+    cut_ops.snap_clips_to_transcript(
+        clips, words, source_duration=100.0,
+        max_duration=30.0, min_duration=15.0)
+    # Baseline [10,40] is 30s (fits max). Padding declined.
+    assert clips[0]["start"] <= 10.0
+    assert clips[0]["end"] >= 40.0, "preserve selected payoff"
+    assert clips[0]["end"] - clips[0]["start"] <= 30.0
+
+def test_oversized_proposal_not_silently_reselected():
+    """Over-limit interval retained with honest conflict, not shrunk to first word."""
+    words = [
+        {"word": "First", "start": 0.0, "end": 0.4},
+        {"word": "payoff.", "start": 34.5, "end": 35.0},
+    ]
+    clips = [{"start": 0.0, "end": 35.0}]
+    cut_ops.snap_clips_to_transcript(
+        clips, words, source_duration=100.0,
+        max_duration=30.0, min_duration=15.0)
+    # Must NOT become [0, 0.4]. Retain with conflict.
+    assert clips[0]["end"] >= 35.0, "retain selected word-safe interval"
+    assert clips[0]["duration_conflict"] == "maximum_conflict"
+
+def test_cap_fallback_checks_minimum():
+    """After fallback, minimum is validated."""
+    words = [
+        {"word": "First", "start": 0.0, "end": 0.4},
+        {"word": "payoff.", "start": 34.5, "end": 35.0},
+    ]
+    clips = [{"start": 0.0, "end": 35.0}]
+    cut_ops.snap_clips_to_transcript(
+        clips, words, source_duration=100.0,
+        max_duration=30.0, min_duration=15.0)
+    duration = clips[0]["end"] - clips[0]["start"]
+    # Either meets min, or reports minimum conflict.
+    assert duration >= 15.0 or clips[0].get("duration_conflict") == "minimum_conflict"
+
+def test_overlapping_word_boundary_safe():
+    """New boundary must not cut through overlapping speech."""
+    words = [
+        {"word": "first", "start": 0.0, "end": 0.4},
+        {"word": "A", "start": 9.5, "end": 10.0},
+        {"word": "B", "start": 9.7, "end": 10.4},  # overlaps A
+    ]
+    clips = [{"start": 0.0, "end": 10.4}]
+    cut_ops.snap_clips_to_transcript(
+        clips, words, source_duration=20.0,
+        max_duration=10.0, min_duration=1.0)
+    edge = clips[0]["end"]
+    # Edge must not be inside any word.
+    for w in words:
+        assert not (w["start"] < edge < w["end"]), f"edge {edge} cuts word {w}"
+
+def test_stale_conflict_cleared_on_success():
+    """Old diagnostic removed when current policy satisfied."""
+    words = [
+        {"word": "First", "start": 0.0, "end": 0.4},
+        {"word": "payoff.", "start": 19.5, "end": 20.0},
+    ]
+    clips = [{"start": 0.0, "end": 20.0,
+              "duration_conflict": "maximum_conflict",
+              "duration_conflict_detail": "old policy"}]
+    cut_ops.snap_clips_to_transcript(
+        clips, words, source_duration=100.0,
+        max_duration=60.0, min_duration=15.0)
+    assert "duration_conflict" not in clips[0]
+    assert "duration_conflict_detail" not in clips[0]
+
+# --- Prompt matches policy (review2) ---
+
+@pytest.mark.parametrize("length", [5.0, 10.0, 24.0])
+def test_short_source_prompt_matches_resolved_minimum(length):
+    """Actual prompt mandatory limits equal resolved policy."""
+    import re
+    p = resolve_duration_policy(video_duration=length)
+    prompt, _ = gr.build_viral_prompt({"segments": []}, length)
+    matches = re.findall(
+        r"([\d.eE+-]+)s\s*\u2264 duration \u2264\s*([\d.eE+-]+)s", prompt)
+    assert matches, "mandatory constraint must be parseable"
+    lo, hi = map(float, matches[0])
+    assert (lo, hi) == (p.min_duration, p.max_duration)
+    assert lo <= hi <= length
+    # Unavailable tiers must not be mandatory.
+    assert "MANDATORY MIX" not in prompt
+
+@pytest.mark.parametrize("maximum", [30.1234567, 99.999999])
+def test_explicit_maximum_full_precision(maximum):
+    """Explicit max preserved with full precision, never rounded up."""
+    import re
+    prompt, _ = gr.build_viral_prompt(
+        {"segments": []}, 100.0, min_duration=15.0, max_duration=maximum)
+    matches = re.findall(
+        r"([\d.eE+-]+)s\s*\u2264 duration \u2264\s*([\d.eE+-]+)s", prompt)
+    assert matches
+    assert float(matches[0][1]) == maximum
+
+def test_segment_summary_parsed_not_incidental():
+    """Segment summary block parsed, not incidental numbers."""
+    import re
+    t = {"text": "Hello", "language": "en", "segments": [{
+        "start": 0.0, "end": 1.0, "speaker": 7,
+        "words": [{"word": "Hello", "start": 0.0, "end": 1.0}],
+    }]}
+    prompt, words = gr.build_viral_prompt(t, 100.0)
+    # Words have no speaker.
+    assert "sp" not in words[0]
+    # Segment summary block exists with correct structure.
+    m = re.search(
+        r"SEGMENT SPEAKER SUMMARIES.*?segment (\d+): speaker (\d+)",
+        prompt, re.DOTALL)
+    assert m, "segment summary block must be parseable"
+    assert m.group(1) == "0"  # segment_index
+    assert m.group(2) == "7"  # speaker
+
+# --- Actual caller integration (not just AST) ---
+
+def test_queued_caller_forwards_policy_values(tmp_path, monkeypatch, capsys):
+    """Actual orchestrator _load_or_analyze forwards resolved max/min."""
+    from types import SimpleNamespace
+    from clippyme.pipeline import orchestrator as orch
+    transcript = {"segments": [{"words": [
+        {"word": "First", "start": 0.0, "end": 0.4},
+        {"word": "last.", "start": 29.5, "end": 29.92},
+    ]}]}
+    args = SimpleNamespace(
+        min_duration=15.0, max_duration=30.0, duration_mode="mixed",
+        clip_type=None, reframe_mode="auto", skip_analysis=False,
+        monitor=False, instructions=None, min_clips=None, max_clips=None,
+        aspect="9:16", caption_style_default=None)
+    class State:
+        def artifact(self, *a): return None
+        def completed(self, *a): return False
+        def start(self, *a): pass
+        def consume_steering(self): return []
+        def set_clip_total(self, *a): pass
+        def complete_stage(self, *a, **k): pass
+    legacy = SimpleNamespace(
+        get_viral_clips=lambda *a, **k: {"shorts": [{"start": 0.0, "end": 29.92}]})
+    monkeypatch.setenv("CLIPPYME_SILENCE_SNAP", "0")
+    monkeypatch.setenv("CLIPPYME_MAX_CLIPS", "0")
+    data, _ = orch._load_or_analyze(
+        args, str(tmp_path / "source.mp4"), "source",
+        str(tmp_path), 100.0, transcript, State(), legacy)
+    clip = data["shorts"][0]
+    # Max 30 respected.
+    assert clip["end"] - clip["start"] <= 30.0
+
+def test_queued_minimum_conflict_observable(tmp_path, monkeypatch, capsys):
+    """Minimum conflict surfaces in actual queued caller."""
+    from types import SimpleNamespace
+    from clippyme.pipeline import orchestrator as orch
+    transcript = {"segments": [{"words": [
+        {"word": "First", "start": 0.0, "end": 0.4},
+        {"word": "last.", "start": 29.4, "end": 29.8},
+    ]}]}
+    args = SimpleNamespace(
+        min_duration=30.0, max_duration=60.0, duration_mode=None,
+        clip_type=None, reframe_mode="auto", skip_analysis=False,
+        monitor=False, instructions=None, min_clips=None, max_clips=None,
+        aspect="9:16", caption_style_default=None)
+    class State:
+        def artifact(self, *a): return None
+        def completed(self, *a): return False
+        def start(self, *a): pass
+        def consume_steering(self): return []
+        def set_clip_total(self, *a): pass
+        def complete_stage(self, *a, **k): pass
+    legacy = SimpleNamespace(
+        get_viral_clips=lambda *a, **k: {"shorts": [{"start": 0.0, "end": 30.0}]})
+    monkeypatch.setenv("CLIPPYME_SILENCE_SNAP", "0")
+    monkeypatch.setenv("CLIPPYME_MAX_CLIPS", "0")
+    data, _ = orch._load_or_analyze(
+        args, str(tmp_path / "source.mp4"), "source",
+        str(tmp_path), 100.0, transcript, State(), legacy)
+    clip = data["shorts"][0]
+    text = capsys.readouterr().out.lower()
+    assert (clip["end"] - clip["start"] >= 30.0
+            or "conflict" in text
+            or any("duration" in k or "conflict" in k for k in clip))

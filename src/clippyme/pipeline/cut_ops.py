@@ -556,24 +556,60 @@ def compute_neighbor_bounds(raw_intervals, idx):
             max(preceding) if preceding else None)
 
 
+def _word_safe_interval(start, end, words):
+    """Snap to word boundaries without cutting through any word.
+
+    Returns (safe_start, safe_end). If no words overlap the interval,
+    returns the original. Ensures boundaries don't split overlapping
+    speech: a boundary is only safe if no word straddles it.
+    """
+    safe_start, safe_end = start, end
+    # Find first word start >= start (don't cut a word at the beginning).
+    for w in words:
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ws <= start < we:
+            # Start is inside this word: move to word start.
+            safe_start = ws
+            break
+    # Find last word end <= end (don't cut a word at the end).
+    for w in reversed(words):
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ws < end <= we:
+            # End is inside this word: move to word end.
+            safe_end = we
+            break
+    return (safe_start, safe_end)
+
+
 def _enforce_duration_cap(new_start, new_end, words, max_duration,
-                            min_duration=None):
-    """Enforce max_duration after all repair stages, word-safely.
+                          min_duration=None, baseline=None):
+    """Enforce max_duration after all repair stages, preserving content.
 
-    Returns (final_start, final_end, conflict) where conflict is None
-    on success or a dict describing the unresolved policy conflict.
+    Args:
+        new_start, new_end: proposed interval after optional stages.
+        words: word list for boundary validation.
+        max_duration: hard limit for optional expansion.
+        min_duration: minimum; conflicts reported, not silently fixed.
+        baseline: (start, end) word-safe interval BEFORE optional stages.
+            If optional stages exceed max, we revert to baseline
+            (decline the optional move), not greedy-shrink.
 
-    - If duration <= max: no change, no conflict.
-    - If duration > max: shrink the end to the latest word boundary
-      at or before start+max (never mid-word). If no such boundary
-      exists (words themselves exceed max), return conflict.
-    - Never truncates arbitrarily at start+max (could cut mid-word).
-    - Already over-limit intervals are not grown; if unchanged, the
-      caller emits a diagnostic.
+    Returns (final_start, final_end, conflict):
+        - If duration <= max: (new_start, new_end, None) or minimum conflict.
+        - If optional stages pushed over max: revert to baseline.
+        - If baseline itself over max: keep baseline, report maximum_conflict.
+        - Never removes selected words to manufacture an in-policy clip.
+        - Never truncates arbitrarily at start+max (could cut mid-word).
     """
     duration = new_end - new_start
     if duration <= max_duration:
-        # Check minimum conflict.
+        # Within max: check minimum.
         if min_duration is not None and duration < min_duration:
             return (new_start, new_end, {
                 "type": "minimum_conflict",
@@ -585,27 +621,35 @@ def _enforce_duration_cap(new_start, new_end, words, max_duration,
                 ),
             })
         return (new_start, new_end, None)
-    # Over max: find latest word end <= start+max.
-    cap = new_start + max_duration
-    best_end = None
-    for w in words:
-        try:
-            ws, we = float(w["start"]), float(w["end"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if we <= cap and we > new_start:
-            if best_end is None or we > best_end:
-                best_end = we
-    if best_end is not None and best_end > new_start:
-        return (new_start, best_end, None)
-    # No word-safe shrink available: honest conflict.
+    # Over max. If we have a baseline (pre-optional), decline the optional
+    # moves and revert to it — this preserves selected content.
+    if baseline is not None:
+        b_start, b_end = baseline
+        b_duration = b_end - b_start
+        if b_duration <= max_duration:
+            # Baseline fits: optional stages caused the overflow.
+            # Revert, preserving content.
+            return (b_start, b_end, None)
+        # Baseline itself over max: keep it, report honest conflict.
+        # Do NOT greedy-shrink to first word (removes payoff/content).
+        return (b_start, b_end, {
+            "type": "maximum_conflict",
+            "duration": b_duration,
+            "max_duration": max_duration,
+            "message": (
+                f"Clip duration {b_duration:.2f}s exceeds maximum "
+                f"{max_duration:.2f}s; retaining word-safe interval "
+                f"with conflict for selection validation."
+            ),
+        })
+    # No baseline: this IS the mandatory interval. Keep it, report conflict.
     return (new_start, new_end, {
         "type": "maximum_conflict",
         "duration": duration,
         "max_duration": max_duration,
         "message": (
             f"Clip duration {duration:.2f}s exceeds maximum "
-            f"{max_duration:.2f}s; no word-safe shrink available."
+            f"{max_duration:.2f}s; no safe shrink without removing content."
         ),
     })
 
@@ -651,10 +695,17 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
         clip.setdefault("reframe_mode", default_reframe_mode)
         if not (words and "start" in clip and "end" in clip):
             continue
+        # Clear stale diagnostics from previous invocations.
+        clip.pop("duration_conflict", None)
+        clip.pop("duration_conflict_detail", None)
         raw_start, raw_end = clip["start"], clip["end"]
         word_start, word_end = snap_clip_to_words(
             raw_start, raw_end, words, source_duration=source_duration,
         )
+        # Baseline: word-safe interval from RAW proposal, before ANY
+        # padding/optional stages. Used to decline moves that exceed limits
+        # while preserving selected content.
+        _baseline = _word_safe_interval(raw_start, raw_end, words)
         neighbor_start, neighbor_end = compute_neighbor_bounds(raw_intervals, idx)
         new_start, new_end, path = snap_clip_to_sentences(
             raw_start, raw_end, words,
@@ -671,10 +722,12 @@ def snap_clips_to_transcript(shorts, words, *, source_duration=None,
             )
             if silence_path != "none":
                 path = f"{path}+{silence_path}"
-        # Enforce duration cap after ALL stages (word, sentence, silence).
-        # Word-safe: shrink to latest word boundary, never mid-word.
+        # Enforce duration cap after ALL stages.
+        # Content-preserving: decline optional moves that exceed max;
+        # retain baseline with honest conflict if baseline itself over.
         new_start, new_end, _conflict = _enforce_duration_cap(
-            new_start, new_end, words, max_duration, min_duration)
+            new_start, new_end, words, max_duration, min_duration,
+            baseline=_baseline)
         if _conflict is not None:
             # Surface conflict as diagnostic, even if edges unchanged.
             clip["duration_conflict"] = _conflict["type"]
