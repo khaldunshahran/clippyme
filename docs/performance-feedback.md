@@ -56,16 +56,21 @@ per-platform attribution) is not implemented. A future system would need
 those cohorts before inferring causal rules. Real-footage and OpusClip
 benchmarks remain unverified.
 
-## Numeric validation and overflow policy
+## Numeric validation and honest totals policy
 
 - Only actual `int`/`float` values (excluding booleans) are accepted as
   numeric evidence. Float-convertible strings like `"100"` or `"0.8"` are
   rejected; they cannot crash valid neighboring records or contaminate
   observed averages.
-- Aggregates use a safe-sum policy: totals never become `Infinity`.
-  On overflow, the total is capped at the maximum finite float and the
-  observation remains usable. All API output stays strict-JSON
-  serializable (`allow_nan=False`).
+- Integer inputs sum with exact integer arithmetic. `9007199254740993`
+  stays `9007199254740993`, never rounded through float.
+- Overflow is DISCLOSED per metric in the API output
+  (`totals.integrity.<metric>: {overflow, inexact, status}`). An
+  overflowed total is `None` (unavailable with a reason), never zero and
+  never presented as an exact "Recorded Total". The dashboard must show
+  this state honestly, not as 0 or an exact number.
+- All API output stays strict-JSON serializable (`allow_nan=False`).
+  Totals never become `Infinity`.
 
 ## Sample provenance
 

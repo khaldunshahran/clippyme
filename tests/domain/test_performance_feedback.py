@@ -338,16 +338,16 @@ def test_string_counts_do_not_crash_good_neighbor(registry):
 
 
 def test_finite_records_cannot_emit_infinite_aggregate(registry):
-    """Two 1e308 view counts: totals stay finite, JSON-serializable."""
+    """Two 1e308 view counts: overflow disclosed, JSON-serializable."""
     import json as _json
     _write(registry, {"a": {"metrics": {"views": 1e308}},
                       "b": {"metrics": {"views": 1e308}},
                       "normal": {"metrics": {"views": 100}}})
     out = pf.analyze_performance_patterns()
-    # Must not raise; all numbers finite.
+    # Must not raise; overflow is disclosed, not Infinity.
     _json.dumps(out, allow_nan=False)
-    import math as _math
-    assert _math.isfinite(out["totals"]["views"])
+    assert out["totals"]["integrity"]["views"]["overflow"] is True
+    assert out["totals"]["views"] is None  # unavailable, not zero/Infinity
 
 
 def test_legacy_observations_not_labeled_as_explicit_measurements(registry):
@@ -376,6 +376,41 @@ def test_string_retention_not_treated_as_numeric_evidence(registry):
     })
     out = pf.analyze_performance_patterns()
     assert out["retention"]["average_recorded"] == .6
+
+
+
+def test_integer_total_preserves_stored_precision(registry):
+    """9007199254740993 stays exact (no float rounding)."""
+    exact = 9007199254740993
+    _write(registry, {"a": {"metrics": {"views": exact}}})
+    out = pf.analyze_performance_patterns()
+    assert out["totals"]["views"] == exact
+    assert out["totals"]["integrity"]["views"]["status"] == "exact"
+
+
+def test_overflow_disclosed_per_metric(registry):
+    """Overflow is API-visible, not silent. All four metrics tracked."""
+    import json as _json
+    for metric in ("views", "likes", "shares", "comments"):
+        _write(registry, {"a": {"metrics": {"views": 100, metric: 1e308}},
+                          "b": {"metrics": {"views": 100, metric: 1e308}}})
+        out = pf.analyze_performance_patterns()
+        payload = _json.dumps(out, allow_nan=False)  # must not raise
+        assert out["totals"]["integrity"][metric]["overflow"] is True
+        assert out["totals"][metric] is None  # unavailable, not zero
+        # Disclosure is API-visible, not just a code comment.
+        import re as _re
+        assert _re.search(r"overflow|capped|saturat|inexact", payload, _re.I)
+
+
+def test_exact_totals_unchanged(registry):
+    """Ordinary integer totals remain exact."""
+    _write(registry, {"a": {"metrics": {"views": 100, "likes": 50}},
+                      "b": {"metrics": {"views": 200, "likes": 75}}})
+    out = pf.analyze_performance_patterns()
+    assert out["totals"]["views"] == 300
+    assert out["totals"]["likes"] == 125
+    assert out["totals"]["integrity"]["views"]["status"] == "exact"
 
 # --- analytics_service presence marker ---
 

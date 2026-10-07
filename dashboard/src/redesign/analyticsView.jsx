@@ -379,7 +379,7 @@ export function AnalyticsView({ pushToast }) {
           </div>
         </Panel>
 
-        <Panel pad className="raised" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <Panel pad className="raised" data-testid="kpi-avg-retention" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: 'var(--ink-dim)', fontSize: '0.85rem' }}>
             <span>Avg Retention</span>
             <Icon n="flame" />
@@ -388,7 +388,7 @@ export function AnalyticsView({ pushToast }) {
             {avgRetention != null ? `${avgRetention}%` : 'Unknown'}
           </div>
           <div style={{ fontSize: '0.75rem', color: avgRetention >= 75 ? '#2e7d32' : 'var(--ink-dim)' }}>
-            {summary?.avg_retention != null ? 'Average of recorded values' : 'No retention recorded yet'}
+            {summary?.avg_retention != null ? `Average of ${summary.retention_sample_count ?? '?'} known values (unweighted)` : 'No retention recorded yet'}
           </div>
         </Panel>
       </div>

@@ -167,37 +167,69 @@ def analyze_performance_patterns() -> Dict[str, Any]:
         }
 
     n = len(measured)
-    def _safe_sum(values):
-        """Sum finite values; cap at max finite float on overflow.
+    # Honest totals policy:
+    # - Integers sum with exact integer arithmetic (no float rounding).
+    # - Floats sum separately; mixed int+float uses float.
+    # - Overflow is DISCLOSED per metric in the API output, not hidden.
+    #   A total that cannot be represented exactly is marked
+    #   "overflow": True with a reason, and the value is either capped
+    #   (clearly flagged) or omitted. Never presented as an exact
+    #   "Recorded Total".
+    def _safe_total(values):
+        """Return (value, overflow, inexact) for a metric.
 
-        Honest overflow policy: totals never become Infinity (which
-        breaks strict JSON). Capped totals are still finite and usable;
-        the cap is documented in the observation note.
+        Exact integer arithmetic when all inputs are ints. Floats are
+        summed as floats. On overflow, value is None and overflow=True.
         """
-        total = 0.0
-        capped = False
+        int_total = 0
+        float_total = 0.0
+        has_int = False
+        has_float = False
         for v in values:
-            fv = _safe_float(v)
-            if fv is None:
+            if isinstance(v, bool):
                 continue
-            total += fv
-            if not math.isfinite(total):
-                capped = True
-                total = 1.7976931348623157e308  # max finite float
-                break
-        return total, capped
+            if isinstance(v, int):
+                # Python ints are arbitrary precision; check float range
+                # only if we later need float conversion.
+                int_total += v
+                has_int = True
+            elif isinstance(v, float):
+                if not math.isfinite(v):
+                    continue
+                float_total += v
+                has_float = True
+                if not math.isfinite(float_total):
+                    return None, True, False
+            # Other types already filtered by _safe_float validation.
+        if has_float:
+            # Mixed: convert int part to float (may lose precision;
+            # flag inexact if int part exceeds float precision).
+            if has_int:
+                if abs(int_total) > 2**53:
+                    # Integer part cannot be represented exactly as float.
+                    return None, True, True
+                float_total += float(int_total)
+                if not math.isfinite(float_total):
+                    return None, True, False
+            return float_total, False, False
+        if has_int:
+            return int_total, False, False
+        return 0, False, False
 
-    total_views, _views_capped = _safe_sum(v[1]["views"] for v in measured)
-    total_likes, _ = _safe_sum(v[1]["likes"] for v in measured)
-    total_shares, _ = _safe_sum(v[1]["shares"] for v in measured)
-    total_comments, _ = _safe_sum(v[1]["comments"] for v in measured)
-    # Convert to int when whole.
-    def _as_number(x):
-        return int(x) if x == int(x) else x
-    total_views = _as_number(total_views)
-    total_likes = _as_number(total_likes)
-    total_shares = _as_number(total_shares)
-    total_comments = _as_number(total_comments)
+    _totals = {}
+    _overflow_flags = {}
+    for _metric in ("views", "likes", "shares", "comments"):
+        _val, _overflow, _inexact = _safe_total(
+            v[1].get(_metric) for v in measured)
+        _totals[_metric] = _val
+        _overflow_flags[_metric] = {
+            "overflow": _overflow,
+            "inexact": _inexact,
+        }
+    total_views = _totals["views"]
+    total_likes = _totals["likes"]
+    total_shares = _totals["shares"]
+    total_comments = _totals["comments"]
 
     observations: List[Dict[str, Any]] = [
         {
@@ -272,6 +304,19 @@ def analyze_performance_patterns() -> Dict[str, Any]:
             "likes": total_likes,
             "shares": total_shares,
             "comments": total_comments,
+            # Per-metric integrity disclosure. A metric with
+            # overflow=True is NOT an exact recorded total; the value
+            # is None (unavailable) with a reason, not zero.
+            "integrity": {
+                _m: {
+                    "overflow": _overflow_flags[_m]["overflow"],
+                    "inexact": _overflow_flags[_m]["inexact"],
+                    "status": ("overflow_unavailable"
+                               if _overflow_flags[_m]["overflow"]
+                               else "exact"),
+                }
+                for _m in ("views", "likes", "shares", "comments")
+            },
         },
         "retention": {
             "average_recorded": avg_retention,

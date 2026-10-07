@@ -147,11 +147,48 @@ test('KPI shows null average as Unknown, not 0%', async () => {
   await waitFor(() => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
-  // Avg Retention KPI card shows Unknown, not 0%. Scoped to avoid
-  // matching leaderboard rows.
-  const kpiCard = screen.getByText('Avg Retention').closest('div');
+  // Full card via stable test id (not title.closest which misses siblings).
+  const kpiCard = screen.getByTestId('kpi-avg-retention');
   expect(within(kpiCard).getByText('Unknown')).toBeInTheDocument();
   expect(within(kpiCard).queryByText('0%')).not.toBeInTheDocument();
+});
+
+test('KPI shows known average with count and unweighted', async () => {
+  const summaryKnown = { ...MOCK_SUMMARY, avg_retention: 0.4,
+                         retention_sample_count: 2,
+                         retention_averaging: 'unweighted' };
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(summaryKnown);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+  const kpiCard = screen.getByTestId('kpi-avg-retention');
+  expect(within(kpiCard).getByText('40%')).toBeInTheDocument();
+  // Denominator and averaging semantics in the actual card.
+  expect(within(kpiCard).getByText(/Average of 2 known values/)).toBeInTheDocument();
+  expect(within(kpiCard).getByText(/unweighted/)).toBeInTheDocument();
+});
+
+test('KPI handles legacy summary without count fields', async () => {
+  // Old summary shape: no retention_sample_count. Must not crash or
+  // claim an absent denominator.
+  const legacySummary = { ...MOCK_SUMMARY, avg_retention: 0.6 };
+  delete legacySummary.retention_sample_count;
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(legacySummary);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
+  });
+  const kpiCard = screen.getByTestId('kpi-avg-retention');
+  expect(within(kpiCard).getByText('60%')).toBeInTheDocument();
+  // Falls back to '?' for unknown count, still honest.
+  expect(within(kpiCard).getByText(/Average of \? known values/)).toBeInTheDocument();
 });
 
 test('empty insights show honest inactive state', async () => {
