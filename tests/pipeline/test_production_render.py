@@ -139,15 +139,41 @@ def _probe(path):
     return json.loads(r.stdout)
 
 
-def _decode_audio_rms(path):
+def _decode_audio_samples(path, sr=8000):
+    """Decode mono audio to float samples."""
     cmd = ["ffmpeg", "-v", "error", "-i", str(path),
-           "-map", "0:a", "-f", "f32le", "-ac", "1", "-ar", "8000", "-"]
+           "-map", "0:a", "-f", "f32le", "-ac", "1", "-ar", str(sr), "-"]
     r = subprocess.run(cmd, capture_output=True, check=True)
     n = len(r.stdout) // 4
     if n == 0:
+        return []
+    return list(struct.unpack(f"<{n}f", r.stdout))
+
+
+def _dominant_freq(samples, sr=8000):
+    """Dominant frequency via zero-crossing rate (robust for pure tones)."""
+    if len(samples) < sr:
         return 0.0
-    samples = struct.unpack(f"<{n}f", r.stdout)
-    return math.sqrt(sum(s * s for s in samples) / n)
+    # Use middle 1s to avoid edge effects.
+    seg = samples[sr:sr*2] if len(samples) >= sr*2 else samples
+    crossings = sum(1 for i in range(1, len(seg))
+                    if (seg[i-1] <= 0) != (seg[i] <= 0))
+    # Two crossings per cycle.
+    return (crossings / 2) * (sr / len(seg))
+
+
+def _check_expected_tone(path, expected_hz=880, sr=8000, tol_hz=40):
+    """Verify the expected sine tone: frequency, duration, energy."""
+    samples = _decode_audio_samples(path, sr)
+    assert len(samples) >= sr * 2, f"audio too short: {len(samples)/sr:.2f}s"
+    freq = _dominant_freq(samples, sr)
+    assert abs(freq - expected_hz) < tol_hz, (
+        f"expected {expected_hz}Hz tone, got {freq:.1f}Hz")
+    # Energy: RMS of middle section must be nonzero (tone present).
+    mid = samples[sr:sr*2]
+    rms = math.sqrt(sum(s*s for s in mid) / len(mid))
+    assert rms > 0.01, f"tone energy missing: rms={rms}"
+    return freq, rms
 
 
 def _is_magenta(px):
@@ -158,6 +184,16 @@ def _is_magenta(px):
 def _is_red(px):
     b, g, r = int(px[0]), int(px[1]), int(px[2])
     return r > 120 and b < 100 and g < 100
+
+
+def _is_yellow(px):
+    b, g, r = int(px[0]), int(px[1]), int(px[2])
+    return r > 120 and g > 120 and b < 100
+
+
+def _is_blue(px):
+    b, g, r = int(px[0]), int(px[1]), int(px[2])
+    return b > 120 and r < 100 and g < 100
 
 
 @pytest.mark.parametrize("comfort", ["1", "0"])
@@ -207,8 +243,9 @@ def test_production_render_three_scenes(three_scene_av, tmp_path, monkeypatch, c
     assert abs(num / den - 30) < 1.0
     assert 85 <= int(vs.get("nb_frames", 0)) <= 95
     assert 2.9 < float(info["format"]["duration"]) < 3.1
-    # 880Hz tone retained.
-    assert _decode_audio_rms(out) > 0.01
+    # 880Hz tone: verify frequency (not just volume), duration, energy.
+    freq, rms = _check_expected_tone(out, expected_hz=880)
+    assert 840 < freq < 920
 
     cap = cv2.VideoCapture(out)
     try:
@@ -258,6 +295,21 @@ def test_production_render_three_scenes(three_scene_av, tmp_path, monkeypatch, c
                    for x in range(0, mid0.shape[1], 4)
                    if _is_magenta(mid0[y, x]))
         assert mag_mid > mag0 * 3, "scene 0 unexpectedly has presenter pane"
+
+        # Scene 2 (frame 75): GENERAL with YELLOW triangle landmark.
+        # A black third scene must fail here.
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 75)
+        ok, f2 = cap.read()
+        assert ok
+        # Yellow triangle is in the upper-middle of the input; in the
+        # vertical crop it should appear in the upper half.
+        top2 = f2[:hh//2]
+        yel2 = sum(1 for y in range(0, top2.shape[0], 4)
+                   for x in range(0, top2.shape[1], 4)
+                   if _is_yellow(top2[y, x]))
+        assert yel2 > 20, (
+            "scene 2 missing YELLOW triangle landmark; "
+            "third-scene content not verified")
     finally:
         cap.release()
 
@@ -287,5 +339,6 @@ def test_explicit_modes_complete_without_classification(three_scene_av, tmp_path
         vs = info["streams"][0]
         w, h = int(vs["width"]), int(vs["height"])
         assert h >= w, f"mode {mode}: not vertical"
-        assert _decode_audio_rms(out) > 0.005, f"mode {mode}: audio lost"
+        f, r = _check_expected_tone(out, expected_hz=880)
+        assert 840 < f < 920, f"mode {mode}: wrong tone"
     assert calls == [], "provider invoked in explicit mode"

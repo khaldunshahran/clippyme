@@ -304,12 +304,11 @@ def _gemini_classify(frames, api_key=None, model_name=None,
 
     Shares the invocation budget: each actual SDK attempt consumes one
     request allowance via _budget.take_attempt(); per-attempt timeout is
-    capped by remaining milliseconds (no floor that exceeds remaining);
-    retries stop when budget is exhausted. SDK internal retries are
-    explicitly disabled via HttpRetryOptions(attempts=1) passed as
-    HttpOptions(retry_options=...). If the retry policy cannot be
-    configured, fails conservatively (no call). Returns response text
-    or None. Never raises. No background threads.
+    capped by remaining milliseconds; retries stop when budget is exhausted.
+    SDK internal retries explicitly disabled via HttpRetryOptions(attempts=1).
+    Every owned SDK client is closed exactly once on all exits (success,
+    failure, budget exhaustion, setup/refresh errors) via finally.
+    Returns response text or None. Never raises. No background threads.
     """
     api_key = api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -323,10 +322,6 @@ def _gemini_classify(frames, api_key=None, model_name=None,
 
         model_name = get_auxiliary_gemini_model(model_name)
 
-        # Configure SDK retry policy: supported API is
-        # HttpRetryOptions(attempts=1) via HttpOptions(retry_options=...).
-        # attempts=1 means no retries (single attempt). Fail conservatively
-        # if the policy cannot be configured.
         try:
             retry_opts = genai_types.HttpRetryOptions(attempts=1)
         except Exception as e:
@@ -334,8 +329,6 @@ def _gemini_classify(frames, api_key=None, model_name=None,
             return None
 
         def _attempt_timeout_ms():
-            # Milliseconds, capped by remaining budget. No floor above
-            # remaining; skip (return 0) when insufficient time.
             t_ms = int(timeout_s * 1000)
             if _budget is not None:
                 rem_ms = int(_budget.remaining_s() * 1000)
@@ -347,7 +340,16 @@ def _gemini_classify(frames, api_key=None, model_name=None,
                 timeout=timeout_ms, retry_options=retry_opts)
             return genai.Client(api_key=api_key, http_options=http_opts)
 
-        # Initial client; rebuilt per attempt with current remaining time.
+        def _close_client(c):
+            if c is None:
+                return
+            close = getattr(c, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
         timeout_ms = _attempt_timeout_ms()
         if timeout_ms <= 0:
             return None
@@ -360,61 +362,54 @@ def _gemini_classify(frames, api_key=None, model_name=None,
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
                  for b in frames]
         last_err = None
-        for attempt in range(max_retries + 1):
-            # Consume one actual-call allowance per attempt. Stops retries
-            # when empty; no double charge (scene-level take_request removed).
-            if _budget is not None:
-                if not _budget.take_attempt():
-                    break
-            # Refresh timeout from current remaining budget.
-            try:
-                cur_ms = _attempt_timeout_ms()
-                if cur_ms <= 0:
-                    break
-                if cur_ms != timeout_ms:
-                    timeout_ms = cur_ms
-                    try:
-                        # Close old client if it supports it; else replace.
-                        close = getattr(client, "close", None)
-                        if callable(close):
-                            try:
-                                close()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    client = _make_client(timeout_ms)
-            except Exception as e:
-                # Do not suppress timeout-refresh failure; fail conservatively.
-                print(f"[LayoutClassifier] timeout refresh failed: {e}")
-                break
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=parts + [LAYOUT_PROMPT],
-                    config=genai_types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                    ),
-                )
-                if response and response.text:
-                    return response.text
-                return None
-            except Exception as e:
-                last_err = e
-                if attempt < max_retries:
-                    if _budget is not None and _budget.expired():
+        try:
+            for attempt in range(max_retries + 1):
+                if _budget is not None:
+                    if not _budget.take_attempt():
                         break
-                    import time
-                    delay = min(2.0 ** attempt, 4.0)
-                    if _budget is not None:
-                        delay = min(delay, _budget.remaining_s())
-                    if delay > 0:
-                        time.sleep(delay)
-                    else:
+                # Refresh timeout from current remaining budget.
+                try:
+                    cur_ms = _attempt_timeout_ms()
+                    if cur_ms <= 0:
                         break
-        if last_err is not None:
-            print(f"[LayoutClassifier] scene classification failed: {last_err}")
-        return None
+                    if cur_ms != timeout_ms:
+                        # Close old before replacing (no leak on refresh).
+                        _close_client(client)
+                        timeout_ms = cur_ms
+                        client = _make_client(timeout_ms)
+                except Exception as e:
+                    print(f"[LayoutClassifier] timeout refresh failed: {e}")
+                    break
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=parts + [LAYOUT_PROMPT],
+                        config=genai_types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                        ),
+                    )
+                    if response and response.text:
+                        return response.text
+                    return None
+                except Exception as e:
+                    last_err = e
+                    if attempt < max_retries:
+                        if _budget is not None and _budget.expired():
+                            break
+                        import time
+                        delay = min(2.0 ** attempt, 4.0)
+                        if _budget is not None:
+                            delay = min(delay, _budget.remaining_s())
+                        if delay > 0:
+                            time.sleep(delay)
+                        else:
+                            break
+            if last_err is not None:
+                print(f"[LayoutClassifier] scene classification failed: {last_err}")
+            return None
+        finally:
+            # Close the current owned client on all exits.
+            _close_client(client)
     except Exception as e:
         print(f"[LayoutClassifier] scene classification failed: {e}")
         return None

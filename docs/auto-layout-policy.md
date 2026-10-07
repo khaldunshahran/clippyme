@@ -81,12 +81,16 @@ Provider (`_gemini_classify`):
 - SDK internal retries explicitly disabled via
   `HttpRetryOptions(attempts=1)` passed as `HttpOptions(retry_options=...)`.
   If the policy cannot be configured, fails conservatively (no call).
+- Every owned SDK client closed exactly once on all exits (success, final
+  failure, budget exhaustion, setup/refresh errors) via try/finally; the
+  previous client is closed before replacement on timeout refresh.
 - Bounded outer retries (2 with backoff, capped by remaining time).
 - Missing key or disabled flag: no call, immediate None.
 
 ## Tests
 
-- `test_layout_policy.py` (52): parser contract, provider injection,
+- `test_layout_policy.py` (52):
+- `test_budget_regressions.py` (10): durable budget/client regressions parser contract, provider injection,
   config flag, policy decisions (GENERAL/TRACK/SPLIT), budgets,
   compatibility wrapper, geometry validation.
 - `test_reframe_layout_promotion.py` (5): synthetic 3-scene unit checks
