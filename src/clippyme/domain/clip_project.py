@@ -192,6 +192,34 @@ def _backfill_word_ids(data: dict, *, repair_duplicates: bool = False) -> dict:
     return data
 
 
+class ReframedBase(BaseModel):
+    """Lineage for automatic framing preservation (Task 05).
+
+    Optional. When present on an auto-emitted project, records the
+    original reframed clip (with tracked-speaker/layout framing) plus
+    the geometry/timeline baseline and file identity needed to detect
+    missing, stale, or replaced assets.
+
+    Eligibility is semantic equivalence to the baseline; see
+    ``domain.project_lineage.check_lineage_eligible``.
+    """
+
+    base_ref: str = Field(
+        description="job-relative path to the reframed base clip")
+    identity: dict = Field(
+        default_factory=dict,
+        description="file identity: file/size/mtime for staleness detection")
+    source: dict = Field(
+        default_factory=dict,
+        description="source baseline: file/width/height")
+    segments: list[dict] = Field(
+        default_factory=list,
+        description="ordered segment geometry baseline")
+    render: dict = Field(
+        default_factory=dict,
+        description="render geometry baseline: width/height/fps")
+
+
 class ClipProject(BaseModel):
     # NOTE: the field name "schema" intentionally matches the plan's contract
     # ("nugget.clip-project/1"). Pydantic v2 emits a harmless UserWarning that
@@ -218,6 +246,11 @@ class ClipProject(BaseModel):
     # evolve the project.
     base_clip: Optional[str] = Field(default=None)
     legacy_params: Optional[dict] = Field(default=None)
+    # Task 05: automatic framing preservation. When set on an auto project
+    # whose source/timeline/render geometry is unchanged, the renderer
+    # reuses the reframed base instead of materializing a static crop.
+    # Additive optional field; old projects without it use existing routes.
+    reframed_base: Optional[ReframedBase] = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod

@@ -34,6 +34,7 @@ import time
 import uuid
 
 from clippyme.domain.clip_project import ClipProject, project_to_json
+from clippyme.domain.project_lineage import check_lineage_eligible
 from clippyme.domain.compose import compose_layers, validate_layer_order
 from clippyme.domain.encode import x264_video_args
 from clippyme.domain.errors import ConflictError, ValidationError
@@ -665,6 +666,7 @@ async def render_project(*, job_id: str, clip_index: int,
         if True:
             # ---- 1. base timeline ----
             if project.base_clip:
+                # Legacy path: unchanged behavior.
                 base_path = os.path.join(job_dir, project.base_clip)
                 if not os.path.isfile(base_path):
                     raise ProjectRenderError(
@@ -684,10 +686,39 @@ async def render_project(*, job_id: str, clip_index: int,
                 banner_params = legacy.get("banner_params", {})
                 eff_drop_ranges = (legacy["drop_ranges"]
                                    if "drop_ranges" in legacy else drop_ranges)
+                _used_lineage_base = False
             else:
-                base_path, timeline_duration = await _materialize_timeline(
-                    project, job_dir, clip_index)
-                timeline_tmp.append(base_path)
+                # Task 05: check reframed-base lineage for unchanged projects.
+                _used_lineage_base = False
+                _lineage = (project.reframed_base.model_dump()
+                            if project.reframed_base else None)
+                if _lineage:
+                    _proj_dict = project.model_dump()
+                    _eligible, _base_path, _reason = check_lineage_eligible(
+                        _lineage, _proj_dict, job_dir)
+                    if _eligible:
+                        # Reuse validated reframed base; apply CURRENT
+                        # composition/music from the project.
+                        base_path = _base_path
+                        probe = probe_media(base_path)
+                        timeline_duration = float(probe.get("duration") or 0)
+                        if not timeline_duration:
+                            raise ProjectRenderError(
+                                "cannot probe duration of lineage base")
+                        _used_lineage_base = True
+                        logger.info(
+                            "project_render: reusing reframed base for "
+                            "unchanged project (clip %d)", clip_index)
+                    else:
+                        logger.info(
+                            "project_render: lineage not eligible (%s); "
+                            "materializing from source", _reason)
+                if not _used_lineage_base:
+                    base_path, timeline_duration = await _materialize_timeline(
+                        project, job_dir, clip_index)
+                    timeline_tmp.append(base_path)
+                # Derive composition from CURRENT project (not stale).
+                # For lineage base: same derivation, applied to reframed base.
                 (toggles, hook_params, subtitle_params, logo_params,
                  grade_params, banner_params,
                  eff_metadata, eff_clip_info) = _derive_compose_inputs(

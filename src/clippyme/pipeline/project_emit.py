@@ -42,6 +42,7 @@ import os
 from typing import Any
 
 from clippyme.domain.clip_project import SCHEMA_TAG, project_to_json, validate_project
+from clippyme.domain.project_lineage import build_lineage
 from clippyme.domain.encode import video_encoder
 from clippyme.pipeline.media_qa import probe_media
 
@@ -114,6 +115,7 @@ def _build_project(
     clips_data: dict[str, Any],
     clip_source: str,
     clip_final: str,
+    job_dir: str | None = None,
 ) -> dict[str, Any]:
     if not (end > start >= 0):
         raise ValueError(f"invalid clip bounds start={start} end={end}")
@@ -148,7 +150,7 @@ def _build_project(
             }
         )
 
-    return {
+    result = {
         "schema": SCHEMA_TAG,
         "job_id": job_id,
         "clip_index": index,
@@ -188,6 +190,20 @@ def _build_project(
             "encoder": video_encoder(),
         },
     }
+    # Task 05: reframed-base lineage for automatic framing preservation.
+    # Only for auto-emitted projects; job_dir needed for safe references.
+    if job_dir:
+        _source = result["source"]
+        _lineage = build_lineage(
+            clip_final=clip_final,
+            job_dir=job_dir,
+            source=_source,
+            segments=result["segments"],
+            render=result["render"],
+        )
+        if _lineage:
+            result["reframed_base"] = _lineage
+    return result
 
 
 def project_has_user_edits(project_path: str) -> bool:
@@ -261,6 +277,7 @@ def emit_clip_project(
             clips_data=clips_data,
             clip_source=clip_source,
             clip_final=clip_final,
+            job_dir=output_dir,
         )
         project = validate_project(data)
         os.makedirs(output_dir, exist_ok=True)
