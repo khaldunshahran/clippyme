@@ -223,6 +223,7 @@ async def _apply_smartcut(
     intermediate_files: list,
     drop_ranges=None,
     layer_order: list | None = None,
+    timeline_duration: float | None = None,
 ) -> str:
     # Smart Cut caching is delegated entirely to smart_cut() itself, which
     # writes a plan-hashed output (`{base}_smartcut_{hash}.mp4`) and validates
@@ -258,6 +259,7 @@ async def _apply_hook(
     intermediate_files: list,
     logo_params: dict = None,
     reframe_mode: str = None,
+    timeline_duration: float | None = None,
 ) -> str:
     """Hook overlay pass. When ``logo_params`` is given the brand logo is
     composited in the SAME encode (hook below, logo topmost — identical
@@ -266,8 +268,33 @@ async def _apply_hook(
     The hook is visible for the first 4s of the clip only, EXCEPT when
     ``reframe_mode`` is the literal 'disabled' (letterbox) — full clip then."""
     from clippyme.domain.hooks import add_hook_to_video
+    from clippyme.domain import hook_timing as ht
 
-    hook_duration = None if reframe_mode == "disabled" else 4
+    # Task 06: explicit timing overrides legacy policy.
+    _hook_start = None
+    _hook_end = None
+    _hook_inactive = False
+    _has_explicit = ht.has_explicit_timing(hook_params)
+    if _has_explicit:
+        try:
+            _vs, _ve = ht.validate_hook_interval(
+                hook_params["hook_start"], hook_params["hook_end"])
+        except ht.HookTimingError as e:
+            from clippyme.domain.project_render import ProjectRenderError
+            raise ProjectRenderError(f"invalid hook timing: {e}")
+        if timeline_duration is not None:
+            _eff = ht.effective_hook_interval(_vs, _ve, timeline_duration)
+            if _eff is None:
+                _hook_inactive = True
+            else:
+                _hook_start, _hook_end = _eff
+        else:
+            _hook_start, _hook_end = _vs, _ve
+    # Legacy fallback (no explicit timing).
+    if not _has_explicit:
+        hook_duration = None if reframe_mode == "disabled" else 4
+    else:
+        hook_duration = None
 
     hook_output = os.path.join(job_dir, f"composed_hook_{clip_index}.mp4")
     intermediate_files.append(hook_output)
@@ -292,6 +319,10 @@ async def _apply_hook(
         }
         from clippyme.domain.logo import DEFAULT_POSITION
         logo["position"] = logo["position"] or DEFAULT_POSITION
+    # Task 06: inactive hook (zero/outside interval) skips the hook
+    # overlay but the fused logo (if any) is still applied independently.
+    if _hook_inactive and logo is None:
+        return current_input
     await asyncio.to_thread(
         add_hook_to_video,
         current_input,
@@ -303,6 +334,9 @@ async def _apply_hook(
         style or None,
         logo,
         hook_duration,
+        _hook_start,
+        _hook_end,
+        _hook_inactive,
     )
     return hook_output
 
@@ -547,6 +581,7 @@ async def compose_layers(
     banner_params: dict = None,
     drop_ranges=None,
     layer_order: list | None = None,
+    timeline_duration: float | None = None,
 ) -> str:
     """Run the active layer pipeline. Returns the final composed filename (basename).
 
@@ -568,6 +603,7 @@ async def compose_layers(
             hook_params=hook_params, subtitle_params=subtitle_params,
             logo_params=logo_params, grade_params=grade_params,
             banner_params=banner_params, drop_ranges=drop_ranges,
+            timeline_duration=timeline_duration,
         )
 
 
@@ -585,6 +621,7 @@ async def _compose_layers_impl(
     grade_params: dict = None,
     banner_params: dict = None,
     drop_ranges=None,
+    timeline_duration: float | None = None,
 ) -> str:
     active = {k: v for k, v in toggles.items() if v}
     # The banner can be enabled via its own params.enabled (frontend convention)
@@ -718,6 +755,7 @@ async def _compose_layers_impl(
                 current_input, job_dir, clip_index, hp_clean, intermediate_files,
                 logo_params=logo_params or {},
                 reframe_mode=(clip_info or {}).get("reframe_mode"),
+                timeline_duration=timeline_duration,
             )
             layers_applied += ["hook", "logo"]
             logger.info("compose_layers: ✓ hook+logo → %s", os.path.basename(current_input))
@@ -726,6 +764,7 @@ async def _compose_layers_impl(
             current_input = await _apply_hook(
                 current_input, job_dir, clip_index, hp_clean, intermediate_files,
                 reframe_mode=(clip_info or {}).get("reframe_mode"),
+                timeline_duration=timeline_duration,
             )
             layers_applied.append("hook")
             logger.info("compose_layers: ✓ hook → %s", os.path.basename(current_input))

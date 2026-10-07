@@ -379,44 +379,51 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png",
     return output_image_path, canvas_w, canvas_h
 
 
-def _enable_suffix(enable_end):
+def _enable_suffix(enable_end, enable_start=None):
     """Return an ffmpeg overlay enable clause, or an empty string."""
     if enable_end is None:
         return ""
-    return f":enable='between(t,0,{enable_end})'"
+    _s = 0 if enable_start is None else enable_start
+    return f":enable='between(t,{_s},{enable_end})'"
 
 
-def build_hook_overlay_filter(x, y0, animate=False, dur=0.4, slide_px=40, enable_end=None):
+def build_hook_overlay_filter(x, y0, animate=False, dur=0.4, slide_px=40, enable_end=None, enable_start=None, anim_start=None):
     """Build the ffmpeg graph overlaying hook input ``[1:v]`` on ``[0:v]``."""
     x = int(x)
     y0 = int(y0)
-    suffix = _enable_suffix(enable_end)
+    suffix = _enable_suffix(enable_end, enable_start)
     if not animate:
         return f"[0:v][1:v]overlay={x}:{y0}{suffix}"
-    y_expr = f"{y0}+{int(slide_px)}*pow(1-min(t/{dur}\\,1)\\,3)"
+    _ast = 0 if anim_start is None else anim_start
+    _t_expr = f"(t-{_ast})" if _ast else "t"
+    y_expr = f"{y0}+{int(slide_px)}*pow(1-min({_t_expr}/{dur}\\,1)\\,3)"
     return (
-        f"[1:v]format=yuva420p,fade=t=in:st=0:d={dur}:alpha=1[hk];"
+        f"[1:v]format=yuva420p,fade=t=in:st={_ast}:d={dur}:alpha=1[hk];"
         f"[0:v][hk]overlay={x}:{y_expr}{suffix}"
     )
 
 
 def build_hook_logo_filter(hook_x, hook_y, logo_chain, logo_x, logo_y,
-                           animate=False, dur=0.4, slide_px=40, enable_end=None):
+                           animate=False, dur=0.4, slide_px=40, enable_end=None,
+                           enable_start=None, anim_start=None):
     """Overlay the hook and then the logo in one ffmpeg filter graph."""
-    suffix = _enable_suffix(enable_end)
+    suffix = _enable_suffix(enable_end, enable_start)
     if not animate:
         hook_part = f"[0:v][1:v]overlay={int(hook_x)}:{int(hook_y)}{suffix}[vh]"
     else:
-        y_expr = f"{int(hook_y)}+{int(slide_px)}*pow(1-min(t/{dur}\\,1)\\,3)"
+        _ast = 0 if anim_start is None else anim_start
+        _t_expr = f"(t-{_ast})" if _ast else "t"
+        y_expr = f"{int(hook_y)}+{int(slide_px)}*pow(1-min({_t_expr}/{dur}\\,1)\\,3)"
         hook_part = (
-            f"[1:v]format=yuva420p,fade=t=in:st=0:d={dur}:alpha=1[hk];"
+            f"[1:v]format=yuva420p,fade=t=in:st={_ast}:d={dur}:alpha=1[hk];"
             f"[0:v][hk]overlay={int(hook_x)}:{y_expr}{suffix}[vh]"
         )
     return f"{hook_part};[2:v]{logo_chain}[lg];[vh][lg]overlay={logo_x}:{logo_y}"
 
 
 def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0,
-                      offset_y=0, style=None, logo=None, hook_duration=None):
+                      offset_y=0, style=None, logo=None, hook_duration=None,
+                      hook_start=None, hook_end=None, hook_inactive=False):
     """Overlay a text hook box, optionally with the brand logo, onto a video."""
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video {video_path} not found")
@@ -438,6 +445,40 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
     # other's hook PNG. mkstemp provides an exclusive path for every render.
     fd, hook_filename = tempfile.mkstemp(prefix="clippyme-hook-", suffix=".png")
     os.close(fd)
+
+    # Task 06: inactive hook (zero/outside interval).
+    if hook_inactive:
+        if logo and logo.get("path") and os.path.exists(logo["path"]):
+            # Apply logo only (no hook). Use a simple overlay.
+            from clippyme.domain.logo import logo_filter_chain
+            try:
+                _dims = subprocess.check_output(
+                    ["ffprobe", "-v", "error", "-show_entries",
+                     "stream=width,height", "-of", "csv=s=x:p=0", video_path],
+                    timeout=30).decode().strip().split("\n")[0].split("x")
+                _vw, _vh = int(_dims[0]), int(_dims[1])
+            except Exception:
+                _vw, _vh = 1080, 1920
+            from clippyme.domain.logo import DEFAULT_POSITION
+            _chain, _lx, _ly = logo_filter_chain(
+                _vw, scale=logo.get("scale", 0.18),
+                opacity=logo.get("opacity", 1.0),
+                margin=logo.get("margin", 0.04),
+                position=logo.get("position", DEFAULT_POSITION))
+            _fc = f"[0:v][1:v]{_chain}[lg];[0:v][lg]overlay={_lx}:{_ly}"
+            # Note: logo input is [1:v] here (no hook image).
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path, "-i", logo["path"],
+                 "-filter_complex", _fc, "-c:a", "copy",
+                 *x264_video_args(), output_path],
+                check=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=ffmpeg_timeout())
+            return True
+        else:
+            # No hook, no logo: copy through.
+            import shutil
+            shutil.copy(video_path, output_path)
+            return True
 
     try:
         img_path, box_w, box_h = create_hook_image(
@@ -469,13 +510,26 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
                 margin=logo.get("margin", 0.04),
                 position=logo.get("position", DEFAULT_POSITION),
             )
-            filter_complex = build_hook_logo_filter(
-                overlay_x, overlay_y, logo_chain, lx, ly, animate=animate,
-                enable_end=hook_duration)
+            # Task 06: explicit timing overrides hook_duration.
+            if hook_start is not None and hook_end is not None:
+                filter_complex = build_hook_logo_filter(
+                    overlay_x, overlay_y, logo_chain, lx, ly, animate=animate,
+                    enable_end=hook_end, enable_start=hook_start,
+                    anim_start=hook_start)
+            else:
+                filter_complex = build_hook_logo_filter(
+                    overlay_x, overlay_y, logo_chain, lx, ly, animate=animate,
+                    enable_end=hook_duration)
             extra_inputs = ["-i", logo["path"]]
         else:
-            filter_complex = build_hook_overlay_filter(
-                overlay_x, overlay_y, animate=animate, enable_end=hook_duration)
+            if hook_start is not None and hook_end is not None:
+                filter_complex = build_hook_overlay_filter(
+                    overlay_x, overlay_y, animate=animate,
+                    enable_end=hook_end, enable_start=hook_start,
+                    anim_start=hook_start)
+            else:
+                filter_complex = build_hook_overlay_filter(
+                    overlay_x, overlay_y, animate=animate, enable_end=hook_duration)
 
         # The animated variant fades the hook in over time. A still PNG decodes to
         # ONE frame at t=0, so fade would stamp alpha=0 on that single frame and

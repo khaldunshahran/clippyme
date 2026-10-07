@@ -555,11 +555,21 @@ def _derive_compose_inputs(project: ClipProject, timeline_duration: float,
     hook_overlays = [o for o in project.overlays
                      if o.type == "hook" and (o.text or "").strip()]
     toggles["hook"] = bool(hook_overlays)
-    hook_params = ({
-        "text": hook_overlays[0].text.strip(),
-        "style": hook_overlays[0].style,
-        "position": hook_overlays[0].position,
-    } if hook_overlays else {})
+    # Task 06: carry explicit start/end (clip-relative seconds).
+    # Overlay.start/end are required fields; use explicit presence
+    # so start=0 is not treated as missing.
+    hook_params = {}
+    if hook_overlays:
+        _ho = hook_overlays[0]
+        hook_params = {
+            "text": _ho.text.strip(),
+            "style": _ho.style,
+            "position": _ho.position,
+        }
+        # Explicit timing keys (distinct from legacy hook_duration).
+        if _ho.start is not None and _ho.end is not None:
+            hook_params["hook_start"] = float(_ho.start)
+            hook_params["hook_end"] = float(_ho.end)
 
     grade_active = project.grade.preset not in ("default", "none", "")
     toggles["grade"] = grade_active
@@ -789,6 +799,7 @@ async def render_project(*, job_id: str, clip_index: int,
                 grade_params=grade_params,
                 banner_params=banner_params,
                 drop_ranges=eff_drop_ranges,
+                timeline_duration=timeline_duration,
             )
             composed_path = os.path.join(job_dir, composed_basename)
 
