@@ -7,6 +7,7 @@ import shutil
 import glob
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Dict, Optional
@@ -17,6 +18,35 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     encoding="utf-8",
 )
+class _RedactSecretsFilter(logging.Filter):
+    """Scrub secret-bearing URL segments (e.g. Telegram bot tokens) from log records.
+
+    httpx logs full request URLs at INFO level, which would otherwise write
+    `https://api.telegram.org/bot<token>/...` into the log files in plaintext.
+    This filter rewrites the token segment before the record is formatted.
+    """
+
+    _TOKEN_RE = re.compile(r"(bot)\d+:[A-Za-z0-9_-]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = self._TOKEN_RE.sub(r"\1***REDACTED***", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+# Attach to the root HANDLERS (not the logger): records from child loggers
+# (e.g. httpx) bypass ancestor logger filters during propagation, but every
+# record passes through these handlers.
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_RedactSecretsFilter())
+
+
 logger = logging.getLogger("clippyme")
 
 # The pinned dependency set (faster-whisper, mediapipe, etc.) is only tested on
@@ -24,7 +54,7 @@ logger = logging.getLogger("clippyme")
 # an older interpreter.
 if sys.version_info < (3, 11):
     logger.warning(
-        "ClippyMe requires Python 3.11+. Detected %s â€” imports may fail or behave unexpectedly.",
+        "ClippyMe requires Python 3.11+. Detected %s ƒ?" imports may fail or behave unexpectedly.",
         ".".join(map(str, sys.version_info[:3])),
     )
 
@@ -114,7 +144,7 @@ save_persistent_config(load_persistent_config())
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "16384"))
-# Default retention is 7 days â€” the frontend History tab is the
+# Default retention is 7 days ƒ?" the frontend History tab is the
 # authoritative source of truth for what the user considers "done".
 # Aggressive auto-purge was destroying clips behind the user's back
 # (jobs older than 1 hour vanished on the next cleanup tick, meaning
@@ -184,7 +214,7 @@ async def lifespan(app: FastAPI):
         recover_jobs(journal_path=JOURNAL_PATH, jobs=jobs,
                      job_queue=job_queue, output_root=OUTPUT_DIR)
     except Exception:
-        logger.exception("Job journal recovery failed â€” starting with an empty queue")
+        logger.exception("Job journal recovery failed ƒ?" starting with an empty queue")
 
     cleanup_jobs, process_queue, _run_job_wrapper = make_workers(
         jobs=jobs,
@@ -200,7 +230,7 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
     # Background auto-update for the auto-editor binary used by smartcut.py.
-    # Failures are non-fatal â€” smartcut has an FFmpeg fallback path.
+    # Failures are non-fatal ƒ?" smartcut has an FFmpeg fallback path.
     from clippyme.integrations.auto_editor_updater import background_updater_loop
     ae_updater_task = asyncio.create_task(background_updater_loop())
 
@@ -250,7 +280,7 @@ async def lifespan(app: FastAPI):
     trend_poller_task = asyncio.create_task(trend_radar_poller())
 
     # Bring back every monitor that was still marked resume_on_start when the
-    # process last went down (durable auto-resume). Never fatal to startup â€”
+    # process last went down (durable auto-resume). Never fatal to startup ƒ?"
     # a per-monitor failure stays visible via its status() instead.
     try:
         await live_monitor.auto_resume()
@@ -265,7 +295,7 @@ async def lifespan(app: FastAPI):
         await live_monitor.shutdown()
     except Exception:
         logger.exception("live monitor failed to stop cleanly")
-    # Cancel ALL background tasks on shutdown â€” not just the updater. Leaving
+    # Cancel ALL background tasks on shutdown ƒ?" not just the updater. Leaving
     # the worker/cleanup loops pending blocks uvicorn's graceful exit and logs
     # "Task was destroyed but it is pending!" tracebacks.
     _bg_tasks = (worker_task, cleanup_task, ae_updater_task, telegram_task, trend_poller_task)
@@ -331,17 +361,20 @@ async def _security_headers(request: Request, call_next):
 # --- structured access log -------------------------------------------------
 # One JSON line per request: timestamp, method, path, status, user_id,
 # cf_connecting_ip. NEVER logs bodies, headers (except CF-Connecting-IP),
-# or keys/secrets. Written to logs/access.jsonl, rotated daily, 30-day
-# retention (see docs/deploy.md).
+# or keys/secrets. Written to $ACCESS_LOG_PATH (default logs/access.jsonl),
+# rotated daily, 30-day retention (see docs/deploy.md). Tests set
+# ACCESS_LOG_PATH to a temp file so they never pollute the live log.
 import logging.handlers as _lh
 
+_ACCESS_LOG_PATH = os.environ.get("ACCESS_LOG_PATH", "logs/access.jsonl")
 _access_logger = logging.getLogger("clippyme.access")
 _access_logger.setLevel(logging.INFO)
 _access_logger.propagate = False
 if not _access_logger.handlers:
-    os.makedirs("logs", exist_ok=True)
+    _log_parent = os.path.dirname(os.path.abspath(_ACCESS_LOG_PATH)) or "."
+    os.makedirs(_log_parent, exist_ok=True)
     _ah = _lh.TimedRotatingFileHandler(
-        "logs/access.jsonl", when="midnight", interval=1,
+        _ACCESS_LOG_PATH, when="midnight", interval=1,
         backupCount=30, encoding="utf-8",
     )
     _ah.setFormatter(logging.Formatter("%(message)s"))
@@ -418,7 +451,7 @@ app.add_middleware(
 # Mount static files for serving videos.
 # The output directory also holds *_metadata.json (full transcripts + AI
 # analysis) and source_*.mp4 (the raw 16:9 slices). Those are internal
-# artifacts and must NOT be publicly downloadable â€” only the rendered clips,
+# artifacts and must NOT be publicly downloadable ƒ?" only the rendered clips,
 # composed clips, covers and thumbnails are user-facing. SafeStaticFiles
 # 404s the sensitive patterns while serving everything else as before.
 class SafeStaticFiles(StaticFiles):
@@ -446,7 +479,7 @@ app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails
 app.mount("/fonts", StaticFiles(directory="fonts"), name="fonts")
 
 # Config-family routes (keys, cookies, fonts, logo, zernio) live in their own
-# router â€” they touch none of the job runtime state, so keeping them out of
+# router ƒ?" they touch none of the job runtime state, so keeping them out of
 # app.py lets this module stay focused on the job lifecycle.
 app.include_router(config_router)
 app.include_router(dubbing_router)
@@ -574,7 +607,7 @@ async def process_endpoint(
             except ValueError:
                 raise HTTPException(status_code=400, detail="source_timeframe must be 'start,end' seconds")
         # Validate the multipart values through the same schema for
-        # consistency â€” we drop the url requirement since we're using
+        # consistency ƒ?" we drop the url requirement since we're using
         # an uploaded file path.
         try:
             ProcessRequest.model_validate({
@@ -758,7 +791,7 @@ async def batch_process(
             )
         except ValueError as exc:
             # This item's output dir was already created above but it never
-            # made it into `jobs` â€” clean it up so a bad URL can't orphan a dir.
+            # made it into `jobs` ƒ?" clean it up so a bad URL can't orphan a dir.
             await asyncio.to_thread(shutil.rmtree, job_output_dir, True)
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -774,7 +807,7 @@ async def batch_process(
             batch_jobs.append({"url": url, "job_id": job_id})
         except QueueFullError:
             # Only the item that failed to enqueue was cleaned up (by
-            # submit_job) â€” already enqueued jobs stay running. Stop adding
+            # submit_job) ƒ?" already enqueued jobs stay running. Stop adding
             # more; the queue is full. Mirrors the single /api/process path.
             break
 
@@ -1305,7 +1338,7 @@ async def smart_cut_clip(job_id: str, clip_index: int, request: Request, user: A
     _verify_job_ownership(job_id, user)
     resolved = await asyncio.to_thread(resolve_clip, job_id, clip_index, OUTPUT_DIR)
     # Optional manual-trim spans (flycut-style interactive cut). Legacy callers
-    # POST no body â€” tolerate that and fall back to pure auto Smart Cut.
+    # POST no body ƒ?" tolerate that and fall back to pure auto Smart Cut.
     drop_ranges = None
     raw_body = await request.body()
     if raw_body:
@@ -1317,7 +1350,7 @@ async def smart_cut_clip(job_id: str, clip_index: int, request: Request, user: A
             raise HTTPException(status_code=422, detail="Request body must be a JSON object")
         drop_ranges = body.get("drop_ranges")
     # This raw-body path bypasses Pydantic, so apply the same bound check the
-    # ComposeRequest/PublishRequest schemas use â€” rejects an oversized or
+    # ComposeRequest/PublishRequest schemas use ƒ?" rejects an oversized or
     # malformed list before the engine iterates it (DoS gate).
     try:
         _validate_drop_ranges(drop_ranges)
@@ -1608,7 +1641,7 @@ async def reframe_clip(
     mode = (req.reframe_mode or "auto").strip().lower()
     if mode not in ("auto", "disabled", "subject", "object", "split", "screencast"):
         raise HTTPException(status_code=400, detail="reframe_mode must be 'auto', 'subject', 'disabled', 'split', or 'screencast'")
-    # 'object' is the legacy name for 'subject' â€” normalize so the subprocess
+    # 'object' is the legacy name for 'subject' ƒ?" normalize so the subprocess
     # argv + metadata are written with the canonical value.
     mode = canonical_reframe_mode(mode)
 
@@ -1725,7 +1758,7 @@ async def delete_history(job_id: str, request: Request, user: AuthUser = Depends
 
 @app.post("/api/compose/{job_id}/{clip_index}")
 async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, request: Request, user: AuthUser = Depends(get_current_user)):
-    """Compose a final video from active toggle layers (Smart Cut â†’ Hook â†’ Subtitles)."""
+    """Compose a final video from active toggle layers (Smart Cut ƒ+' Hook ƒ+' Subtitles)."""
     require_trusted_config_request(request)
     enforce_rate_limit(request, "compose", capacity=30, refill_per_sec=30 / 60)
     if not is_valid_job_id(job_id):
@@ -1819,6 +1852,46 @@ async def compose_clip(job_id: str, clip_index: int, req: ComposeRequest, reques
     except Exception as e:
         logger.error("Compose error for job %s clip %d: %s", job_id, clip_index, e)
         raise HTTPException(status_code=500, detail="Compose pipeline failed")
+
+
+# ---------------------------------------------------------------------------
+# Caption templates (Slice 2): word-highlight palette for the editor
+# ---------------------------------------------------------------------------
+
+# Display labels for caption templates (mirrors
+# dashboard-chat/src/editor/data.js SUBTITLE_PRESETS labels).
+_CAPTION_TEMPLATE_LABELS = {
+    "classic_white": "Classic",
+    "hormozi_bold": "Hormozi",
+    "neon_glow": "Neon",
+    "mrbeast_box": "MrBeast",
+    "minimal_clean": "Minimal",
+    "fire_impact": "Fire",
+}
+
+
+@app.get("/api/caption-templates")
+async def caption_templates(request: Request, user: AuthUser = Depends(get_current_user)):
+    """Word-highlight palette per caption preset (Slice 2).
+
+    Returns ``{preset_id: {"label": ..., "colors": {"0": hex, "1": hex,
+    "2": hex}}}`` for every preset in ``SUBTITLE_PRESETS`` so the editor
+    resolves highlight colors from the template instead of hardcoding hex.
+    Color 0 = template default, 1 = Color 1, 2 = Color 2.
+    """
+    require_trusted_config_request(request)
+    from clippyme.domain.subtitles import SUBTITLE_PRESETS, resolve_word_color
+    out = {}
+    for preset_id in SUBTITLE_PRESETS:
+        out[preset_id] = {
+            "label": _CAPTION_TEMPLATE_LABELS.get(preset_id, preset_id),
+            "colors": {
+                "0": resolve_word_color(preset_id, 0),
+                "1": resolve_word_color(preset_id, 1),
+                "2": resolve_word_color(preset_id, 2),
+            },
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2226,8 +2299,8 @@ async def backfill_clip_projects(job_id: str, request: Request, user: AuthUser =
 async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishRequest, request: Request, user: AuthUser = Depends(get_current_user)):
     """Upload a clip to Zernio and create a post on the requested platforms.
 
-    If req.compose_first is True, the clip is freshly composed (Smart Cut â†’
-    Hook â†’ Subtitles) using req.toggles before upload â€” same flow as
+    If req.compose_first is True, the clip is freshly composed (Smart Cut ƒ+'
+    Hook ƒ+' Subtitles) using req.toggles before upload ƒ?" same flow as
     /api/compose. Otherwise we look for an existing composed_clip_{i}.mp4
     on disk and fall back to the base clip.
     """
@@ -2239,7 +2312,7 @@ async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishReques
     _verify_job_ownership(job_id, user)
 
     # require_file=False: the base clip may be absent when a composed file
-    # exists on disk â€” publish_clip_flow resolves the actual upload path.
+    # exists on disk ƒ?" publish_clip_flow resolves the actual upload path.
     resolved = await asyncio.to_thread(
         resolve_clip, job_id, clip_index, OUTPUT_DIR, require_file=False)
 
@@ -2456,11 +2529,11 @@ async def live_monitor_start(req: LiveMonitorStartRequest, request: Request,
     user: AuthUser = Depends(get_current_user)
 ):
     """Start a monitor for one platform:channel. Returns that monitor's status
-    (incl. its ``id``). Starting a duplicate (platform, channel) â†’ 409."""
+    (incl. its ``id``). Starting a duplicate (platform, channel) ƒ+' 409."""
     require_trusted_config_request(request)
     require_admin(request, user)
     enforce_rate_limit(request, "livemonitor", capacity=10, refill_per_sec=10 / 60)
-    # start() raises ValidationError/ConflictError (ClippyMeError) â†’ mapped to HTTP.
+    # start() raises ValidationError/ConflictError (ClippyMeError) ƒ+' mapped to HTTP.
     return live_monitor.start(req.model_dump())
 
 
@@ -2491,7 +2564,7 @@ async def live_monitor_update_config(monitor_id: str, request: Request,
     user: AuthUser = Depends(get_current_user)
 ):
     """Patch selected settings on a running monitor (body: partial dict of
-    updatable fields â€” see ``validate_monitor_partial_update``). Applies to
+    updatable fields ƒ?" see ``validate_monitor_partial_update``). Applies to
     FUTURE segments/publishes only, never retroactively."""
     require_trusted_config_request(request)
     require_admin(request, user)
@@ -2598,3 +2671,4 @@ async def restore_job(job_id: str, request: Request,
     jobs[job_id] = job_entry
     logger.info("Restored job %s into memory (%d clips)", job_id, len(job_entry["result"]["clips"]))
     return {"success": True, "status": "completed", "result": job_entry["result"]}
+

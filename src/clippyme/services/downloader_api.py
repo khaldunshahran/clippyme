@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from typing import Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
@@ -195,7 +196,7 @@ def download_video(req: DownloadRequest, request: Request = None):
     
     if cookies_path:
         attempts = [
-            ("default", True, False),      # web + cookies, NO po token â€” full quality, most reliable
+            ("default", True, False),      # web + cookies, NO po token ƒ?" full quality, most reliable
             ("web_safari", True, False),   # safari + cookies, NO po token
             ("default", True, True),       # cookies + po token (only if bgutil server running)
             ("web_safari", True, True),
@@ -377,17 +378,17 @@ def startup_event():
     if not os.path.exists(repo_dir):
         logger.info("Cloning bgutil-ytdlp-pot-provider...")
         subprocess.run(["git", "clone", "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git", repo_dir], check=True)
-        subprocess.run(["npm", "install"], cwd=server_dir, check=True)
+        subprocess.run(["npm.cmd" if sys.platform == "win32" else "npm", "install"], cwd=server_dir, check=True)
     elif not os.path.exists(os.path.join(server_dir, "node_modules")):
         logger.info("Installing bgutil-ytdlp-pot-provider dependencies...")
-        subprocess.run(["npm", "install"], cwd=server_dir, check=True)
+        subprocess.run(["npm.cmd" if sys.platform == "win32" else "npm", "install"], cwd=server_dir, check=True)
     else:
         logger.info("bgutil-ytdlp-pot-provider already exists.")
         logger.info("Running npm install in bgutil-ytdlp-pot-provider...")
-        subprocess.run(["npm", "install"], cwd=server_dir, check=True)
+        subprocess.run(["npm.cmd" if sys.platform == "win32" else "npm", "install"], cwd=server_dir, check=True)
     
     logger.info("Compiling typescript (npx tsc)...")
-    subprocess.run(["npx", "tsc"], cwd=server_dir, check=True)
+    subprocess.run(["npx.cmd" if sys.platform == "win32" else "npx", "tsc"], cwd=server_dir, check=True)
     logger.info("bgutil-ytdlp-pot-provider build complete.")
     
     logger.info("Starting bgutil-ytdlp-pot-provider HTTP server...")
@@ -402,3 +403,4 @@ def shutdown_event():
         bgutil_process.terminate()
         bgutil_process.wait()
     logger.info("Downloader Microservice stopping.")
+
