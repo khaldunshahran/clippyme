@@ -15,22 +15,22 @@
         "baseline": {
           "acceptance_rate": 0.5,
           "accepted": 1,
-          "accepted_per_source_hour": 60.0,
+          "accepted_per_source_hour": 1200.0,
           "candidate": 2,
           "review_completeness": 1.0,
           "reviewed": 2,
           "source_count": 1,
-          "source_hours": 0.016666666666666666
+          "source_hours": 0.0008333333333333334
         },
         "candidate": {
           "acceptance_rate": 1.0,
           "accepted": 1,
-          "accepted_per_source_hour": 60.0,
+          "accepted_per_source_hour": 1200.0,
           "candidate": 1,
           "review_completeness": 1.0,
           "reviewed": 1,
           "source_count": 1,
-          "source_hours": 0.016666666666666666
+          "source_hours": 0.0008333333333333334
         }
       },
       "candidate_count": 3,
@@ -57,7 +57,7 @@
           "review_completeness": null,
           "reviewed": 0,
           "source_count": 1,
-          "source_hours": 0.016666666666666666
+          "source_hours": 0.0008333333333333334
         }
       },
       "candidate_count": 0,
@@ -83,91 +83,65 @@
   },
   "media_checks": {
     "clip:c1": {
-      "critical": true,
-      "duration": 15.0,
-      "errors": [
-        "output is effectively empty (5766 bytes)",
-        "output has no audio stream"
-      ],
-      "height": 90,
+      "critical": false,
+      "duration": 2.0,
+      "errors": [],
+      "height": 180,
       "invocation_error": null,
-      "issues": [
-        "output is effectively empty (5766 bytes)",
-        "output has no audio stream"
-      ],
-      "ok": false,
+      "issues": [],
+      "ok": true,
       "warnings": [],
-      "width": 160
+      "width": 320
     },
     "clip:c2": {
-      "critical": true,
-      "duration": 15.0,
-      "errors": [
-        "output is effectively empty (5766 bytes)",
-        "output has no audio stream"
-      ],
-      "height": 90,
+      "critical": false,
+      "duration": 2.0,
+      "errors": [],
+      "height": 180,
       "invocation_error": null,
-      "issues": [
-        "output is effectively empty (5766 bytes)",
-        "output has no audio stream"
-      ],
-      "ok": false,
+      "issues": [],
+      "ok": true,
       "warnings": [],
-      "width": 160
+      "width": 320
     },
     "clip:c3": {
-      "critical": true,
-      "duration": 10.0,
-      "errors": [
-        "output is effectively empty (4367 bytes)",
-        "output has no audio stream"
-      ],
-      "height": 90,
+      "critical": false,
+      "duration": 1.0,
+      "errors": [],
+      "height": 180,
       "invocation_error": null,
-      "issues": [
-        "output is effectively empty (4367 bytes)",
-        "output has no audio stream"
-      ],
-      "ok": false,
+      "issues": [],
+      "ok": true,
       "warnings": [],
-      "width": 160
+      "width": 320
     },
     "source:syn1": {
-      "critical": true,
-      "duration": 60.0,
-      "errors": [
-        "output has no audio stream"
-      ],
-      "height": 90,
+      "critical": false,
+      "duration": 3.0,
+      "errors": [],
+      "height": 180,
       "invocation_error": null,
-      "issues": [
-        "output has no audio stream"
-      ],
-      "ok": false,
+      "issues": [],
+      "ok": true,
       "warnings": [],
-      "width": 160
+      "width": 320
     },
     "source:syn2": {
-      "critical": true,
-      "duration": 60.0,
-      "errors": [
-        "output has no audio stream"
-      ],
-      "height": 90,
+      "critical": false,
+      "duration": 3.0,
+      "errors": [],
+      "height": 180,
       "invocation_error": null,
-      "issues": [
-        "output has no audio stream"
-      ],
-      "ok": false,
+      "issues": [],
+      "ok": true,
       "warnings": [],
-      "width": 160
+      "width": 320
     }
   },
   "note": "Real-footage benchmark has not run; synthetic only.",
   "paired_sources": {
     "syn1": {
-      "current_fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d",
+      "current_fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b",
       "fingerprints_compatible": true,
       "missing_runs": [],
       "runs": {
@@ -177,19 +151,19 @@
             "c2"
           ],
           "commit": "abc123",
-          "source_fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+          "source_fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
         },
         "candidate": {
           "clip_ids": [
             "c3"
           ],
           "commit": "def456",
-          "source_fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+          "source_fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
         }
       }
     },
     "syn2": {
-      "current_fingerprint": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72",
+      "current_fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b",
       "fingerprints_compatible": true,
       "missing_runs": [
         "candidate"
@@ -198,7 +172,7 @@
         "baseline": {
           "clip_ids": [],
           "commit": "abc123",
-          "source_fingerprint": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
+          "source_fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
         }
       }
     }
@@ -207,24 +181,24 @@
     {
       "acceptance_rate": 0.5,
       "accepted_count": 1,
-      "accepted_per_source_hour": 30.0,
+      "accepted_per_source_hour": 600.0,
       "candidate_count": 2,
       "clips": [
         {
           "clip_id": "c1",
-          "end": 25.0,
-          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8",
+          "end": 2.0,
+          "fingerprint": "sha256:197b1263b5c8467f4e56e419f404b1f0614f83ee72a0db6da6be5f742e25a57f",
           "moment_id": "m1",
           "source_id": "syn1",
-          "start": 10.0
+          "start": 0.0
         },
         {
           "clip_id": "c2",
-          "end": 45.0,
-          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8",
+          "end": 2.0,
+          "fingerprint": "sha256:197b1263b5c8467f4e56e419f404b1f0614f83ee72a0db6da6be5f742e25a57f",
           "moment_id": "m1",
           "source_id": "syn1",
-          "start": 30.0
+          "start": 0.0
         }
       ],
       "commit": "abc123",
@@ -264,10 +238,10 @@
         "preset": "base"
       },
       "source_fingerprints": {
-        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d",
-        "syn2": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
+        "syn1": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b",
+        "syn2": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
       },
-      "source_hours": 0.0333,
+      "source_hours": 0.0017,
       "source_ids": [
         "syn1",
         "syn2"
@@ -276,13 +250,13 @@
     {
       "acceptance_rate": 1.0,
       "accepted_count": 1,
-      "accepted_per_source_hour": 60.0,
+      "accepted_per_source_hour": 1200.0,
       "candidate_count": 1,
       "clips": [
         {
           "clip_id": "c3",
-          "end": 10.0,
-          "fingerprint": "sha256:c3b97555333cfd91f4758cd55c89488777587a5cfc6dc3838994ed6ba38cdd2c",
+          "end": 1.0,
+          "fingerprint": "sha256:5a4e8ade7787868ec717188b8c40ced92ed5c3d95b209db434b40479ff1e166f",
           "moment_id": "m2",
           "source_id": "syn1",
           "start": 0.0
@@ -325,9 +299,9 @@
         "preset": "improved"
       },
       "source_fingerprints": {
-        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+        "syn1": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
       },
-      "source_hours": 0.0167,
+      "source_hours": 0.0008,
       "source_ids": [
         "syn1"
       ]

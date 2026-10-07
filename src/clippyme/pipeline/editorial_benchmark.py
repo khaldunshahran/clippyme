@@ -725,24 +725,35 @@ def main(argv=None):
         print(f"error: I/O failure: {e}", file=sys.stderr)
         return 1
 
-    # Write with backup/restore for atomicity (test patches write_text).
-    backups = {}
+    # Write outputs atomically: backup existing, track created.
+    # On failure, restore backups and delete created files.
+    backups = {}  # path -> original bytes (for existing files)
+    created = []  # paths we created (did not exist before)
     try:
         if args.json_out:
             jp = Path(args.json_out)
             if jp.exists():
                 backups[jp] = jp.read_bytes()
+            else:
+                created.append(jp)
             jp.write_text(json_str, encoding="utf-8")
         if args.text_out:
             tp = Path(args.text_out)
             if tp.exists():
                 backups[tp] = tp.read_bytes()
+            else:
+                created.append(tp)
             tp.write_text(text_str, encoding="utf-8")
     except OSError as e:
-        # Restore backups; originals preserved.
+        # Restore existing files, delete newly created.
         for p, data in backups.items():
             try:
                 p.write_bytes(data)
+            except OSError:
+                pass
+        for p in created:
+            try:
+                p.unlink()
             except OSError:
                 pass
         print(f"error: write failed: {e}", file=sys.stderr)

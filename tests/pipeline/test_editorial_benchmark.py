@@ -193,3 +193,46 @@ def test_duplicate_source_membership_rejected(fx):
     p.write_text(json.dumps(data))
     with pytest.raises(eb.BenchmarkError):
         eb.load_manifest(p)
+
+def test_generate_demo_clean_checkout(tmp_path):
+    """Clean-checkout: generator in isolated dir, verify, run CLI."""
+    import shutil
+    import subprocess
+    src_gen = (Path(__file__).parent.parent.parent / "tests" / "fixtures"
+               / "editorial_benchmark" / "generate_demo.py")
+    iso = tmp_path / "iso"
+    iso.mkdir()
+    shutil.copy(src_gen, iso / "generate_demo.py")
+    subprocess.run(
+        [sys.executable, str(iso / "generate_demo.py"), str(iso)],
+        check=True, cwd=str(tmp_path))
+    manifest_path = iso / "manifest.json"
+    assert manifest_path.exists()
+    m = eb.load_manifest(manifest_path)
+    for sid, s in m["sources"].items():
+        result = eb._media_check(s["_path"], s["duration"], None)
+        assert result["invocation_error"] is None
+    reviews_path = iso / "reviews.json"
+    json_out = tmp_path / "out.json"
+    text_out = tmp_path / "out.txt"
+    rc = eb.main([
+        "--manifest", str(manifest_path),
+        "--reviews", str(reviews_path),
+        "--check-media",
+        "--json-out", str(json_out),
+        "--text-out", str(text_out),
+    ])
+    assert rc == 0
+    data = json.loads(json_out.read_text())
+    assert data["version"] == eb.MANIFEST_VERSION
+    assert "media_checks" in data
+    assert any(v["ok"] for v in data["media_checks"].values())
+    text = text_out.read_text()
+    assert "baseline" in text and "candidate" in text
+    # Rerun deterministically.
+    subprocess.run(
+        [sys.executable, str(iso / "generate_demo.py"), str(iso)],
+        check=True, cwd=str(tmp_path))
+    m2 = eb.load_manifest(manifest_path)
+    assert (m2["sources"]["syn1"]["fingerprint"]
+            == m["sources"]["syn1"]["fingerprint"])

@@ -5,18 +5,18 @@
     {
       "id": "syn1",
       "file": "syn1.mp4",
-      "duration": 60.0,
+      "duration": 3.0,
       "genre": "interview/podcast",
       "synthetic": true,
-      "fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+      "fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
     },
     {
       "id": "syn2",
       "file": "syn2.mp4",
-      "duration": 60.0,
+      "duration": 3.0,
       "genre": "reaction/comedy",
       "synthetic": true,
-      "fingerprint": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
+      "fingerprint": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
     }
   ],
   "runs": [
@@ -31,27 +31,27 @@
         "syn2"
       ],
       "source_fingerprints": {
-        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d",
-        "syn2": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
+        "syn1": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b",
+        "syn2": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
       },
       "clips": [
         {
           "clip_id": "c1",
           "source_id": "syn1",
-          "start": 10.0,
-          "end": 25.0,
+          "start": 0.0,
+          "end": 2.0,
           "moment_id": "m1",
           "file": "c1.mp4",
-          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8"
+          "fingerprint": "sha256:197b1263b5c8467f4e56e419f404b1f0614f83ee72a0db6da6be5f742e25a57f"
         },
         {
           "clip_id": "c2",
           "source_id": "syn1",
-          "start": 30.0,
-          "end": 45.0,
+          "start": 0.0,
+          "end": 2.0,
           "moment_id": "m1",
           "file": "c2.mp4",
-          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8"
+          "fingerprint": "sha256:197b1263b5c8467f4e56e419f404b1f0614f83ee72a0db6da6be5f742e25a57f"
         }
       ]
     },
@@ -65,17 +65,17 @@
         "syn1"
       ],
       "source_fingerprints": {
-        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+        "syn1": "sha256:ff3ed3b0fbb26388cc7d05ce6a432912f4879e257d98a7a0e70cab35730b6c5b"
       },
       "clips": [
         {
           "clip_id": "c3",
           "source_id": "syn1",
           "start": 0.0,
-          "end": 10.0,
+          "end": 1.0,
           "moment_id": "m2",
           "file": "c3.mp4",
-          "fingerprint": "sha256:c3b97555333cfd91f4758cd55c89488777587a5cfc6dc3838994ed6ba38cdd2c"
+          "fingerprint": "sha256:5a4e8ade7787868ec717188b8c40ced92ed5c3d95b209db434b40479ff1e166f"
         }
       ]
     }
