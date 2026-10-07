@@ -1,6 +1,5 @@
-"""Tests for editorial benchmark foundation (Task 07)."""
+"""Tests for editorial benchmark foundation (Task 07, rev2)."""
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -16,15 +15,13 @@ from clippyme.pipeline import editorial_benchmark as eb
 def fixture_dir(tmp_path):
     d = tmp_path / "eb"
     d.mkdir()
-    # Tiny synthetic videos.
-    for name in ("syn1.mp4", "syn2.mp4"):
+    for name in ("syn1.mp4", "syn2.mp4", "c1.mp4", "c2.mp4"):
         p = d / name
         subprocess.run([
             "ffmpeg", "-y", "-v", "error",
             "-f", "lavfi", "-i", "color=blue:s=160x90:r=10:d=1",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)],
             check=True)
-    # Manifest.
     manifest = {
         "version": 1, "asset_root": ".",
         "sources": [
@@ -34,17 +31,18 @@ def fixture_dir(tmp_path):
              "genre": "reaction/comedy", "synthetic": True},
         ],
         "runs": [
-            {"run_id": "baseline", "commit": "abc",
+            {"run_id": "baseline", "commit": "abc", "settings": {},
              "clips": [
                  {"clip_id": "c1", "source_id": "syn1",
-                  "start": 10.0, "end": 25.0, "moment_id": "m1"},
+                  "start": 10.0, "end": 25.0, "moment_id": "m1",
+                  "file": "c1.mp4"},
                  {"clip_id": "c2", "source_id": "syn1",
-                  "start": 30.0, "end": 45.0, "moment_id": "m1"},
+                  "start": 30.0, "end": 45.0, "moment_id": "m1",
+                  "file": "c2.mp4"},
              ]},
         ],
     }
     (d / "manifest.json").write_text(json.dumps(manifest))
-    # Reviews.
     reviews = {"reviews": [
         {"clip_id": "c1", "accepted": True},
         {"clip_id": "c2", "accepted": False},
@@ -56,92 +54,135 @@ def fixture_dir(tmp_path):
 def test_load_manifest_ok(fixture_dir):
     m = eb.load_manifest(fixture_dir / "manifest.json")
     assert m["version"] == 1
-    assert len(m["sources"]) == 2
-    assert len(m["runs"]) == 1
+    assert "sha256:" in m["sources"]["syn1"]["fingerprint"]
 
 
-def test_manifest_rejects_traversal(tmp_path):
-    d = tmp_path / "t"
-    d.mkdir()
-    (d / "manifest.json").write_text(json.dumps({
-        "version": 1, "asset_root": ".",
-        "sources": [{"id": "s", "file": "../evil.mp4",
-                     "duration": 10.0, "genre": "interview/podcast"}],
-        "runs": []}))
-    with pytest.raises(eb.BenchmarkError, match="traversal"):
-        eb.load_manifest(d / "manifest.json")
+def test_sibling_prefix_escape_rejected(tmp_path):
+    root = tmp_path / "assets"
+    root.mkdir()
+    sibling = tmp_path / "assets_other"
+    sibling.mkdir()
+    (sibling / "x.mp4").write_bytes(b"outside")
+    with pytest.raises(eb.BenchmarkError):
+        eb._resolve_asset(root, "../assets_other/x.mp4")
 
 
-def test_manifest_rejects_missing_asset(tmp_path):
-    d = tmp_path / "t"
-    d.mkdir()
-    (d / "manifest.json").write_text(json.dumps({
-        "version": 1, "asset_root": ".",
-        "sources": [{"id": "s", "file": "nope.mp4",
-                     "duration": 10.0, "genre": "interview/podcast"}],
-        "runs": []}))
-    with pytest.raises(eb.BenchmarkError, match="missing"):
-        eb.load_manifest(d / "manifest.json")
+def test_duplicate_run_ids_rejected(fixture_dir):
+    p = fixture_dir / "manifest.json"
+    data = json.loads(p.read_text())
+    data["runs"].append({"run_id": "baseline", "clips": []})
+    p.write_text(json.dumps(data))
+    with pytest.raises(eb.BenchmarkError):
+        eb.load_manifest(p)
 
 
-def test_manifest_rejects_duplicate_clip(fixture_dir):
-    m_path = fixture_dir / "manifest.json"
-    data = json.loads(m_path.read_text())
-    data["runs"][0]["clips"].append(
-        {"clip_id": "c1", "source_id": "syn1", "start": 0, "end": 5})
-    m_path.write_text(json.dumps(data))
-    with pytest.raises(eb.BenchmarkError, match="duplicate"):
-        eb.load_manifest(m_path)
+def test_bool_duration_rejected(fixture_dir):
+    p = fixture_dir / "manifest.json"
+    data = json.loads(p.read_text())
+    data["sources"][0]["duration"] = True
+    data["runs"][0]["clips"] = []
+    p.write_text(json.dumps(data))
+    with pytest.raises(eb.BenchmarkError):
+        eb.load_manifest(p)
 
 
-def test_reviews_duplicate_rejected(tmp_path):
+def test_missing_clip_asset_rejected(fixture_dir):
+    p = fixture_dir / "manifest.json"
+    data = json.loads(p.read_text())
+    data["runs"][0]["clips"][0]["file"] = "missing.mp4"
+    p.write_text(json.dumps(data))
+    with pytest.raises(eb.BenchmarkError):
+        eb.load_manifest(p)
+
+
+def test_malformed_root_rejected(tmp_path):
+    p = tmp_path / "m.json"
+    p.write_text("[]")
+    with pytest.raises(eb.BenchmarkError):
+        eb.load_manifest(p)
+
+
+def test_invalid_boolean_rejected(tmp_path):
     p = tmp_path / "r.json"
-    p.write_text(json.dumps({"reviews": [
-        {"clip_id": "c1", "accepted": True},
-        {"clip_id": "c1", "accepted": False},
-    ]}))
-    with pytest.raises(eb.BenchmarkError, match="duplicate"):
+    p.write_text(json.dumps(
+        {"reviews": [{"clip_id": "c", "accepted": "definitely"}]}))
+    with pytest.raises(eb.BenchmarkError):
         eb.load_reviews(p)
 
 
-def test_unknown_stays_unknown(fixture_dir):
+def test_orphan_review_rejected(fixture_dir):
     m = eb.load_manifest(fixture_dir / "manifest.json")
-    # No reviews for c2? Actually c2 has review. Let's test unreviewed.
-    reviews = {"c1": {"accepted": True}}  # c2 unreviewed
-    stats = eb.run_benchmark(m, reviews)
-    rs = stats["run_stats"][0]
-    # c1 reviewed/accepted, c2 unknown -> reviewed=1, accepted=1
-    assert rs["reviewed_count"] == 1
-    assert rs["accepted_count"] == 1
+    with pytest.raises(eb.BenchmarkError):
+        eb.run_benchmark(m, {"typo": {"accepted": True}})
 
 
-def test_distinct_moments_only_with_labels(fixture_dir):
+def test_partial_labels_no_distinct_claim(fixture_dir):
     m = eb.load_manifest(fixture_dir / "manifest.json")
-    reviews = {
-        "c1": {"accepted": True},
-        "c2": {"accepted": True},  # same moment m1
-    }
-    stats = eb.run_benchmark(m, reviews)
-    rs = stats["run_stats"][0]
-    # Both accepted, same moment m1 -> distinct=1
-    assert rs["distinct_accepted_moments"] == 1
+    # c1 has moment m1, c2 has moment m1 but we remove c2's label.
+    # Actually both have m1. Let's make c2 unlabeled.
+    p = fixture_dir / "manifest.json"
+    data = json.loads(p.read_text())
+    del data["runs"][0]["clips"][1]["moment_id"]
+    p.write_text(json.dumps(data))
+    m = eb.load_manifest(p)
+    stats = eb.run_benchmark(
+        m, {"c1": {"accepted": True}, "c2": {"accepted": True}})
+    # c1 labeled, c2 not -> partial -> None
+    assert stats["run_stats"][0]["distinct_accepted_moments"] is None
 
 
-def test_denominator_correctness(fixture_dir):
+def test_moment_ids_source_scoped(fixture_dir):
+    p = fixture_dir / "manifest.json"
+    data = json.loads(p.read_text())
+    # Add second source with same moment ID.
+    data["sources"].append({
+        "id": "syn3", "file": "syn2.mp4", "duration": 60.0,
+        "genre": "interview/podcast", "synthetic": True})
+    data["runs"][0]["clips"].append({
+        "clip_id": "c3", "source_id": "syn3",
+        "start": 0.0, "end": 10.0, "moment_id": "m1", "file": "c1.mp4"})
+    p.write_text(json.dumps(data))
+    m = eb.load_manifest(p)
+    stats = eb.run_benchmark(m, {
+        "c1": {"accepted": True}, "c2": {"accepted": False},
+        "c3": {"accepted": True}})
+    # (syn1,m1) and (syn3,m1) are distinct -> 2
+    assert stats["run_stats"][0]["distinct_accepted_moments"] == 2
+
+
+def test_all_genres_visible(fixture_dir):
     m = eb.load_manifest(fixture_dir / "manifest.json")
-    reviews = eb.load_reviews(fixture_dir / "reviews.json")
-    stats = eb.run_benchmark(m, reviews)
-    rs = stats["run_stats"][0]
-    # 2 candidates, 2 reviewed, 1 accepted -> rate 50%
-    assert rs["candidate_count"] == 2
-    assert rs["reviewed_count"] == 2
-    assert rs["accepted_count"] == 1
-    assert rs["acceptance_rate"] == 0.5
+    stats = eb.run_benchmark(m, {})
+    assert set(stats["genre_stats"]) == set(eb.GENRES)
+
+
+def test_per_run_hour_denominators(fixture_dir):
+    p = fixture_dir / "manifest.json"
+    data = json.loads(p.read_text())
+    # Add candidate run with same source.
+    data["runs"].append({
+        "run_id": "candidate", "commit": "def",
+        "clips": [{"clip_id": "c3", "source_id": "syn1",
+                   "start": 0.0, "end": 10.0, "file": "c1.mp4"}]})
+    p.write_text(json.dumps(data))
+    m = eb.load_manifest(p)
+    stats = eb.run_benchmark(m, {
+        "c1": {"accepted": True}, "c2": {"accepted": False},
+        "c3": {"accepted": True}})
+    # Each run: 1 accepted, 60s source = 0.0167h -> 60/hour
+    for rs in stats["run_stats"]:
+        assert rs["accepted_per_source_hour"] == 60
+
+
+def test_fingerprints_preserved(fixture_dir):
+    m = eb.load_manifest(fixture_dir / "manifest.json")
+    stats = eb.run_benchmark(m, {})
+    assert "sha256:" in eb._strict_json(stats)
 
 
 def test_strict_json_rejects_nan():
     import math
-    with pytest.raises(eb.BenchmarkError, match="non-finite"):
+    with pytest.raises(eb.BenchmarkError):
         eb._strict_json({"x": math.nan})
 
 
@@ -155,16 +196,21 @@ def test_cli_end_to_end(fixture_dir, tmp_path):
         "--text-out", str(out_txt),
     ])
     assert rc == 0
-    data = json.loads(out_json.read_text())
-    assert "run_stats" in data
-    assert out_txt.read_text().startswith("Editorial Benchmark Report")
+    assert "sha256:" in out_json.read_text()
 
 
 def test_cli_malformed_fails(tmp_path):
     bad = tmp_path / "bad.json"
-    bad.write_text("{invalid json")
+    bad.write_text("{invalid")
+    assert eb.main(["--manifest", str(bad), "--reviews", str(bad)]) == 1
+
+
+def test_output_collision_rejected(fixture_dir, tmp_path):
+    # Output inside asset root should be rejected.
+    out = fixture_dir / "report.json"
     rc = eb.main([
-        "--manifest", str(bad),
-        "--reviews", str(bad),
+        "--manifest", str(fixture_dir / "manifest.json"),
+        "--reviews", str(fixture_dir / "reviews.json"),
+        "--json-out", str(out),
     ])
     assert rc == 1

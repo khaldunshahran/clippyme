@@ -5,7 +5,7 @@
     {
       "id": "syn1",
       "file": "syn1.mp4",
-      "duration": 60.0,
+      "duration": 5.0,
       "genre": "interview/podcast",
       "synthetic": true,
       "notes": "Synthetic fixture, not real footage."
@@ -13,7 +13,7 @@
     {
       "id": "syn2",
       "file": "syn2.mp4",
-      "duration": 60.0,
+      "duration": 5.0,
       "genre": "reaction/comedy",
       "synthetic": true
     }
@@ -29,22 +29,25 @@
         {
           "clip_id": "c1",
           "source_id": "syn1",
-          "start": 10.0,
-          "end": 25.0,
-          "moment_id": "m1"
+          "start": 0.0,
+          "end": 5.0,
+          "moment_id": "m1",
+          "file": "c1.mp4"
         },
         {
           "clip_id": "c2",
           "source_id": "syn1",
-          "start": 30.0,
-          "end": 45.0,
-          "moment_id": "m1"
+          "start": 0.0,
+          "end": 5.0,
+          "moment_id": "m1",
+          "file": "c2.mp4"
         },
         {
           "clip_id": "c3",
           "source_id": "syn2",
-          "start": 5.0,
-          "end": 20.0
+          "start": 0.0,
+          "end": 5.0,
+          "file": "c3.mp4"
         }
       ]
     },
@@ -58,16 +61,18 @@
         {
           "clip_id": "c4",
           "source_id": "syn1",
-          "start": 10.0,
-          "end": 25.0,
-          "moment_id": "m1"
+          "start": 0.0,
+          "end": 5.0,
+          "moment_id": "m1",
+          "file": "c4.mp4"
         },
         {
           "clip_id": "c5",
           "source_id": "syn2",
-          "start": 5.0,
-          "end": 20.0,
-          "moment_id": "m2"
+          "start": 0.0,
+          "end": 5.0,
+          "moment_id": "m2",
+          "file": "c5.mp4"
         }
       ]
     }
