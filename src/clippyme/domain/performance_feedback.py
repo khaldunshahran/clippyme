@@ -24,12 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_float(value: Any) -> Optional[float]:
-    """Convert to float safely; None on any failure (incl. OverflowError)."""
+    """Return float for actual int/float input; None otherwise.
+
+    Strings are rejected even when float-convertible: numeric evidence
+    must be numeric. Never raises (incl. OverflowError on huge ints).
+    """
     if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
         return None
     try:
         fv = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except (OverflowError, ValueError):
         return None
     try:
         if not math.isfinite(fv):
@@ -161,10 +167,37 @@ def analyze_performance_patterns() -> Dict[str, Any]:
         }
 
     n = len(measured)
-    total_views = sum(v[1]["views"] for v in measured)
-    total_likes = sum(v[1]["likes"] for v in measured)
-    total_shares = sum(v[1]["shares"] for v in measured)
-    total_comments = sum(v[1]["comments"] for v in measured)
+    def _safe_sum(values):
+        """Sum finite values; cap at max finite float on overflow.
+
+        Honest overflow policy: totals never become Infinity (which
+        breaks strict JSON). Capped totals are still finite and usable;
+        the cap is documented in the observation note.
+        """
+        total = 0.0
+        capped = False
+        for v in values:
+            fv = _safe_float(v)
+            if fv is None:
+                continue
+            total += fv
+            if not math.isfinite(total):
+                capped = True
+                total = 1.7976931348623157e308  # max finite float
+                break
+        return total, capped
+
+    total_views, _views_capped = _safe_sum(v[1]["views"] for v in measured)
+    total_likes, _ = _safe_sum(v[1]["likes"] for v in measured)
+    total_shares, _ = _safe_sum(v[1]["shares"] for v in measured)
+    total_comments, _ = _safe_sum(v[1]["comments"] for v in measured)
+    # Convert to int when whole.
+    def _as_number(x):
+        return int(x) if x == int(x) else x
+    total_views = _as_number(total_views)
+    total_likes = _as_number(total_likes)
+    total_shares = _as_number(total_shares)
+    total_comments = _as_number(total_comments)
 
     observations: List[Dict[str, Any]] = [
         {
@@ -182,22 +215,33 @@ def analyze_performance_patterns() -> Dict[str, Any]:
     ]
 
     # Retention: explicitly recorded values (zero counts) plus positive
-    # finite legacy fractions. Unknown stays unknown. Unweighted average
-    # with explicit sample counts.
-    recorded = [v[1]["retention_rate"] for v in measured
-                if (v[1].get("retention_recorded") or v[1].get("retention_legacy_positive"))
+    # finite legacy fractions. Unknown stays unknown. Unweighted average.
+    # Provenance tracked separately: explicit vs legacy-positive.
+    explicit = [v[1]["retention_rate"] for v in measured
+                if v[1].get("retention_recorded")
                 and v[1]["retention_rate"] is not None]
+    legacy_pos = [v[1]["retention_rate"] for v in measured
+                  if v[1].get("retention_legacy_positive")
+                  and v[1]["retention_rate"] is not None]
+    recorded = explicit + legacy_pos
     avg_retention: Optional[float] = None
     if recorded:
         avg_retention = round(sum(recorded) / len(recorded), 4)
+        # Honest provenance: distinguish explicit from legacy-positive.
+        if explicit and legacy_pos:
+            _prov = (f"{len(explicit)} explicitly recorded + "
+                     f"{len(legacy_pos)} legacy positive observations")
+        elif explicit:
+            _prov = f"{len(explicit)} explicitly recorded values"
+        else:
+            _prov = f"{len(legacy_pos)} legacy positive observations"
         observations.append({
             "metric": "retention_rate",
             "count": len(recorded),
-            "denominator": f"{n} measured clips",
+            "denominator": f"{n} measured clips (unweighted average)",
             "note": (
-                f"Average of {len(recorded)} explicitly recorded retention "
-                f"values: {avg_retention}. Unknown retention is not counted "
-                f"as zero."
+                f"Observed average retention: {avg_retention} from {_prov}. "
+                f"Unknown retention is not counted as zero."
             ),
         })
 
@@ -232,7 +276,10 @@ def analyze_performance_patterns() -> Dict[str, Any]:
         "retention": {
             "average_recorded": avg_retention,
             "recorded_count": len(recorded),
+            "explicit_count": len(explicit),
+            "legacy_positive_count": len(legacy_pos),
             "measured_count": n,
+            "averaging": "unweighted",
         },
     }
 

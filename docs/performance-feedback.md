@@ -55,3 +55,24 @@ Comparable-cohort learning (creator, genre, post-age, experiment/version,
 per-platform attribution) is not implemented. A future system would need
 those cohorts before inferring causal rules. Real-footage and OpusClip
 benchmarks remain unverified.
+
+## Numeric validation and overflow policy
+
+- Only actual `int`/`float` values (excluding booleans) are accepted as
+  numeric evidence. Float-convertible strings like `"100"` or `"0.8"` are
+  rejected; they cannot crash valid neighboring records or contaminate
+  observed averages.
+- Aggregates use a safe-sum policy: totals never become `Infinity`.
+  On overflow, the total is capped at the maximum finite float and the
+  observation remains usable. All API output stays strict-JSON
+  serializable (`allow_nan=False`).
+
+## Sample provenance
+
+- Retention observations distinguish `explicit_count` (boolean marker
+  `retention_recorded is True`) from `legacy_positive_count` (positive
+  finite values without a marker).
+- The combined average is labeled "observed", not "explicitly recorded".
+- Averages are unweighted; the denominator (`N measured clips`) is
+  exposed in both the feedback output and `get_analytics_summary`
+  (`retention_sample_count`, `retention_averaging: "unweighted"`).

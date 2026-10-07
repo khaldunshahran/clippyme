@@ -464,7 +464,7 @@ export function AnalyticsView({ pushToast }) {
               </span>
               <span style={{ fontSize: '0.75rem', color: 'var(--ink-dim)', display: 'block' }}>
                 {patterns.retention?.recorded_count
-                  ? `Average of ${patterns.retention.recorded_count} explicitly recorded values`
+                  ? `Observed avg of ${patterns.retention.recorded_count} values (${patterns.retention.explicit_count ?? 0} explicit + ${patterns.retention.legacy_positive_count ?? 0} legacy, unweighted)`
                   : 'No retention values recorded yet'}
               </span>
             </div>
@@ -532,7 +532,6 @@ export function AnalyticsView({ pushToast }) {
               const retentionDisplay = retentionKnown
                 ? `${Math.round((clip.metrics?.retention_rate ?? clip.retention_rate) * 100)}%`
                 : 'Unknown';
-                              ? `${Math.round(rawRetention * 100)}%` : 'Unknown';
               const viewsCount = (clip.metrics?.views ?? clip.views) || 0;
               const likesCount = (clip.metrics?.likes ?? clip.likes) || 0;
               const sharesCount = (clip.metrics?.shares ?? clip.shares) || 0;

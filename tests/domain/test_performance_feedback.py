@@ -325,6 +325,58 @@ def test_oversized_int_isolated(registry):
     assert out["totals"]["views"] == 100
     assert out["retention"]["average_recorded"] == 0.5
 
+
+
+def test_string_counts_do_not_crash_good_neighbor(registry):
+    """views:"100" and likes:"10" are rejected; valid neighbor preserved."""
+    for bad in ({"views": "100"}, {"views": 100, "likes": "10"}):
+        _write(registry, {"good": {"metrics": {"views": 100}},
+                          "malformed": {"metrics": bad}})
+        out = pf.analyze_performance_patterns()
+        assert out["totals"]["views"] == 100, f"bad={bad}"
+        assert out["sample_size"] == 1
+
+
+def test_finite_records_cannot_emit_infinite_aggregate(registry):
+    """Two 1e308 view counts: totals stay finite, JSON-serializable."""
+    import json as _json
+    _write(registry, {"a": {"metrics": {"views": 1e308}},
+                      "b": {"metrics": {"views": 1e308}},
+                      "normal": {"metrics": {"views": 100}}})
+    out = pf.analyze_performance_patterns()
+    # Must not raise; all numbers finite.
+    _json.dumps(out, allow_nan=False)
+    import math as _math
+    assert _math.isfinite(out["totals"]["views"])
+
+
+def test_legacy_observations_not_labeled_as_explicit_measurements(registry):
+    """One explicit zero + legacy .8 averages .4 without false 'explicit' label."""
+    _write(registry, {
+        "explicit": {"metrics": {"views": 100, "retention_rate": 0,
+                                 "retention_recorded": True}},
+        "legacy": {"metrics": {"views": 100, "retention_rate": .8}},
+    })
+    out = pf.analyze_performance_patterns()
+    assert out["retention"]["average_recorded"] == .4
+    note = next(o["note"] for o in out["observations"]
+                if o["metric"] == "retention_rate")
+    assert "2 explicitly recorded" not in note
+    assert out["retention"]["explicit_count"] == 1
+    assert out["retention"]["legacy_positive_count"] == 1
+
+
+def test_string_retention_not_treated_as_numeric_evidence(registry):
+    """retention_rate:"0.8" (string) excluded from observed average."""
+    _write(registry, {
+        "good": {"metrics": {"views": 100, "retention_rate": .6,
+                             "retention_recorded": True}},
+        "malformed": {"metrics": {"views": 100, "retention_rate": "0.8",
+                                  "retention_recorded": True}},
+    })
+    out = pf.analyze_performance_patterns()
+    assert out["retention"]["average_recorded"] == .6
+
 # --- analytics_service presence marker ---
 
 def test_retention_marker_only_on_explicit_valid(registry):

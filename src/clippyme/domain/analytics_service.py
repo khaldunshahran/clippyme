@@ -321,6 +321,8 @@ def get_analytics_summary() -> Dict[str, Any]:
         "total_shares": total_shares,
         "total_comments": total_comments,
         "avg_retention": avg_retention,
+        "retention_sample_count": len(clips_with_retention),
+        "retention_averaging": "unweighted",
         "platform_breakdown": platforms_stat,
         "top_clips": top_clips,
         "all_clips": enriched_clips,

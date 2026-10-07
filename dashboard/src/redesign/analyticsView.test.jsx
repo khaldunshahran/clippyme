@@ -147,8 +147,11 @@ test('KPI shows null average as Unknown, not 0%', async () => {
   await waitFor(() => {
     expect(screen.getByText('Recorded retention clip')).toBeInTheDocument();
   });
-  // Avg Retention card shows Unknown, not 0%.
-  expect(screen.getByText('Unknown')).toBeInTheDocument();
+  // Avg Retention KPI card shows Unknown, not 0%. Scoped to avoid
+  // matching leaderboard rows.
+  const kpiCard = screen.getByText('Avg Retention').closest('div');
+  expect(within(kpiCard).getByText('Unknown')).toBeInTheDocument();
+  expect(within(kpiCard).queryByText('0%')).not.toBeInTheDocument();
 });
 
 test('empty insights show honest inactive state', async () => {
@@ -175,10 +178,9 @@ test('malformed insights handled defensively', async () => {
   expect(screen.getByText(/audience-based selection rules are not active yet/i)).toBeInTheDocument();
 });
 
-test('modal initializes unknown as empty, explicit zero as 0', async () => {
+test('modal initializes unknown as empty', async () => {
   vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
   vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
-  vi.spyOn(realApi, 'trackClipAnalytics').mockResolvedValue({ success: true });
 
   render(<AnalyticsView pushToast={vi.fn()} />);
 
@@ -186,13 +188,30 @@ test('modal initializes unknown as empty, explicit zero as 0', async () => {
     expect(screen.getByText('Unknown retention clip')).toBeInTheDocument();
   });
 
-  // Open modal for unknown clip.
-  const updateButtons = screen.getAllByRole('button', { name: /update/i });
-  fireEvent.click(updateButtons[2]); // third clip = unknown
+  fireEvent.click(screen.getAllByRole('button', { name: /update/i })[2]);
 
-  const retentionInput = screen.getByLabelText(/audience retention rate/i);
+  const dialog = screen.getByRole('dialog');
+  const retentionInput = within(dialog).getByLabelText(/audience retention rate/i);
   expect(retentionInput.value).toBe(''); // unknown -> empty, not 0
-  expect(screen.getByText('Unknown')).toBeInTheDocument();
+  // Scoped to dialog; leaderboard still shows Unknown rows outside.
+  expect(within(dialog).getByText('Unknown')).toBeInTheDocument();
+});
+
+test('modal initializes explicit zero as 0', async () => {
+  vi.spyOn(realApi, 'getAnalyticsSummary').mockResolvedValue(MOCK_SUMMARY);
+  vi.spyOn(realApi, 'getAnalyticsInsights').mockResolvedValue(MOCK_INSIGHTS);
+
+  render(<AnalyticsView pushToast={vi.fn()} />);
+
+  await waitFor(() => {
+    expect(screen.getByText('Explicit zero retention clip')).toBeInTheDocument();
+  });
+
+  fireEvent.click(screen.getAllByRole('button', { name: /update/i })[1]);
+
+  const dialog = screen.getByRole('dialog');
+  const retentionInput = within(dialog).getByLabelText(/audience retention rate/i);
+  expect(retentionInput.value).toBe('0'); // explicit zero -> '0', not empty
 });
 
 test('saves metrics with honest wording, preserves untouched retention', async () => {
