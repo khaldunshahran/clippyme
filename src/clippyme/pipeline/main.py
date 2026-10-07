@@ -535,7 +535,75 @@ def get_viral_clips(
         print("❌ Error: GEMINI_API_KEY not found in environment variables.")
         return None
 
+    # Task 08: windowed candidate discovery (default ON). Set
+    # CLIPPYME_WINDOWED_DISCOVERY=0/false/no for the legacy path.
+    from clippyme.pipeline.candidate_discovery import (
+        windowed_discovery_enabled,
+    )
+    if windowed_discovery_enabled():
+        return _get_viral_clips_windowed(
+            transcript_result, video_duration, api_key,
+            instructions=instructions, min_duration=min_duration,
+            max_duration=max_duration, min_clips=min_clips,
+            max_clips=max_clips, clip_type=clip_type,
+            duration_mode=duration_mode, audience_intel=audience_intel,
+        )
+
+    # Legacy single-pass path; client closed exactly once.
     client = genai.Client(api_key=api_key)
+    try:
+        return _get_viral_clips_legacy(
+            client, transcript_result, video_duration,
+            instructions=instructions, min_duration=min_duration,
+            max_duration=max_duration, min_clips=min_clips,
+            max_clips=max_clips, clip_type=clip_type,
+            duration_mode=duration_mode, audience_intel=audience_intel,
+        )
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _get_viral_clips_windowed(
+    transcript_result, video_duration, api_key,
+    instructions=None, min_duration=None, max_duration=None,
+    min_clips=None, max_clips=None, clip_type=None,
+    duration_mode=None, audience_intel=None,
+):
+    """Windowed discovery path (Task 08)."""
+    from clippyme.pipeline.candidate_discovery import (
+        DiscoveryConfig, run_windowed_discovery,
+    )
+    model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    fb = os.getenv("GEMINI_FALLBACK_MODELS") or ""
+    fallback_models = [m.strip() for m in fb.split(",") if m.strip()]
+    config = DiscoveryConfig.from_env(
+        model_name=model_name, fallback_models=fallback_models)
+
+    def _client_factory():
+        return genai.Client(api_key=api_key)
+
+    result = run_windowed_discovery(
+        transcript_result, video_duration,
+        config=config, client_factory=_client_factory,
+        instructions=instructions,
+    )
+    # Preserve exhaustion semantics for the orchestrator.
+    funnel = result.get("candidate_discovery", {})
+    get_viral_clips._last_gemini_exhausted = bool(
+        funnel.get("budget", {}).get("exhausted"))
+    return result
+
+
+def _get_viral_clips_legacy(
+    client, transcript_result, video_duration,
+    instructions=None, min_duration=None, max_duration=None,
+    min_clips=None, max_clips=None, clip_type=None,
+    duration_mode=None, audience_intel=None,
+):
+    """Legacy single-pass path (unchanged logic)."""
     
     # Use selected model from env, or default to gemini-3.5-flash
     model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
@@ -706,6 +774,7 @@ def get_viral_clips(
         print(f"❌ Unexpected error in Gemini response processing: {e}")
         logging.getLogger("clippyme").exception("Unexpected error in Gemini response processing")
         return None
+
 
 
 def build_texttiling_fallback(transcript_result, video_title):

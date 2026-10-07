@@ -584,6 +584,22 @@ def _load_or_analyze(
 
     clips_data["transcript"] = transcript
     clips_data["aspect"] = args.aspect
+    # Task 08: fail-soft validation of windowed discovery metadata.
+    # The candidate_discovery dict (if present) flows through the
+    # existing atomic checkpoint unchanged; we only verify its version.
+    _cd = clips_data.get("candidate_discovery")
+    if isinstance(_cd, dict):
+        try:
+            from clippyme.pipeline.candidate_discovery import (
+                DISCOVERY_VERSION)
+            if _cd.get("version") != DISCOVERY_VERSION:
+                print(
+                    f"?? candidate_discovery version mismatch "
+                    f"(got {_cd.get('version')}, want {DISCOVERY_VERSION}); "
+                    f"keeping metadata as-is (fail-soft).",
+                    flush=True)
+        except Exception:
+            pass
     if getattr(args, "caption_style_default", None):
         clips_data["caption_style_default"] = args.caption_style_default
     shorts = clips_data.get("shorts") or []

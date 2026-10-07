@@ -532,3 +532,38 @@ __all__ = [
     "backfill_hook_text",
     "drop_wordless_clips",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Task 08: discovery payload parsing.
+# ---------------------------------------------------------------------------
+
+def parse_discovery_payload(text):
+    """Parse a discovery response; expect {"candidates": [...]}.
+
+    Returns the raw candidate list (each validated independently by
+    the caller). Raises ValueError on malformed payloads so the
+    window is isolated as parse_failed rather than silently dropped.
+    """
+    import json as _json
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("empty discovery response")
+    body = text.strip()
+    # Strip code fences if present.
+    if body.startswith("```"):
+        body = body.strip("`").strip()
+        nl = body.find("\n")
+        if nl != -1 and body[:nl].strip().isalpha():
+            body = body[nl + 1:]
+    try:
+        data = _json.loads(body)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"discovery JSON invalid: {e}")
+    if not isinstance(data, dict):
+        raise ValueError("discovery payload must be an object")
+    cands = data.get("candidates")
+    if cands is None:
+        raise ValueError('discovery payload missing "candidates"')
+    if not isinstance(cands, list):
+        raise ValueError('"candidates" must be a list')
+    return cands
