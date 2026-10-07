@@ -197,7 +197,7 @@ def test_policy_promotes_only_evidence_plus_geometry(rf, monkeypatch):
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     # Scene 1: screen + stable presenter. Others: no screen.
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         if scene_id == 1:
             return dict(_evidence("screencast"), scene_id=1)
         return dict(_evidence("none", conf=0.95, screen=False), scene_id=scene_id)
@@ -218,7 +218,7 @@ def test_policy_promotes_only_evidence_plus_geometry(rf, monkeypatch):
 def test_policy_screen_without_presenter_keeps_general(rf, monkeypatch):
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         return dict(_evidence("screencast"), scene_id=scene_id)
     monkeypatch.setattr(
         "clippyme.pipeline.layouts.layout_classifier.classify_scene",
@@ -238,7 +238,7 @@ def test_policy_track_with_evidence_promotes(rf, monkeypatch):
     # TRACK with screen + presenter evidence promotes (webcam scenes).
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         return dict(_evidence("screencast"), scene_id=scene_id)
     monkeypatch.setattr(
         "clippyme.pipeline.layouts.layout_classifier.classify_scene",
@@ -257,7 +257,7 @@ def test_policy_split_never_promotes(rf, monkeypatch):
     # Two-person SPLIT is never auto-promoted.
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         return dict(_evidence("screencast"), scene_id=scene_id)
     monkeypatch.setattr(
         "clippyme.pipeline.layouts.layout_classifier.classify_scene",
@@ -277,7 +277,7 @@ def test_policy_track_without_evidence_keeps_track(rf, monkeypatch):
     # Negative/unknown TRACK scenes retain TRACK.
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         return None
     monkeypatch.setattr(
         "clippyme.pipeline.layouts.layout_classifier.classify_scene",
@@ -292,7 +292,7 @@ def test_policy_track_without_evidence_keeps_track(rf, monkeypatch):
 def test_policy_unknown_evidence_keeps_previous(rf, monkeypatch):
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         return None  # provider error / unreadable / low confidence
     monkeypatch.setattr(
         "clippyme.pipeline.layouts.layout_classifier.classify_scene",
@@ -360,7 +360,7 @@ def test_budget_max_requests_stops_early(rf, monkeypatch):
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     calls = []
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         calls.append(scene_id)
         return dict(_evidence("screencast"), scene_id=scene_id)
     monkeypatch.setattr(
@@ -437,3 +437,47 @@ def test_pick_and_apply_auto_unset_returns_auto(monkeypatch):
     monkeypatch.setattr(lc, "classify_layout", lambda *a, **k: calls.append(1) or "screencast")
     assert lc.pick_and_apply_layout("v.mp4", explicit_layout="auto") == "auto"
     assert calls == []
+
+
+# --- inset/webcam support (durable regression) --------------------------------
+
+def test_inset_label_with_evidence_promotes(rf, monkeypatch):
+    """Documented inset (screen/webcam) promotes via SCREENCAST composition."""
+    monkeypatch.setenv("AUTO_LAYOUT", "1")
+    def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
+                      api_key=None, model_name=None, _budget=None):
+        # Real parser route with injected raw JSON.
+        import json as _j
+        text = _j.dumps({"layout": "inset", "confidence": 0.97,
+                         "screen_evidence": True,
+                         "why": "software with stable webcam"})
+        from clippyme.pipeline.layouts import layout_classifier as _lc
+        parsed = _lc.parse_layout_response(text)
+        parsed["scene_id"] = scene_id
+        parsed["samples"] = 5
+        return parsed
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
+        fake_classify)
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.screencast_layout.detect_presenter_geometry",
+        lambda *a, **k: {0: (320.0, 400.0)})
+    strategies = ["TRACK"]
+    meta = {}
+    promoted = rf.maybe_promote_screencast("v.mp4", [(0, 90)], strategies, meta)
+    assert promoted == [0]
+    assert strategies == ["SCREENCAST"]
+
+
+def test_inset_without_evidence_does_not_promote(rf, monkeypatch):
+    monkeypatch.setenv("AUTO_LAYOUT", "1")
+    def fake_classify(*a, **k):
+        return None
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
+        fake_classify)
+    strategies = ["TRACK"]
+    meta = {}
+    promoted = rf.maybe_promote_screencast("v.mp4", [(0, 90)], strategies, meta)
+    assert promoted == []
+    assert strategies == ["TRACK"]

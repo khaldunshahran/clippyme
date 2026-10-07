@@ -63,7 +63,7 @@ def _inject_evidence(monkeypatch):
     monkeypatch.setenv("AUTO_LAYOUT", "1")
 
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None):
+                      api_key=None, model_name=None, _budget=None):
         if scene_id == 1:
             return {"layout": "screencast", "confidence": 0.93,
                     "screen_evidence": True, "reason": "checkerboard + presenter",

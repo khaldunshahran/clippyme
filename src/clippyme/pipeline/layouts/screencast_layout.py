@@ -248,30 +248,65 @@ def detect_screencast_scenes(video_path, scenes, samples=10):
     return found
 
 
+class _InvocationBudget:
+    """Shared budget across geometry, sampling, provider attempts, backoff.
+
+    Tracks remaining requests and deadline. All consumers check before
+    expensive work. No background threads.
+    """
+    def __init__(self, max_requests, deadline_s, clock):
+        self.max_requests = max(0, int(max_requests))
+        self.deadline_s = max(0.0, float(deadline_s))
+        self._clock = clock
+        self._t0 = clock()
+        self.requests_used = 0
+        self.attempts_used = 0
+
+    def remaining_s(self):
+        return max(0.0, self.deadline_s - (self._clock() - self._t0))
+
+    def expired(self):
+        return self.remaining_s() <= 0
+
+    def can_request(self):
+        return not self.expired() and self.requests_used < self.max_requests
+
+    def take_request(self):
+        """Consume one provider-request allowance. Returns False if none."""
+        if not self.can_request():
+            return False
+        self.requests_used += 1
+        return True
+
+    def note_attempt(self):
+        self.attempts_used += 1
+
+
 def maybe_promote_screencast(input_video, scenes, scene_strategies, screen_metadata,
                              provider=None, api_key=None,
                              max_scenes=None, max_requests=None,
                              deadline_s=None, _clock=None):
     """Conservative auto-promotion: GENERAL/TRACK -> SCREENCAST only on evidence.
 
-    For each eligible GENERAL or TRACK scene (SPLIT is left alone):
+    Accepts documented "screencast" and "inset" (screen/webcam) labels through
+    the existing SCREENCAST composition, under the same strict evidence and
+    geometry gate.
+
+    For each eligible scene:
       1. Scene-local semantic classification (is there a screen?).
-         Requires layout 'screencast', confidence >= 0.85, explicit positive
-         screen evidence, nonempty reason.
-      2. Reliable presenter geometry (is there a stable real speaker?).
-         Uses detect_presenter_geometry (no center fallback).
-      3. Screen + presenter -> SCREENCAST (existing composition).
-         Screen without presenter -> keep previous (no fabricated pane).
-         Anything unknown/failed/low-confidence -> keep previous.
+         Requires layout in ("screencast", "inset"), confidence >= 0.85,
+         explicit positive screen evidence, nonempty reason.
+      2. Reliable presenter geometry (stable real speaker?).
+      3. Screen + presenter -> SCREENCAST. Otherwise keep previous.
 
-    Budgets (invocation-level): at most max_scenes scenes evaluated, at most
-    max_requests provider calls, deadline_s seconds total. Exhaustion stops
-    evaluation; evaluated scenes keep their results, the rest keep the
-    previous strategy. Defaults from layout_classifier.
+    Budgets: one shared _InvocationBudget covers geometry scan, sampling,
+    provider attempts and backoff. Eligible scenes are selected (up to
+    max_scenes) BEFORE geometry runs, preserving original IDs. The provider
+    receives remaining time/request allowance; per-call SDK timeout is
+    capped by remaining time; retries stop when budget is exhausted.
 
-    Only runs when AUTO_LAYOUT is enabled (opt-in); otherwise no-op.
-    Never raises. Mutates scene_strategies and screen_metadata in place.
-    Returns the list of promoted scene indices.
+    Only runs when AUTO_LAYOUT is enabled. Never raises. Mutates inputs.
+    Returns promoted scene indices (original IDs).
     """
     from clippyme.pipeline.layouts import layout_classifier as lc
     import time as _time
@@ -279,53 +314,66 @@ def maybe_promote_screencast(input_video, scenes, scene_strategies, screen_metad
     if not lc.is_auto_layout_enabled():
         return []
     clock = _clock or _time.monotonic
-    t0 = clock()
-    max_scenes = lc.MAX_SCENES_PER_INVOCATION if max_scenes is None else max_scenes
-    max_requests = lc.MAX_REQUESTS_PER_INVOCATION if max_requests is None else max_requests
-    deadline_s = lc.INVOCATION_DEADLINE_S if deadline_s is None else deadline_s
 
-    # Geometry first (local CV, no provider cost); scenes without geometry
-    # are skipped before any paid classification.
+    # Validate budget inputs; fall back to defaults on invalid.
     try:
-        geometry = detect_presenter_geometry(input_video, scenes)
+        max_scenes_v = int(max_scenes) if max_scenes is not None else lc.MAX_SCENES_PER_INVOCATION
+        max_requests_v = int(max_requests) if max_requests is not None else lc.MAX_REQUESTS_PER_INVOCATION
+        deadline_v = float(deadline_s) if deadline_s is not None else lc.INVOCATION_DEADLINE_S
+    except (TypeError, ValueError):
+        max_scenes_v = lc.MAX_SCENES_PER_INVOCATION
+        max_requests_v = lc.MAX_REQUESTS_PER_INVOCATION
+        deadline_v = lc.INVOCATION_DEADLINE_S
+    max_scenes_v = max(0, max_scenes_v)
+    max_requests_v = max(0, max_requests_v)
+    deadline_v = max(0.0, deadline_v)
+
+    budget = _InvocationBudget(max_requests_v, deadline_v, clock)
+
+    # Select bounded eligible scenes FIRST (preserve original IDs).
+    # SPLIT and explicit strategies are never auto-promoted.
+    eligible = []
+    for idx, strat in enumerate(scene_strategies):
+        if strat in ("GENERAL", "TRACK"):
+            eligible.append(idx)
+        if len(eligible) >= max_scenes_v:
+            break
+    if not eligible or budget.expired():
+        return []
+
+    # Geometry on the bounded subset only. Map subset positions back to IDs.
+    subset_scenes = [scenes[i] for i in eligible]
+    try:
+        subset_geometry = detect_presenter_geometry(input_video, subset_scenes)
     except Exception:
-        geometry = {}
+        subset_geometry = {}
+    geometry = {eligible[pos]: center for pos, center in subset_geometry.items()
+                if pos < len(eligible)}
 
     promoted = []
-    evaluated = 0
-    requests = 0
-    for idx, strat in enumerate(scene_strategies):
-        # Eligible: GENERAL and TRACK (a visible webcam often yields TRACK).
-        # SPLIT (two-person) and explicit strategies are never auto-promoted.
-        if strat not in ("GENERAL", "TRACK"):
-            continue
-        if evaluated >= max_scenes:
-            break
-        if requests >= max_requests:
-            break
-        if clock() - t0 >= deadline_s:
+    for idx in eligible:
+        if budget.expired():
             break
         # Skip paid classification when geometry already rules the scene out.
         if idx not in geometry:
             continue
-        evaluated += 1
+        if not budget.take_request():
+            break
         try:
             start, end = scenes[idx]
             s_f = start.get_frames() if hasattr(start, "get_frames") else int(start)
             e_f = end.get_frames() if hasattr(end, "get_frames") else int(end)
-            requests += 1
             evidence = lc.classify_scene(
                 input_video, idx, s_f, e_f,
-                provider=provider, api_key=api_key)
+                provider=provider, api_key=api_key, _budget=budget)
         except Exception:
             continue
         if evidence is None:
             continue
-        if evidence.get("layout") != "screencast":
+        if evidence.get("layout") not in ("screencast", "inset"):
             continue
         if not evidence.get("screen_evidence"):
             continue
-        # Geometry was precomputed; re-check (cheap).
         center = geometry.get(idx)
         if center is None:
             continue

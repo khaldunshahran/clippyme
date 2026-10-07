@@ -250,15 +250,18 @@ def sample_scene_frames(video_path, start_frame, end_frame, n=MAX_SCENE_SAMPLES,
 
 
 def classify_scene(video_path, scene_id, start_frame, end_frame,
-                   provider=None, api_key=None, model_name=None):
+                   provider=None, api_key=None, model_name=None, _budget=None):
     """Classify one scene's layout. Never raises; returns evidence dict or None.
 
     provider: injectable callable(frames, prompt) -> response text.
     When None, uses the Gemini provider (requires AUTO_LAYOUT + api_key).
-    Returns None on: disabled, no frames, provider error, invalid response,
-    low confidence. Callers retain the previous strategy on None.
+    _budget: optional shared budget; provider attempts respect remaining
+      time/requests. Returns None on: disabled, no frames, provider error,
+      invalid response, low confidence, budget exhausted.
     """
     if not is_auto_layout_enabled():
+        return None
+    if _budget is not None and _budget.expired():
         return None
     frames = sample_scene_frames(video_path, start_frame, end_frame)
     if len(frames) < MIN_SCENE_SAMPLES:
@@ -267,7 +270,8 @@ def classify_scene(video_path, scene_id, start_frame, end_frame,
         if provider is not None:
             text = provider(frames, LAYOUT_PROMPT)
         else:
-            text = _gemini_classify(frames, api_key=api_key, model_name=model_name)
+            text = _gemini_classify(frames, api_key=api_key, model_name=model_name,
+                                    _budget=_budget)
     except Exception:
         return None
     if not text:
@@ -283,14 +287,20 @@ def classify_scene(video_path, scene_id, start_frame, end_frame,
 
 
 def _gemini_classify(frames, api_key=None, model_name=None,
-                     timeout_s=CLASSIFY_TIMEOUT_S, max_retries=GEMINI_MAX_RETRIES):
+                     timeout_s=CLASSIFY_TIMEOUT_S, max_retries=GEMINI_MAX_RETRIES,
+                     _budget=None):
     """Gemini provider with timeout and bounded retries.
 
-    Returns response text or None. Never raises. No background workers
-    are leaked: each attempt is a single bounded blocking call.
+    Shares the invocation budget: per-attempt timeout is capped by remaining
+    time, retries stop when budget is exhausted, and each SDK attempt is
+    counted. SDK retries are disabled explicitly (we manage retries) so they
+    do not multiply the outer allowance. Returns response text or None.
+    Never raises. No background threads.
     """
     api_key = api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
+        return None
+    if _budget is not None and _budget.expired():
         return None
     try:
         from clippyme.pipeline.gemini_service import get_auxiliary_gemini_model
@@ -298,12 +308,38 @@ def _gemini_classify(frames, api_key=None, model_name=None,
         from google.genai import types as genai_types
 
         model_name = get_auxiliary_gemini_model(model_name)
-        http_opts = genai_types.HttpOptions(timeout=timeout_s * 1000)
+
+        def _attempt_timeout():
+            t = timeout_s
+            if _budget is not None:
+                t = min(t, _budget.remaining_s())
+            return max(1.0, t)
+
+        try:
+            retry_cfg = genai_types.RetryConfig(max_retries=0)
+        except Exception:
+            retry_cfg = None
+        http_kw = {"timeout": int(_attempt_timeout() * 1000)}
+        if retry_cfg is not None:
+            http_kw["retry_config"] = retry_cfg
+        http_opts = genai_types.HttpOptions(**http_kw)
         client = genai.Client(api_key=api_key, http_options=http_opts)
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
                  for b in frames]
         last_err = None
         for attempt in range(max_retries + 1):
+            if _budget is not None:
+                if _budget.expired():
+                    break
+                _budget.note_attempt()
+            try:
+                cur_timeout = int(_attempt_timeout() * 1000)
+                if cur_timeout != http_opts.timeout:
+                    http_kw["timeout"] = cur_timeout
+                    http_opts = genai_types.HttpOptions(**http_kw)
+                    client = genai.Client(api_key=api_key, http_options=http_opts)
+            except Exception:
+                pass
             try:
                 response = client.models.generate_content(
                     model=model_name,
@@ -318,9 +354,16 @@ def _gemini_classify(frames, api_key=None, model_name=None,
             except Exception as e:
                 last_err = e
                 if attempt < max_retries:
+                    if _budget is not None and _budget.expired():
+                        break
                     import time
-                    time.sleep(min(2.0 ** attempt, 4.0))
-        print(f"[LayoutClassifier] scene classification failed: {last_err}")
+                    delay = min(2.0 ** attempt, 4.0)
+                    if _budget is not None:
+                        delay = min(delay, _budget.remaining_s())
+                    if delay > 0:
+                        time.sleep(delay)
+        if last_err is not None:
+            print(f"[LayoutClassifier] scene classification failed: {last_err}")
         return None
     except Exception as e:
         print(f"[LayoutClassifier] scene classification failed: {e}")
