@@ -16,7 +16,7 @@ SAMPLE_WIDTH = int(os.environ.get("LAYOUT_SAMPLE_WIDTH", "1024"))
 
 VALID_LAYOUTS = {"none", "standard", "split", "screencast", "inset"}
 
-LAYOUT_PROMPT = """Analyze these 12 sampled frames from a video.
+LAYOUT_PROMPT = """Analyze these sampled frames from one video scene.
 Determine the most appropriate vertical (9:16) video framing layout among these options:
 1. "split": A two-person podcast or dialogue where two main speakers sit apart in a wide shot.
 2. "screencast": A screen recording, software demo, presentation, code editor, or spreadsheet where full-width screen content is essential.
@@ -27,8 +27,20 @@ Return strict JSON:
 {
   "layout": "none" | "split" | "screencast" | "inset",
   "confidence": 0.0 to 1.0,
+  "screen_evidence": true or false,
   "why": "concise explanation"
 }
+
+Rules:
+- "screen_evidence" must be boolean true ONLY when you see positive,
+  unambiguous screen content (code editor, slides, spreadsheet, software UI,
+  gameplay) filling a substantial part of the frame. A talking head, wall
+  poster, or corner face alone is NOT screen evidence; set it false.
+- "screencast"/"inset" require "screen_evidence": true. Do not label a
+  natural scene "screencast" just because a face is visible.
+- "why" must be a nonempty concise explanation naming what you saw.
+- The number of frames provided varies by scene length; judge only what
+  is shown.
 """
 
 
@@ -98,12 +110,25 @@ def classify_layout(video_path, api_key=None, model_name=None):
         return "none"
 
 
+def is_auto_layout_enabled():
+    """AUTO_LAYOUT as opt-in flag. Unset/empty/false -> False. Never raises."""
+    try:
+        return os.environ.get("AUTO_LAYOUT", "0").strip().lower() in ("1", "true", "yes")
+    except Exception:
+        return False
+
+
 def pick_and_apply_layout(video_path, explicit_layout=None, api_key=None):
-    """Determine the effective layout strategy."""
+    """Determine the effective layout strategy.
+
+    Explicit modes pass through unchanged. "auto" (or unset) consults the
+    invocation-time AUTO_LAYOUT flag: when disabled, no classification runs
+    and "auto" is returned. Never triggers paid classification while off.
+    """
     if explicit_layout and explicit_layout not in ("auto", "none"):
         return explicit_layout
 
-    if ENABLED or explicit_layout == "auto":
+    if is_auto_layout_enabled():
         detected = classify_layout(video_path, api_key=api_key)
         return detected if detected != "none" else "auto"
 
@@ -111,8 +136,6 @@ def pick_and_apply_layout(video_path, explicit_layout=None, api_key=None):
 
 
 # --- Task 02: scene-local semantic classification ---------------------------
-# Separate semantic ELIGIBILITY (is there a screen?) from presenter GEOMETRY
-# (where is the speaker?). Auto-promotion requires both.
 
 # Policy defaults (provisional, not calibrated). Conservative: failures
 # retain the previous strategy.
@@ -126,12 +149,24 @@ MAX_PRESENTER_SPREAD_FRACTION = 0.10
 MAX_SCENE_SAMPLES = 8
 CLASSIFY_TIMEOUT_S = 30
 
+# Invocation-level budgets (per maybe_promote_screencast call)
+MAX_SCENES_PER_INVOCATION = 32
+MAX_REQUESTS_PER_INVOCATION = 16
+INVOCATION_DEADLINE_S = 120.0
+GEMINI_MAX_RETRIES = 2
+
 
 def parse_layout_response(text):
     """Validate a provider JSON response into structured evidence.
 
-    Returns dict with layout, confidence, screen_evidence, reason;
-    or None when invalid. Never raises.
+    Strict contract:
+    - layout in VALID_LAYOUTS ("standard" maps to "none")
+    - confidence: finite number in [0, 1] (bool rejected)
+    - screen_evidence: must be boolean. For "screencast"/"inset" it must be
+      exactly True; False/missing/invalid never becomes positive from the
+      label alone.
+    - why/reason: nonempty string.
+    Returns the evidence dict, or None when invalid. Never raises.
     """
     import json
     import math
@@ -148,24 +183,25 @@ def parse_layout_response(text):
     if layout not in VALID_LAYOUTS:
         return None
     conf = data.get("confidence")
-    # Reject NaN/Infinity/bool/non-numeric; must be finite in [0, 1].
     if isinstance(conf, bool) or not isinstance(conf, (int, float)):
         return None
     if not math.isfinite(conf) or not (0.0 <= conf <= 1.0):
         return None
     reason = data.get("why") or data.get("reason") or ""
-    if not isinstance(reason, str):
+    if not isinstance(reason, str) or not reason.strip():
         return None
-    # Positive screen-content evidence: explicit flag or a screencast/
-    # inset label with high confidence. A bare label is not sufficient.
-    screen_evidence = bool(data.get("screen_evidence"))
-    if layout in ("screencast", "inset") and conf >= MIN_SEMANTIC_CONFIDENCE:
+    ev = data.get("screen_evidence")
+    if layout in ("screencast", "inset"):
+        if ev is not True:
+            return None
         screen_evidence = True
+    else:
+        screen_evidence = ev is True
     return {
         "layout": layout,
         "confidence": float(conf),
         "screen_evidence": screen_evidence,
-        "reason": reason[:500],
+        "reason": reason.strip()[:500],
     }
 
 
@@ -174,10 +210,15 @@ def sample_scene_frames(video_path, start_frame, end_frame, n=MAX_SCENE_SAMPLES,
     """JPEG bytes for n frames within [start_frame, end_frame).
 
     Deduplicates indices; all samples lie inside the half-open scene
-    bounds. Returns [] on unreadable video. Never raises.
+    bounds. n is clamped to [1, MAX_SCENE_SAMPLES]. Returns [] on
+    unreadable video. Never raises.
     """
     import cv2
 
+    try:
+        n = max(1, min(int(n), MAX_SCENE_SAMPLES))
+    except (TypeError, ValueError):
+        n = MAX_SCENE_SAMPLES
     try:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -186,7 +227,6 @@ def sample_scene_frames(video_path, start_frame, end_frame, n=MAX_SCENE_SAMPLES,
             s, e = int(start_frame), int(end_frame)
             if e <= s:
                 return []
-            # Evenly spaced, deduplicated, clipped to [s, e).
             import numpy as np
             idxs = sorted(set(int(round(x)) for x in np.linspace(s, e - 1, min(n, e - s))))
             idxs = [i for i in idxs if s <= i < e]
@@ -213,7 +253,7 @@ def classify_scene(video_path, scene_id, start_frame, end_frame,
                    provider=None, api_key=None, model_name=None):
     """Classify one scene's layout. Never raises; returns evidence dict or None.
 
-    ``provider``: injectable callable(frames, prompt) -> response text.
+    provider: injectable callable(frames, prompt) -> response text.
     When None, uses the Gemini provider (requires AUTO_LAYOUT + api_key).
     Returns None on: disabled, no frames, provider error, invalid response,
     low confidence. Callers retain the previous strategy on None.
@@ -242,8 +282,13 @@ def classify_scene(video_path, scene_id, start_frame, end_frame,
     return parsed
 
 
-def _gemini_classify(frames, api_key=None, model_name=None):
-    """Gemini provider. Returns response text or None. Never raises."""
+def _gemini_classify(frames, api_key=None, model_name=None,
+                     timeout_s=CLASSIFY_TIMEOUT_S, max_retries=GEMINI_MAX_RETRIES):
+    """Gemini provider with timeout and bounded retries.
+
+    Returns response text or None. Never raises. No background workers
+    are leaked: each attempt is a single bounded blocking call.
+    """
     api_key = api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
@@ -253,31 +298,30 @@ def _gemini_classify(frames, api_key=None, model_name=None):
         from google.genai import types as genai_types
 
         model_name = get_auxiliary_gemini_model(model_name)
-        client = genai.Client(api_key=api_key)
+        http_opts = genai_types.HttpOptions(timeout=timeout_s * 1000)
+        client = genai.Client(api_key=api_key, http_options=http_opts)
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
                  for b in frames]
-        response = client.models.generate_content(
-            model=model_name,
-            contents=parts + [LAYOUT_PROMPT],
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-        if not response or not response.text:
-            return None
-        return response.text
+        last_err = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=parts + [LAYOUT_PROMPT],
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
+                )
+                if response and response.text:
+                    return response.text
+                return None
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries:
+                    import time
+                    time.sleep(min(2.0 ** attempt, 4.0))
+        print(f"[LayoutClassifier] scene classification failed: {last_err}")
+        return None
     except Exception as e:
         print(f"[LayoutClassifier] scene classification failed: {e}")
         return None
-
-
-def is_auto_layout_enabled():
-    """AUTO_LAYOUT as opt-in flag. Unset/empty/false -> False. Never raises."""
-    try:
-        return os.environ.get("AUTO_LAYOUT", "0").strip().lower() in ("1", "true", "yes")
-    except Exception:
-        return False
-
-
-# Keep the module-level ENABLED for backward compat (import-time snapshot).
-# New code should call is_auto_layout_enabled() for invocation-time config.

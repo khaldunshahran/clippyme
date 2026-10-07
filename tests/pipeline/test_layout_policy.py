@@ -234,7 +234,8 @@ def test_policy_screen_without_presenter_keeps_general(rf, monkeypatch):
     assert meta == {}
 
 
-def test_policy_preserves_track_and_split(rf, monkeypatch):
+def test_policy_track_with_evidence_promotes(rf, monkeypatch):
+    # TRACK with screen + presenter evidence promotes (webcam scenes).
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
                       api_key=None, model_name=None):
@@ -244,13 +245,48 @@ def test_policy_preserves_track_and_split(rf, monkeypatch):
         fake_classify)
     monkeypatch.setattr(
         "clippyme.pipeline.layouts.screencast_layout.detect_presenter_geometry",
-        lambda *a, **k: {0: (1.0, 1.0), 1: (2.0, 2.0), 2: (3.0, 3.0)})
-    strategies = ["TRACK", "SPLIT", "OBJECT"]
+        lambda *a, **k: {0: (1.0, 1.0)})
+    strategies = ["TRACK"]
+    meta = {}
+    promoted = rf.maybe_promote_screencast("v.mp4", [(0, 90)], strategies, meta)
+    assert promoted == [0]
+    assert strategies == ["SCREENCAST"]
+
+
+def test_policy_split_never_promotes(rf, monkeypatch):
+    # Two-person SPLIT is never auto-promoted.
+    monkeypatch.setenv("AUTO_LAYOUT", "1")
+    def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
+                      api_key=None, model_name=None):
+        return dict(_evidence("screencast"), scene_id=scene_id)
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
+        fake_classify)
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.screencast_layout.detect_presenter_geometry",
+        lambda *a, **k: {0: (1.0, 1.0), 1: (2.0, 2.0)})
+    strategies = ["SPLIT", "OBJECT"]
     meta = {}
     promoted = rf.maybe_promote_screencast(
-        "v.mp4", [(0, 90), (90, 180), (180, 270)], strategies, meta)
+        "v.mp4", [(0, 90), (90, 180)], strategies, meta)
     assert promoted == []
-    assert strategies == ["TRACK", "SPLIT", "OBJECT"]
+    assert strategies == ["SPLIT", "OBJECT"]
+
+
+def test_policy_track_without_evidence_keeps_track(rf, monkeypatch):
+    # Negative/unknown TRACK scenes retain TRACK.
+    monkeypatch.setenv("AUTO_LAYOUT", "1")
+    def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
+                      api_key=None, model_name=None):
+        return None
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
+        fake_classify)
+    strategies = ["TRACK"]
+    meta = {}
+    promoted = rf.maybe_promote_screencast("v.mp4", [(0, 90)], strategies, meta)
+    assert promoted == []
+    assert strategies == ["TRACK"]
 
 
 def test_policy_unknown_evidence_keeps_previous(rf, monkeypatch):
@@ -294,3 +330,110 @@ def test_detect_presenter_geometry_never_fabricates_center(monkeypatch):
     import inspect
     src = inspect.getsource(sl.detect_presenter_geometry)
     assert "orig_w/2" not in src and "orig_h/2" not in src
+
+
+# --- strict evidence contract -----------------------------------------------
+
+import json as _json
+
+def test_evidence_false_cannot_become_positive():
+    r = lc.parse_layout_response(_json.dumps({
+        "layout": "screencast", "confidence": 0.99,
+        "screen_evidence": False, "why": "talking head"}))
+    assert r is None
+
+def test_evidence_missing_reason_invalid():
+    r = lc.parse_layout_response(_json.dumps({
+        "layout": "screencast", "confidence": 0.99,
+        "screen_evidence": True}))
+    assert r is None
+
+def test_evidence_none_layout_ok():
+    r = lc.parse_layout_response(_json.dumps({
+        "layout": "none", "confidence": 0.95, "why": "vlog"}))
+    assert r is not None and r["screen_evidence"] is False
+
+
+# --- budgets -----------------------------------------------------------------
+
+def test_budget_max_requests_stops_early(rf, monkeypatch):
+    monkeypatch.setenv("AUTO_LAYOUT", "1")
+    calls = []
+    def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
+                      api_key=None, model_name=None):
+        calls.append(scene_id)
+        return dict(_evidence("screencast"), scene_id=scene_id)
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
+        fake_classify)
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.screencast_layout.detect_presenter_geometry",
+        lambda *a, **k: {i: (1.0, 1.0) for i in range(10)})
+    strategies = ["GENERAL"] * 10
+    meta = {}
+    promoted = rf.maybe_promote_screencast(
+        "v.mp4", [(i*90, (i+1)*90) for i in range(10)],
+        strategies, meta, max_requests=3)
+    assert len(calls) == 3
+    assert promoted == [0, 1, 2]
+
+def test_budget_deadline_stops_early(rf, monkeypatch):
+    monkeypatch.setenv("AUTO_LAYOUT", "1")
+    ticks = [0.0]
+    def fake_clock():
+        ticks[0] += 100.0  # jump past deadline immediately
+        return ticks[0]
+    def fake_classify(*a, **k):
+        raise AssertionError("should not be called after deadline")
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
+        fake_classify)
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.screencast_layout.detect_presenter_geometry",
+        lambda *a, **k: {0: (1.0, 1.0)})
+    strategies = ["GENERAL"]
+    meta = {}
+    promoted = rf.maybe_promote_screencast(
+        "v.mp4", [(0, 90)], strategies, meta,
+        deadline_s=1.0, _clock=fake_clock)
+    assert promoted == []
+
+def test_no_provider_call_without_geometry(rf, monkeypatch):
+    # Scenes lacking presenter geometry skip paid classification.
+    monkeypatch.setenv("AUTO_LAYOUT", "1")
+    calls = []
+    def fake_classify(*a, **k):
+        calls.append(1)
+        return None
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
+        fake_classify)
+    monkeypatch.setattr(
+        "clippyme.pipeline.layouts.screencast_layout.detect_presenter_geometry",
+        lambda *a, **k: {})
+    strategies = ["GENERAL", "GENERAL"]
+    meta = {}
+    rf.maybe_promote_screencast("v.mp4", [(0, 90), (90, 180)], strategies, meta)
+    assert calls == []
+
+
+# --- compatibility wrapper ----------------------------------------------------
+
+def test_pick_and_apply_explicit_passthrough(monkeypatch):
+    monkeypatch.setenv("AUTO_LAYOUT", "0")
+    assert lc.pick_and_apply_layout("v.mp4", explicit_layout="screencast") == "screencast"
+    assert lc.pick_and_apply_layout("v.mp4", explicit_layout="split") == "split"
+
+def test_pick_and_apply_auto_disabled_returns_auto(monkeypatch):
+    monkeypatch.setenv("AUTO_LAYOUT", "false")
+    calls = []
+    monkeypatch.setattr(lc, "classify_layout", lambda *a, **k: calls.append(1) or "screencast")
+    assert lc.pick_and_apply_layout("v.mp4", explicit_layout="auto") == "auto"
+    assert calls == []
+
+def test_pick_and_apply_auto_unset_returns_auto(monkeypatch):
+    monkeypatch.delenv("AUTO_LAYOUT", raising=False)
+    calls = []
+    monkeypatch.setattr(lc, "classify_layout", lambda *a, **k: calls.append(1) or "screencast")
+    assert lc.pick_and_apply_layout("v.mp4", explicit_layout="auto") == "auto"
+    assert calls == []
