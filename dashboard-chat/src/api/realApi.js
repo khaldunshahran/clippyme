@@ -1057,3 +1057,16 @@ export async function getAnalyticsInsights() {
   return res.json();
 }
 
+// --- Caption templates (slice 2: word-highlight palette) ------------------
+// Memoized: every editor surface resolves highlight colors from the backend
+// so no hex is ever hardcoded in the frontend. Never rejects ({} on error).
+let _captionTemplatesPromise = null;
+export function getCaptionTemplates() {
+  if (!_captionTemplatesPromise) {
+    _captionTemplatesPromise = apiFetch(getApiUrl('/api/caption-templates'))
+      .then((res) => (res.ok ? res.json().catch(() => ({})) : {}))
+      .catch(() => ({}));
+  }
+  return _captionTemplatesPromise;
+}
+

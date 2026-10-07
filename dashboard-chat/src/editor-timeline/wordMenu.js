@@ -34,6 +34,32 @@ export function applyWordEdit(project, wordId, text) {
   return project;
 }
 
+/**
+ * Slice 2: highlight words -> captions.word_colors keyed by stable word ID.
+ * colorIndex 0 = template default (deletes the key -- 0 is stored as absent),
+ * 1 = Color 1, 2 = Color 2. Applies to every id in wordIds.
+ */
+export function applyWordColors(project, wordIds, colorIndex) {
+  if (!Number.isInteger(colorIndex) || colorIndex < 0 || colorIndex > 2) {
+    throw new Error(`color index must be 0, 1, or 2, got ${colorIndex}`);
+  }
+  const ids = [...new Set(wordIds || [])];
+  if (!ids.length) throw new Error("no words selected");
+  const known = new Set((project?.captions?.words || []).map((w) => w.id));
+  for (const id of ids) {
+    if (!known.has(id)) throw new Error(`unknown word id ${id}`);
+  }
+  if (!project.captions) project.captions = {};
+  const wc = { ...(project.captions.word_colors || {}) };
+  for (const id of ids) {
+    if (colorIndex === 0) delete wc[id];
+    else wc[id] = colorIndex;
+  }
+  project.captions.word_colors = wc;
+  project.origin = "user";
+  return project;
+}
+
 /** Slice 1: split & trim -> split the containing segment at the word start. */
 export function applySplitAtWord(project, word) {
   const before = (project.segments || []).length;
@@ -102,4 +128,20 @@ export function slice1Menu({ hasRange, hasRemoved, allRemoved }) {
     hint: hasRange ? "selected range" : undefined,
   });
   return items;
+}
+
+/** Menu descriptor for the transcript panel (slice 2: slice 1 + Highlight). */
+export function slice2Menu(opts) {
+  return [
+    ...slice1Menu(opts),
+    {
+      id: "highlight",
+      label: "Highlight",
+      submenu: [
+        { id: "color-0", label: "Default" },
+        { id: "color-1", label: "Color 1" },
+        { id: "color-2", label: "Color 2" },
+      ],
+    },
+  ];
 }

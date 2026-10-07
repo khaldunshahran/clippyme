@@ -8,10 +8,12 @@ import {
   applyRemoveWords,
   applyRestoreWords,
   applySplitAtWord,
+  applyWordColors,
   applyWordEdit,
   displayWord,
-  slice1Menu,
+  slice2Menu,
 } from './wordMenu.js';
+import { getCaptionTemplates } from '../api/realApi.js';
 import './transcript.css';
 
 /**
@@ -43,7 +45,17 @@ export default function TranscriptPanel({
   const [editText, setEditText] = useState('');
   const [activeId, setActiveId] = useState(null); // word under playhead
   const [busy, setBusy] = useState(false);
+  const [palette, setPalette] = useState(null); // caption-template palette
   const commitGuard = useRef(false); // Enter+blur must not double-commit
+
+  // Slice 2: caption-template palette (Color 0/1/2 hex per preset) for word
+  // highlights -- fetched once (memoized in realApi), resolved via the
+  // backend so no hex is hardcoded in the editor.
+  useEffect(() => {
+    let alive = true;
+    getCaptionTemplates().then((p) => { if (alive) setPalette(p); });
+    return () => { alive = false; };
+  }, []);
 
   const startEdit = (w, i) => {
     setAnchor(i);
@@ -185,6 +197,17 @@ export default function TranscriptPanel({
         );
         setSel([]);
         pushToast?.('Restored to timeline');
+      } else if (id === 'color-0' || id === 'color-1' || id === 'color-2') {
+        // Slice 2: highlight the FULL shift-click selection (not just the
+        // right-clicked word) via the undo-safe edit queue.
+        const colorIndex = Number(id.slice('color-'.length));
+        if (!targets.length) return;
+        await applyEdit(
+          `highlight ${targets.length} word${targets.length > 1 ? 's' : ''}`,
+          (before) => applyWordColors(
+            before, targets.map((t) => t.id), colorIndex)
+        );
+        pushToast?.(`Highlighted ${targets.length} word${targets.length > 1 ? 's' : ''}`);
       }
     }).catch(() => {});
   };
@@ -205,12 +228,18 @@ export default function TranscriptPanel({
     }).catch(() => {});
   };
 
-  const menuItems = slice1Menu({
+  const menuItems = slice2Menu({
     hasRange: selectedWords.length > 1,
     hasRemoved: selectedWords.some((w) => w.removed),
     allRemoved:
       selectedWords.length > 0 && selectedWords.every((w) => w.removed),
   });
+
+  // Slice 2: per-word highlight color from the template palette. No inline
+  // color until the palette loads (falls back to the default word style).
+  const wordColors = project?.captions?.word_colors || {};
+  const paletteColors = palette?.[project?.captions?.style]?.colors;
+  const wordHex = (w) => paletteColors?.[String(wordColors[w.id] ?? 0)] || null;
 
   return (
     <div className="tp" data-testid="transcript-panel">
@@ -276,6 +305,7 @@ export default function TranscriptPanel({
             <span
               key={w.id}
               className={cls}
+              style={wordHex(w) ? { color: wordHex(w) } : undefined}
               title={`${fmtTime(w.start)} → ${fmtTime(w.end)} (source)`}
               onClick={(e) => onWordClick(e, w, i)}
               onContextMenu={(e) => onWordContext(e, w, i)}
@@ -301,15 +331,42 @@ export default function TranscriptPanel({
           onMouseDown={(e) => e.stopPropagation()}
         >
           {menuItems.map((m) => (
-            <button
-              key={m.id}
-              className={'tp-menu-item' + (m.danger ? ' danger' : '')}
-              disabled={disabled || busy}
-              onClick={() => doAction(m.id)}
-            >
-              {m.label}
-              {m.hint && <span className="tp-menu-hint">{m.hint}</span>}
-            </button>
+            m.submenu ? (
+              <div key={m.id} className="tp-menu-group">
+                <div className="tp-menu-label">{m.label}</div>
+                {m.submenu.map((s) => {
+                  // Color dot from the template palette -- never hardcoded.
+                  const dot = paletteColors?.[s.id.replace('color-', '')];
+                  return (
+                    <button
+                      key={s.id}
+                      className="tp-menu-item tp-menu-subitem"
+                      disabled={disabled || busy}
+                      onClick={() => doAction(s.id)}
+                    >
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        {dot && (
+                          <span style={{ width: 12, height: 12, borderRadius: '50%',
+                            background: dot, border: '1px solid rgba(255,255,255,.25)',
+                            flexShrink: 0 }} />
+                        )}
+                        {s.label}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <button
+                key={m.id}
+                className={'tp-menu-item' + (m.danger ? ' danger' : '')}
+                disabled={disabled || busy}
+                onClick={() => doAction(m.id)}
+              >
+                {m.label}
+                {m.hint && <span className="tp-menu-hint">{m.hint}</span>}
+              </button>
+            )
           ))}
         </div>
       )}

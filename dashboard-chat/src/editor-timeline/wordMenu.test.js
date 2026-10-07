@@ -2,7 +2,13 @@
  * wordMenu: removed flag + restore (Phase A item 1).
  */
 import { describe, expect, it } from 'vitest';
-import { applyRemoveWords, applyRestoreWords, slice1Menu } from './wordMenu.js';
+import {
+  applyRemoveWords,
+  applyRestoreWords,
+  applyWordColors,
+  slice1Menu,
+  slice2Menu,
+} from './wordMenu.js';
 
 const crop = { x: 0, y: 0, w: 1080, h: 1920 };
 function project() {
@@ -77,5 +83,69 @@ describe('slice1Menu', () => {
     const ids = slice1Menu({ hasRange: false, hasRemoved: false, allRemoved: false })
       .map((m) => m.id);
     expect(ids).toEqual(['edit', 'split', 'remove']);
+  });
+});
+
+describe('applyWordColors', () => {
+  it('sets color indexes by word id', () => {
+    const p = project();
+    applyWordColors(p, ['w0', 'w2'], 1);
+    expect(p.captions.word_colors).toEqual({ w0: 1, w2: 1 });
+    expect(p.origin).toBe('user');
+  });
+
+  it('applies to multiple ids at once', () => {
+    const p = project();
+    applyWordColors(p, ['w0', 'w1', 'w2'], 2);
+    expect(p.captions.word_colors).toEqual({ w0: 2, w1: 2, w2: 2 });
+  });
+
+  it('deletes the key for color 0 (default = absent)', () => {
+    const p = project();
+    p.captions.word_colors = { w0: 1, w1: 2 };
+    applyWordColors(p, ['w0'], 0);
+    expect(p.captions.word_colors).toEqual({ w1: 2 });
+  });
+
+  it('rejects a bad color index', () => {
+    expect(() => applyWordColors(project(), ['w0'], 3))
+      .toThrow('color index must be 0, 1, or 2');
+    expect(() => applyWordColors(project(), ['w0'], -1))
+      .toThrow('color index must be 0, 1, or 2');
+    expect(() => applyWordColors(project(), ['w0'], '1'))
+      .toThrow('color index must be 0, 1, or 2');
+  });
+
+  it('rejects unknown word ids', () => {
+    expect(() => applyWordColors(project(), ['w99'], 1))
+      .toThrow('unknown word id w99');
+  });
+
+  it('rejects an empty selection', () => {
+    expect(() => applyWordColors(project(), [], 1))
+      .toThrow('no words selected');
+  });
+
+  it('dedupes repeated ids', () => {
+    const p = project();
+    applyWordColors(p, ['w1', 'w1'], 2);
+    expect(p.captions.word_colors).toEqual({ w1: 2 });
+  });
+});
+
+describe('slice2Menu', () => {
+  it('keeps all slice-1 items and adds the Highlight submenu', () => {
+    const items = slice2Menu({ hasRange: true, hasRemoved: true, allRemoved: false });
+    expect(items.map((m) => m.id)).toEqual(['edit', 'split', 'restore', 'remove', 'highlight']);
+    const hl = items.find((m) => m.id === 'highlight');
+    expect(hl.label).toBe('Highlight');
+    expect(hl.submenu.map((s) => s.id)).toEqual(['color-0', 'color-1', 'color-2']);
+    expect(hl.submenu.map((s) => s.label)).toEqual(['Default', 'Color 1', 'Color 2']);
+  });
+
+  it('still shows only restore + highlight when everything is removed', () => {
+    const ids = slice2Menu({ hasRange: false, hasRemoved: true, allRemoved: true })
+      .map((m) => m.id);
+    expect(ids).toEqual(['restore', 'highlight']);
   });
 });
