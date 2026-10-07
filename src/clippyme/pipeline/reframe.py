@@ -975,13 +975,8 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
             print(f"      -> Upgraded scene {idx} to SPLIT")
             
         print("\n   🔍 Step 3.2: Checking for SCREENCAST upgrades in GENERAL scenes...")
-        from clippyme.pipeline.layouts.screencast_layout import detect_screencast_scenes
-        screen_metadata_detected = detect_screencast_scenes(input_video, scenes)
-        for idx in screen_metadata_detected:
-            if scene_strategies[idx] == 'GENERAL':
-                scene_strategies[idx] = 'SCREENCAST'
-                screen_metadata[idx] = screen_metadata_detected[idx]
-                print(f"      -> Upgraded scene {idx} to SCREENCAST")
+        from clippyme.pipeline.layouts.screencast_layout import maybe_promote_screencast
+        maybe_promote_screencast(input_video, scenes, scene_strategies, screen_metadata)
 
     print("\n   ✂️ Step 4: Processing video frames...")
 
