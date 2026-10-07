@@ -55,20 +55,20 @@ def test_existing_directory_passthrough(tmp_path):
 def test_cut_command_shape_and_precision():
     cmd = build_cut_command("/in/video.mp4", 12.3456, 47.9, "/out/source_clip.mp4")
     assert cmd[0] == "ffmpeg" and cmd[1] == "-y"
-    # Fast input seek: -ss BEFORE -i (to 5s before start); the trim
-    # filters select the exact interval.
-    assert cmd.index("-ss") < cmd.index("-i")
-    assert cmd[cmd.index("-ss") + 1] == "7.346"           # 12.346 - 5.0
+    # Reference shape: no input -ss; trim filters own the interval.
+    assert "-ss" not in cmd, "input seek changes the trim clock"
+    assert cmd.index("-i") < cmd.index("-vf")
     assert cmd[-1] == "/out/source_clip.mp4"
-    # Accurate-cut contract: video re-encoded via the shared x264 policy.
-    # Stream-aware trim filters select the interval on each stream's own
-    # timeline, then rebase by the shared start origin.
-    assert "copy" not in cmd
+    # Normalized shared clock: SAME [S,E) for both streams, SAME S subtracted.
     vf = cmd[cmd.index("-vf") + 1]
-    assert "trim=start=12.346:end=47.900" in vf
-    assert "setpts=PTS-12.346/TB" in vf
-    # No -t, no -frames:v: trim filters own the boundaries (VFR-safe).
-    assert "-t" not in cmd
+    assert vf == "trim=start=12.346:end=47.900,setpts=PTS-12.346/TB"
+    af = cmd[cmd.index("-af") + 1]
+    assert af == "atrim=start=12.346:end=47.900,asetpts=PTS-12.346/TB"
+    assert "-fps_mode" in cmd and cmd[cmd.index("-fps_mode") + 1] == "passthrough"
+    # Stream specifiers: 0:v:0 and optional 0:a? (no probing).
+    assert "0:v:0" in cmd and "0:a?" in cmd
+    # Video re-encoded via shared policy; no stream copy, no frame caps.
+    assert "copy" not in cmd
     assert "-frames:v" not in cmd
 
 

@@ -95,14 +95,12 @@ def test_build_cut_command_rejects_bad_intervals(tmp_path):
 
 
 def test_build_cut_command_accurate_seek_shape():
-    """Input -ss for speed + trim filters for accuracy; streams re-encode."""
+    """Reference shape: no -ss; trim filters select [S,E); streams re-encode."""
     cmd = build_cut_command("in.mp4", 3.5, 7.5, "out.mp4")
-    i_idx = cmd.index("-i")
-    ss_idx = cmd.index("-ss")
-    assert ss_idx < i_idx, "fast input seek before -i"
+    assert "-ss" not in cmd, "input seek changes the trim clock"
     assert "copy" not in cmd, "stream copy must not be used"
     vf = cmd[cmd.index("-vf") + 1]
-    assert "trim=start=3.500:end=7.500" in vf, "trim selects exact interval"
+    assert vf == "trim=start=3.500:end=7.500,setpts=PTS-3.500/TB"
 
 
 # --- frame accuracy ------------------------------------------------------------
@@ -272,7 +270,7 @@ def test_provenance_record_shape(tmp_path):
     src.write_bytes(b"x" * 100)
     rec = slice_provenance(start=1.0, end=2.0,
                            source_fp=source_fingerprint(str(src)))
-    assert rec["version"] == 3
+    assert rec["version"] == 4
     assert rec["start"] == 1.0 and rec["end"] == 2.0
     assert rec["source"]["size"] == 100
 
@@ -506,9 +504,10 @@ def test_last_frame_respects_half_open_end(tmp_path):
     s149 = ssim(last_png, ref149)
     s150 = ssim(last_png, ref150)
     print(f"\nlast-frame SSIM vs 149: {s149:.4f}, vs 150: {s150:.4f}")
-    # Half-open [3.517, 5.0): last frame must be inside the interval.
-    # 149 is inside; 150 is exactly at the exclusive end.
-    assert max(s149, s150) > 0.90, "last frame must match a source frame near the end"
+    # Half-open [3.517, 5.0): frame 149 is inside, 150 is at the
+    # exclusive end and must NOT be retained.
+    assert s149 > s150, "last frame must be 149 (inside), not 150 (excluded)"
+    assert s149 > 0.90, f"last frame should match source frame 149, SSIM={s149}"
     print(f"last frame is '149 (inside)' if s149 > s150 else '150 (at boundary)'")
 
 
@@ -564,8 +563,30 @@ def test_genuine_stream_offset_preserved(tmp_path):
     # We verify via the beep alignment + a duration check rather than
     # frame identity (frame numbers shift with the offset).
     dur = _probe_duration(cut)
-    # Genuine 0.5s video offset preserved: video [0.5, 2.5), audio [0, 2).
-    assert abs(dur - 2.5) < 0.2, f"duration {dur}, expected ~2.5s"
+    # Normalized shared clock: both streams trimmed to [3.5, 5.5), rebased
+    # by 3.5. Duration is exactly 2.0s; the genuine offset is preserved in
+    # content alignment, not in duration.
+    assert abs(dur - 2.0) < 0.2, f"duration {dur}, expected 2.0s"
+    # Video identity: first frame must be source frame 90 (at 3.5s), not
+    # frame 105 (at 4.0s, the rev3 error).
+    first_png = str(tmp_path / "first.png")
+    _extract_frame(cut, first_png, 0)
+    ref90 = str(tmp_path / "ref90.png")
+    _extract_frame(src, ref90, 90)
+    ref105 = str(tmp_path / "ref105.png")
+    _extract_frame(src, ref105, 105)
+    def _ssim(a, b):
+        import re
+        flt = (f"[0:v][1:v]ssim")
+        err = _run([FFMPEG, "-i", a, "-i", b, "-filter_complex", flt,
+                    "-f", "null", "-"], text=True).stderr
+        m = re.search(r"All:([0-9.]+)", err)
+        return float(m.group(1)) if m else 0.0
+    s90 = _ssim(first_png, ref90)
+    s105 = _ssim(first_png, ref105)
+    print(f"\nfirst-frame SSIM vs 90: {s90:.4f}, vs 105: {s105:.4f}")
+    assert s90 > s105, "first frame must be 90 (at 3.5s), not 105 (at 4.0s)"
+    assert s90 > 0.90, f"first frame should match source frame 90, SSIM={s90}"
 
 
 @needs_ff
@@ -605,3 +626,32 @@ def test_source_mutation_rejected_before_swap(tmp_path):
     assert fp_before != fp_after, "mutation must be detectable"
     # The pre-swap check is a dict inequality:
     assert fp_after != fp_before
+
+
+def test_v3_slice_rejected_by_v4_contract(tmp_path):
+    """A revision-2 (v3) slice/stamp must NOT be reused under v4.
+
+    The timing contract changed (normalized shared-clock trim); v3 slices
+    used incorrect content selection. The reuse validator must reject them
+    so they are re-cut, not silently reused.
+    """
+    from clippyme.pipeline import run_ops
+
+    assert run_ops._SLICE_PROVENANCE_VERSION == 4
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"x" * 5000)
+    dest = tmp_path / "slice.mp4"
+    dest.write_bytes(b"y" * 8000)
+    # Write a v3 stamp (simulating a revision-2 slice)
+    import json, time
+    stamp = {
+        "version": 3,
+        "start": 1.0, "end": 3.0,
+        "source_fingerprint": run_ops.source_fingerprint(str(src)),
+        "size": 8000, "mtime": dest.stat().st_mtime,
+    }
+    (tmp_path / "slice.provenance.json").write_text(json.dumps(stamp))
+    # v4 validator must reject v3
+    assert not run_ops.slice_provenance_valid(
+        str(dest), start=1.0, end=3.0, source_path=str(src)
+    ), "v3 stamp must be invalid under v4 contract"

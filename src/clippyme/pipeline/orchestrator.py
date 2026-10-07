@@ -652,28 +652,49 @@ def _clip_bounds(clip: dict[str, Any]) -> tuple[float, float]:
 
 
 
-def _maybe_emit_clip_project(**kwargs) -> str | None:
+def _maybe_emit_clip_project(**kwargs):
     """Emit the default-edit project unless the user already edited it.
 
-    Preservation guard (Task 01 rev 2): on resume, a completed clip's
-    working project may carry user edits (version > 1). Overwriting it
-    with a fresh version-1 project would silently discard their work.
+    Preservation guard (Task 01): a completed clip's project may carry
+    user edits. Overwriting it with a fresh version-1 would silently
+    discard their work or hide an archived user version.
+
+    Resolution contract: check the WORKING file first; if absent, resolve
+    via ``get_project_path`` which falls back to the latest archived
+    version. Preserve any resolved project with user edits -- including
+    archived-only state -- by not emitting a new default.
     """
     from clippyme.pipeline.project_emit import PROJECT_FILENAME_TEMPLATE
 
     output_dir = kwargs.get("output_dir")
     index = kwargs.get("index")
     if output_dir is not None and index is not None:
-        project_path = os.path.join(
+        working = os.path.join(
             output_dir, PROJECT_FILENAME_TEMPLATE.format(index=index)
         )
-        if project_has_user_edits(project_path):
+        # 1. Working file exists: preserve if it has user edits.
+        if os.path.isfile(working) and project_has_user_edits(working):
             print(
                 f"clip-project: preserving user-edited project for clip {index + 1}",
                 flush=True,
             )
-            return project_path
+            return working
+        # 2. No working file: resolve via the fallback contract (archived).
+        if not os.path.isfile(working):
+            try:
+                from clippyme.domain.project_render import get_project_path
+
+                resolved = get_project_path(output_dir, index)
+            except Exception:
+                resolved = None
+            if resolved and project_has_user_edits(resolved):
+                print(
+                    f"clip-project: preserving archived user project for clip {index + 1}",
+                    flush=True,
+                )
+                return resolved
     return emit_clip_project(**kwargs)
+
 
 
 def _render_one_clip(

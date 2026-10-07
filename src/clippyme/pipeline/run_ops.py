@@ -102,7 +102,10 @@ def build_vfr_normalization_command(input_video: str, dest: str) -> list[str]:
 
 # Bump when the slice contract changes in a way that invalidates slices
 # cut by an older implementation (resume must re-cut them).
-_SLICE_PROVENANCE_VERSION = 3
+# v4: timing contract changed (normalized shared-clock trim; no input
+# seek, no per-stream offset additions). v3 slices used incorrect content
+# selection and must be re-cut, not reused.
+_SLICE_PROVENANCE_VERSION = 4
 
 # --- Timing convention (single source of truth) ------------------------------
 # A source slice is a half-open interval [start, end) on the SOURCE timeline,
@@ -117,72 +120,23 @@ _SLICE_PROVENANCE_VERSION = 3
 #   timestamp < the requested end. Callers pass ``frames`` (computed from
 #   probed source fps as floor((end - start) * fps)) so the frame count is
 #   deterministic; a frame exactly AT ``end`` is NOT retained.
-# PRESENTATION ORIGIN: streams are trimmed on their OWN timelines to
-#   select the correct content, then re-based by the SAME shared origin.
-#   ``stream_trim_args`` probes video/audio start_times; if they differ,
-#   the trim interval is shifted per-stream (e.g. video at +0.5s trims
-#   [start+0.5, end+0.5) on video PTS). Both streams are then re-based by
-#   subtracting the requested ``start`` -- a single shared constant -- so
-#   genuine inter-stream offsets are preserved (video 0.5s late stays 0.5s
-#   late) while the slice timeline is anchored at the requested start.
-#   Slice time T corresponds to source container time (T + start).
-#   Encoder-introduced sub-frame offsets (B-frame delay, AAC priming) may
-#   appear as small positive first timestamps; downstream consumers map
-#   against the requested start, the documented shared origin.
+# PRESENTATION ORIGIN (normalized shared-clock baseline):
+#   ``-i source -vf trim=start=S:end=E,setpts=PTS-S/TB
+#     -af atrim=start=S:end=E,asetpts=PTS-S/TB -fps_mode passthrough``
+#   Both streams are trimmed to the SAME [S, E) on the normalized
+#   container-elapsed clock, then both are re-based by subtracting the SAME
+#   requested S. FFmpeg's container-origin normalization handles genuine
+#   stream start offsets; we do NOT add stream start_times to trim
+#   boundaries (that selects different source intervals per stream).
+#   No input -ss: seeking changes the clock the trim filters see.
+#   ``fps_mode passthrough`` preserves VFR frame timing.
+#   Slice time T corresponds to source container-elapsed time (T + S).
+#   Encoder sub-frame offsets (B-frame delay, AAC priming) may appear as
+#   small positive first timestamps; consumers map against requested S.
 #
 # All downstream consumers (word timings, compose, Smart Cut, project emit,
 # reframe audio extraction) use the REQUESTED start as slice time 0, which
 # is the shared rebase origin. No consumer re-rounds independently.
-
-
-def stream_trim_args(
-    input_video: str, start: float, end: float
-) -> tuple[str, str, bool]:
-    """Per-stream trim filter args accounting for genuine stream offsets.
-
-    Probes video/audio start_times. Returns (video_filters, audio_filters,
-    has_audio). Each stream is trimmed on its OWN timeline:
-    [start+offset, end+offset), then both are re-based by the shared
-    ``start`` origin. When offsets are equal (the common case), this
-    reduces to identical trims. Never raises; falls back to zero offsets
-    if probing fails.
-    """
-    v_off, a_off, has_audio = 0.0, 0.0, False
-    try:
-        from clippyme.pipeline.media_qa import probe_media
-
-        # probe_media gives stream start via ffprobe; use a light probe here
-        import json
-        import shutil
-        import subprocess
-
-        ffprobe = shutil.which("ffprobe")
-        if ffprobe:
-            out = subprocess.run(
-                [ffprobe, "-v", "error", "-show_entries",
-                 "stream=index,codec_type,start_time",
-                 "-of", "json", input_video],
-                capture_output=True, text=True, timeout=15,
-            )
-            if out.returncode == 0:
-                for s in json.loads(out.stdout or "{}").get("streams", []):
-                    try:
-                        st = float(s.get("start_time", 0.0))
-                    except (TypeError, ValueError):
-                        st = 0.0
-                    if s.get("codec_type") == "video" and s.get("index") == 0:
-                        v_off = st
-                    elif s.get("codec_type") == "audio":
-                        has_audio = True
-                        if s.get("index") == 1:
-                            a_off = st
-    except Exception:
-        pass
-    s, e = float(start), float(end)
-    # Shared rebase origin: subtract the requested start from both.
-    v_trim = f"trim=start={s + v_off:.3f}:end={e + v_off:.3f},setpts=PTS-{s:.3f}/TB"
-    a_trim = f"atrim=start={s + a_off:.3f}:end={e + a_off:.3f},asetpts=PTS-{s:.3f}/TB"
-    return v_trim, a_trim, has_audio
 
 
 def build_cut_command(
@@ -190,47 +144,35 @@ def build_cut_command(
 ) -> list[str]:
     """ffmpeg argv for cutting the 16:9 source slice of one clip.
 
-    Accurate cut: input-side ``-ss`` seeks fast to just before the
-    interval, then ``trim``/``atrim`` filters select the exact [start, end)
-    range on each stream's OWN timeline (accounting for genuine stream
-    start offsets via ``stream_trim_args``). Video and audio are re-encoded
-    with the shared encode policy (``domain.encode.x264_video_args``). No
-    keyframe preroll; correct timing has priority over cut speed.
+    Normalized shared-clock baseline (verified reference):
+    ``-i source -vf trim=start=S:end=E,setpts=PTS-S/TB
+      -af atrim=start=S:end=E,asetpts=PTS-S/TB -fps_mode passthrough``
 
-    Shared source clock: each stream is trimmed to its correct interval,
-    then both are re-based by subtracting the SAME requested ``start``.
-    Genuine inter-stream offsets are preserved; the slice timeline is
-    anchored at the requested start. See the timing convention above.
-
-    End boundary: the trim filters limit by presentation timestamp, which
-    is correct for VFR sources (no frame-count arithmetic).
-
-    Audio: re-encoded to AAC. Audio mapping is included only when the
-    source has an audio stream (probed by ``stream_trim_args``).
+    Both streams trim to the SAME [S, E) and rebase by the SAME S.
+    No input -ss (it changes the clock trim sees). ``fps_mode passthrough``
+    preserves VFR timing. Video/audio re-encoded with the shared policy
+    (``domain.encode.x264_video_args``); ``-map 0:a?`` keeps audio
+    optional without probing. Correct timing has priority over cut speed.
     """
     start_f, end_f = float(start), float(end)
-    clip_duration = end_f - start_f
-    if not (clip_duration > 0):
+    if not (end_f - start_f > 0):
         raise ValueError(f"invalid cut interval start={start_f} end={end_f}")
     if start_f < 0:
         raise ValueError(f"cut start must be >= 0, got {start_f}")
-    v_trim, a_trim, has_audio = stream_trim_args(input_video, start_f, end_f)
-    # Fast input seek to 5s before the interval (or 0); the trim filters
-    # select the exact range. Absolute trim timestamps remain valid after
-    # input seeking.
-    seek = max(0.0, start_f - 5.0)
-    cmd = [
+    s = f"{start_f:.3f}"
+    e = f"{end_f:.3f}"
+    return [
         'ffmpeg', '-y',
-        '-ss', f'{seek:.3f}',
         '-i', input_video,
         '-map', '0:v:0',
-        '-vf', v_trim,
+        '-map', '0:a?',
+        '-vf', f'trim=start={s}:end={e},setpts=PTS-{s}/TB',
+        '-af', f'atrim=start={s}:end={e},asetpts=PTS-{s}/TB',
+        '-fps_mode', 'passthrough',
         *x264_video_args(faststart=False),
+        '-c:a', 'aac',
+        dest,
     ]
-    if has_audio:
-        cmd += ['-map', '0:a?', '-af', a_trim, '-c:a', 'aac']
-    cmd.append(dest)
-    return cmd
 
 
 
@@ -374,12 +316,11 @@ def validate_cut_output(
     dur = report.get("duration")
     if dur is None:
         return False, "unknown duration"
-    # Lower bound: must not be truncated. Upper bound: allow +1.0s for
-    # genuine inter-stream offsets (video may extend beyond audio).
-    if dur < expected_duration - 0.2:
-        return False, f"duration {dur:.3f}s too short for {expected_duration:.3f}s"
-    if dur > expected_duration + 1.0:
-        return False, f"duration {dur:.3f}s too long for {expected_duration:.3f}s"
+    # Tight validation: duration must match the requested interval.
+    # The normalized shared-clock cut selects exactly [S, E); incorrect
+    # content selection must fail, not be accommodated.
+    if abs(dur - expected_duration) > 0.2:
+        return False, f"duration {dur:.3f}s not within tolerance of {expected_duration:.3f}s"
     return True, ""
 
 
