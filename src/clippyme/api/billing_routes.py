@@ -67,7 +67,7 @@ async def stripe_webhook(
     secret = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
     if not secret:
         logger.error("Stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured.")
-        raise HTTPException(status_code=500, detail="Stripe webhook secret not configured")
+        raise HTTPException(status_code=503, detail="Stripe webhook secret not configured")
 
     if not stripe_signature:
         raise HTTPException(status_code=400, detail="Missing stripe-signature header")

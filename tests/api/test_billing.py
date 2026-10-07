@@ -127,10 +127,10 @@ def test_billing_webhook_security_guards(client, monkeypatch):
     secret = "whsec_guard_test"
     payload = json.dumps({"type": "test"}).encode("utf-8")
 
-    # 1. Unset STRIPE_WEBHOOK_SECRET -> 500 error
+    # 1. Unset STRIPE_WEBHOOK_SECRET -> 503 error
     monkeypatch.delenv("STRIPE_WEBHOOK_SECRET", raising=False)
     resp = client.post("/api/billing/webhook", content=payload)
-    assert resp.status_code == 500
+    assert resp.status_code == 503
     assert "not configured" in resp.json()["detail"]
 
     # 2. Configured secret but missing signature header -> 400
