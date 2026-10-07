@@ -3,6 +3,7 @@
 Used for screen recordings, presentations, and tutorials.
 Preserves full-width content on top and stacks the speaker face below.
 """
+import math
 import os
 
 ENABLED = os.environ.get("SCREENCAST_LAYOUT", "0") == "1"
@@ -78,7 +79,7 @@ def create_screencast_frame(frame, out_w, out_h, face_centre):
 
 def detect_presenter_geometry(video_path, scenes, samples=10,
                               min_coverage=0.60, min_detections=3,
-                              max_spread_fraction=0.10):
+                              max_spread_fraction=0.10, _budget=None):
     """Optional presenter geometry per scene. No fallback.
 
     Returns dict {scene_idx: (cx, cy)} ONLY for scenes with reliable real
@@ -143,6 +144,9 @@ def detect_presenter_geometry(video_path, scenes, samples=10,
         if not (math.isfinite(fw) and math.isfinite(fh) and fw > 0 and fh > 0):
             return found
         for i, (start, end) in enumerate(scenes):
+            # Cooperative budget check: stop starting new scenes after exhaustion.
+            if _budget is not None and _budget.expired():
+                break
             try:
                 s_f = start.get_frames() if hasattr(start, "get_frames") else int(start)
                 e_f = end.get_frames() if hasattr(end, "get_frames") else int(end)
@@ -160,6 +164,11 @@ def detect_presenter_geometry(video_path, scenes, samples=10,
             centers = []
             attempted = 0
             for f_idx in idxs:
+                # Cooperative check before each sample; do not start new
+                # native reads after deadline. Already-running reads are
+                # not preempted (no false hard-preemption claims).
+                if _budget is not None and _budget.expired():
+                    break
                 attempted += 1
                 try:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
@@ -252,34 +261,61 @@ class _InvocationBudget:
     """Shared budget across geometry, sampling, provider attempts, backoff.
 
     Tracks remaining requests and deadline. All consumers check before
-    expensive work. No background threads.
+    expensive work. take_attempt() consumes one actual-call allowance per
+    provider attempt (including retries); take_request() is for scene-level
+    gating only when no per-attempt accounting exists. No background threads.
     """
     def __init__(self, max_requests, deadline_s, clock):
-        self.max_requests = max(0, int(max_requests))
-        self.deadline_s = max(0.0, float(deadline_s))
+        # Validate finite inputs; nonfinite -> zero (conservative, no raise).
+        try:
+            mr = float(max_requests)
+            self.max_requests = int(mr) if math.isfinite(mr) else 0
+        except (TypeError, ValueError):
+            self.max_requests = 0
+        try:
+            dl = float(deadline_s)
+            self.deadline_s = dl if math.isfinite(dl) else 0.0
+        except (TypeError, ValueError):
+            self.deadline_s = 0.0
+        self.max_requests = max(0, self.max_requests)
+        self.deadline_s = max(0.0, self.deadline_s)
         self._clock = clock
         self._t0 = clock()
         self.requests_used = 0
         self.attempts_used = 0
 
     def remaining_s(self):
-        return max(0.0, self.deadline_s - (self._clock() - self._t0))
+        try:
+            return max(0.0, self.deadline_s - (self._clock() - self._t0))
+        except Exception:
+            return 0.0
 
     def expired(self):
         return self.remaining_s() <= 0
 
-    def can_request(self):
-        return not self.expired() and self.requests_used < self.max_requests
+    def _has_allowance(self):
+        return not self.expired() and self.attempts_used < self.max_requests
 
-    def take_request(self):
-        """Consume one provider-request allowance. Returns False if none."""
-        if not self.can_request():
+    def has_allowance(self):
+        """Peek: True if at least one attempt allowance remains (no consume)."""
+        return self._has_allowance()
+
+    def take_attempt(self):
+        """Consume one actual provider-call allowance. Returns False if empty."""
+        if not self._has_allowance():
             return False
+        self.attempts_used += 1
         self.requests_used += 1
         return True
 
+    def take_request(self):
+        """Scene-level gating (legacy). Prefer take_attempt per actual call."""
+        return self.take_attempt()
+
     def note_attempt(self):
+        # Deprecated: use take_attempt() which enforces allowance.
         self.attempts_used += 1
+
 
 
 def maybe_promote_screencast(input_video, scenes, scene_strategies, screen_metadata,
@@ -315,36 +351,53 @@ def maybe_promote_screencast(input_video, scenes, scene_strategies, screen_metad
         return []
     clock = _clock or _time.monotonic
 
-    # Validate budget inputs; fall back to defaults on invalid.
-    try:
-        max_scenes_v = int(max_scenes) if max_scenes is not None else lc.MAX_SCENES_PER_INVOCATION
-        max_requests_v = int(max_requests) if max_requests is not None else lc.MAX_REQUESTS_PER_INVOCATION
-        deadline_v = float(deadline_s) if deadline_s is not None else lc.INVOCATION_DEADLINE_S
-    except (TypeError, ValueError):
-        max_scenes_v = lc.MAX_SCENES_PER_INVOCATION
-        max_requests_v = lc.MAX_REQUESTS_PER_INVOCATION
-        deadline_v = lc.INVOCATION_DEADLINE_S
+    # Validate budget inputs independently; finite only. Nonfinite or
+    # invalid -> conservative defaults (no raise). Zero is valid and means
+    # "no work".
+    def _finite_int(v, default):
+        try:
+            f = float(v)
+            return int(f) if math.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
+    def _finite_float(v, default):
+        try:
+            f = float(v)
+            return f if math.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
+    max_scenes_v = _finite_int(max_scenes, lc.MAX_SCENES_PER_INVOCATION)
+    max_requests_v = _finite_int(max_requests, lc.MAX_REQUESTS_PER_INVOCATION)
+    deadline_v = _finite_float(deadline_s, lc.INVOCATION_DEADLINE_S)
     max_scenes_v = max(0, max_scenes_v)
     max_requests_v = max(0, max_requests_v)
     deadline_v = max(0.0, deadline_v)
 
     budget = _InvocationBudget(max_requests_v, deadline_v, clock)
 
+    # Zero scene allowance: no geometry, no work.
+    if max_scenes_v == 0 or budget.expired():
+        return []
+
     # Select bounded eligible scenes FIRST (preserve original IDs).
     # SPLIT and explicit strategies are never auto-promoted.
+    # Check limit BEFORE append to respect max_scenes=0 (handled above)
+    # and avoid off-by-one.
     eligible = []
     for idx, strat in enumerate(scene_strategies):
-        if strat in ("GENERAL", "TRACK"):
-            eligible.append(idx)
         if len(eligible) >= max_scenes_v:
             break
+        if strat in ("GENERAL", "TRACK"):
+            eligible.append(idx)
     if not eligible or budget.expired():
         return []
 
-    # Geometry on the bounded subset only. Map subset positions back to IDs.
+    # Geometry on the bounded subset only, with budget for cooperative stops.
+    # Map subset positions back to original IDs.
     subset_scenes = [scenes[i] for i in eligible]
     try:
-        subset_geometry = detect_presenter_geometry(input_video, subset_scenes)
+        subset_geometry = detect_presenter_geometry(
+            input_video, subset_scenes, _budget=budget)
     except Exception:
         subset_geometry = {}
     geometry = {eligible[pos]: center for pos, center in subset_geometry.items()
@@ -357,7 +410,9 @@ def maybe_promote_screencast(input_video, scenes, scene_strategies, screen_metad
         # Skip paid classification when geometry already rules the scene out.
         if idx not in geometry:
             continue
-        if not budget.take_request():
+        # Peek: stop when no attempt allowance remains. Actual consumption
+        # happens per-attempt inside classify_scene/_gemini_classify (no double).
+        if not budget.has_allowance():
             break
         try:
             start, end = scenes[idx]

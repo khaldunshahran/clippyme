@@ -357,23 +357,25 @@ def test_evidence_none_layout_ok():
 # --- budgets -----------------------------------------------------------------
 
 def test_budget_max_requests_stops_early(rf, monkeypatch):
+    # Mock at provider level (not classify_scene) so real budget logic runs.
     monkeypatch.setenv("AUTO_LAYOUT", "1")
     calls = []
-    def fake_classify(video_path, scene_id, s_f, e_f, provider=None,
-                      api_key=None, model_name=None, _budget=None):
-        calls.append(scene_id)
-        return dict(_evidence("screencast"), scene_id=scene_id)
-    monkeypatch.setattr(
-        "clippyme.pipeline.layouts.layout_classifier.classify_scene",
-        fake_classify)
+    import json as _j
+    def fake_provider(frames, prompt):
+        calls.append(1)
+        return _j.dumps({"layout": "screencast", "confidence": 0.93,
+                         "screen_evidence": True, "why": "test"})
     monkeypatch.setattr(
         "clippyme.pipeline.layouts.screencast_layout.detect_presenter_geometry",
         lambda *a, **k: {i: (1.0, 1.0) for i in range(10)})
+    # Patch sample_scene_frames to avoid needing a real video.
+    from clippyme.pipeline.layouts import layout_classifier as _lc
+    monkeypatch.setattr(_lc, "sample_scene_frames", lambda *a, **k: [b"x"] * 5)
     strategies = ["GENERAL"] * 10
     meta = {}
     promoted = rf.maybe_promote_screencast(
         "v.mp4", [(i*90, (i+1)*90) for i in range(10)],
-        strategies, meta, max_requests=3)
+        strategies, meta, max_requests=3, provider=fake_provider)
     assert len(calls) == 3
     assert promoted == [0, 1, 2]
 

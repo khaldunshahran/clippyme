@@ -58,21 +58,35 @@ Per-scene:
 - Max 8 samples, min 3 usable samples for a decision.
 - Sample count clamped to `[1, MAX_SCENE_SAMPLES]`.
 
-Invocation-level (`maybe_promote_screencast`):
+Invocation-level (`maybe_promote_screencast` via `_InvocationBudget`):
 - Max 32 scenes evaluated, max 16 provider requests, 120s deadline.
+  Inputs validated: nonfinite -> conservative defaults (no raise);
+  zero is valid and means "no work".
+- Eligible scenes selected BEFORE geometry (original IDs preserved).
+- Budget passed through geometry and sampling; cooperative checks stop
+  starting new scenes/samples/reads after exhaustion (no preemption of
+  running native ops, no abandoned threads).
 - Exhaustion stops evaluation; evaluated scenes keep results, rest keep
   previous strategy.
 - Geometry (local CV) runs first; scenes without geometry skip paid
   classification entirely.
 
 Provider (`_gemini_classify`):
-- Explicit SDK timeout (30s per attempt, no unbounded defaults).
-- Bounded retries (2 retries with backoff, no leaked workers).
+- Each actual SDK attempt consumes one shared allowance via
+  `take_attempt()`; retries stop when empty. Injected providers consume
+  via `classify_scene`.
+- Per-attempt timeout capped by remaining milliseconds (no floor above
+  remaining; skip when insufficient). Clients rebuilt on timeout change;
+  refresh failures fail conservatively (no stale options).
+- SDK internal retries explicitly disabled via
+  `HttpRetryOptions(attempts=1)` passed as `HttpOptions(retry_options=...)`.
+  If the policy cannot be configured, fails conservatively (no call).
+- Bounded outer retries (2 with backoff, capped by remaining time).
 - Missing key or disabled flag: no call, immediate None.
 
 ## Tests
 
-- `test_layout_policy.py` (50): parser contract, provider injection,
+- `test_layout_policy.py` (52): parser contract, provider injection,
   config flag, policy decisions (GENERAL/TRACK/SPLIT), budgets,
   compatibility wrapper, geometry validation.
 - `test_reframe_layout_promotion.py` (5): synthetic 3-scene unit checks
