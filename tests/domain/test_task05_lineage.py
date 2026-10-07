@@ -115,9 +115,9 @@ def test_build_lineage_missing_file(job_dir):
 
 def test_eligible_unchanged(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
-    eligible, path, reason = pl.check_lineage_eligible(
+    outcome, path, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert eligible
+    assert outcome == "eligible"
     assert path == base_clip
     assert reason is None
 
@@ -127,9 +127,9 @@ def test_eligible_caption_only_edit(job_dir, base_clip):
     proj["captions"]["edits"] = {"w1": "corrected"}
     proj["version"] = 2
     proj["origin"] = "user"
-    eligible, _, _ = pl.check_lineage_eligible(
+    outcome, _, _ = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert eligible, "caption/metadata edits must not invalidate"
+    assert outcome == "eligible", "caption/metadata edits must not invalidate"
 
 
 def test_eligible_overlay_grade_music_only(job_dir, base_clip):
@@ -138,26 +138,26 @@ def test_eligible_overlay_grade_music_only(job_dir, base_clip):
                          "start": 0.0, "end": 3.0, "position": "top"}]
     proj["grade"] = {"preset": "cinematic"}
     proj["audio"] = [{"file": "music.mp3", "volume": 0.5, "offset": 0.0}]
-    eligible, _, _ = pl.check_lineage_eligible(
+    outcome, _, _ = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert eligible
+    assert outcome == "eligible"
 
 
 def test_ineligible_crop_change(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
     proj["segments"][0]["crop"]["x"] = 0.0
-    eligible, _, reason = pl.check_lineage_eligible(
+    outcome, _, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome == "geometry_edit"
     assert "crop" in reason
 
 
 def test_ineligible_trim_change(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
     proj["segments"][0]["end"] = 8.0
-    eligible, _, reason = pl.check_lineage_eligible(
+    outcome, _, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome != "eligible"
     assert "end" in reason
 
 
@@ -168,43 +168,43 @@ def test_ineligible_segment_count(job_dir, base_clip):
         "crop": {"x": 0.0, "y": 0.0, "w": 600.0, "h": 1080.0},
         "transition_in": "cut",
     })
-    eligible, _, reason = pl.check_lineage_eligible(
+    outcome, _, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome != "eligible"
     assert "count" in reason
 
 
 def test_ineligible_transition_change(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
     proj["segments"][0]["transition_in"] = "fade"
-    eligible, _, _ = pl.check_lineage_eligible(
+    outcome, _, _ = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome != "eligible"
 
 
 def test_ineligible_render_change(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
     proj["render"]["width"] = 720
-    eligible, _, reason = pl.check_lineage_eligible(
+    outcome, _, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome != "eligible"
     assert "render" in reason
 
 
 def test_ineligible_source_change(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
     proj["source"]["file"] = "other.mp4"
-    eligible, _, _ = pl.check_lineage_eligible(
+    outcome, _, _ = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome != "eligible"
 
 
 def test_missing_base_file(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
     os.remove(base_clip)
-    eligible, _, reason = pl.check_lineage_eligible(
+    outcome, _, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome == "invalid_asset"
     assert "missing" in reason
 
 
@@ -213,18 +213,18 @@ def test_stale_base_file(job_dir, base_clip):
     # Modify file (size change).
     with open(base_clip, "ab") as f:
         f.write(b"more content")
-    eligible, _, reason = pl.check_lineage_eligible(
+    outcome, _, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome == "invalid_asset"
     assert "changed" in reason
 
 
 def test_malformed_reference(job_dir, base_clip):
     proj = _project_dict(base_clip, job_dir)
     proj["reframed_base"]["base_ref"] = "../../../etc/passwd"
-    eligible, _, reason = pl.check_lineage_eligible(
+    outcome, _, reason = pl.check_lineage_eligible(
         proj["reframed_base"], proj, job_dir)
-    assert not eligible
+    assert outcome == "invalid_asset"
     assert "invalid" in reason
 
 
@@ -253,3 +253,90 @@ def test_old_project_without_lineage():
     assert validated.reframed_base is None
     # Existing routes continue to work.
     assert validated.base_clip is None
+
+# --- Actual emission and versioned save/load ---
+
+def test_actual_emission_includes_lineage(tmp_path):
+    """emit_clip_project writes lineage for auto projects."""
+    from clippyme.pipeline import project_emit
+    job_dir = str(tmp_path / "job")
+    os.makedirs(job_dir, exist_ok=True)
+    # Create source slice and final clip.
+    src_path = os.path.join(job_dir, "source_0.mp4")
+    final_path = os.path.join(job_dir, "clip_final_0.mp4")
+    with open(src_path, "wb") as f:
+        f.write(b"x" * 1000)
+    with open(final_path, "wb") as f:
+        f.write(b"y" * 2000)
+    # Mock probe_media to avoid needing real video.
+    import clippyme.pipeline.project_emit as pe
+    orig_probe = pe.probe_media
+    def fake_probe(p):
+        return {"width": 1920, "height": 1080, "duration": 10.0,
+                "fps": 30}
+    pe.probe_media = fake_probe
+    try:
+        out = project_emit.emit_clip_project(
+            output_dir=job_dir, job_id="job1", index=0,
+            start=0.0, end=10.0,
+            clip={}, clips_data={"transcript": {"segments": []}},
+            clip_source=src_path, clip_final=final_path,
+        )
+        assert out is not None
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        assert "reframed_base" in data
+        assert data["reframed_base"]["base_ref"] == "clip_final_0.mp4"
+    finally:
+        pe.probe_media = orig_probe
+
+
+def test_segment_id_is_metadata(job_dir, base_clip):
+    """Renaming segment ID does not invalidate framing."""
+    proj = _project_dict(base_clip, job_dir)
+    proj["segments"][0]["id"] = "renamed-only"
+    outcome, _, _ = pl.check_lineage_eligible(
+        proj["reframed_base"], proj, job_dir)
+    assert outcome == "eligible", "segment IDs are metadata, not geometry"
+
+
+def test_versioned_save_load_preserves_lineage(tmp_path):
+    """Versioned save/load round-trip keeps lineage."""
+    from clippyme.domain.clip_project import validate_project
+    job_dir = str(tmp_path / "job")
+    os.makedirs(job_dir, exist_ok=True)
+    base = os.path.join(job_dir, "base.mp4")
+    with open(base, "wb") as f:
+        f.write(b"base content")
+    proj_dict = _project_dict(base, job_dir)
+    # Simulate version bump (user save).
+    proj_dict["version"] = 2
+    proj_dict["origin"] = "user"
+    validated = validate_project(proj_dict)
+    # Save.
+    save_path = os.path.join(job_dir, "clip-project-0.json")
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write(project_to_json(validated))
+    # Load.
+    with open(save_path, encoding="utf-8") as f:
+        loaded = json.load(f)
+    restored = validate_project(loaded)
+    assert restored.reframed_base is not None
+    assert restored.reframed_base.base_ref == "base.mp4"
+    # Eligibility still holds after version bump.
+    outcome, _, _ = pl.check_lineage_eligible(
+        loaded["reframed_base"], loaded, job_dir)
+    assert outcome == "eligible"
+
+
+def test_schema_twin_has_lineage():
+    """Generated schema twin includes reframed_base."""
+    import pathlib
+    schema_path = (pathlib.Path(__file__).parent.parent.parent /
+                   "src/clippyme/domain/clip_project.schema.json")
+    # Fallback: try relative to repo.
+    if not schema_path.exists():
+        import clippyme.domain.clip_project as cp
+        schema_path = pathlib.Path(cp.__file__).parent / "clip_project.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert "reframed_base" in schema["properties"]

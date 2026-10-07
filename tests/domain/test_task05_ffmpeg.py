@@ -65,14 +65,23 @@ def synth_job(tmp_path):
     return job_s, src, base
 
 
-def test_lineage_base_preserves_framing(synth_job):
-    """Render uses lineage base; output keeps red subject (not center crop)."""
+def test_lineage_base_preserves_framing(synth_job, monkeypatch=None):
+    # Allow direct invocation (review mutation test) without pytest fixtures.
+    if monkeypatch is None:
+        class _MP:
+            def __init__(self):
+                self._orig = []
+            def setattr(self, obj, name, value):
+                self._orig.append((obj, name, getattr(obj, name)))
+                setattr(obj, name, value)
+            def undo(self):
+                for obj, name, val in reversed(self._orig):
+                    setattr(obj, name, val)
+        monkeypatch = _MP()
+    """Production render selector reuses lineage base (not center crop)."""
     job_dir, src, base = synth_job
-    # Build a project with lineage pointing to the reframed base.
-    # The project's segment crop is center (x=660), but lineage base
-    # has the tracked left framing. Since geometry is "unchanged"
-    # relative to baseline, the base should be reused.
     from clippyme.domain import project_lineage as pl
+    from clippyme.domain import project_render as pr
     lin = pl.build_lineage(
         clip_final=base, job_dir=job_dir,
         source={"file": "source_0.mp4", "width": 1920, "height": 1080},
@@ -82,6 +91,7 @@ def test_lineage_base_preserves_framing(synth_job):
             "transition_in": "cut",
         }],
         render={"width": 608, "height": 1080, "fps": 30},
+        source_path=src,
     )
     assert lin is not None
     proj_dict = {
@@ -105,11 +115,40 @@ def test_lineage_base_preserves_framing(synth_job):
         "reframed_base": lin,
     }
     project = validate_project(proj_dict)
-    # Eligibility should hold (unchanged geometry).
-    eligible, base_path, reason = pl.check_lineage_eligible(
-        lin, proj_dict, job_dir)
-    assert eligible, f"should be eligible: {reason}"
-    assert base_path == base
+    # Drive the real render_project selector with injected I/O.
+    used_base = {}
+    async def fake_materialize(*a, **k):
+        raise AssertionError("eligible lineage must not materialize")
+    async def fake_compose(**kw):
+        used_base["path"] = kw["base_clip"]
+        out = os.path.join(job_dir, "composed_clip_0.mp4")
+        import shutil
+        shutil.copy(kw["base_clip"], out)
+        return "composed_clip_0.mp4"
+    async def fake_music(p, prj, jd, ci):
+        return p
+    def fake_qa(path, **kw):
+        return {"critical": []}
+    monkeypatch.setattr(pr, "_materialize_timeline", fake_materialize)
+    monkeypatch.setattr(pr, "compose_layers", fake_compose)
+    monkeypatch.setattr(pr, "_mix_music", fake_music)
+    monkeypatch.setattr(pr, "inspect_clip", fake_qa)
+    monkeypatch.setattr(pr, "probe_media",
+                        lambda p: {"duration": 2.0, "width": 608,
+                                   "height": 1080, "fps": 30})
+    coro = pr.render_project(
+        job_id="job1", clip_index=0, project=project,
+        job_dir=job_dir, metadata={}, clip_info={})
+    try:
+        coro.send(None)
+    except StopIteration:
+        pass
+    else:
+        coro.close()
+        raise AssertionError("unexpected suspension")
+    # The production selector must have reused the lineage base.
+    assert used_base.get("path") == base, (
+        f"render selector must reuse lineage base, got {used_base.get('path')}")
 
 
 def test_center_crop_would_lose_subject(synth_job):
@@ -157,6 +196,6 @@ def test_edited_crop_invalidates_lineage(synth_job):
         }],
         "render": {"width": 608, "height": 1080, "fps": 30},
     }
-    eligible, _, reason = pl.check_lineage_eligible(lin, proj, job_dir)
-    assert not eligible
+    outcome, _, reason = pl.check_lineage_eligible(lin, proj, job_dir)
+    assert outcome == "geometry_edit"
     assert "crop" in reason

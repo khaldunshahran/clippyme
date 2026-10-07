@@ -34,19 +34,33 @@
     },
     "CaptionWord": {
       "properties": {
+        "id": {
+          "default": "",
+          "description": "stable word ID, e.g. 'w12'",
+          "title": "Id",
+          "type": "string"
+        },
         "w": {
           "title": "W",
           "type": "string"
         },
         "start": {
+          "description": "source seconds",
           "minimum": 0,
           "title": "Start",
           "type": "number"
         },
         "end": {
+          "description": "source seconds",
           "minimum": 0,
           "title": "End",
           "type": "number"
+        },
+        "removed": {
+          "default": false,
+          "description": "word carved out of the timeline; kept with its ID for strikethrough/restore (ID-keyed data like colors/emoji survives)",
+          "title": "Removed",
+          "type": "boolean"
         }
       },
       "required": [
@@ -80,9 +94,16 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "word-index (as string) -> corrected text",
+          "description": "word ID (or legacy word-index as string) -> corrected text",
           "title": "Edits",
           "type": "object"
+        },
+        "next_word_id": {
+          "default": 0,
+          "description": "persisted counter; fresh word IDs are f'w{next_word_id}', then it increments",
+          "minimum": 0,
+          "title": "Next Word Id",
+          "type": "integer"
         }
       },
       "title": "Captions",
@@ -217,6 +238,48 @@
         "crop"
       ],
       "title": "ProjectSegment",
+      "type": "object"
+    },
+    "ReframedBase": {
+      "description": "Lineage for automatic framing preservation (Task 05).\n\nOptional. When present on an auto-emitted project, records the\noriginal reframed clip (with tracked-speaker/layout framing) plus\nthe geometry/timeline baseline and file identity needed to detect\nmissing, stale, or replaced assets.\n\nEligibility is semantic equivalence to the baseline; see\n``domain.project_lineage.check_lineage_eligible``.",
+      "properties": {
+        "base_ref": {
+          "description": "job-relative path to the reframed base clip",
+          "title": "Base Ref",
+          "type": "string"
+        },
+        "identity": {
+          "additionalProperties": true,
+          "description": "file identity: file/size/mtime for staleness detection",
+          "title": "Identity",
+          "type": "object"
+        },
+        "source": {
+          "additionalProperties": true,
+          "description": "source baseline: file/width/height",
+          "title": "Source",
+          "type": "object"
+        },
+        "segments": {
+          "description": "ordered segment geometry baseline",
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Segments",
+          "type": "array"
+        },
+        "render": {
+          "additionalProperties": true,
+          "description": "render geometry baseline: width/height/fps",
+          "title": "Render",
+          "type": "object"
+        }
+      },
+      "required": [
+        "base_ref"
+      ],
+      "title": "ReframedBase",
       "type": "object"
     },
     "RenderSpec": {
@@ -387,10 +450,20 @@
       ],
       "default": null,
       "title": "Legacy Params"
+    },
+    "reframed_base": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReframedBase"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [
-    "schema",
     "job_id",
     "clip_index",
     "source",

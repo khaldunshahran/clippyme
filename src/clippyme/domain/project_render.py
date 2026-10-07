@@ -694,24 +694,47 @@ async def render_project(*, job_id: str, clip_index: int,
                             if project.reframed_base else None)
                 if _lineage:
                     _proj_dict = project.model_dump()
-                    _eligible, _base_path, _reason = check_lineage_eligible(
+                    _outcome, _base_path, _reason = check_lineage_eligible(
                         _lineage, _proj_dict, job_dir)
-                    if _eligible:
+                    if _outcome == "eligible":
+                        # Validate base media geometry before reuse.
+                        _probe = probe_media(_base_path)
+                        _bw = _probe.get("width")
+                        _bh = _probe.get("height")
+                        _bdur = float(_probe.get("duration") or 0)
+                        _bfps = _probe.get("fps")
+                        _rw, _rh = project.render.width, project.render.height
+                        # Dimensions must match project render spec.
+                        if not (_bw and _bh and _bw == _rw and _bh == _rh):
+                            raise ProjectRenderError(
+                                f"lineage base dimensions {_bw}x{_bh} do not "
+                                f"match project render {_rw}x{_rh}")
+                        if not (_bdur > 0):
+                            raise ProjectRenderError(
+                                "cannot probe duration of lineage base")
+                        # FPS tolerance: allow small rounding differences.
+                        if _bfps and project.render.fps:
+                            if abs(float(_bfps) - float(project.render.fps)) > 1.0:
+                                raise ProjectRenderError(
+                                    f"lineage base FPS {_bfps} mismatches "
+                                    f"project {project.render.fps}")
                         # Reuse validated reframed base; apply CURRENT
                         # composition/music from the project.
                         base_path = _base_path
-                        probe = probe_media(base_path)
-                        timeline_duration = float(probe.get("duration") or 0)
-                        if not timeline_duration:
-                            raise ProjectRenderError(
-                                "cannot probe duration of lineage base")
+                        timeline_duration = _bdur
                         _used_lineage_base = True
                         logger.info(
                             "project_render: reusing reframed base for "
                             "unchanged project (clip %d)", clip_index)
+                    elif _outcome == "invalid_asset":
+                        # P1: fail clearly. Do NOT silently publish a center
+                        # crop with different framing.
+                        raise ProjectRenderError(
+                            f"reframed base unusable: {_reason}")
                     else:
+                        # Geometry edit: use existing source renderer.
                         logger.info(
-                            "project_render: lineage not eligible (%s); "
+                            "project_render: lineage geometry edit (%s); "
                             "materializing from source", _reason)
                 if not _used_lineage_base:
                     base_path, timeline_duration = await _materialize_timeline(
@@ -754,7 +777,8 @@ async def render_project(*, job_id: str, clip_index: int,
             report = inspect_clip(
                 composed_path,
                 expected_duration=None,
-                expected_aspect=9 / 16,
+                expected_aspect=(project.render.width /
+                                 project.render.height),
                 run_signal_checks=False,
             )
             if report.get("critical"):
