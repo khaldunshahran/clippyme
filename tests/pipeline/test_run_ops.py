@@ -79,15 +79,14 @@ def test_cut_command_is_accurate_reencode_not_stream_copy():
     assert "libx264" in cmd or "h264_nvenc" in cmd
 
 def test_stream_copy_cut_keyframe_granularity(tmp_path):
-    """Verify the accurate cut has ~zero seek offset on a real file.
+    """Verify the accurate cut starts at presentation time zero.
 
     (Historical name: this test used to quantify the old stream-copy
-    keyframe granularity.) build_cut_command now seeks accurately (``-ss``
-    AFTER ``-i``) and re-encodes, so the slice starts at the first frame
-    at/after the requested start. This runs the command's seek flags WITHOUT
-    the ``-avoid_negative_ts`` rebase and reads the first packet's DTS via
-    ffprobe: ``requested_start - actual_start`` must now be ~0 (sub-frame),
-    not up to one GOP. Skips when ffmpeg/ffprobe are unavailable.
+    keyframe granularity, asserting ``offset < 2.0``.) The command now
+    seeks accurately and re-bases presentation timestamps with setpts, so
+    the first presented video frame must be at ~0 and the stream start
+    times must be ~0 -- not up to one GOP early. Content identity is
+    covered by test_accurate_cuts.py::test_accurate_cut_starts_at_requested_frame_not_keyframe.
     """
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
@@ -101,38 +100,29 @@ def test_stream_copy_cut_keyframe_granularity(tmp_path):
          "-c:v", "libx264", "-g", "60", "-pix_fmt", "yuv420p", src],
         check=True, capture_output=True)
     start, length = 3.5, 4.0  # 3.5s is not a keyframe
-    probe_out = str(tmp_path / "probe.mp4")
-    probe_cmd = build_cut_command(src, start, start + length, probe_out)
-    # Drop the timestamp rebase so ffprobe reveals the true seek point.
-    probe_cmd = [a for a in probe_cmd
-                 if a not in ("-avoid_negative_ts", "make_zero")]
-    subprocess.run(probe_cmd, check=True, capture_output=True)
-    out = subprocess.run(
-        [ffprobe, "-v", "quiet", "-select_streams", "v:0",
-         "-show_entries", "packet=dts_time", "-of", "csv=p=0",
-         "-read_intervals", "%+#1", probe_out],
-        check=True, capture_output=True, text=True).stdout.strip().splitlines()
-    first_dts = float(out[0])
-    actual_start = start + first_dts  # first_dts <= 0: keyframe at/before start
-    offset = start - actual_start
-    print(f"\nkeyframe-granularity: requested={start}, "
-          f"actual={actual_start:.3f}, offset={offset:.3f}s (GOP=2.0s)")
-    assert 0.0 <= offset < 2.0, f"cut started {offset:.3f}s before request"
-    # And the real command (with rebase): the slice ENDS at the requested end
-    # (seek target + length), so the persisted duration is the requested
-    # length PLUS the head offset -- the clip is longer than asked, starting
-    # early. This is the documented stream-copy contract, not a bug in the
-    # test: word timings mapped against the requested start therefore run up
-    # to ~one GOP early relative to the slice's actual audio.
-    real_out = str(tmp_path / "cut.mp4")
-    subprocess.run(build_cut_command(src, start, start + length, real_out),
+    out = str(tmp_path / "cut.mp4")
+    subprocess.run(build_cut_command(src, start, start + length, out),
                    check=True, capture_output=True)
-    dur = float(subprocess.run(
-        [ffprobe, "-v", "quiet", "-select_streams", "v:0",
-         "-show_entries", "format=duration", "-of", "csv=p=0", real_out],
-        check=True, capture_output=True, text=True).stdout.strip())
-    assert abs(dur - (length + offset)) < 0.15, (
-        f"duration {dur} != requested {length} + offset {offset:.3f}")
+    probe = json.loads(subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries",
+         "stream=index,codec_type,start_time",
+         "-of", "json", out],
+        check=True, capture_output=True, text=True).stdout)
+    for s in probe["streams"]:
+        st = float(s["start_time"])
+        assert abs(st) < 0.001, (
+            f"stream {s['index']} ({s['codec_type']}) starts at {st}s, expected ~0"
+        )
+    frames = json.loads(subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "frame=best_effort_timestamp_time",
+         "-of", "json", out],
+        check=True, capture_output=True, text=True).stdout)["frames"]
+    first_pts = float(frames[0]["best_effort_timestamp_time"])
+    assert abs(first_pts) < 0.001, f"first video PTS {first_pts}s, expected ~0"
+    print(f"\npresentation origin: first video PTS={first_pts:.6f}s "
+          f"(old stream-copy behavior: first frame was the 2.0s keyframe)")
+
 
 
 def test_vfr_normalization_command_uses_shared_encode_policy(monkeypatch):

@@ -886,6 +886,8 @@ if __name__ == '__main__':
 
     from clippyme.pipeline.run_ops import (
         build_cut_command, clip_output_basename, resolve_output_dir, should_use_fallback,
+    source_fingerprint,
+    validate_cut_output,
     write_slice_provenance,
     )
 
@@ -1087,13 +1089,20 @@ if __name__ == '__main__':
                 # the seek/CFR/x264 rationale). On very long sources (1h+) the
                 # first cut's input seek can take 30-60s.
                 clip_duration = float(end) - float(start)
-                cut_command = build_cut_command(input_video, start, end, clip_source_path)
-                # Emit a "beat" before/after so the user sees progress even
-                # though ffmpeg runs silent (stdout=DEVNULL). Hard timeout of
-                # 10 minutes per cut prevents an infinite hang on corrupt
-                # sources — 10 min is ~10x the worst legitimate seek time
-                # on a 1 hour input video.
-                print(f"   ✂️  ffmpeg cut: seek→{start:.2f}s, duration={clip_duration:.2f}s …", flush=True)
+                # Fingerprint BEFORE the cut; deterministic frame count for [start, end).
+                _src_fp = source_fingerprint(input_video)
+                _cut_frames = None
+                try:
+                    from clippyme.pipeline.media_qa import probe_media as _probe_media
+                    _fps = _probe_media(input_video).get("fps")
+                    if _fps and _fps > 0:
+                        import math as _math
+                        _cut_frames = max(1, _math.floor(clip_duration * float(_fps)))
+                except Exception:
+                    pass
+                _temp_cut = clip_source_path + ".tmp.mp4"
+                cut_command = build_cut_command(input_video, start, end, _temp_cut, frames=_cut_frames)
+                print(f"   ffmpeg cut: start={start:.2f}s, duration={clip_duration:.2f}s", flush=True)
                 try:
                     cut_proc = subprocess.run(
                         cut_command,
@@ -1103,11 +1112,23 @@ if __name__ == '__main__':
                     )
                     if cut_proc.returncode != 0:
                         err_tail = (cut_proc.stderr or b'').decode('utf-8', errors='replace')[-500:]
-                        print(f"   ⚠️  ffmpeg cut failed (code {cut_proc.returncode}): {err_tail}", flush=True)
+                        print(f"   ffmpeg cut failed (code {cut_proc.returncode}): {err_tail}", flush=True)
+                        try:
+                            os.remove(_temp_cut)
+                        except OSError:
+                            pass
                         continue
-                    else:
-                        print(f"   ✅ ffmpeg cut done", flush=True)
-                        write_slice_provenance(clip_source_path, start=start, end=end, source_path=input_video)
+                    _ok, _reason = validate_cut_output(_temp_cut, clip_duration)
+                    if not _ok:
+                        print(f"   ffmpeg cut produced invalid output: {_reason}", flush=True)
+                        try:
+                            os.remove(_temp_cut)
+                        except OSError:
+                            pass
+                        continue
+                    os.replace(_temp_cut, clip_source_path)
+                    print(f"   ffmpeg cut done", flush=True)
+                    write_slice_provenance(clip_source_path, start=start, end=end, source_fp=_src_fp)
                 except subprocess.TimeoutExpired:
                     print(f"   ❌ ffmpeg cut TIMED OUT after 10 min — skipping this clip. Input may be corrupt or seek is stuck.", flush=True)
                     continue

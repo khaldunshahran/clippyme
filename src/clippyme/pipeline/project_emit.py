@@ -190,6 +190,33 @@ def _build_project(
     }
 
 
+def project_has_user_edits(project_path: str) -> bool:
+    """True when a working project file carries user edits worth preserving.
+
+    A freshly emitted project has ``version: 1`` and empty/default edits.
+    The clip editor bumps the version on every user save, so ``version > 1``
+    (or a non-empty ``edits`` list) means the user touched it. Conservative:
+    any parse failure returns False (treat as fresh), any present version
+    above 1 returns True.
+    """
+    import json
+
+    try:
+        with open(project_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    try:
+        if int(data.get("version", 1)) > 1:
+            return True
+    except (TypeError, ValueError):
+        pass
+    edits = data.get("edits")
+    return bool(edits)
+
+
 def emit_clip_project(
     *,
     output_dir: str,

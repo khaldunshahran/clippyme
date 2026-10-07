@@ -23,6 +23,8 @@ from clippyme.pipeline.run_ops import (
     read_slice_provenance,
     slice_provenance,
     slice_provenance_valid,
+    source_fingerprint,
+    validate_cut_output,
     write_slice_provenance,
 )
 
@@ -226,12 +228,22 @@ def test_absent_audio_cuts_cleanly(tmp_path):
 
 # --- provenance -----------------------------------------------------------------
 
+def _write_fp(sl, start, end, src):
+    """Helper: write provenance the way the orchestrator does (pre-cut fp)."""
+    fp = source_fingerprint(str(src))
+    # Simulate the post-swap state: create the slice file first so the
+    # stamp binds to its identity.
+    with open(sl, "wb") as f:
+        f.write(b"v" * 20000)
+    write_slice_provenance(sl, start=start, end=end, source_fp=fp)
+
+
 def test_provenance_roundtrip_and_invalidation(tmp_path):
     src = tmp_path / "src.mp4"
     src.write_bytes(b"x" * 20000)
     sl = str(tmp_path / "source_clip.mp4")
 
-    write_slice_provenance(sl, start=3.5, end=7.5, source_path=str(src))
+    _write_fp(sl, 3.5, 7.5, src)
     assert slice_provenance_valid(sl, start=3.5, end=7.5, source_path=str(src))
 
     # Changed interval invalidates
@@ -257,10 +269,85 @@ def test_provenance_roundtrip_and_invalidation(tmp_path):
 def test_provenance_record_shape(tmp_path):
     src = tmp_path / "src.mp4"
     src.write_bytes(b"x" * 100)
-    rec = slice_provenance(start=1.0, end=2.0, source_path=str(src))
-    assert rec["version"] == 2
+    rec = slice_provenance(start=1.0, end=2.0,
+                           source_fp=source_fingerprint(str(src)))
+    assert rec["version"] == 3
     assert rec["start"] == 1.0 and rec["end"] == 2.0
     assert rec["source"]["size"] == 100
+
+
+def test_torn_provenance_pair_fails_closed(tmp_path):
+    """Interrupted swap: new media B on disk, old stamp A -> must NOT validate.
+
+    Simulates: slice A for [0,1] exists with stamp A; media B for [1,2]
+    replaces A on disk; crash before the stamp updates. A resume for [0,1]
+    must fail closed (re-cut), not trust stamp A against media B.
+    """
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"x" * 20000)
+    sl = str(tmp_path / "source_clip.mp4")
+
+    # Generation A: media + stamp for [0, 1]
+    with open(sl, "wb") as f:
+        f.write(b"A" * 20000)
+    write_slice_provenance(sl, start=0.0, end=1.0,
+                           source_fp=source_fingerprint(str(src)))
+    assert slice_provenance_valid(sl, start=0.0, end=1.0, source_path=str(src))
+
+    # Generation B replaces the media (interrupted before stamp update)
+    with open(sl, "wb") as f:
+        f.write(b"B" * 21000)
+    # Stamp still describes generation A -> validation must FAIL
+    assert not slice_provenance_valid(sl, start=0.0, end=1.0, source_path=str(src)), \
+        "torn pair validated: old stamp trusted against new media"
+
+
+def test_validate_cut_output_rejects_broken(tmp_path):
+    # Empty / tiny file
+    tiny = tmp_path / "tiny.mp4"
+    tiny.write_bytes(b"x" * 262)
+    ok, reason = validate_cut_output(str(tiny), 1.0)
+    assert not ok and reason
+
+    # Nonexistent
+    ok, _ = validate_cut_output(str(tmp_path / "nope.mp4"), 1.0)
+    assert not ok
+
+    # Text file masquerading as mp4
+    fake = tmp_path / "fake.mp4"
+    fake.write_bytes(b"not a video" * 2000)
+    ok, _ = validate_cut_output(str(fake), 1.0)
+    assert not ok
+
+
+@needs_ff
+def test_validate_cut_output_accepts_good(tmp_path):
+    src = str(tmp_path / "src.mp4")
+    _make_source(src)
+    cut = str(tmp_path / "cut.mp4")
+    _run(build_cut_command(src, 1.0, 3.0, cut))
+    ok, reason = validate_cut_output(cut, 2.0)
+    assert ok, f"valid cut rejected: {reason}"
+
+
+def test_project_has_user_edits(tmp_path):
+    from clippyme.pipeline.project_emit import project_has_user_edits
+
+    # Fresh project (version 1, no edits) -> not edited
+    fresh = tmp_path / "clip-project-0.json"
+    fresh.write_text('{"version": 1, "edits": []}', encoding="utf-8")
+    assert not project_has_user_edits(str(fresh))
+
+    # Edited project (version 8) -> edited
+    edited = tmp_path / "clip-project-1.json"
+    edited.write_text('{"version": 8, "edits": [{"op": "trim"}]}', encoding="utf-8")
+    assert project_has_user_edits(str(edited))
+
+    # Missing / corrupt -> not edited (conservative: treat as fresh)
+    assert not project_has_user_edits(str(tmp_path / "missing.json"))
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json{", encoding="utf-8")
+    assert not project_has_user_edits(str(bad))
 
 
 # --- project word-timing consistency (Task 01 req 8) ---------------------------
@@ -297,3 +384,111 @@ def test_clip_relative_words_consistent_with_accurate_slice():
     # All word times lie within [0, duration]
     for w in words:
         assert 0.0 <= w["start"] < w["end"] <= 4.0
+
+
+# --- review fixture: distinguishable audio events -----------------------------
+
+def _make_marker_source(path, duration=10.0, fps=30, gop=60):
+    """Source with a 20ms 1kHz beep at exactly t=4.0s (distinguishable event)."""
+    _run([
+        FFMPEG, "-y",
+        "-f", "lavfi", "-i", f"testsrc=duration={duration}:size=320x240:rate={fps}",
+        "-f", "lavfi", "-i",
+        "aevalsrc='if(between(t,4,4.02),0.9*sin(2*PI*1000*t),0)':s=48000:d=10",
+        "-c:v", "libx264", "-g", str(gop), "-pix_fmt", "yuv420p",
+        "-c:a", "pcm_s16le", path,
+    ])
+
+
+def _find_audio_marker(path, threshold=5000):
+    """First sample index (in seconds) exceeding threshold, via PCM decode."""
+    import array
+    pcm = _run([FFMPEG, "-v", "error", "-copyts", "-i", path, "-map", "0:a:0",
+                "-af", "aresample=async=1:first_pts=0",
+                "-ar", "48000", "-ac", "1", "-f", "s16le", "-"]).stdout
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    for i, s in enumerate(samples):
+        if abs(s) > threshold:
+            return i / 48000
+    return None
+
+
+def _first_video_pts(path):
+    import json as _json
+    out = _run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "frame=best_effort_timestamp_time",
+                "-of", "json", path], text=True).stdout
+    frames = _json.loads(out)["frames"]
+    return float(frames[0]["best_effort_timestamp_time"])
+
+
+@needs_ff
+def test_presentation_origin_is_zero(tmp_path):
+    """First presented video PTS and audio start must be exactly 0.
+
+    Regression for the review finding: -avoid_negative_ts make_zero left
+    B-frame presentation delay (0.100s video) and AAC priming (0.078s audio).
+    """
+    src = str(tmp_path / "src.mkv")
+    _make_marker_source(src)
+    for start in (0.0, 3.5, 3.517):
+        cut = str(tmp_path / f"cut-{start}.mp4")
+        _run(build_cut_command(src, start, 7.5, cut))
+        vpts = _first_video_pts(cut)
+        assert vpts == pytest.approx(0.0, abs=1e-3), \
+            f"start={start}: first video PTS {vpts}, expected 0"
+
+
+@needs_ff
+def test_audio_event_lands_on_true_slice_time(tmp_path):
+    """The 4.0s source beep must appear at (4.0 - start) in the slice.
+
+    Content-based (not duration-based) proof that audio and video share
+    the same presentation origin. Tolerance 5ms.
+    """
+    src = str(tmp_path / "src.mkv")
+    _make_marker_source(src)
+    for start, expected in ((3.5, 0.5), (3.517, 0.483), (0.0, 4.0)):
+        cut = str(tmp_path / f"cut-{start}.mp4")
+        _run(build_cut_command(src, start, 7.5, cut))
+        marker = _find_audio_marker(cut)
+        assert marker is not None, f"start={start}: beep not found in slice"
+        assert marker == pytest.approx(expected, abs=0.005), \
+            f"start={start}: beep at {marker:.4f}s, expected {expected:.3f}s"
+
+
+@needs_ff
+def test_last_frame_respects_half_open_end(tmp_path):
+    """[3.517, 5.0) must end at source frame 149, not 150.
+
+    Frame 150 sits exactly at t=5.0 (the exclusive end) and must not be
+    retained. Frame count = floor((5.0 - 3.517) * 30) = 44.
+    """
+    src = str(tmp_path / "src.mp4")
+    _make_source(src)
+    nframes = 44  # floor(1.483 * 30)
+    cut = str(tmp_path / "cut.mp4")
+    _run(build_cut_command(src, 3.517, 5.0, cut, frames=nframes))
+
+    def ssim(a, b):
+        out = _run([FFMPEG, "-y", "-i", a, "-i", b,
+                    "-lavfi", "ssim", "-f", "null", "-"],
+                   text=True).stderr
+        for line in out.splitlines():
+            if "SSIM" in line and "All:" in line:
+                return float(line.split("All:")[1].split()[0])
+        return -1.0
+
+    # Extract the LAST frame of the cut
+    last_png = str(tmp_path / "last.png")
+    _run([FFMPEG, "-y", "-sseof", "-0.05", "-i", cut, "-vframes", "1", last_png])
+    ref149 = str(tmp_path / "ref149.png")
+    _extract_frame(src, ref149, 149)
+    ref150 = str(tmp_path / "ref150.png")
+    _extract_frame(src, ref150, 150)
+    s149 = ssim(last_png, ref149)
+    s150 = ssim(last_png, ref150)
+    print(f"\nlast-frame SSIM vs 149: {s149:.4f}, vs 150: {s150:.4f}")
+    assert s149 > s150, "last retained frame must be 149 (inside [3.517,5.0)), not 150"
+    assert s149 > 0.90, f"last frame should match source frame 149, SSIM={s149}"

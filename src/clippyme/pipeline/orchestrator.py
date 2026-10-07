@@ -29,7 +29,7 @@ from typing import Any
 
 from clippyme.domain.runtime_state import RuntimeState
 from clippyme.pipeline.media_qa import inspect_clip, probe_media
-from clippyme.pipeline.project_emit import emit_clip_project
+from clippyme.pipeline.project_emit import emit_clip_project, project_has_user_edits
 from clippyme.pipeline.preflight import (
     PreflightInputs,
     PreflightRejected,
@@ -47,6 +47,8 @@ from clippyme.pipeline.run_ops import (
     sanitize_windows_basename,
     should_use_fallback,
     slice_provenance_valid,
+    source_fingerprint,
+    validate_cut_output,
     write_slice_provenance,
 )
 
@@ -649,6 +651,49 @@ def _clip_bounds(clip: dict[str, Any]) -> tuple[float, float]:
     return start, end
 
 
+
+def _maybe_emit_clip_project(**kwargs) -> str | None:
+    """Emit the default-edit project unless the user already edited it.
+
+    Preservation guard (Task 01 rev 2): on resume, a completed clip's
+    working project may carry user edits (version > 1). Overwriting it
+    with a fresh version-1 project would silently discard their work.
+    """
+    from clippyme.pipeline.project_emit import PROJECT_FILENAME_TEMPLATE
+
+    output_dir = kwargs.get("output_dir")
+    index = kwargs.get("index")
+    if output_dir is not None and index is not None:
+        project_path = os.path.join(
+            output_dir, PROJECT_FILENAME_TEMPLATE.format(index=index)
+        )
+        if project_has_user_edits(project_path):
+            print(
+                f"clip-project: preserving user-edited project for clip {index + 1}",
+                flush=True,
+            )
+            return project_path
+    return emit_clip_project(**kwargs)
+
+
+def _cut_frame_count(input_video: str, start: float, end: float) -> int | None:
+    """Exact video frame count for the half-open [start, end) cut interval.
+
+    Probed from the source fps as floor((end - start) * fps). Returns None
+    when fps cannot be determined (caller then cuts without -frames:v).
+    Never raises.
+    """
+    try:
+        from clippyme.pipeline.media_qa import probe_media
+
+        fps = probe_media(input_video).get("fps")
+        if fps and fps > 0:
+            return max(1, math.floor((float(end) - float(start)) * float(fps)))
+    except Exception:
+        pass
+    return None
+
+
 def _render_one_clip(
     *,
     index: int,
@@ -685,9 +730,11 @@ def _render_one_clip(
             clip["qa"] = report
             state.mark_clip(index, _qa_status(report), report)
             _save_metadata(metadata_file, clips_data)
-            # Phase 1 (clip editor): emit the default-edit project. Additive
-            # only -- emit_clip_project never raises.
-            emit_clip_project(
+            # Phase 1 (clip editor): emit the default-edit project -- but
+            # NEVER overwrite an existing working project that carries user
+            # edits (Task 01 preservation guarantee). Additive only;
+            # emit_clip_project never raises.
+            _maybe_emit_clip_project(
                 output_dir=output_dir,
                 job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
                 index=index,
@@ -733,8 +780,13 @@ def _render_one_clip(
         if not _valid_media_file(input_video, 10_000):
             raise FileNotFoundError(f"Input source video file not found on disk: {input_video}")
         
+        # Fingerprint the source BEFORE the cut: if it changes mid-cut,
+        # the provenance check will invalidate the result.
+        src_fp = source_fingerprint(input_video)
+        # Deterministic last frame: floor((end - start) * fps).
+        cut_frames = _cut_frame_count(input_video, start, end)
         temp_dest = clip_source + ".tmp.mp4"
-        command = build_cut_command(input_video, start, end, temp_dest)
+        command = build_cut_command(input_video, start, end, temp_dest, frames=cut_frames)
         print(f"✂️ Clip {index + 1}/{total}: {start:.2f}s → {end:.2f}s", flush=True)
         
         clip_duration = float(end) - float(start)
@@ -754,8 +806,18 @@ def _render_one_clip(
             except OSError:
                 pass
             raise RuntimeError(f"ffmpeg cut failed for clip {index + 1}: {tail}")
+        # Validate BEFORE swapping: a successful ffmpeg exit code does not
+        # guarantee usable media. Never replace a known-good slice with a
+        # broken temp file.
+        ok, reason = validate_cut_output(temp_dest, clip_duration)
+        if not ok:
+            try:
+                os.remove(temp_dest)
+            except OSError:
+                pass
+            raise RuntimeError(f"ffmpeg cut produced invalid output for clip {index + 1}: {reason}")
         os.replace(temp_dest, clip_source)
-        write_slice_provenance(clip_source, start=start, end=end, source_path=input_video)
+        write_slice_provenance(clip_source, start=start, end=end, source_fp=src_fp)
     else:
         print(f"♻️ Resume: reusing source slice for clip {index + 1}", flush=True)
 

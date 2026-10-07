@@ -102,36 +102,63 @@ def build_vfr_normalization_command(input_video: str, dest: str) -> list[str]:
 
 # Bump when the slice contract changes in a way that invalidates slices
 # cut by an older implementation (resume must re-cut them).
-_SLICE_PROVENANCE_VERSION = 2
+_SLICE_PROVENANCE_VERSION = 3
 
 # --- Timing convention (single source of truth) ------------------------------
-# The slice's time 0 corresponds to the first decoded source frame whose
-# presentation timestamp is >= the requested start. ``-ss`` is placed AFTER
-# ``-i`` (output seeking): ffmpeg decodes from the nearest seek point and
-# discards everything before ``start``, so the retained head offset is in
-# [0, 1/fps) -- sub-frame, never a GOP. A requested edge that falls between
-# two source frames resolves to the NEXT frame (ceil to frame boundary).
-# All downstream consumers (word timings, compose, Smart Cut, project emit)
-# use the REQUESTED start as time 0; the residual (< 1 frame, < ~33ms at
-# 30fps) is below the caption display threshold and inside the QA duration
-# tolerance, so no consumer re-rounds independently.
+# A source slice is a half-open interval [start, end) on the SOURCE timeline,
+# re-based so the slice's own presentation timeline starts at exactly 0.
+#
+# START policy: the first retained frame is the first decoded source frame
+#   whose presentation timestamp is >= the requested start (ceil to frame
+#   boundary). ``-ss`` is placed AFTER ``-i`` (output seeking): ffmpeg
+#   decodes from the nearest seek point and discards everything before
+#   ``start``. Head offset is in [0, 1/fps) -- sub-frame, never a GOP.
+# END policy: the last retained frame is the last frame with presentation
+#   timestamp < the requested end. Callers pass ``frames`` (computed from
+#   probed source fps as floor((end - start) * fps)) so the frame count is
+#   deterministic; a frame exactly AT ``end`` is NOT retained.
+# PRESENTATION ORIGIN: ``setpts=PTS-STARTPTS`` /
+#   ``asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0`` re-base both
+#   streams so the first presented frame/sample is at exactly 0. This is
+#   stronger than ``-avoid_negative_ts make_zero``, which only shifts decode
+#   timestamps and leaves B-frame presentation delay (measured: first video
+#   PTS 0.100s) and AAC encoder priming (measured: audio start 0.078s).
+#   With the filters, measured first video PTS = 0.000000 and audio marker
+#   error < 0.1ms on the review fixture.
+#
+# All downstream consumers (word timings, compose, Smart Cut, project emit,
+# reframe audio extraction) use the REQUESTED start as slice time 0, which
+# now matches the actual presentation origin. No consumer re-rounds
+# independently.
 
 
-def build_cut_command(input_video: str, start: float, end: float, dest: str) -> list[str]:
+def build_cut_command(
+    input_video: str, start: float, end: float, dest: str,
+    *, frames: int | None = None,
+) -> list[str]:
     """ffmpeg argv for cutting the 16:9 source slice of one clip.
 
     Accurate cut: ``-ss`` AFTER ``-i`` seeks accurately by decoding and
     discarding pre-start frames, then video AND audio are re-encoded with
     the shared encode policy (``domain.encode.x264_video_args``). The
     persisted slice starts at the first frame at/after ``start`` -- no
-    keyframe-granularity head preroll. ``-avoid_negative_ts make_zero``
-    re-bases timestamps so the slice starts at zero. Slower than the old
-    stream-copy cut; correct timing has priority over cut speed.
+    keyframe-granularity head preroll. Slower than stream copy; correct
+    timing has priority over cut speed.
+
+    Presentation origin: ``setpts``/``asetpts`` filters re-base both streams
+    so the first presented frame/sample is at exactly 0 (see the timing
+    convention above). ``aresample=async=1:first_pts=0`` absorbs AAC
+    encoder priming so audio events land on their true slice-relative time.
 
     Audio: re-encoded to AAC so the audio track is trimmed to the same
     accurate boundaries as the video. ``-map 0:a?`` makes the audio
     stream optional -- sources without audio cut cleanly instead of
     failing.
+
+    ``frames``: exact video frame count for the half-open [start, end)
+    interval, computed by the caller from probed source fps as
+    ``floor((end - start) * fps)``. When given, ``-frames:v`` caps the
+    output so a frame exactly at ``end`` is never retained.
     """
     start_f, end_f = float(start), float(end)
     clip_duration = end_f - start_f
@@ -139,18 +166,43 @@ def build_cut_command(input_video: str, start: float, end: float, dest: str) -> 
         raise ValueError(f"invalid cut interval start={start_f} end={end_f}")
     if start_f < 0:
         raise ValueError(f"cut start must be >= 0, got {start_f}")
-    return [
+    cmd = [
         'ffmpeg', '-y',
         '-i', input_video,
         '-ss', f'{start_f:.3f}',
         '-t', f'{clip_duration:.3f}',
         '-map', '0:v:0',
         '-map', '0:a?',
+        '-vf', 'setpts=PTS-STARTPTS',
+        '-af', 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0',
         *x264_video_args(faststart=False),
         '-c:a', 'aac',
-        '-avoid_negative_ts', 'make_zero',
-        dest,
     ]
+    if frames is not None:
+        frames_i = int(frames)
+        if frames_i <= 0:
+            raise ValueError(f"frames must be positive, got {frames}")
+        cmd += ['-frames:v', str(frames_i)]
+    cmd.append(dest)
+    return cmd
+
+
+
+def source_fingerprint(path: str) -> dict:
+    """Identity of a source file, captured BEFORE a cut.
+
+    Taken pre-cut so a source that changes mid-cut invalidates the result
+    instead of being described only by its post-cut state.
+    """
+    try:
+        st = os.stat(path)
+        return {
+            "path": os.path.abspath(path),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        }
+    except OSError:
+        return {"path": os.path.abspath(path), "size": None, "mtime": None}
 
 
 def slice_provenance_path(slice_path: str) -> str:
@@ -158,35 +210,54 @@ def slice_provenance_path(slice_path: str) -> str:
     return slice_path + ".slice.json"
 
 
-def slice_provenance(*, start: float, end: float, source_path: str) -> dict:
-    """Fingerprint binding a source slice to its requested interval + source.
-
-    Resume decisions compare this against the current request; any change
-    to the interval or the source file invalidates reuse.
-    """
+def _output_identity(path: str) -> dict | None:
+    """Identity of the produced slice file itself (binds stamp to artifact)."""
     try:
-        st = os.stat(source_path)
-        src_id: dict = {
-            "path": os.path.abspath(source_path),
-            "size": st.st_size,
-            "mtime": st.st_mtime,
-        }
+        st = os.stat(path)
+        return {"size": st.st_size, "mtime": st.st_mtime}
     except OSError:
-        src_id = {"path": os.path.abspath(source_path), "size": None, "mtime": None}
+        return None
+
+
+def slice_provenance(
+    *, start: float, end: float, source_fp: dict, output_path: str | None = None
+) -> dict:
+    """Fingerprint binding a source slice to its requested interval.
+
+    ``source_fp`` must be captured via ``source_fingerprint`` BEFORE the cut.
+    When ``output_path`` is given, the record also binds to the produced
+    artifact's identity, so a torn media/provenance pair (new media, old
+    stamp after an interrupted swap) fails validation instead of falsely
+    validating.
+    """
     return {
         "version": _SLICE_PROVENANCE_VERSION,
         "start": round(float(start), 3),
         "end": round(float(end), 3),
-        "source": src_id,
+        "source": source_fp,
+        "output": _output_identity(output_path) if output_path else None,
     }
 
 
-def write_slice_provenance(slice_path: str, *, start: float, end: float, source_path: str) -> None:
-    """Persist the provenance sidecar next to a freshly cut slice."""
+def write_slice_provenance(
+    slice_path: str, *, start: float, end: float, source_fp: dict
+) -> None:
+    """Persist the provenance sidecar atomically, bound to the slice file.
+
+    The record is written to a temp file and atomically renamed, and it
+    captures the slice file's own identity -- so the stamp always describes
+    the exact bytes on disk, never a previous generation. Call AFTER the
+    media swap (``os.replace``) has completed.
+    """
     import json
 
-    with open(slice_provenance_path(slice_path), "w", encoding="utf-8") as f:
-        json.dump(slice_provenance(start=start, end=end, source_path=source_path), f)
+    record = slice_provenance(
+        start=start, end=end, source_fp=source_fp, output_path=slice_path
+    )
+    tmp_path = slice_provenance_path(slice_path) + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(record, f)
+    os.replace(tmp_path, slice_provenance_path(slice_path))
 
 
 def read_slice_provenance(slice_path: str) -> dict | None:
@@ -201,18 +272,65 @@ def read_slice_provenance(slice_path: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def slice_provenance_valid(slice_path: str, *, start: float, end: float, source_path: str) -> bool:
+def slice_provenance_valid(
+    slice_path: str, *, start: float, end: float, source_path: str
+) -> bool:
     """True when the on-disk slice was cut for this exact request.
 
     Guards resume: an old slice (pre-accurate-cut ``version``), a changed
-    interval, or a changed source file all invalidate reuse. A slice with
-    no provenance record is treated as legacy and re-cut.
+    interval, a changed source file, a missing/unparseable record, or a
+    torn media/provenance pair (stamp's output identity != current file)
+    all invalidate reuse. A slice with no provenance record is treated as
+    legacy and re-cut.
     """
     record = read_slice_provenance(slice_path)
     if record is None:
         return False
-    expected = slice_provenance(start=start, end=end, source_path=source_path)
-    return record == expected
+    source_fp = source_fingerprint(source_path)
+    expected = slice_provenance(
+        start=start, end=end, source_fp=source_fp, output_path=slice_path
+    )
+    for key in ("version", "start", "end", "source"):
+        if record.get(key) != expected.get(key):
+            return False
+    stamped_output = record.get("output")
+    current_output = expected.get("output")
+    if not stamped_output or not current_output:
+        return False
+    return stamped_output == current_output
+
+
+def validate_cut_output(
+    path: str, expected_duration: float, *, min_size: int = 10_000
+) -> tuple[bool, str]:
+    """Verify a freshly cut temp file before it replaces a known-good slice.
+
+    Returns (True, "") when the file is usable, else (False, reason).
+    Catches the "ffmpeg exit 0 but empty/truncated output" case: a
+    successful return code alone must never authorize replacing good media.
+    Never raises.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return False, f"unreadable: {exc}"
+    if size < min_size:
+        return False, f"too small ({size} bytes < {min_size})"
+    try:
+        from clippyme.pipeline.media_qa import probe_media
+    except Exception as exc:
+        return False, f"probe unavailable: {exc}"
+    report = probe_media(path)
+    if report.get("probe_error"):
+        return False, f"probe failed: {report['probe_error']}"
+    if not report.get("has_video"):
+        return False, "no usable video stream"
+    dur = report.get("duration")
+    if dur is None:
+        return False, "unknown duration"
+    if abs(dur - expected_duration) > 0.2:
+        return False, f"duration {dur:.3f}s not within tolerance of {expected_duration:.3f}s"
+    return True, ""
 
 
 _CLIP_SUFFIX_RE = re.compile(r"_clip_\d+\.mp4$", re.IGNORECASE)
