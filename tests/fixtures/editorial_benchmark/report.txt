@@ -1,15 +1,36 @@
 Editorial Benchmark Report
 ==============================
 
-Source hours: 0.033
-Accepted per source hour: 60.0
+Run baseline (abc123):
+  Sources: ['syn1', 'syn2'] (0.0333h)
+  Candidates: 2, Reviewed: 2 (100%), Accepted: 1 (50.0%)
+  Distinct moments: 1, Accepted/hour: 30.0
+  Opening: 1/2, Payoff: 1/1, Ending: 0/1
+  Framing: 1 defects / 1 reviewed, Hook obstruction: 0/1, Caption: 0/0
+Run candidate (def456):
+  Sources: ['syn1'] (0.0167h)
+  Candidates: 1, Reviewed: 1 (100%), Accepted: 1 (100.0%)
+  Distinct moments: 1, Accepted/hour: 60.0
+  Opening: 0/0, Payoff: 0/0, Ending: 0/0
+  Framing: 0 defects / 0 reviewed, Hook obstruction: 0/0, Caption: 0/0
 
-Per run:
-  baseline: 1/2 accepted (50.0%), distinct moments: 1
-  candidate: 1/2 accepted (50.0%), distinct moments: 1
+Per genre (all six):
+  interview/podcast: 2/3 (66.7%), distinct: 2
+  reaction/comedy: 0/0 (no data), distinct: unknown
+  gaming/stream: 0/0 (no data), distinct: unknown
+  tutorial/screen: 0/0 (no data), distinct: unknown
+  sport/action: 0/0 (no data), distinct: unknown
+  performance/visual: 0/0 (no data), distinct: unknown
 
-Per genre:
-  interview/podcast: 2/3 (66.7%)
-  reaction/comedy: 0/1 (0.0%)
+Paired sources:
+  syn1: [baseline, candidate] compatible
+  syn2: [baseline] compatible, missing: ['candidate']
 
-Real-footage benchmark has not run; synthetic fixtures only.
+Media checks (objective):
+  source:syn1: FAIL
+  source:syn2: FAIL
+  clip:c1: FAIL
+  clip:c2: FAIL
+  clip:c3: FAIL
+
+Real-footage benchmark has not run; synthetic only.

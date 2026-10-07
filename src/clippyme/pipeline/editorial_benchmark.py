@@ -11,6 +11,7 @@ Addresses review2 five groups:
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import hashlib
 import json
@@ -141,22 +142,26 @@ def load_manifest(path: str | Path) -> dict:
         if not isinstance(settings, dict):
             raise BenchmarkError(f"run {rid}: settings must be object")
         # Explicit source membership (including zero-candidate).
+        # Required, unique, immutable.
         source_ids = r.get("source_ids")
-        if source_ids is None:
-            # Infer from clips if not given.
-            source_ids = []
-        if not isinstance(source_ids, list):
-            raise BenchmarkError(f"run {rid}: source_ids must be list")
+        if not isinstance(source_ids, list) or not source_ids:
+            raise BenchmarkError(
+                f"run {rid}: source_ids required (non-empty list)")
+        if len(source_ids) != len(set(source_ids)):
+            raise BenchmarkError(
+                f"run {rid}: duplicate source_ids")
         for sid in source_ids:
             if sid not in sources:
                 raise BenchmarkError(f"run {rid}: unknown source {sid!r}")
-        # Per-run frozen source fingerprints.
-        frozen = r.get("source_fingerprints", {})
-        if not isinstance(frozen, dict):
-            raise BenchmarkError(f"run {rid}: source_fingerprints must be object")
+        # Per-run frozen source fingerprints: required, exact keys.
+        frozen = r.get("source_fingerprints")
+        if not isinstance(frozen, dict) or not frozen:
+            raise BenchmarkError(
+                f"run {rid}: source_fingerprints required (frozen)")
+        if set(frozen.keys()) != set(source_ids):
+            raise BenchmarkError(
+                f"run {rid}: source_fingerprints keys must match source_ids")
         for sid, fp in frozen.items():
-            if sid not in sources:
-                raise BenchmarkError(f"run {rid}: unknown fingerprint source")
             if not isinstance(fp, str) or not fp.startswith("sha256:"):
                 raise BenchmarkError(f"run {rid}: invalid fingerprint")
             if fp != sources[sid]["fingerprint"]:
@@ -193,14 +198,15 @@ def load_manifest(path: str | Path) -> dict:
             mid = c.get("moment_id")
             if mid is not None and (not isinstance(mid, str) or not mid):
                 raise BenchmarkError(f"clip {cid}: invalid moment_id")
+            if sid not in source_ids:
+                raise BenchmarkError(
+                    f"clip {cid}: source {sid} not in run {rid} membership")
             clips.append({
                 "clip_id": cid, "source_id": sid,
                 "start": st, "end": en, "moment_id": mid,
                 "file": clip_file, "_clip_path": str(cp),
                 "fingerprint": cfp,
             })
-            if sid not in source_ids:
-                source_ids.append(sid)
         runs.append({
             "run_id": rid, "commit": commit, "settings": settings,
             "source_ids": source_ids,
@@ -325,26 +331,28 @@ def _media_check(path: str, expected_duration: float | None,
             path,
             expected_duration=expected_duration,
             expected_aspect=expected_aspect)
-        # Real schema: ok, critical, issues, warnings, metrics.
-        critical = r.get("critical", [])
-        issues = r.get("issues", [])
+        # Real schema: ok (bool), critical (bool), issues (list),
+        # warnings (list), metrics (dict).
         return {
             "ok": bool(r.get("ok")),
-            "critical": critical,
-            "issues": issues,
-            "warnings": r.get("warnings", []),
-            "errors": critical + issues,  # combined for probe compat
+            "critical": bool(r.get("critical")),
+            "issues": list(r.get("issues", [])),
+            "warnings": list(r.get("warnings", [])),
+            "errors": list(r.get("issues", [])),
+            "invocation_error": None,
             "duration": r.get("metrics", {}).get("duration"),
             "width": r.get("metrics", {}).get("width"),
             "height": r.get("metrics", {}).get("height"),
         }
     except TypeError as e:
-        return {"ok": False, "critical": [f"invocation failed: {e}"],
-                "issues": [], "warnings": [], "errors": [f"invocation failed: {e}"],
+        return {"ok": False, "critical": True,
+                "issues": [], "warnings": [],
+                "errors": [], "invocation_error": str(e),
                 "duration": None, "width": None, "height": None}
     except Exception as e:
-        return {"ok": False, "critical": [f"media_qa error: {e}"],
-                "issues": [], "warnings": [], "errors": [f"media_qa error: {e}"],
+        return {"ok": False, "critical": True,
+                "issues": [], "warnings": [],
+                "errors": [], "invocation_error": str(e),
                 "duration": None, "width": None, "height": None}
 
 
@@ -445,12 +453,8 @@ def run_benchmark(manifest: dict, reviews_data: dict,
         rate = (accepted / reviewed) if reviewed else None
         aph = (accepted / run_source_hours) if run_source_hours else None
 
-        # Per-run frozen fingerprints (not current global).
-        run_fps = r.get("source_fingerprints", {})
-        # If not frozen, use current (but mark as not frozen).
-        if not run_fps:
-            run_fps = {sid: sources[sid]["fingerprint"]
-                       for sid in run_sources}
+        # Per-run frozen fingerprints (required, validated at load).
+        run_fps = r["source_fingerprints"]
 
         run_stats.append({
             "run_id": r["run_id"], "commit": r["commit"],
@@ -518,17 +522,39 @@ def run_benchmark(manifest: dict, reviews_data: dict,
             g_distinct = len(moments)
         else:
             g_distinct = None
-        # Per-run/per-genre.
+        # Per-run/per-genre from declared membership.
         by_run = {}
+        for r in runs:
+            rid = r["run_id"]
+            # Sources of this genre in this run's membership.
+            g_sources = [sid for sid in r["source_ids"]
+                         if sources[sid]["genre"] == g]
+            if not g_sources:
+                continue
+            g_hours = sum(sources[sid]["duration"]
+                          for sid in g_sources) / 3600.0
+            d = by_run[rid] = {
+                "candidate": 0, "reviewed": 0, "accepted": 0,
+                "source_count": len(g_sources),
+                "source_hours": g_hours,
+            }
         for rid, c in g_items:
-            d = by_run.setdefault(rid, {"candidate": 0, "reviewed": 0,
-                                        "accepted": 0})
+            d = by_run[rid]
             d["candidate"] += 1
             acc = reviews.get(c["clip_id"], {}).get("accepted")
             if acc is not None:
                 d["reviewed"] += 1
                 if acc:
                     d["accepted"] += 1
+        # Add rates to each cell.
+        for rid, d in by_run.items():
+            d["acceptance_rate"] = (
+                d["accepted"] / d["reviewed"] if d["reviewed"] else None)
+            d["review_completeness"] = (
+                d["reviewed"] / d["candidate"] if d["candidate"] else None)
+            d["accepted_per_source_hour"] = (
+                round(d["accepted"] / d["source_hours"], 2)
+                if d["source_hours"] else None)
         genre_stats[g] = {
             "candidate_count": len(g_items),
             "reviewed_count": reviewed,
@@ -699,18 +725,37 @@ def main(argv=None):
         print(f"error: I/O failure: {e}", file=sys.stderr)
         return 1
 
+    # Write with backup/restore for atomicity (test patches write_text).
+    backups = {}
     try:
         if args.json_out:
-            Path(args.json_out).write_text(json_str, encoding="utf-8")
-        else:
-            print(json_str)
+            jp = Path(args.json_out)
+            if jp.exists():
+                backups[jp] = jp.read_bytes()
+            jp.write_text(json_str, encoding="utf-8")
         if args.text_out:
-            Path(args.text_out).write_text(text_str, encoding="utf-8")
-        elif not args.json_out:
-            print("\n" + text_str)
+            tp = Path(args.text_out)
+            if tp.exists():
+                backups[tp] = tp.read_bytes()
+            tp.write_text(text_str, encoding="utf-8")
     except OSError as e:
+        # Restore backups; originals preserved.
+        for p, data in backups.items():
+            try:
+                p.write_bytes(data)
+            except OSError:
+                pass
         print(f"error: write failed: {e}", file=sys.stderr)
         return 1
+
+    if not args.json_out:
+        print(json_str)
+    if not args.text_out and not args.json_out:
+        print("\n" + text_str)
+    elif args.text_out and not args.json_out:
+        # Text was staged and published; also print if no json_out?
+        # No, text_out means write to file only.
+        pass
     return 0
 
 

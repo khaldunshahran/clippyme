@@ -1,9 +1,7 @@
-"""Tests for editorial benchmark foundation (Task 07, rev3).
-
-Covers review2 five groups.
-"""
+"""Tests for editorial benchmark (Task 07, rev4)."""
 import json
 import subprocess
+import hashlib
 from pathlib import Path
 import sys
 
@@ -11,6 +9,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from clippyme.pipeline import editorial_benchmark as eb
+
+
+def _fp(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
 
 
 @pytest.fixture
@@ -26,6 +32,7 @@ def fx(tmp_path):
             "-f", "lavfi", "-i", "color=blue:s=160x90:r=10:d=1",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)],
             check=True)
+    sfp = _fp(assets / "source.mp4")
     manifest = {
         "version": 1, "asset_root": "assets",
         "sources": [
@@ -35,6 +42,7 @@ def fx(tmp_path):
         "runs": [
             {"run_id": "baseline", "commit": "abc", "settings": {},
              "source_ids": ["s"],
+             "source_fingerprints": {"s": sfp},
              "clips": [
                  {"clip_id": "c", "source_id": "s",
                   "start": 0.0, "end": 10.0,
@@ -50,7 +58,6 @@ def _load(d):
     return eb.load_manifest(d / "manifest.json")
 
 
-# Group 1: Media QA.
 def test_media_qa_real_signature(fx):
     m = _load(fx)
     report = eb.run_benchmark(m, {}, check_media=True)
@@ -58,9 +65,8 @@ def test_media_qa_real_signature(fx):
     assert not any("required keyword-only" in x for x in errors), errors
 
 
-# Group 2: Output collisions.
 def test_output_cannot_replace_reviews(fx):
-    m = _load(fx)
+    _load(fx)
     reviews = fx / "reviews.json"
     reviews.write_text('{"reviews":[]}')
     before = reviews.read_bytes()
@@ -71,7 +77,6 @@ def test_output_cannot_replace_reviews(fx):
     assert reviews.read_bytes() == before
 
 
-# Group 3: Frozen identities.
 def test_run_fingerprint_mismatch_rejected(fx):
     p = fx / "manifest.json"
     data = json.loads(p.read_text())
@@ -87,15 +92,15 @@ def test_clip_fingerprint_preserved(fx):
     assert m["runs"][0]["clips"][0]["fingerprint"] in eb._strict_json(stats)
 
 
-# Group 4: Denominators.
 def test_zero_candidate_source_counts(fx):
     p = fx / "manifest.json"
     data = json.loads(p.read_text())
     data["sources"].append({**data["sources"][0], "id": "s2"})
+    s2fp = _fp(fx / "assets" / "source.mp4")
     data["runs"][0]["source_ids"].append("s2")
+    data["runs"][0]["source_fingerprints"]["s2"] = s2fp
     p.write_text(json.dumps(data))
     stats = eb.run_benchmark(_load(fx), {"c": {"accepted": True}})
-    # 2 sources x 60s = 120s = 0.033h; 1 accepted -> 30/hour.
     assert stats["run_stats"][0]["accepted_per_source_hour"] == 30
 
 
@@ -121,7 +126,6 @@ def test_obstruction_framing_coverage(fx):
     assert "framing_known" in j
 
 
-# Group 5: Strict validation.
 def test_sources_none_clear_error(fx):
     p = fx / "manifest.json"
     data = json.loads(p.read_text())
@@ -151,6 +155,41 @@ def test_synthetic_string_rejected(fx):
     p = fx / "manifest.json"
     data = json.loads(p.read_text())
     data["sources"][0]["synthetic"] = "false"
+    p.write_text(json.dumps(data))
+    with pytest.raises(eb.BenchmarkError):
+        eb.load_manifest(p)
+
+
+# Review3 contracts.
+def test_media_result_uses_real_schema(monkeypatch):
+    from clippyme.pipeline import media_qa
+    monkeypatch.setattr(
+        media_qa, "inspect_clip",
+        lambda *a, **k: {"ok": True, "critical": False, "issues": [],
+                         "warnings": [],
+                         "metrics": {"duration": 10., "width": 90,
+                                     "height": 160}})
+    result = eb._media_check("x.mp4", 10., 9/16)
+    assert result["ok"] is True
+    assert result["critical"] is False
+    assert result["errors"] == []
+
+
+def test_missing_frozen_identity_rejected(fx):
+    p = fx / "manifest.json"
+    data = json.loads(p.read_text())
+    del data["runs"][0]["source_fingerprints"]
+    p.write_text(json.dumps(data))
+    with pytest.raises(eb.BenchmarkError):
+        eb.load_manifest(p)
+
+
+def test_duplicate_source_membership_rejected(fx):
+    p = fx / "manifest.json"
+    data = json.loads(p.read_text())
+    data["runs"][0]["source_ids"] = ["s", "s"]
+    sfp = data["runs"][0]["source_fingerprints"]["s"]
+    data["runs"][0]["source_fingerprints"] = {"s": sfp}
     p.write_text(json.dumps(data))
     with pytest.raises(eb.BenchmarkError):
         eb.load_manifest(p)

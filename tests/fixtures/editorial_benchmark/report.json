@@ -1,61 +1,337 @@
 {
-  "accepted_per_source_hour": 60.0,
   "genre_stats": {
+    "gaming/stream": {
+      "acceptance_rate": null,
+      "accepted_count": 0,
+      "by_run": {},
+      "candidate_count": 0,
+      "distinct_accepted_moments": null,
+      "reviewed_count": 0
+    },
     "interview/podcast": {
       "acceptance_rate": 0.6666666666666666,
       "accepted_count": 2,
+      "by_run": {
+        "baseline": {
+          "acceptance_rate": 0.5,
+          "accepted": 1,
+          "accepted_per_source_hour": 60.0,
+          "candidate": 2,
+          "review_completeness": 1.0,
+          "reviewed": 2,
+          "source_count": 1,
+          "source_hours": 0.016666666666666666
+        },
+        "candidate": {
+          "acceptance_rate": 1.0,
+          "accepted": 1,
+          "accepted_per_source_hour": 60.0,
+          "candidate": 1,
+          "review_completeness": 1.0,
+          "reviewed": 1,
+          "source_count": 1,
+          "source_hours": 0.016666666666666666
+        }
+      },
       "candidate_count": 3,
-      "distinct_accepted_moments": 1,
+      "distinct_accepted_moments": 2,
       "reviewed_count": 3
     },
-    "reaction/comedy": {
-      "acceptance_rate": 0.0,
+    "performance/visual": {
+      "acceptance_rate": null,
       "accepted_count": 0,
-      "candidate_count": 2,
+      "by_run": {},
+      "candidate_count": 0,
       "distinct_accepted_moments": null,
-      "reviewed_count": 1
+      "reviewed_count": 0
+    },
+    "reaction/comedy": {
+      "acceptance_rate": null,
+      "accepted_count": 0,
+      "by_run": {
+        "baseline": {
+          "acceptance_rate": null,
+          "accepted": 0,
+          "accepted_per_source_hour": 0.0,
+          "candidate": 0,
+          "review_completeness": null,
+          "reviewed": 0,
+          "source_count": 1,
+          "source_hours": 0.016666666666666666
+        }
+      },
+      "candidate_count": 0,
+      "distinct_accepted_moments": null,
+      "reviewed_count": 0
+    },
+    "sport/action": {
+      "acceptance_rate": null,
+      "accepted_count": 0,
+      "by_run": {},
+      "candidate_count": 0,
+      "distinct_accepted_moments": null,
+      "reviewed_count": 0
+    },
+    "tutorial/screen": {
+      "acceptance_rate": null,
+      "accepted_count": 0,
+      "by_run": {},
+      "candidate_count": 0,
+      "distinct_accepted_moments": null,
+      "reviewed_count": 0
     }
   },
-  "note": "Real-footage benchmark has not run; synthetic fixtures only.",
+  "media_checks": {
+    "clip:c1": {
+      "critical": true,
+      "duration": 15.0,
+      "errors": [
+        "output is effectively empty (5766 bytes)",
+        "output has no audio stream"
+      ],
+      "height": 90,
+      "invocation_error": null,
+      "issues": [
+        "output is effectively empty (5766 bytes)",
+        "output has no audio stream"
+      ],
+      "ok": false,
+      "warnings": [],
+      "width": 160
+    },
+    "clip:c2": {
+      "critical": true,
+      "duration": 15.0,
+      "errors": [
+        "output is effectively empty (5766 bytes)",
+        "output has no audio stream"
+      ],
+      "height": 90,
+      "invocation_error": null,
+      "issues": [
+        "output is effectively empty (5766 bytes)",
+        "output has no audio stream"
+      ],
+      "ok": false,
+      "warnings": [],
+      "width": 160
+    },
+    "clip:c3": {
+      "critical": true,
+      "duration": 10.0,
+      "errors": [
+        "output is effectively empty (4367 bytes)",
+        "output has no audio stream"
+      ],
+      "height": 90,
+      "invocation_error": null,
+      "issues": [
+        "output is effectively empty (4367 bytes)",
+        "output has no audio stream"
+      ],
+      "ok": false,
+      "warnings": [],
+      "width": 160
+    },
+    "source:syn1": {
+      "critical": true,
+      "duration": 60.0,
+      "errors": [
+        "output has no audio stream"
+      ],
+      "height": 90,
+      "invocation_error": null,
+      "issues": [
+        "output has no audio stream"
+      ],
+      "ok": false,
+      "warnings": [],
+      "width": 160
+    },
+    "source:syn2": {
+      "critical": true,
+      "duration": 60.0,
+      "errors": [
+        "output has no audio stream"
+      ],
+      "height": 90,
+      "invocation_error": null,
+      "issues": [
+        "output has no audio stream"
+      ],
+      "ok": false,
+      "warnings": [],
+      "width": 160
+    }
+  },
+  "note": "Real-footage benchmark has not run; synthetic only.",
   "paired_sources": {
     "syn1": {
-      "baseline": [
-        "c1",
-        "c2"
-      ],
-      "candidate": [
-        "c4"
-      ]
+      "current_fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d",
+      "fingerprints_compatible": true,
+      "missing_runs": [],
+      "runs": {
+        "baseline": {
+          "clip_ids": [
+            "c1",
+            "c2"
+          ],
+          "commit": "abc123",
+          "source_fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+        },
+        "candidate": {
+          "clip_ids": [
+            "c3"
+          ],
+          "commit": "def456",
+          "source_fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+        }
+      }
     },
     "syn2": {
-      "baseline": [
-        "c3"
+      "current_fingerprint": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72",
+      "fingerprints_compatible": true,
+      "missing_runs": [
+        "candidate"
       ],
-      "candidate": [
-        "c5"
-      ]
+      "runs": {
+        "baseline": {
+          "clip_ids": [],
+          "commit": "abc123",
+          "source_fingerprint": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
+        }
+      }
     }
   },
   "run_stats": [
     {
       "acceptance_rate": 0.5,
       "accepted_count": 1,
-      "candidate_count": 3,
+      "accepted_per_source_hour": 30.0,
+      "candidate_count": 2,
+      "clips": [
+        {
+          "clip_id": "c1",
+          "end": 25.0,
+          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8",
+          "moment_id": "m1",
+          "source_id": "syn1",
+          "start": 10.0
+        },
+        {
+          "clip_id": "c2",
+          "end": 45.0,
+          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8",
+          "moment_id": "m1",
+          "source_id": "syn1",
+          "start": 30.0
+        }
+      ],
+      "commit": "abc123",
       "distinct_accepted_moments": 1,
+      "judgments": {
+        "caption_obstruction": {
+          "defects": 0,
+          "known": 0
+        },
+        "ending": {
+          "known": 1,
+          "ok": 0
+        },
+        "framing": {
+          "defects": 1,
+          "known": 1
+        },
+        "framing_known": 1,
+        "hook_obstruction": {
+          "defects": 0,
+          "known": 1
+        },
+        "opening": {
+          "known": 2,
+          "ok": 1
+        },
+        "payoff": {
+          "known": 1,
+          "ok": 1
+        }
+      },
       "moment_label_coverage": 1.0,
+      "review_completeness": 1.0,
       "reviewed_count": 2,
-      "run_id": "baseline"
+      "run_id": "baseline",
+      "settings": {
+        "preset": "base"
+      },
+      "source_fingerprints": {
+        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d",
+        "syn2": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
+      },
+      "source_hours": 0.0333,
+      "source_ids": [
+        "syn1",
+        "syn2"
+      ]
     },
     {
-      "acceptance_rate": 0.5,
+      "acceptance_rate": 1.0,
       "accepted_count": 1,
-      "candidate_count": 2,
+      "accepted_per_source_hour": 60.0,
+      "candidate_count": 1,
+      "clips": [
+        {
+          "clip_id": "c3",
+          "end": 10.0,
+          "fingerprint": "sha256:c3b97555333cfd91f4758cd55c89488777587a5cfc6dc3838994ed6ba38cdd2c",
+          "moment_id": "m2",
+          "source_id": "syn1",
+          "start": 0.0
+        }
+      ],
+      "commit": "def456",
       "distinct_accepted_moments": 1,
+      "judgments": {
+        "caption_obstruction": {
+          "defects": 0,
+          "known": 0
+        },
+        "ending": {
+          "known": 0,
+          "ok": 0
+        },
+        "framing": {
+          "defects": 0,
+          "known": 0
+        },
+        "framing_known": 0,
+        "hook_obstruction": {
+          "defects": 0,
+          "known": 0
+        },
+        "opening": {
+          "known": 0,
+          "ok": 0
+        },
+        "payoff": {
+          "known": 0,
+          "ok": 0
+        }
+      },
       "moment_label_coverage": 1.0,
-      "reviewed_count": 2,
-      "run_id": "candidate"
+      "review_completeness": 1.0,
+      "reviewed_count": 1,
+      "run_id": "candidate",
+      "settings": {
+        "preset": "improved"
+      },
+      "source_fingerprints": {
+        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
+      },
+      "source_hours": 0.0167,
+      "source_ids": [
+        "syn1"
+      ]
     }
   ],
-  "total_source_hours": 0.033,
   "version": 1
 }
