@@ -31,6 +31,7 @@ PATCH_KEYS = frozenset({
     "caption_position",
     "grade_preset",
     "word_edits",
+    "word_colors",
     "crop_nudge",
 })
 
@@ -85,6 +86,8 @@ def build_patch_prompt(project_summary: dict, segments: list[dict], instruction:
         '- "word_edits": object mapping transcript word-index (as string) to '
         "corrected word text, e.g. {\"42\": \"their\"}. Only fix real "
         "mis-transcriptions; never rewrite phrasing.\n"
+        '- "word_colors": object mapping word ID to 0/1/2 (highlight words '
+        "in a template color: 0 = default, 1 = Color 1, 2 = Color 2).\n"
         '- "crop_nudge": {"dx": <pixels>, "dy": <pixels>} -- shift the crop '
         "window right/down (negative = left/up), in source pixels.\n\n"
         "Rules:\n"
@@ -135,14 +138,15 @@ def apply_copilot_patch(project, patch: dict):
     """Apply a copilot patch to a ClipProject (mutates + returns it).
 
     Supported keys: hook_text, caption_style, caption_position, grade_preset,
-    word_edits, crop_nudge. Raises ValueError on anything invalid -- never
-    silently corrupts.
+    word_edits, word_colors, crop_nudge. Raises ValueError on anything
+    invalid -- never silently corrupts.
     """
     from clippyme.domain.clip_project import (
         CAPTION_POSITIONS,
         CAPTION_STYLES,
         GRADE_PRESETS,
         Overlay,
+        validate_word_colors_mapping,
     )
 
     if not isinstance(patch, dict):
@@ -204,6 +208,19 @@ def apply_copilot_patch(project, patch: dict):
                     f"string, got {key!r}")
             wid = words[idx].id or str(idx)
             project.captions.edits[wid] = val.strip()[:MAX_WORD_EDIT_CHARS]
+
+    if "word_colors" in patch:
+        wc = patch["word_colors"]
+        if not isinstance(wc, dict) or not wc:
+            raise ValueError("word_colors must be a non-empty object")
+        words = project.captions.words or []
+        known_ids = {w.id for w in words if w.id}
+        # Same strict messages as the Captions model validator.
+        validated = validate_word_colors_mapping(wc, known_ids)
+        if project.captions.word_colors is None:
+            project.captions.word_colors = {}
+        for key, val in validated.items():
+            project.captions.word_colors[key] = val
 
     if "crop_nudge" in patch:
         nudge = patch["crop_nudge"]

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -60,6 +60,38 @@ class ProjectSegment(BaseModel):
         return v
 
 
+def validate_word_colors_mapping(word_colors, known_ids):
+    """Strictly validate a word-ID -> color-index mapping (Slice 2).
+
+    ``known_ids``: set of stable word IDs (non-empty strings).
+    Returns a plain ``dict[str, int]`` copy.
+
+    Raises ``ValueError`` with a precise message on the first problem:
+    non-dict input, non-string/empty keys, unknown word IDs, non-int
+    values (bools, floats and numeric strings are all rejected -- ``bool``
+    is an ``int`` subclass so it needs the explicit check), or ints
+    outside (0, 1, 2).
+    """
+    if not isinstance(word_colors, dict):
+        raise ValueError(
+            f"word_colors must be an object, got {type(word_colors).__name__}")
+    out: dict[str, int] = {}
+    for key, val in word_colors.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                f"word_colors key must be a non-empty string, got {key!r}")
+        if key not in known_ids:
+            raise ValueError(f"word_colors[{key!r}] is not a known word ID")
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise ValueError(
+                f"word_colors[{key!r}] must be 0, 1, or 2, got {val!r}")
+        if val not in (0, 1, 2):
+            raise ValueError(
+                f"word_colors[{key!r}] must be 0, 1, or 2, got {val}")
+        out[key] = val
+    return out
+
+
 class CaptionWord(BaseModel):
     # Stable word ID (e.g. "w12"): assigned at project creation from
     # Captions.next_word_id, persisted, never reused. Splits/drops never
@@ -81,6 +113,15 @@ class Captions(BaseModel):
     style: str = "hormozi"  # mirrors dashboard seedClipParams styles
     position: str = "lower-third"
     words: list[CaptionWord] = Field(default_factory=list)
+    # Slice 2: stable word ID -> color index (0 = template default,
+    # 1 = Color 1, 2 = Color 2). 0 is the default and is stored by simply
+    # omitting the key. Validated strictly (see _validate_word_colors);
+    # this field MUST stay after `words` so the validator sees validated
+    # word IDs in info.data.
+    word_colors: dict[str, Any] = Field(
+        default_factory=dict,
+        description="word ID -> color index (0/1/2); 0 = template default",
+    )
     edits: dict[str, str] = Field(
         default_factory=dict,
         description="word ID (or legacy word-index as string) -> corrected text",
@@ -90,6 +131,15 @@ class Captions(BaseModel):
         ge=0,
         description="persisted counter; fresh word IDs are f'w{next_word_id}', then it increments",
     )
+
+    @field_validator("word_colors")
+    @classmethod
+    def _validate_word_colors(cls, v, info):
+        # Runs AFTER `words` (field definition order): known IDs are the
+        # validated CaptionWord models, so this also covers IDs backfilled
+        # by the read-path migration.
+        known_ids = {w.id for w in (info.data.get("words") or []) if w.id}
+        return validate_word_colors_mapping(v, known_ids)
 
 
 class Overlay(BaseModel):

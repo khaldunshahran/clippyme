@@ -30,7 +30,11 @@ import pytest
 
 from clippyme.domain.clip_project import validate_project
 from clippyme.domain.project_render import _map_words_to_timeline
-from clippyme.domain.subtitles import generate_ass_karaoke
+from clippyme.domain.subtitles import (
+    generate_ass_karaoke,
+    hex_to_ass_color,
+    resolve_word_color,
+)
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "..", "fixtures")
 FONTS_DIR = os.path.join(FIXTURES, "fonts")
@@ -56,7 +60,10 @@ _GOLDEN_ENABLED = (
 )
 
 
-def _project(words, edits=None, segments=None):
+def _project(words, edits=None, segments=None, word_colors=None):
+    caps = {"words": words, "edits": edits or {}}
+    if word_colors:
+        caps["word_colors"] = word_colors
     d = {
         "schema": "nugget.clip-project/1",
         "job_id": "golden",
@@ -66,7 +73,7 @@ def _project(words, edits=None, segments=None):
         "segments": segments or [
             {"id": "seg0", "start": 0.0, "end": 60.0,
              "crop": {"x": 0, "y": 0, "w": 1920, "h": 1080}}],
-        "captions": {"words": words, "edits": edits or {}},
+        "captions": caps,
     }
     return validate_project(d)
 
@@ -96,7 +103,8 @@ def _render_frame(project, at, tmp_path):
     """Render one captioned frame at output-timeline time ``at``."""
     mapped, timeline_dur = _map_words_to_timeline(project)
     transcript = {"segments": [{"words": [
-        {"word": w["word"], "start": w["start"], "end": w["end"]}
+        {"word": w["word"], "start": w["start"], "end": w["end"],
+         "color": w.get("color", 0)}
         for w in mapped]}]}
     # Relative paths + cwd dodge ffmpeg's Windows drive-colon escaping in
     # filter args; the pinned font rides alongside for a relative fontsdir.
@@ -182,3 +190,50 @@ def test_dropped_span_frame(tmp_path, generate_golden):
     _check_or_generate("dropped_span", project, at=14.5,
                        tmp_path=tmp_path, generate_golden=generate_golden,
                        expect_text="KEPTWORD")
+
+
+def _expected_color_override(preset, color_index):
+    """The ASS override a word with this color index must carry."""
+    c = hex_to_ass_color(resolve_word_color(preset, color_index), 1.0)
+    return f"\\1c{c}\\2c{c}"
+
+
+@pytest.mark.skipif(not ffmpeg, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(not _GOLDEN_ENABLED, reason="golden tests run in CI or with RUN_GOLDEN=1")
+def test_color1_word_frame(tmp_path, generate_golden):
+    """A Color-1 word burns in the template highlight color (slice 2)."""
+    project = _project(_words(4, texts=["hello", "brave", "new", "world"]),
+                       word_colors={"w1": 1})
+    _check_or_generate("color1_word", project, at=1.7,
+                       tmp_path=tmp_path, generate_golden=generate_golden,
+                       expect_text=_expected_color_override(
+                           "classic_white", 1))
+
+
+@pytest.mark.skipif(not ffmpeg, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(not _GOLDEN_ENABLED, reason="golden tests run in CI or with RUN_GOLDEN=1")
+def test_color2_word_frame(tmp_path, generate_golden):
+    """A Color-2 word burns in the template accent color (slice 2)."""
+    project = _project(_words(4, texts=["hello", "brave", "new", "world"]),
+                       word_colors={"w1": 2})
+    _check_or_generate("color2_word", project, at=1.7,
+                       tmp_path=tmp_path, generate_golden=generate_golden,
+                       expect_text=_expected_color_override(
+                           "classic_white", 2))
+
+
+@pytest.mark.skipif(not ffmpeg, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(not _GOLDEN_ENABLED, reason="golden tests run in CI or with RUN_GOLDEN=1")
+def test_colored_edited_word_frame(tmp_path, generate_golden):
+    """A colored word keeps its color through a text edit (slice 1+2)."""
+    project = _project(_words(4, texts=["hello", "brave", "new", "world"]),
+                       edits={"w1": "changed"},
+                       word_colors={"w1": 1})
+    _check_or_generate("colored_edited_word", project, at=1.7,
+                       tmp_path=tmp_path, generate_golden=generate_golden,
+                       expect_text="CHANGED")  # classic_white uppercases
+    # The color override must survive the edit too -- checked on the ASS
+    # text by re-rendering (the pixel comparison above covers the burn).
+    _, ass_text = _render_frame(
+        project, 1.7, tmp_path)
+    assert _expected_color_override("classic_white", 1) in ass_text

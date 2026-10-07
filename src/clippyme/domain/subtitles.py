@@ -261,11 +261,21 @@ def hex_to_ass_color(hex_color, opacity=1.0):
 
 
 # --- Viral Subtitle Presets ---
+# Slice 2 "Color 2" (accent_color) choices -- the per-word highlight palette:
+# index 0 = text_color (template default), 1 = highlight_color ("Color 1"),
+# 2 = accent_color ("Color 2"). Each accent complements its preset's Color 1:
+# - classic_white: Color 1 is yellow  -> accent is vivid green  (#00FF66)
+# - hormozi_bold:  Color 1 is green   -> accent is yellow       (#FFFF00)
+# - neon_glow:     Color 1 is cyan    -> accent is magenta      (#FF00FF, neon pair)
+# - mrbeast_box:   Color 1 is yellow  -> accent is MrBeast blue (#00A2FF)
+# - minimal_clean: Color 1 == text white -> accent is soft gold (#FFD166)
+# - fire_impact:   Color 1 is red     -> accent is ember orange (#FFAA00)
 SUBTITLE_PRESETS = {
     "classic_white": {
         "font": "Montserrat-Black",
         "text_color": "#FFFFFF",
         "highlight_color": "#FFFF00",
+        "accent_color": "#00FF66",
         "outline_color": "#000000",
         "outline_width": 4,
         "border_style": 1,
@@ -278,6 +288,7 @@ SUBTITLE_PRESETS = {
         "font": "Bangers-Regular",
         "text_color": "#FFFFFF",
         "highlight_color": "#00FF00",
+        "accent_color": "#FFFF00",
         "outline_color": "#000000",
         "outline_width": 5,
         "border_style": 1,
@@ -290,6 +301,7 @@ SUBTITLE_PRESETS = {
         "font": "Montserrat-Black",
         "text_color": "#FFFFFF",
         "highlight_color": "#00FFFF",
+        "accent_color": "#FF00FF",
         "outline_color": "#00AAAA",
         "outline_width": 3,
         "border_style": 1,
@@ -302,6 +314,7 @@ SUBTITLE_PRESETS = {
         "font": "Poppins-Black",
         "text_color": "#FFFFFF",
         "highlight_color": "#FFFF00",
+        "accent_color": "#00A2FF",
         "outline_color": "#000000",
         "outline_width": 1,
         "border_style": 3,
@@ -314,6 +327,7 @@ SUBTITLE_PRESETS = {
         "font": "Poppins-Medium",
         "text_color": "#FFFFFF",
         "highlight_color": "#FFFFFF",
+        "accent_color": "#FFD166",
         "outline_color": "#000000",
         "outline_width": 2,
         "border_style": 1,
@@ -326,6 +340,7 @@ SUBTITLE_PRESETS = {
         "font": "Anton-Regular",
         "text_color": "#FFFFFF",
         "highlight_color": "#FF4444",
+        "accent_color": "#FFAA00",
         "outline_color": "#000000",
         "outline_width": 5,
         "border_style": 1,
@@ -335,6 +350,26 @@ SUBTITLE_PRESETS = {
         "fontsize": 43,
     },
 }
+
+
+def resolve_word_color(preset="classic_white", color_index=0) -> str:
+    """Resolve a word color index to hex via the active template.
+
+    0 -> text_color (template default), 1 -> highlight_color (Color 1),
+    2 -> accent_color (Color 2). Unknown preset falls back to classic_white.
+
+    Raises ValueError on a bad color index or a malformed preset hex.
+    """
+    if isinstance(color_index, bool) or color_index not in (0, 1, 2):
+        raise ValueError(
+            f"color_index must be 0, 1, or 2, got {color_index!r}")
+    style = SUBTITLE_PRESETS.get(preset) or SUBTITLE_PRESETS["classic_white"]
+    key = ("text_color", "highlight_color", "accent_color")[color_index]
+    hex_color = style.get(key) or SUBTITLE_PRESETS["classic_white"][key]
+    if not _HEX_RE.match(str(hex_color)):
+        raise ValueError(
+            f"invalid {key} for preset {preset!r}: {hex_color!r}")
+    return hex_color
 
 # Bundled TTF fonts live at repo-root `fonts/` and are also mounted by
 # the FastAPI static handler at /fonts. We resolve the repo root by
@@ -585,10 +620,18 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
             except (TypeError, ValueError):
                 continue
             if w_end > clip_start and w_start < clip_end:
+                try:
+                    color = int(word_info.get('color') or 0)
+                except (TypeError, ValueError):
+                    color = 0
                 words.append({
                     'word': str(word_info.get('word', '')),
                     'start': w_start,
                     'end': w_end,
+                    # Slice 2: template color index for this word
+                    # (0 = default). Set by project_render from
+                    # captions.word_colors; absent -> 0.
+                    'color': color,
                 })
 
     if not words:
@@ -643,7 +686,18 @@ def generate_ass_karaoke(transcript, clip_start, clip_end, output_path,
             text = _strip_ass_braces(w['word'].strip())
             if style["uppercase"]:
                 text = text.upper()
-            karaoke_parts.append(f"{{\\k{duration_cs}}}{text}")
+            color_index = w.get('color', 0)
+            if color_index in (1, 2):
+                # Slice 2: hold the word in its template color through the
+                # whole karaoke sweep -- primary AND secondary become the
+                # resolved color so no sweep transition is visible.
+                c_ass = hex_to_ass_color(
+                    resolve_word_color(preset, color_index), 1.0)
+                karaoke_parts.append(
+                    f"{{\\1c{c_ass}\\2c{c_ass}\\k{duration_cs}}}{text}")
+            else:
+                # color 0: exactly the pre-slice-2 output (no override tags).
+                karaoke_parts.append(f"{{\\k{duration_cs}}}{text}")
 
         line_text = " ".join(karaoke_parts)
         # Fix: \k tags shouldn't have space before them inside the line

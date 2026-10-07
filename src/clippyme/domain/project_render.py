@@ -507,6 +507,10 @@ def _map_words_to_timeline(project: ClipProject) -> tuple[list[dict], float]:
                     "word": text,
                     "start": round(off + (ws - s0), 3),
                     "end": round(off + (min(we, s1) - s0), 3),
+                    # Slice 2: template color index for this word's stable
+                    # ID (0 = default). generate_ass_karaoke reads "color".
+                    "color": (project.captions.word_colors or {}).get(
+                        w.get("id"), 0),
                 })
                 break
     # drop zero-length after rounding

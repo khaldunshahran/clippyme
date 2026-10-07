@@ -15,7 +15,7 @@ import { SUBTITLE_PRESETS } from './data';
 import {
   getClipProject, saveClipProject, composeProject, backfillClipProjects,
   listClipProjectVersions, editClipAI, safeResolveUrl, clipPreviewSrc,
-  uploadAudio,
+  uploadAudio, getCaptionTemplates,
 } from '../api/realApi';
 
 // ---------------------------------------------------------------- helpers
@@ -56,13 +56,20 @@ function defaultCrop(p) {
   return { x: Math.round((W - w) / 2), y: 0, w, h: H };
 }
 
-// Word active at time t (with text edits applied). Returns {i, text, edited}.
-function wordAt(words, edits, t) {
+// Word active at time t (with text edits applied).
+// Returns {i, id, text, edited, color} -- id is the stable word ID and color
+// is the slice-2 template color index (0 = default).
+function wordAt(words, edits, wordColors, t) {
   for (let i = 0; i < words.length; i++) {
     const w = words[i];
     if (t >= w.start && t < w.end) {
       const over = edits ? edits[String(i)] : undefined;
-      return { i, text: over !== undefined ? over : w.w, edited: over !== undefined };
+      return {
+        i, id: w.id,
+        text: over !== undefined ? over : w.w,
+        edited: over !== undefined,
+        color: (wordColors || {})[w.id] ?? 0,
+      };
     }
   }
   return null;
@@ -661,8 +668,25 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
   const caps = (project && project.captions) || {};
   const words = caps.words || [];
   const edits = caps.edits || {};
+  const wordColors = caps.word_colors || {};
   const hook = ((project && project.overlays) || []).find((o) => o.type === 'hook');
-  const activeWord = useMemo(() => wordAt(words, edits, playhead), [words, edits, playhead]);
+  const activeWord = useMemo(
+    () => wordAt(words, edits, wordColors, playhead),
+    [words, edits, wordColors, playhead]
+  );
+
+  // Slice 2: caption-template palette (Color 0/1/2 hex per preset) so the
+  // preview caption renders in the word's highlight color. Fetched once
+  // (memoized in realApi); no hex is hardcoded here.
+  const [palette, setPalette] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    getCaptionTemplates().then((p) => { if (alive) setPalette(p); });
+    return () => { alive = false; };
+  }, []);
+  const activeColorHex = activeWord
+    ? palette?.[caps.style]?.colors?.[String(activeWord.color ?? 0)]
+    : null;
 
   // --- preview playback ------------------------------------------------
   const onTimeUpdate = () => {
@@ -1003,7 +1027,10 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
               <div style={{ position: 'absolute', zIndex: 2, pointerEvents: 'none', textAlign: 'center',
                 ...(CAP_POS_STYLE[caps.position] || CAP_POS_STYLE.bottom) }}>
                 <span style={{ ...capStyle, fontSize: 26, fontWeight: 800, padding: '2px 10px',
-                  borderRadius: 6, display: 'inline-block', lineHeight: 1.25 }}>
+                  borderRadius: 6, display: 'inline-block', lineHeight: 1.25,
+                  // Slice 2: render the active word in its highlight color
+                  // (resolved from the template palette; default = preset style).
+                  ...(activeColorHex ? { color: activeColorHex } : {}) }}>
                   {activeWord.text}
                 </span>
               </div>
