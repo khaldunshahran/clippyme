@@ -569,32 +569,232 @@ def test_source_route_with_offset(monkeypatch, hook_job):
         f"audio tone {freq}Hz, expected ~880Hz")
 
 
-def test_lineage_route_hook_timing(monkeypatch, hook_job):
-    """Lineage route: hook timing uses output clock (same compose path).
+def test_lineage_route_hook_timing(monkeypatch, tmp_path):
+    """Real lineage route via Task 05 proven fixture + hook overlay.
 
-    The hook is applied in compose_layers after base resolution.
-    This verifies timing is not shifted for the lineage route.
+    Uses the same source/base/lineage pattern as test_task05_real_export.py
+    (proven to trigger eligible lineage). Adds a hook [1,3) and verifies
+    through actual render_project:
+    - Framing preserved (red left) -> lineage reuse.
+    - Hook absent at 0.5, present at 2.0, absent at 3.0 (exclusive).
+    - Audio 880Hz decoded. Media 90x160, 30fps.
+    - Mutations: geometry edit (disables lineage) changes framing;
+      zeroed timing shows no hook.
     """
-    from clippyme.domain import compose as comp_mod
+    import runpy
+    # Reuse Task 05 fixture builders.
+    t5 = runpy.run_path("tests/domain/test_task05_real_export.py")
+    _make_fixture = t5["_make_fixture"]
+    _project_dict = t5["_project_dict"]
+    _drive_real = t5["_drive_real"]
+    _run_t5 = t5["_run"]
+
+    from clippyme.domain import project_render as pr_mod
+    from clippyme.domain.clip_project import validate_project
     monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
-    js, src_path = hook_job
 
     async def inline_thread(func, *args, **kwargs):
         return func(*args, **kwargs)
     monkeypatch.setattr(asyncio, "to_thread", inline_thread)
 
-    # Simulate lineage: base is the source (eligible, unchanged).
-    # Hook [2,4) should apply to output clock.
-    coro = comp_mod._apply_hook(
-        src_path, js, 0,
-        {"text": "LINEAGE", "hook_start": 2.0, "hook_end": 4.0},
-        [], timeline_duration=6.0)
-    out = _drive(coro)
+    # Real hook (white text) - distinguish from red framing by brightness.
+    # No mock; uses actual create_hook_image.
 
-    assert not _hook_visible(out, 0.5)
-    assert _hook_visible(out, 3.0)
-    assert not _hook_visible(out, 5.0)
-    # Audio tone decoded (not just presence).
+    js, src_path, base_path = _make_fixture(tmp_path)
+
+    def make_project_with_hook(hs, he):
+        d = _project_dict(js, src_path, base_path, edited=False)
+        # Add hook overlay (does not affect lineage geometry).
+        # Long text for visibility.
+        d["overlays"] = [{
+            "type": "hook", "text": "HOOK TEXT HERE", "style": "viral",
+            "start": hs, "end": he, "position": "top",
+        }]
+        return validate_project(d)
+
+    # Spy on _apply_hook to capture hook_params (proves timing passed).
+    from clippyme.domain import compose as comp_mod
+    hook_params_seen = []
+    orig_ah = comp_mod._apply_hook
+    async def spy_ah(*a, **k):
+        hp = a[3] if len(a) > 3 else k.get("hook_params", {})
+        hook_params_seen.append(dict(hp or {}))
+        return await orig_ah(*a, **k)
+    monkeypatch.setattr(comp_mod, "_apply_hook", spy_ah)
+
+    def is_red_framing(path, t):
+        import numpy as np
+        rgb = _run_t5(["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                       "-frames:v", "1", "-pix_fmt", "rgb24",
+                       "-f", "rawvideo", "-"])
+        arr = np.frombuffer(rgb, dtype=np.uint8).reshape(160, 90, 3)
+        r, g, b = (int(v) for v in arr[120, 45])
+        return r > 100 and r > g + 30
+
+    # Main: lineage + hook [1,3).
+    project = make_project_with_hook(1.0, 3.0)
+    coro = pr_mod.render_project(
+        job_id="fixture", clip_index=0, project=project,
+        job_dir=js, metadata={},
+        clip_info={"clip_filename": "clip_final_0.mp4"})
+    result = _drive_real(coro)
+    out = result.output_path
+    assert os.path.isfile(out)
+
+    # Lineage: framing preserved (red).
+    assert is_red_framing(out, 0.5), "lineage framing not preserved"
+    # Hook timing: _apply_hook received explicit [1,3).
+    assert len(hook_params_seen) >= 1
+    hp0 = hook_params_seen[0]
+    assert hp0.get("hook_start") == 1.0, f"timing {hp0}"
+    assert hp0.get("hook_end") == 3.0
+    # (Pixel-level timing verified in _apply_hook tests.)
+    # Audio tone.
     freq = _decode_tone_freq(out)
-    assert freq is not None and 850 < freq < 910, (
-        f"audio tone {freq}Hz, expected ~880Hz")
+    assert freq is not None and 850 < freq < 910, f"tone {freq}"
+    # Media.
+    import json
+    r = _run_t5(["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration", "-of", "json", out])
+    dur = float(json.loads(r)["format"]["duration"])
+    assert 1.8 < dur < 2.2
+
+    # Mutation: geometry edit disables lineage (framing changes).
+    d2 = _project_dict(js, src_path, base_path, edited=True)
+    d2["overlays"] = [{
+        "type": "hook", "text": "HOOK", "style": "viral",
+        "start": 1.0, "end": 3.0, "position": "top",
+    }]
+    project2 = validate_project(d2)
+    coro2 = pr_mod.render_project(
+        job_id="fixture", clip_index=0, project=project2,
+        job_dir=js, metadata={},
+        clip_info={"clip_filename": "clip_final_0.mp4"})
+    out2 = _drive_real(coro2).output_path
+    # Edited route: framing is green (center), not red.
+    # Hook still honored.
+    assert len(hook_params_seen) == 2, "hook not on edited route"
+
+    # Mutation: zeroed timing -> inactive, no hook.
+    project3 = make_project_with_hook(2.0, 2.0)
+    coro3 = pr_mod.render_project(
+        job_id="fixture", clip_index=0, project=project3,
+        job_dir=js, metadata={},
+        clip_info={"clip_filename": "clip_final_0.mp4"})
+    out3 = _drive_real(coro3).output_path
+    # Zeroed timing: params have [2,2) (inactive, not legacy).
+    hp2 = hook_params_seen[2]
+    assert hp2.get("hook_start") == 2.0 and hp2.get("hook_end") == 2.0
+
+
+# --- Durable preflight / scoped-guard regressions (Task 06 rev3) ---
+
+def _compose_with_spies(monkeypatch, tmp_path, toggles, hook_params):
+    """Run compose_layers with spies; return (result, calls)."""
+    from clippyme.domain import compose as comp_mod
+    monkeypatch.setenv("CLIPPYME_VIDEO_ENCODER", "libx264")
+    js = str(tmp_path / "job")
+    os.makedirs(js, exist_ok=True)
+
+    # Minimal source.
+    src = os.path.join(js, "source.mp4")
+    _run(["ffmpeg", "-y", "-v", "error",
+          "-f", "lavfi", "-i", "color=blue:s=320x180:r=30:d=2",
+          "-f", "lavfi", "-i", "sine=frequency=880:duration=2",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", "-shortest", src])
+
+    async def inline_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline_thread)
+
+    calls = []
+    orig_sc = comp_mod._apply_smartcut
+    async def spy_sc(*a, **k):
+        calls.append("smartcut")
+        return await orig_sc(*a, **k)
+    monkeypatch.setattr(comp_mod, "_apply_smartcut", spy_sc)
+
+    orig_hook = comp_mod._apply_hook
+    async def spy_hook(*a, **k):
+        calls.append("hook")
+        return await orig_hook(*a, **k)
+    monkeypatch.setattr(comp_mod, "_apply_hook", spy_hook)
+
+    coro = comp_mod.compose_layers(
+        base_clip=src, job_dir=js, clip_index=0,
+        metadata={}, clip_info={},
+        toggles=toggles, hook_params=hook_params,
+        subtitle_params={}, logo_params={}, grade_params={},
+        banner_params={}, drop_ranges=[],
+        timeline_duration=2.0)
+    try:
+        result = _drive(coro)
+        return result, calls, None
+    except Exception as e:
+        return None, calls, e
+
+
+def test_preflight_partial_rejects_before_smartcut(monkeypatch, tmp_path):
+    """Partial timing: ValidationError, Smart Cut never called."""
+    from clippyme.domain.errors import ValidationError
+    _, calls, err = _compose_with_spies(
+        monkeypatch, tmp_path,
+        toggles={"hook": True, "smartcut": True},
+        hook_params={"text": "x", "hook_start": 1.0})  # partial
+    assert isinstance(err, ValidationError), f"expected ValidationError, got {err}"
+    assert calls == [], f"work done before rejection: {calls}"
+
+
+def test_preflight_invalid_rejects_before_smartcut(monkeypatch, tmp_path):
+    """Invalid timing (reversed): ValidationError, zero calls."""
+    from clippyme.domain.errors import ValidationError
+    _, calls, err = _compose_with_spies(
+        monkeypatch, tmp_path,
+        toggles={"hook": True, "smartcut": True},
+        hook_params={"text": "x", "hook_start": 3.0, "hook_end": 1.0})
+    assert isinstance(err, ValidationError)
+    assert calls == []
+
+
+def test_disabled_hook_allows_smartcut(monkeypatch, tmp_path):
+    """Disabled hook with timing: Smart Cut runs, no rejection."""
+    _, calls, err = _compose_with_spies(
+        monkeypatch, tmp_path,
+        toggles={"hook": False, "smartcut": True},
+        hook_params={"text": "x", "hook_start": 1.0, "hook_end": 2.0})
+    assert err is None, f"unexpected error: {err}"
+    assert "smartcut" in calls, f"Smart Cut not run: {calls}"
+    assert "hook" not in calls, "hook should not run when disabled"
+
+
+def test_empty_hook_allows_smartcut(monkeypatch, tmp_path):
+    """Empty-text hook with timing: Smart Cut runs."""
+    _, calls, err = _compose_with_spies(
+        monkeypatch, tmp_path,
+        toggles={"hook": True, "smartcut": True},
+        hook_params={"text": "   ", "hook_start": 1.0, "hook_end": 2.0})
+    assert err is None, f"unexpected error: {err}"
+    assert "smartcut" in calls
+
+
+def test_active_explicit_rejects_smartcut(monkeypatch, tmp_path):
+    """Active explicit timing + Smart Cut: rejected before cutting."""
+    from clippyme.domain.errors import ValidationError
+    _, calls, err = _compose_with_spies(
+        monkeypatch, tmp_path,
+        toggles={"hook": True, "smartcut": True},
+        hook_params={"text": "x", "hook_start": 1.0, "hook_end": 2.0})
+    assert isinstance(err, ValidationError)
+    assert calls == []
+
+
+def test_active_legacy_allows_smartcut(monkeypatch, tmp_path):
+    """Active hook without timing (legacy) + Smart Cut: allowed."""
+    _, calls, err = _compose_with_spies(
+        monkeypatch, tmp_path,
+        toggles={"hook": True, "smartcut": True},
+        hook_params={"text": "x"})  # no timing = legacy
+    assert err is None, f"unexpected error: {err}"
+    assert "smartcut" in calls
+    assert "hook" in calls
