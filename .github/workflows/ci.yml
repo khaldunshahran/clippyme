@@ -35,7 +35,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[host-tests]"
-          pip install pytest pytest-cov pytest-timeout pip-audit ruff bandit
+          pip install pytest pytest-cov pytest-timeout pip-audit "ruff==0.16.10" bandit
 
       - name: Lint (ruff — bug-class rules)
         run: ruff check src/clippyme tests --select E9,F63,F7,F82
@@ -175,3 +175,4 @@ jobs:
 
       - name: Run integration suite in the backend image
         run: docker compose run --rm -u root backend sh -lc "pip install -q pytest && pytest -m integration -q"
+

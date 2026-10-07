@@ -389,8 +389,8 @@ function MusicPanel({ project, uploading, onUpload, onVolume, onOffset, onRemove
 
 function CaptionsPanel({ project, onStyle, onPosition, onWordEdit, onClearEdits }) {
   const caps = project.captions || { style: 'classic_white', position: 'bottom', words: [], edits: {} };
-  const words = caps.words || [];
-  const edits = caps.edits || {};
+  const words = useMemo(() => caps.words || [], [caps.words]);
+  const edits = useMemo(() => caps.edits || {}, [caps.edits]);
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState('');
   const editedCount = Object.keys(edits).length;
@@ -657,10 +657,9 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
 
   const duration = (project && project.source && project.source.duration) || 0;
   const segs = (project && project.segments) || [];
-  const seg = segs[selSeg];
   const caps = (project && project.captions) || {};
-  const words = caps.words || [];
-  const edits = caps.edits || {};
+  const words = useMemo(() => caps.words || [], [caps.words]);
+  const edits = useMemo(() => caps.edits || {}, [caps.edits]);
   const hook = ((project && project.overlays) || []).find((o) => o.type === 'hook');
   const activeWord = useMemo(() => wordAt(words, edits, playhead), [words, edits, playhead]);
 
@@ -1083,3 +1082,6 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
     </main>
   );
 }
+
+
+

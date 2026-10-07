@@ -50,3 +50,16 @@ python_files = ["test_*.py"]
 markers = [
     "integration: requires the heavy CV/ML runtime (cv2, scenedetect, mediapipe); run in Docker",
 ]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI dependency injection markers are immutable by design
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Query",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Path",
+    "fastapi.Body",
+]
