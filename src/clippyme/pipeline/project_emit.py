@@ -191,30 +191,48 @@ def _build_project(
 
 
 def project_has_user_edits(project_path: str) -> bool:
-    """True when a working project file carries user edits worth preserving.
+    """True when a working project file must be preserved, not overwritten.
 
-    A freshly emitted project has ``version: 1`` and empty/default edits.
-    The clip editor bumps the version on every user save, so ``version > 1``
-    (or a non-empty ``edits`` list) means the user touched it. Conservative:
-    any parse failure returns False (treat as fresh), any present version
-    above 1 returns True.
+    Real project schema (see ``_build_project``):
+    - ``origin``: "auto" (fresh) vs "user" (edited in the clip editor)
+    - ``version``: 1 (fresh); the editor bumps it on every user save
+    - ``captions.edits``: {} (fresh) vs non-empty dict (caption edits)
+    - ``segments`` / ``overlays``: user may also edit these nested structures
+
+    Conservative: a missing file returns False (nothing to preserve, safe
+    to create). An UNREADABLE or malformed existing file returns True --
+    it must NOT be classified as safe to overwrite.
     """
     import json
 
     try:
         with open(project_path, encoding="utf-8") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        return False
     except (OSError, ValueError):
-        return False
+        # Unreadable existing file: preserve, do not overwrite.
+        return True
     if not isinstance(data, dict):
-        return False
+        return True
+    if data.get("origin") == "user":
+        return True
     try:
         if int(data.get("version", 1)) > 1:
             return True
     except (TypeError, ValueError):
-        pass
-    edits = data.get("edits")
-    return bool(edits)
+        return True
+    captions = data.get("captions")
+    if isinstance(captions, dict) and captions.get("edits"):
+        return True
+    # Nested timeline/segment edits: any segment with a user origin marker
+    segments = data.get("segments")
+    if isinstance(segments, list):
+        for seg in segments:
+            if isinstance(seg, dict) and seg.get("origin") == "user":
+                return True
+    return False
+
 
 
 def emit_clip_project(

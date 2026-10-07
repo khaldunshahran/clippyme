@@ -1091,17 +1091,8 @@ if __name__ == '__main__':
                 clip_duration = float(end) - float(start)
                 # Fingerprint BEFORE the cut; deterministic frame count for [start, end).
                 _src_fp = source_fingerprint(input_video)
-                _cut_frames = None
-                try:
-                    from clippyme.pipeline.media_qa import probe_media as _probe_media
-                    _fps = _probe_media(input_video).get("fps")
-                    if _fps and _fps > 0:
-                        import math as _math
-                        _cut_frames = max(1, _math.floor(clip_duration * float(_fps)))
-                except Exception:
-                    pass
                 _temp_cut = clip_source_path + ".tmp.mp4"
-                cut_command = build_cut_command(input_video, start, end, _temp_cut, frames=_cut_frames)
+                cut_command = build_cut_command(input_video, start, end, _temp_cut)
                 print(f"   ffmpeg cut: start={start:.2f}s, duration={clip_duration:.2f}s", flush=True)
                 try:
                     cut_proc = subprocess.run(
@@ -1126,6 +1117,13 @@ if __name__ == '__main__':
                         except OSError:
                             pass
                         continue
+                    if source_fingerprint(input_video) != _src_fp:
+                        print(f"   source changed during cut; discarding temp slice", flush=True)
+                        try:
+                            os.remove(_temp_cut)
+                        except OSError:
+                            pass
+                        continue
                     os.replace(_temp_cut, clip_source_path)
                     print(f"   ffmpeg cut done", flush=True)
                     write_slice_provenance(clip_source_path, start=start, end=end, source_fp=_src_fp)
@@ -1137,13 +1135,31 @@ if __name__ == '__main__':
                 # zoom rides inside the master encode (zoom_end) — see
                 # process_video_to_vertical; the old apply_subtle_zoom pass
                 # only runs as its internal fallback.
+                # Atomic final render: reframe into a temp file, validate,
+                # then swap. A failed/interrupted render must not destroy a
+                # known-good finished clip.
+                _temp_final = clip_final_path + ".render.tmp.mp4"
+                try:
+                    os.remove(_temp_final)
+                except OSError:
+                    pass
                 success = process_video_to_vertical(
-                    clip_source_path, clip_final_path,
+                    clip_source_path, _temp_final,
                     reframe_mode=args.reframe_mode,
                     zoom_end=None if args.no_zoom else 1.05,
                     aspect_ratio=aspect_ratio, letterbox_zoom=letterbox_zoom)
-
+                
                 if success:
+                    _fok, _freason = validate_cut_output(_temp_final, clip_duration)
+                    if not _fok:
+                        print(f"   render produced invalid output: {_freason}", flush=True)
+                        try:
+                            os.remove(_temp_final)
+                        except OSError:
+                            pass
+                        success = False
+                if success:
+                    os.replace(_temp_final, clip_final_path)
                     normalize_audio(clip_final_path)
                     select_cover_frame(clip_final_path)
                     print(f"   ✅ Clip {i+1} ready: {clip_final_path}")

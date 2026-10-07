@@ -676,24 +676,6 @@ def _maybe_emit_clip_project(**kwargs) -> str | None:
     return emit_clip_project(**kwargs)
 
 
-def _cut_frame_count(input_video: str, start: float, end: float) -> int | None:
-    """Exact video frame count for the half-open [start, end) cut interval.
-
-    Probed from the source fps as floor((end - start) * fps). Returns None
-    when fps cannot be determined (caller then cuts without -frames:v).
-    Never raises.
-    """
-    try:
-        from clippyme.pipeline.media_qa import probe_media
-
-        fps = probe_media(input_video).get("fps")
-        if fps and fps > 0:
-            return max(1, math.floor((float(end) - float(start)) * float(fps)))
-    except Exception:
-        pass
-    return None
-
-
 def _render_one_clip(
     *,
     index: int,
@@ -783,10 +765,8 @@ def _render_one_clip(
         # Fingerprint the source BEFORE the cut: if it changes mid-cut,
         # the provenance check will invalidate the result.
         src_fp = source_fingerprint(input_video)
-        # Deterministic last frame: floor((end - start) * fps).
-        cut_frames = _cut_frame_count(input_video, start, end)
         temp_dest = clip_source + ".tmp.mp4"
-        command = build_cut_command(input_video, start, end, temp_dest, frames=cut_frames)
+        command = build_cut_command(input_video, start, end, temp_dest)
         print(f"✂️ Clip {index + 1}/{total}: {start:.2f}s → {end:.2f}s", flush=True)
         
         clip_duration = float(end) - float(start)
@@ -816,6 +796,17 @@ def _render_one_clip(
             except OSError:
                 pass
             raise RuntimeError(f"ffmpeg cut produced invalid output for clip {index + 1}: {reason}")
+        # Re-compare the source fingerprint BEFORE publishing: a source
+        # that changed mid-cut must not replace the old slice.
+        if source_fingerprint(input_video) != src_fp:
+            try:
+                os.remove(temp_dest)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"source changed during cut for clip {index + 1}; "
+                "discarding temp slice, keeping previous"
+            )
         os.replace(temp_dest, clip_source)
         write_slice_provenance(clip_source, start=start, end=end, source_fp=src_fp)
     else:
@@ -873,7 +864,7 @@ def _render_one_clip(
             _save_metadata(metadata_file, clips_data)
             # Phase 1 (clip editor): emit the default-edit project. Additive
             # only -- emit_clip_project never raises.
-            emit_clip_project(
+            _maybe_emit_clip_project(
                 output_dir=output_dir,
                 job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
                 index=index,
