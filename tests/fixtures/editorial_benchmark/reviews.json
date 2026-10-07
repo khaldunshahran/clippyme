@@ -2,44 +2,24 @@
   "reviews": [
     {
       "clip_id": "c1",
-      "opening_understandable": true,
-      "payoff_delivered": true,
-      "ending_natural": true,
-      "framing_errors": [],
-      "hook_obstruction": false,
-      "caption_obstruction": false,
       "accepted": true,
-      "notes": "Good."
-    },
-    {
-      "clip_id": "c2",
-      "opening_understandable": true,
-      "payoff_delivered": false,
-      "ending_natural": true,
-      "framing_errors": [
-        "face_cropped"
-      ],
-      "accepted": false
-    },
-    {
-      "clip_id": "c3",
-      "opening_understandable": null,
-      "payoff_delivered": null,
-      "ending_natural": null,
-      "accepted": null,
-      "notes": "Unreviewed."
-    },
-    {
-      "clip_id": "c4",
       "opening_understandable": true,
       "payoff_delivered": true,
       "ending_natural": false,
-      "accepted": true
+      "framing_errors": [
+        "face_crop"
+      ],
+      "hook_obstruction": false,
+      "caption_obstruction": null
     },
     {
-      "clip_id": "c5",
-      "opening_understandable": false,
-      "accepted": false
+      "clip_id": "c2",
+      "accepted": false,
+      "opening_understandable": false
+    },
+    {
+      "clip_id": "c3",
+      "accepted": true
     }
   ]
 }

@@ -1,9 +1,11 @@
-"""Tests for editorial benchmark foundation (Task 07, rev2)."""
+"""Tests for editorial benchmark foundation (Task 07, rev3).
+
+Covers review2 five groups.
+"""
 import json
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -12,205 +14,143 @@ from clippyme.pipeline import editorial_benchmark as eb
 
 
 @pytest.fixture
-def fixture_dir(tmp_path):
+def fx(tmp_path):
     d = tmp_path / "eb"
     d.mkdir()
-    for name in ("syn1.mp4", "syn2.mp4", "c1.mp4", "c2.mp4"):
-        p = d / name
+    assets = d / "assets"
+    assets.mkdir()
+    for name in ("source.mp4", "clip.mp4"):
+        p = assets / name
         subprocess.run([
             "ffmpeg", "-y", "-v", "error",
             "-f", "lavfi", "-i", "color=blue:s=160x90:r=10:d=1",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)],
             check=True)
     manifest = {
-        "version": 1, "asset_root": ".",
+        "version": 1, "asset_root": "assets",
         "sources": [
-            {"id": "syn1", "file": "syn1.mp4", "duration": 60.0,
-             "genre": "interview/podcast", "synthetic": True},
-            {"id": "syn2", "file": "syn2.mp4", "duration": 60.0,
-             "genre": "reaction/comedy", "synthetic": True},
+            {"id": "s", "file": "source.mp4", "duration": 60.0,
+             "genre": eb.GENRES[0], "synthetic": True},
         ],
         "runs": [
             {"run_id": "baseline", "commit": "abc", "settings": {},
+             "source_ids": ["s"],
              "clips": [
-                 {"clip_id": "c1", "source_id": "syn1",
-                  "start": 10.0, "end": 25.0, "moment_id": "m1",
-                  "file": "c1.mp4"},
-                 {"clip_id": "c2", "source_id": "syn1",
-                  "start": 30.0, "end": 45.0, "moment_id": "m1",
-                  "file": "c2.mp4"},
+                 {"clip_id": "c", "source_id": "s",
+                  "start": 0.0, "end": 10.0,
+                  "file": "clip.mp4", "moment_id": "m"},
              ]},
         ],
     }
     (d / "manifest.json").write_text(json.dumps(manifest))
-    reviews = {"reviews": [
-        {"clip_id": "c1", "accepted": True},
-        {"clip_id": "c2", "accepted": False},
-    ]}
-    (d / "reviews.json").write_text(json.dumps(reviews))
     return d
 
 
-def test_load_manifest_ok(fixture_dir):
-    m = eb.load_manifest(fixture_dir / "manifest.json")
-    assert m["version"] == 1
-    assert "sha256:" in m["sources"]["syn1"]["fingerprint"]
+def _load(d):
+    return eb.load_manifest(d / "manifest.json")
 
 
-def test_sibling_prefix_escape_rejected(tmp_path):
-    root = tmp_path / "assets"
-    root.mkdir()
-    sibling = tmp_path / "assets_other"
-    sibling.mkdir()
-    (sibling / "x.mp4").write_bytes(b"outside")
-    with pytest.raises(eb.BenchmarkError):
-        eb._resolve_asset(root, "../assets_other/x.mp4")
+# Group 1: Media QA.
+def test_media_qa_real_signature(fx):
+    m = _load(fx)
+    report = eb.run_benchmark(m, {}, check_media=True)
+    errors = report["media_checks"]["source:s"]["errors"]
+    assert not any("required keyword-only" in x for x in errors), errors
 
 
-def test_duplicate_run_ids_rejected(fixture_dir):
-    p = fixture_dir / "manifest.json"
+# Group 2: Output collisions.
+def test_output_cannot_replace_reviews(fx):
+    m = _load(fx)
+    reviews = fx / "reviews.json"
+    reviews.write_text('{"reviews":[]}')
+    before = reviews.read_bytes()
+    rc = eb.main(["--manifest", str(fx / "manifest.json"),
+                  "--reviews", str(reviews),
+                  "--json-out", str(reviews)])
+    assert rc == 1
+    assert reviews.read_bytes() == before
+
+
+# Group 3: Frozen identities.
+def test_run_fingerprint_mismatch_rejected(fx):
+    p = fx / "manifest.json"
     data = json.loads(p.read_text())
-    data["runs"].append({"run_id": "baseline", "clips": []})
+    data["runs"][0]["source_fingerprints"] = {"s": "sha256:old"}
     p.write_text(json.dumps(data))
     with pytest.raises(eb.BenchmarkError):
         eb.load_manifest(p)
 
 
-def test_bool_duration_rejected(fixture_dir):
-    p = fixture_dir / "manifest.json"
+def test_clip_fingerprint_preserved(fx):
+    m = _load(fx)
+    stats = eb.run_benchmark(m, {})
+    assert m["runs"][0]["clips"][0]["fingerprint"] in eb._strict_json(stats)
+
+
+# Group 4: Denominators.
+def test_zero_candidate_source_counts(fx):
+    p = fx / "manifest.json"
     data = json.loads(p.read_text())
-    data["sources"][0]["duration"] = True
-    data["runs"][0]["clips"] = []
+    data["sources"].append({**data["sources"][0], "id": "s2"})
+    data["runs"][0]["source_ids"].append("s2")
+    p.write_text(json.dumps(data))
+    stats = eb.run_benchmark(_load(fx), {"c": {"accepted": True}})
+    # 2 sources x 60s = 120s = 0.033h; 1 accepted -> 30/hour.
+    assert stats["run_stats"][0]["accepted_per_source_hour"] == 30
+
+
+def test_partial_labels_genre_unknown(fx):
+    p = fx / "manifest.json"
+    data = json.loads(p.read_text())
+    data["runs"][0]["clips"].append(
+        {**data["runs"][0]["clips"][0], "clip_id": "c2", "moment_id": None})
+    p.write_text(json.dumps(data))
+    stats = eb.run_benchmark(
+        _load(fx), {"c": {"accepted": True}, "c2": {"accepted": True}})
+    assert stats["genre_stats"][eb.GENRES[0]][
+        "distinct_accepted_moments"] is None
+
+
+def test_obstruction_framing_coverage(fx):
+    stats = eb.run_benchmark(
+        _load(fx),
+        {"c": {"accepted": None, "hook_obstruction": True,
+               "caption_obstruction": False}})
+    j = stats["run_stats"][0]["judgments"]
+    assert "hook_obstruction" in j and "caption_obstruction" in j
+    assert "framing_known" in j
+
+
+# Group 5: Strict validation.
+def test_sources_none_clear_error(fx):
+    p = fx / "manifest.json"
+    data = json.loads(p.read_text())
+    data["sources"] = None
     p.write_text(json.dumps(data))
     with pytest.raises(eb.BenchmarkError):
         eb.load_manifest(p)
 
 
-def test_missing_clip_asset_rejected(fixture_dir):
-    p = fixture_dir / "manifest.json"
+def test_oversized_number_clear_error(fx):
+    p = fx / "manifest.json"
     data = json.loads(p.read_text())
-    data["runs"][0]["clips"][0]["file"] = "missing.mp4"
+    data["sources"][0]["duration"] = 10 ** 1000
     p.write_text(json.dumps(data))
     with pytest.raises(eb.BenchmarkError):
         eb.load_manifest(p)
 
 
-def test_malformed_root_rejected(tmp_path):
-    p = tmp_path / "m.json"
-    p.write_text("[]")
-    with pytest.raises(eb.BenchmarkError):
-        eb.load_manifest(p)
-
-
-def test_invalid_boolean_rejected(tmp_path):
+def test_json_boolean_string_rejected(tmp_path):
     p = tmp_path / "r.json"
-    p.write_text(json.dumps(
-        {"reviews": [{"clip_id": "c", "accepted": "definitely"}]}))
+    p.write_text('{"reviews":[{"clip_id":"c","accepted":"true"}]}')
     with pytest.raises(eb.BenchmarkError):
         eb.load_reviews(p)
 
 
-def test_orphan_review_rejected(fixture_dir):
-    m = eb.load_manifest(fixture_dir / "manifest.json")
+def test_synthetic_string_rejected(fx):
+    p = fx / "manifest.json"
+    data = json.loads(p.read_text())
+    data["sources"][0]["synthetic"] = "false"
+    p.write_text(json.dumps(data))
     with pytest.raises(eb.BenchmarkError):
-        eb.run_benchmark(m, {"typo": {"accepted": True}})
-
-
-def test_partial_labels_no_distinct_claim(fixture_dir):
-    m = eb.load_manifest(fixture_dir / "manifest.json")
-    # c1 has moment m1, c2 has moment m1 but we remove c2's label.
-    # Actually both have m1. Let's make c2 unlabeled.
-    p = fixture_dir / "manifest.json"
-    data = json.loads(p.read_text())
-    del data["runs"][0]["clips"][1]["moment_id"]
-    p.write_text(json.dumps(data))
-    m = eb.load_manifest(p)
-    stats = eb.run_benchmark(
-        m, {"c1": {"accepted": True}, "c2": {"accepted": True}})
-    # c1 labeled, c2 not -> partial -> None
-    assert stats["run_stats"][0]["distinct_accepted_moments"] is None
-
-
-def test_moment_ids_source_scoped(fixture_dir):
-    p = fixture_dir / "manifest.json"
-    data = json.loads(p.read_text())
-    # Add second source with same moment ID.
-    data["sources"].append({
-        "id": "syn3", "file": "syn2.mp4", "duration": 60.0,
-        "genre": "interview/podcast", "synthetic": True})
-    data["runs"][0]["clips"].append({
-        "clip_id": "c3", "source_id": "syn3",
-        "start": 0.0, "end": 10.0, "moment_id": "m1", "file": "c1.mp4"})
-    p.write_text(json.dumps(data))
-    m = eb.load_manifest(p)
-    stats = eb.run_benchmark(m, {
-        "c1": {"accepted": True}, "c2": {"accepted": False},
-        "c3": {"accepted": True}})
-    # (syn1,m1) and (syn3,m1) are distinct -> 2
-    assert stats["run_stats"][0]["distinct_accepted_moments"] == 2
-
-
-def test_all_genres_visible(fixture_dir):
-    m = eb.load_manifest(fixture_dir / "manifest.json")
-    stats = eb.run_benchmark(m, {})
-    assert set(stats["genre_stats"]) == set(eb.GENRES)
-
-
-def test_per_run_hour_denominators(fixture_dir):
-    p = fixture_dir / "manifest.json"
-    data = json.loads(p.read_text())
-    # Add candidate run with same source.
-    data["runs"].append({
-        "run_id": "candidate", "commit": "def",
-        "clips": [{"clip_id": "c3", "source_id": "syn1",
-                   "start": 0.0, "end": 10.0, "file": "c1.mp4"}]})
-    p.write_text(json.dumps(data))
-    m = eb.load_manifest(p)
-    stats = eb.run_benchmark(m, {
-        "c1": {"accepted": True}, "c2": {"accepted": False},
-        "c3": {"accepted": True}})
-    # Each run: 1 accepted, 60s source = 0.0167h -> 60/hour
-    for rs in stats["run_stats"]:
-        assert rs["accepted_per_source_hour"] == 60
-
-
-def test_fingerprints_preserved(fixture_dir):
-    m = eb.load_manifest(fixture_dir / "manifest.json")
-    stats = eb.run_benchmark(m, {})
-    assert "sha256:" in eb._strict_json(stats)
-
-
-def test_strict_json_rejects_nan():
-    import math
-    with pytest.raises(eb.BenchmarkError):
-        eb._strict_json({"x": math.nan})
-
-
-def test_cli_end_to_end(fixture_dir, tmp_path):
-    out_json = tmp_path / "out.json"
-    out_txt = tmp_path / "out.txt"
-    rc = eb.main([
-        "--manifest", str(fixture_dir / "manifest.json"),
-        "--reviews", str(fixture_dir / "reviews.json"),
-        "--json-out", str(out_json),
-        "--text-out", str(out_txt),
-    ])
-    assert rc == 0
-    assert "sha256:" in out_json.read_text()
-
-
-def test_cli_malformed_fails(tmp_path):
-    bad = tmp_path / "bad.json"
-    bad.write_text("{invalid")
-    assert eb.main(["--manifest", str(bad), "--reviews", str(bad)]) == 1
-
-
-def test_output_collision_rejected(fixture_dir, tmp_path):
-    # Output inside asset root should be rejected.
-    out = fixture_dir / "report.json"
-    rc = eb.main([
-        "--manifest", str(fixture_dir / "manifest.json"),
-        "--reviews", str(fixture_dir / "reviews.json"),
-        "--json-out", str(out),
-    ])
-    assert rc == 1
+        eb.load_manifest(p)

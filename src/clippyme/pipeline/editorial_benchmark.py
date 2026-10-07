@@ -1,13 +1,12 @@
-"""Editorial benchmark foundation (Task 07, rev2).
+"""Editorial benchmark foundation (Task 07, rev3).
 
-Records what clips were produced, how many distinct useful moments humans
-accept, and their editorial/framing/text defects. Human judgments are kept
-separate from automated checks; unreviewed stays unknown, invalid is an
-error.
-
-Owns only this file. Does not modify discovery, models, prompts, renderers,
-frontend, or existing test manifests. Reuses media_qa.inspect_clip for
-objective media checks without changing its policy.
+Addresses review2 five groups:
+1. Real media_qa.inspect_clip API with expected_duration/aspect.
+2. Manifest/review paths protected; output collisions rejected.
+3. Per-run frozen identities (source_fingerprints); clip fingerprints
+   preserved; non-tautological pairing.
+4. Zero-candidate sources in denominators; complete coverage.
+5. Strict validation; reproducible synthetic demo.
 """
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ import csv
 import hashlib
 import json
 import math
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,21 +32,25 @@ MANIFEST_VERSION = 1
 
 
 class BenchmarkError(Exception):
-    """Clear failure for malformed records (never silently counted)."""
+    pass
 
 
 def _is_finite_number(v: Any) -> bool:
-    # Strict: bool is not numeric.
     if isinstance(v, bool):
         return False
-    return isinstance(v, (int, float)) and math.isfinite(v)
+    if isinstance(v, int):
+        # Huge ints cause OverflowError on float conversion.
+        try:
+            f = float(v)
+        except OverflowError:
+            return False
+        return math.isfinite(f)
+    return isinstance(v, float) and math.isfinite(v)
 
 
 def _resolve_asset(asset_root: Path, rel: str) -> Path:
-    """Resolve asset with real path containment (not string prefix)."""
-    if not rel or not isinstance(rel, str):
+    if not isinstance(rel, str) or not rel:
         raise BenchmarkError(f"invalid asset path: {rel!r}")
-    # Resolve both (handles symlinks, .., absolute).
     root = asset_root.resolve()
     p = (root / rel).resolve()
     try:
@@ -68,136 +70,164 @@ def _fingerprint(path: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
-def _check_output_collision(path: Path, manifest: dict):
-    """Reject output paths colliding with inputs or projects."""
-    p = Path(path).resolve()
-    protected = set()
-    root = Path(manifest["asset_root"]).resolve()
-    protected.add(root)
-    for s in manifest["sources"].values():
-        protected.add(Path(s["_path"]).resolve())
-        # Clip assets.
-    for r in manifest["runs"]:
-        for c in r["clips"]:
-            if "_clip_path" in c:
-                protected.add(Path(c["_clip_path"]).resolve())
-    # Also protect manifest/review files themselves (caller's responsibility
-    # to pass them; we check the output path isn't inside asset root).
-    if str(p).startswith(str(root)):
-        # Allow output inside asset root only if not colliding with assets.
-        # Actually, safest: reject any output inside asset root.
-        raise BenchmarkError(
-            f"output path inside asset root (collision risk): {path}")
-    for prot in protected:
-        if p == prot:
-            raise BenchmarkError(f"output collides with input: {path}")
-
-
 def load_manifest(path: str | Path) -> dict:
-    """Load and validate versioned input manifest."""
-    p = Path(path)
+    p = Path(path).resolve()
     with open(p, encoding="utf-8") as f:
         try:
             data = json.load(f)
         except json.JSONDecodeError as e:
             raise BenchmarkError(f"manifest JSON invalid: {e}")
-
     if not isinstance(data, dict):
-        raise BenchmarkError(
-            f"manifest root must be object, got {type(data).__name__}")
+        raise BenchmarkError("manifest root must be object")
     if data.get("version") != MANIFEST_VERSION:
-        raise BenchmarkError(
-            f"manifest version must be {MANIFEST_VERSION}")
+        raise BenchmarkError("manifest version must be 1")
 
-    asset_root = Path(p.parent) / data.get("asset_root", ".")
+    asset_root = (p.parent / data.get("asset_root", ".")).resolve()
     if not asset_root.is_dir():
         raise BenchmarkError("asset_root not a directory")
 
-    # Sources.
+    sources_raw = data.get("sources")
+    if not isinstance(sources_raw, list):
+        raise BenchmarkError("sources must be list")
     sources = {}
-    for s in data.get("sources", []):
+    for s in sources_raw:
         if not isinstance(s, dict):
-            raise BenchmarkError("source record must be object")
+            raise BenchmarkError("source must be object")
         sid = s.get("id")
         if not isinstance(sid, str) or not sid or sid in sources:
-            raise BenchmarkError(f"duplicate or invalid source id: {sid!r}")
+            raise BenchmarkError(f"invalid source id: {sid!r}")
         genre = s.get("genre")
         if genre not in GENRES:
-            raise BenchmarkError(f"source {sid}: invalid genre {genre!r}")
+            raise BenchmarkError(f"source {sid}: invalid genre")
         dur = s.get("duration")
-        if not _is_finite_number(dur) or dur <= 0:
+        if not _is_finite_number(dur) or float(dur) <= 0:
             raise BenchmarkError(f"source {sid}: invalid duration")
+        # synthetic must be bool, not truthy string.
+        syn = s.get("synthetic", False)
+        if not isinstance(syn, bool):
+            raise BenchmarkError(
+                f"source {sid}: synthetic must be boolean")
         ap = _resolve_asset(asset_root, s.get("file", ""))
         fp = _fingerprint(ap)
         if "fingerprint" in s and s["fingerprint"] != fp:
-            raise BenchmarkError(f"source {sid}: fingerprint mismatch")
+            raise BenchmarkError(f"source {sid}: stale fingerprint")
+        # Validate typed fields.
+        commit = s.get("commit", "")
+        if not isinstance(commit, str):
+            raise BenchmarkError(f"source {sid}: commit must be string")
         sources[sid] = {
             "id": sid, "genre": genre, "duration": float(dur),
-            "file": s.get("file"), "_path": str(ap), "fingerprint": fp,
-            "synthetic": bool(s.get("synthetic", False)),
+            "file": s.get("file"), "_path": str(ap),
+            "fingerprint": fp, "synthetic": syn,
         }
 
-    # Runs (duplicate run IDs rejected).
+    runs_raw = data.get("runs")
+    if not isinstance(runs_raw, list):
+        raise BenchmarkError("runs must be list")
     runs = []
     run_ids = set()
     clip_ids = set()
-    for r in data.get("runs", []):
+    for r in runs_raw:
         if not isinstance(r, dict):
-            raise BenchmarkError("run record must be object")
+            raise BenchmarkError("run must be object")
         rid = r.get("run_id")
         if not isinstance(rid, str) or not rid or rid in run_ids:
-            raise BenchmarkError(f"duplicate or invalid run_id: {rid!r}")
+            raise BenchmarkError(f"invalid run_id: {rid!r}")
         run_ids.add(rid)
+        commit = r.get("commit", "")
+        if not isinstance(commit, str):
+            raise BenchmarkError(f"run {rid}: commit must be string")
+        settings = r.get("settings", {})
+        if not isinstance(settings, dict):
+            raise BenchmarkError(f"run {rid}: settings must be object")
+        # Explicit source membership (including zero-candidate).
+        source_ids = r.get("source_ids")
+        if source_ids is None:
+            # Infer from clips if not given.
+            source_ids = []
+        if not isinstance(source_ids, list):
+            raise BenchmarkError(f"run {rid}: source_ids must be list")
+        for sid in source_ids:
+            if sid not in sources:
+                raise BenchmarkError(f"run {rid}: unknown source {sid!r}")
+        # Per-run frozen source fingerprints.
+        frozen = r.get("source_fingerprints", {})
+        if not isinstance(frozen, dict):
+            raise BenchmarkError(f"run {rid}: source_fingerprints must be object")
+        for sid, fp in frozen.items():
+            if sid not in sources:
+                raise BenchmarkError(f"run {rid}: unknown fingerprint source")
+            if not isinstance(fp, str) or not fp.startswith("sha256:"):
+                raise BenchmarkError(f"run {rid}: invalid fingerprint")
+            if fp != sources[sid]["fingerprint"]:
+                raise BenchmarkError(
+                    f"run {rid}: source {sid} fingerprint mismatch "
+                    f"(stale run or changed source)")
+        clips_raw = r.get("clips", [])
+        if not isinstance(clips_raw, list):
+            raise BenchmarkError(f"run {rid}: clips must be list")
         clips = []
-        for c in r.get("clips", []):
+        for c in clips_raw:
             if not isinstance(c, dict):
-                raise BenchmarkError("clip record must be object")
+                raise BenchmarkError("clip must be object")
             cid = c.get("clip_id")
             if not isinstance(cid, str) or not cid or cid in clip_ids:
-                raise BenchmarkError(
-                    f"duplicate or invalid clip_id: {cid!r}")
+                raise BenchmarkError(f"invalid clip_id: {cid!r}")
             clip_ids.add(cid)
             sid = c.get("source_id")
             if sid not in sources:
-                raise BenchmarkError(f"clip {cid}: unknown source {sid!r}")
+                raise BenchmarkError(f"clip {cid}: unknown source")
             st, en = c.get("start"), c.get("end")
             if not (_is_finite_number(st) and _is_finite_number(en)):
                 raise BenchmarkError(f"clip {cid}: invalid interval")
+            st, en = float(st), float(en)
             if not (0 <= st < en <= sources[sid]["duration"]):
                 raise BenchmarkError(f"clip {cid}: interval out of range")
-            # Clip asset (rendered file) is required.
             clip_file = c.get("file")
-            if not clip_file:
+            if not isinstance(clip_file, str) or not clip_file:
                 raise BenchmarkError(f"clip {cid}: missing file")
             cp = _resolve_asset(asset_root, clip_file)
             cfp = _fingerprint(cp)
             if "fingerprint" in c and c["fingerprint"] != cfp:
-                raise BenchmarkError(f"clip {cid}: fingerprint mismatch")
+                raise BenchmarkError(f"clip {cid}: stale fingerprint")
             mid = c.get("moment_id")
             if mid is not None and (not isinstance(mid, str) or not mid):
                 raise BenchmarkError(f"clip {cid}: invalid moment_id")
             clips.append({
                 "clip_id": cid, "source_id": sid,
-                "start": float(st), "end": float(en),
-                "moment_id": mid, "file": clip_file,
-                "_clip_path": str(cp), "fingerprint": cfp,
+                "start": st, "end": en, "moment_id": mid,
+                "file": clip_file, "_clip_path": str(cp),
+                "fingerprint": cfp,
             })
+            if sid not in source_ids:
+                source_ids.append(sid)
         runs.append({
-            "run_id": rid, "commit": r.get("commit", ""),
-            "settings": r.get("settings", {}),
+            "run_id": rid, "commit": commit, "settings": settings,
+            "source_ids": source_ids,
+            "source_fingerprints": dict(frozen),
             "clips": clips,
         })
 
-    return {"version": MANIFEST_VERSION, "asset_root": str(asset_root),
+    return {"version": MANIFEST_VERSION,
+            "asset_root": str(asset_root),
+            "manifest_path": str(p),
             "sources": sources, "runs": runs}
 
 
-def _parse_bool_strict(v: Any, field: str, cid: str) -> bool | None:
-    """Strict boolean parsing. Unknown is None/blank/omitted; invalid errors."""
+def _parse_bool_strict(v: Any, field: str, cid: str,
+                       from_json: bool = False) -> bool | None:
+    # Unknown: None, "", omitted. Invalid: anything else.
+    # JSON: only actual booleans accepted; strings rejected.
+    # CSV: documented tokens "true"/"false"/"1"/"0" allowed.
     if v is None or v == "":
         return None
     if isinstance(v, bool):
         return v
+    if from_json:
+        # JSON strings are never valid booleans.
+        raise BenchmarkError(
+            f"clip {cid}: invalid boolean for {field}: {v!r} "
+            f"(JSON requires true/false, not strings)")
     if isinstance(v, str):
         lv = v.strip().lower()
         if lv in ("true", "1", "yes"):
@@ -209,18 +239,16 @@ def _parse_bool_strict(v: Any, field: str, cid: str) -> bool | None:
 
 
 def load_reviews(path: str | Path) -> dict[str, dict]:
-    """Load human reviews. Unknown review IDs are validated later."""
-    p = Path(path)
+    p = Path(path).resolve()
     if p.suffix == ".csv":
         with open(p, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-        # Parse framing_errors as comma-separated list.
+            rows = list(csv.DictReader(f))
         for r in rows:
             fe = r.get("framing_errors", "")
             r["framing_errors"] = (
                 [x.strip() for x in fe.split(",") if x.strip()]
-                if fe else [])
+                if isinstance(fe, str) and fe else
+                fe if isinstance(fe, list) else None)
     else:
         with open(p, encoding="utf-8") as f:
             try:
@@ -230,47 +258,54 @@ def load_reviews(path: str | Path) -> dict[str, dict]:
         if not isinstance(data, dict):
             raise BenchmarkError("reviews root must be object")
         rows = data.get("reviews", [])
+        if not isinstance(rows, list):
+            raise BenchmarkError("reviews must be list")
 
     reviews = {}
+    from_json = p.suffix != ".csv"
     for r in rows:
         if not isinstance(r, dict):
-            raise BenchmarkError("review record must be object")
+            raise BenchmarkError("review must be object")
         cid = r.get("clip_id")
         if not isinstance(cid, str) or not cid or cid in reviews:
-            raise BenchmarkError(f"duplicate or invalid clip_id: {cid!r}")
-        fe = r.get("framing_errors", [])
-        if isinstance(fe, str):
-            # Should have been parsed for CSV; for JSON, reject opaque string.
+            raise BenchmarkError(f"invalid clip_id: {cid!r}")
+        fe = r.get("framing_errors")
+        # None/omitted -> unknown (None), not [].
+        if fe is None or fe == "":
+            fe_val = None
+        elif isinstance(fe, list):
+            if not all(isinstance(x, str) for x in fe):
+                raise BenchmarkError(f"clip {cid}: framing_errors elements must be strings")
+            fe_val = fe
+        else:
             raise BenchmarkError(
-                f"clip {cid}: framing_errors must be list, not string")
-        if not isinstance(fe, list):
-            raise BenchmarkError(f"clip {cid}: invalid framing_errors")
+                f"clip {cid}: framing_errors must be list or null")
         notes = r.get("notes", "")
         if not isinstance(notes, str):
             raise BenchmarkError(f"clip {cid}: notes must be string")
         reviews[cid] = {
             "clip_id": cid,
             "opening_understandable": _parse_bool_strict(
-                r.get("opening_understandable"), "opening_understandable", cid),
+                r.get("opening_understandable"), "opening", cid, from_json),
             "payoff_delivered": _parse_bool_strict(
-                r.get("payoff_delivered"), "payoff_delivered", cid),
+                r.get("payoff_delivered"), "payoff", cid, from_json),
             "ending_natural": _parse_bool_strict(
-                r.get("ending_natural"), "ending_natural", cid),
-            "framing_errors": fe,
+                r.get("ending_natural"), "ending", cid, from_json),
+            "framing_errors": fe_val,  # None = unknown
             "hook_obstruction": _parse_bool_strict(
-                r.get("hook_obstruction"), "hook_obstruction", cid),
+                r.get("hook_obstruction"), "hook_obstruction", cid, from_json),
             "caption_obstruction": _parse_bool_strict(
-                r.get("caption_obstruction"), "caption_obstruction", cid),
-            "accepted": _parse_bool_strict(r.get("accepted"), "accepted", cid),
+                r.get("caption_obstruction"), "caption_obstruction", cid, from_json),
+            "accepted": _parse_bool_strict(r.get("accepted"), "accepted", cid, from_json),
             "notes": notes,
         }
-    return reviews
+    return {"reviews": reviews, "reviews_path": str(p)}
 
 
 def _strict_json(obj: Any) -> str:
     def _check(o):
         if isinstance(o, float) and not math.isfinite(o):
-            raise BenchmarkError("non-finite number in output")
+            raise BenchmarkError("non-finite in output")
         if isinstance(o, dict):
             for v in o.values():
                 _check(v)
@@ -281,68 +316,86 @@ def _strict_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, sort_keys=True)
 
 
-def _media_check(path: str) -> dict:
-    """Objective media check via media_qa (separate from human ratings)."""
+def _media_check(path: str, expected_duration: float | None,
+                 expected_aspect: float | None) -> dict:
+    """Real media_qa.inspect_clip with correct API."""
     try:
         from clippyme.pipeline.media_qa import inspect_clip
-        report = inspect_clip(path)
+        r = inspect_clip(
+            path,
+            expected_duration=expected_duration,
+            expected_aspect=expected_aspect)
+        # Real schema: ok, critical, issues, warnings, metrics.
+        critical = r.get("critical", [])
+        issues = r.get("issues", [])
         return {
-            "valid": bool(report.get("ok", False)),
-            "duration": report.get("duration"),
-            "errors": report.get("errors", []),
+            "ok": bool(r.get("ok")),
+            "critical": critical,
+            "issues": issues,
+            "warnings": r.get("warnings", []),
+            "errors": critical + issues,  # combined for probe compat
+            "duration": r.get("metrics", {}).get("duration"),
+            "width": r.get("metrics", {}).get("width"),
+            "height": r.get("metrics", {}).get("height"),
         }
+    except TypeError as e:
+        return {"ok": False, "critical": [f"invocation failed: {e}"],
+                "issues": [], "warnings": [], "errors": [f"invocation failed: {e}"],
+                "duration": None, "width": None, "height": None}
     except Exception as e:
-        return {"valid": False, "duration": None,
-                "errors": [f"media_qa failed: {e}"]}
+        return {"ok": False, "critical": [f"media_qa error: {e}"],
+                "issues": [], "warnings": [], "errors": [f"media_qa error: {e}"],
+                "duration": None, "width": None, "height": None}
 
 
-def run_benchmark(manifest: dict, reviews: dict[str, dict],
+def run_benchmark(manifest: dict, reviews_data: dict,
                   check_media: bool = False) -> dict:
-    """Compute stats. Orphan reviews rejected; unknown stays unknown."""
+    reviews = reviews_data["reviews"] if isinstance(
+        reviews_data, dict) and "reviews" in reviews_data else reviews_data
+
     sources = manifest["sources"]
     runs = manifest["runs"]
-
-    # Reject unknown review IDs.
     all_cids = {c["clip_id"] for r in runs for c in r["clips"]}
     for cid in reviews:
         if cid not in all_cids:
-            raise BenchmarkError(f"review for unknown clip_id: {cid!r}")
+            raise BenchmarkError(f"unknown review clip_id: {cid!r}")
 
-    # Media checks (objective, separate).
     media_results = {}
     if check_media:
         for sid, s in sources.items():
-            media_results[f"source:{sid}"] = _media_check(s["_path"])
+            # Expected aspect from source? Use None; duration validated.
+            media_results[f"source:{sid}"] = _media_check(
+                s["_path"], expected_duration=s["duration"],
+                expected_aspect=None)
         for r in runs:
             for c in r["clips"]:
+                exp_dur = c["end"] - c["start"]
                 media_results[f"clip:{c['clip_id']}"] = _media_check(
-                    c["_clip_path"])
+                    c["_clip_path"], expected_duration=exp_dur,
+                    expected_aspect=None)
 
     run_stats = []
     for r in runs:
-        clips = r["clips"]
-        # Source membership for this run.
-        run_sources = {c["source_id"] for c in clips}
+        # Explicit source membership (including zero-candidate).
+        run_sources = r["source_ids"]
         run_source_hours = sum(
             sources[sid]["duration"] for sid in run_sources) / 3600.0
 
+        clips = r["clips"]
         candidate = len(clips)
-        reviewed = 0
-        accepted = 0
-        # Moments scoped by (source_id, moment_id).
+        reviewed = accepted = 0
         moments = set()
         labeled_accepted = 0
-        # Human judgment tallies.
-        opening_known = opening_ok = 0
-        payoff_known = payoff_ok = 0
-        ending_known = ending_ok = 0
-        framing_defects = 0
+        # Judgments.
+        j_known = {"opening": 0, "payoff": 0, "ending": 0,
+                   "framing": 0, "hook": 0, "caption": 0}
+        j_ok = {"opening": 0, "payoff": 0, "ending": 0}
+        j_defects = {"framing": 0, "hook": 0, "caption": 0}
 
         for c in clips:
             rev = reviews.get(c["clip_id"])
             if rev is None:
                 continue
-            # Robust to minimal dicts (probes) vs normalized (load_reviews).
             acc = rev.get("accepted")
             if acc is not None:
                 reviewed += 1
@@ -352,41 +405,58 @@ def run_benchmark(manifest: dict, reviews: dict[str, dict],
                     if mid:
                         moments.add((c["source_id"], mid))
                         labeled_accepted += 1
-            # Judgment coverage (known denominators).
-            ou = rev.get("opening_understandable")
-            if ou is not None:
-                opening_known += 1
-                if ou:
-                    opening_ok += 1
-            pd = rev.get("payoff_delivered")
-            if pd is not None:
-                payoff_known += 1
-                if pd:
-                    payoff_ok += 1
-            en = rev.get("ending_natural")
-            if en is not None:
-                ending_known += 1
-                if en:
-                    ending_ok += 1
-            if rev.get("framing_errors"):
-                framing_defects += 1
+            # Coverage: known vs unknown.
+            if rev.get("opening_understandable") is not None:
+                j_known["opening"] += 1
+                if rev["opening_understandable"]:
+                    j_ok["opening"] += 1
+            if rev.get("payoff_delivered") is not None:
+                j_known["payoff"] += 1
+                if rev["payoff_delivered"]:
+                    j_ok["payoff"] += 1
+            if rev.get("ending_natural") is not None:
+                j_known["ending"] += 1
+                if rev["ending_natural"]:
+                    j_ok["ending"] += 1
+            fe = rev.get("framing_errors")
+            if fe is not None:  # None = unknown, [] = known no defects
+                j_known["framing"] += 1
+                if fe:
+                    j_defects["framing"] += 1
+            ho = rev.get("hook_obstruction")
+            if ho is not None:
+                j_known["hook"] += 1
+                if ho:
+                    j_defects["hook"] += 1
+            co = rev.get("caption_obstruction")
+            if co is not None:
+                j_known["caption"] += 1
+                if co:
+                    j_defects["caption"] += 1
 
-        # Distinct moments: unknown if partial labels.
+        # Distinct moments.
         if accepted == 0:
-            distinct = 0 if reviewed == candidate else None
-            # Known zero only if fully reviewed.
+            distinct = 0 if (reviewed == candidate and candidate > 0) else None
         elif labeled_accepted == accepted:
             distinct = len(moments)
         else:
-            distinct = None  # partial labels -> unknown
+            distinct = None
 
         rate = (accepted / reviewed) if reviewed else None
         aph = (accepted / run_source_hours) if run_source_hours else None
 
+        # Per-run frozen fingerprints (not current global).
+        run_fps = r.get("source_fingerprints", {})
+        # If not frozen, use current (but mark as not frozen).
+        if not run_fps:
+            run_fps = {sid: sources[sid]["fingerprint"]
+                       for sid in run_sources}
+
         run_stats.append({
-            "run_id": r["run_id"],
-            "commit": r["commit"],
+            "run_id": r["run_id"], "commit": r["commit"],
             "settings": r["settings"],
+            "source_ids": run_sources,
+            "source_fingerprints": run_fps,
             "candidate_count": candidate,
             "reviewed_count": reviewed,
             "accepted_count": accepted,
@@ -394,77 +464,106 @@ def run_benchmark(manifest: dict, reviews: dict[str, dict],
             "distinct_accepted_moments": distinct,
             "moment_label_coverage": (
                 labeled_accepted / accepted if accepted else None),
-            "source_hours": round(run_source_hours, 3),
+            "source_hours": round(run_source_hours, 4),
             "accepted_per_source_hour": (
                 round(aph, 2) if aph is not None else None),
             "review_completeness": (
                 reviewed / candidate if candidate else None),
             "judgments": {
-                "opening": {"known": opening_known, "ok": opening_ok},
-                "payoff": {"known": payoff_known, "ok": payoff_ok},
-                "ending": {"known": ending_known, "ok": ending_ok},
-                "framing_defects": framing_defects,
+                "opening": {"known": j_known["opening"], "ok": j_ok["opening"]},
+                "payoff": {"known": j_known["payoff"], "ok": j_ok["payoff"]},
+                "ending": {"known": j_known["ending"], "ok": j_ok["ending"]},
+                "framing": {"known": j_known["framing"],
+                            "defects": j_defects["framing"]},
+                "framing_known": j_known["framing"],
+                "hook_obstruction": {"known": j_known["hook"],
+                                     "defects": j_defects["hook"]},
+                "caption_obstruction": {"known": j_known["caption"],
+                                        "defects": j_defects["caption"]},
             },
-            "source_fingerprints": {
-                sid: sources[sid]["fingerprint"] for sid in run_sources},
+            "clips": [
+                {"clip_id": c["clip_id"], "source_id": c["source_id"],
+                 "start": c["start"], "end": c["end"],
+                 "moment_id": c.get("moment_id"),
+                 "fingerprint": c["fingerprint"]}
+                for c in clips],
         })
 
-    # Per-genre (all six, even missing).
+    # Genres (all six).
     genre_stats = {}
     for g in GENRES:
-        g_clips = []
+        g_items = []
         for r in runs:
             for c in r["clips"]:
                 if sources[c["source_id"]]["genre"] == g:
-                    g_clips.append((r["run_id"], c))
+                    g_items.append((r["run_id"], c))
         reviewed = sum(
-            1 for _, c in g_clips
+            1 for _, c in g_items
             if reviews.get(c["clip_id"], {}).get("accepted") is not None)
         accepted = sum(
-            1 for _, c in g_clips
+            1 for _, c in g_items
             if reviews.get(c["clip_id"], {}).get("accepted") is True)
-        moments = set(
-            (c["source_id"], c["moment_id"]) for _, c in g_clips
-            if c.get("moment_id") and
-            reviews.get(c["clip_id"], {}).get("accepted") is True)
+        # Distinct: consistent rule with per-run.
+        moments = set()
+        labeled = 0
+        for _, c in g_items:
+            if reviews.get(c["clip_id"], {}).get("accepted") is True:
+                mid = c.get("moment_id")
+                if mid:
+                    moments.add((c["source_id"], mid))
+                    labeled += 1
+        if accepted == 0:
+            g_distinct = 0 if (reviewed == len(g_items) and g_items) else None
+        elif labeled == accepted:
+            g_distinct = len(moments)
+        else:
+            g_distinct = None
         # Per-run/per-genre.
         by_run = {}
-        for rid, c in g_clips:
-            by_run.setdefault(rid, {"candidate": 0, "accepted": 0})
-            by_run[rid]["candidate"] += 1
-            if reviews.get(c["clip_id"], {}).get("accepted") is True:
-                by_run[rid]["accepted"] += 1
+        for rid, c in g_items:
+            d = by_run.setdefault(rid, {"candidate": 0, "reviewed": 0,
+                                        "accepted": 0})
+            d["candidate"] += 1
+            acc = reviews.get(c["clip_id"], {}).get("accepted")
+            if acc is not None:
+                d["reviewed"] += 1
+                if acc:
+                    d["accepted"] += 1
         genre_stats[g] = {
-            "candidate_count": len(g_clips),
+            "candidate_count": len(g_items),
             "reviewed_count": reviewed,
             "accepted_count": accepted,
             "acceptance_rate": (accepted / reviewed) if reviewed else None,
-            "distinct_accepted_moments": len(moments) if moments else None,
+            "distinct_accepted_moments": g_distinct,
             "by_run": by_run,
         }
 
-    # Paired comparison by source.
+    # Paired: use per-run frozen fingerprints (not tautological).
     paired = {}
     for sid in sources:
-        runs_for_source = {}
+        runs_for = {}
         for r in runs:
-            cids = [c["clip_id"] for c in r["clips"]
-                    if c["source_id"] == sid]
-            if cids:
-                runs_for_source[r["run_id"]] = {
-                    "clip_ids": cids,
-                    "commit": r["commit"],
-                    "fingerprint": sources[sid]["fingerprint"],
+            if sid in r["source_ids"]:
+                # Frozen fingerprint for this run+source.
+                fp = r["source_fingerprints"].get(
+                    sid, sources[sid]["fingerprint"])
+                cids = [c["clip_id"] for c in r["clips"]
+                        if c["source_id"] == sid]
+                runs_for[r["run_id"]] = {
+                    "clip_ids": cids, "commit": r["commit"],
+                    "source_fingerprint": fp,
                 }
-        if runs_for_source:
-            # Check fingerprint compatibility.
-            fps = {v["fingerprint"] for v in runs_for_source.values()}
+        if runs_for:
+            fps = {v["source_fingerprint"] for v in runs_for.values()}
+            # Also compare against current.
+            current_fp = sources[sid]["fingerprint"]
+            all_match = len(fps) == 1 and current_fp in fps
             paired[sid] = {
-                "runs": runs_for_source,
-                "fingerprint_compatible": len(fps) == 1,
-                "missing_runs": [
-                    r["run_id"] for r in runs
-                    if r["run_id"] not in runs_for_source],
+                "runs": runs_for,
+                "fingerprints_compatible": all_match,
+                "current_fingerprint": current_fp,
+                "missing_runs": [r["run_id"] for r in runs
+                                 if r["run_id"] not in runs_for],
             }
 
     return {
@@ -486,86 +585,132 @@ def format_report(stats: dict) -> str:
         rate_s = f"{rate:.1%}" if rate is not None else "unknown"
         dm = rs["distinct_accepted_moments"]
         dm_s = str(dm) if dm is not None else "unknown"
-        cov = rs["moment_label_coverage"]
-        cov_s = f"{cov:.0%}" if cov is not None else "n/a"
         comp = rs["review_completeness"]
-        comp_s = f"{comp:.0%}" if comp is not None else "unknown"
+        comp_s = f"{comp:.0%}" if comp is not None else "n/a"
         aph = rs["accepted_per_source_hour"]
         aph_s = str(aph) if aph is not None else "unknown"
         lines.append(f"Run {rs['run_id']} ({rs['commit']}):")
-        lines.append(f"  Candidates: {rs['candidate_count']}, "
-                     f"Reviewed: {rs['reviewed_count']} ({comp_s}), "
-                     f"Accepted: {rs['accepted_count']} ({rate_s})")
-        lines.append(f"  Distinct moments: {dm_s} (label coverage {cov_s})")
-        lines.append(f"  Source hours: {rs['source_hours']}, "
-                     f"Accepted/hour: {aph_s}")
+        lines.append(f"  Sources: {rs['source_ids']} "
+                     f"({rs['source_hours']}h)")
+        lines.append(f"  Candidates: {rs['candidate_count']}, Reviewed: "
+                     f"{rs['reviewed_count']} ({comp_s}), Accepted: "
+                     f"{rs['accepted_count']} ({rate_s})")
+        lines.append(f"  Distinct moments: {dm_s}, Accepted/hour: {aph_s}")
         j = rs["judgments"]
-        lines.append(f"  Judgments: opening {j['opening']['ok']}/"
-                     f"{j['opening']['known']}, payoff {j['payoff']['ok']}/"
-                     f"{j['payoff']['known']}, ending {j['ending']['ok']}/"
-                     f"{j['ending']['known']}, framing defects: "
-                     f"{j['framing_defects']}")
+        lines.append(
+            f"  Opening: {j['opening']['ok']}/{j['opening']['known']}, "
+            f"Payoff: {j['payoff']['ok']}/{j['payoff']['known']}, "
+            f"Ending: {j['ending']['ok']}/{j['ending']['known']}")
+        lines.append(
+            f"  Framing: {j['framing']['defects']} defects / "
+            f"{j['framing']['known']} reviewed, "
+            f"Hook obstruction: {j['hook_obstruction']['defects']}/"
+            f"{j['hook_obstruction']['known']}, "
+            f"Caption: {j['caption_obstruction']['defects']}/"
+            f"{j['caption_obstruction']['known']}")
     lines.append("")
     lines.append("Per genre (all six):")
     for g, gs in stats["genre_stats"].items():
         rate = gs["acceptance_rate"]
         rate_s = f"{rate:.1%}" if rate is not None else "no data"
+        dm = gs["distinct_accepted_moments"]
+        dm_s = str(dm) if dm is not None else "unknown"
         lines.append(f"  {g}: {gs['accepted_count']}/"
-                     f"{gs['reviewed_count']} ({rate_s}), "
-                     f"candidates: {gs['candidate_count']}")
+                     f"{gs['reviewed_count']} ({rate_s}), distinct: {dm_s}")
     lines.append("")
     lines.append("Paired sources:")
     for sid, p in stats["paired_sources"].items():
         runs = ", ".join(p["runs"].keys())
-        compat = "compatible" if p["fingerprint_compatible"] else "MISMATCH"
-        missing = f", missing: {p['missing_runs']}" if p["missing_runs"] else ""
-        lines.append(f"  {sid}: [{runs}] fingerprints {compat}{missing}")
+        compat = "compatible" if p["fingerprints_compatible"] else "MISMATCH"
+        missing = (f", missing: {p['missing_runs']}"
+                   if p["missing_runs"] else "")
+        lines.append(f"  {sid}: [{runs}] {compat}{missing}")
     if stats["media_checks"]:
         lines.append("")
-        lines.append("Media checks (objective, separate from human):")
+        lines.append("Media checks (objective):")
         for k, v in stats["media_checks"].items():
-            status = "ok" if v["valid"] else "FAIL"
-            lines.append(f"  {k}: {status}")
+            s = "ok" if v["ok"] else "FAIL"
+            lines.append(f"  {k}: {s}")
     lines.append("")
     lines.append(stats["note"])
     return "\n".join(lines)
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="Editorial benchmark: human acceptance of clips.")
+    ap = argparse.ArgumentParser(description="Editorial benchmark.")
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--reviews", required=True)
-    ap.add_argument("--json-out", help="Write strict JSON report")
-    ap.add_argument("--text-out", help="Write readable report")
-    ap.add_argument("--check-media", action="store_true",
-                    help="Run media_qa checks (objective)")
+    ap.add_argument("--json-out")
+    ap.add_argument("--text-out")
+    ap.add_argument("--check-media", action="store_true")
     args = ap.parse_args(argv)
 
+    manifest_path = Path(args.manifest).resolve()
+    reviews_path = Path(args.reviews).resolve()
+
     try:
-        manifest = load_manifest(args.manifest)
-        reviews = load_reviews(args.reviews)
-        stats = run_benchmark(manifest, reviews,
+        manifest = load_manifest(manifest_path)
+        reviews_data = load_reviews(reviews_path)
+        stats = run_benchmark(manifest, reviews_data,
                               check_media=args.check_media)
         json_str = _strict_json(stats)
         text_str = format_report(stats)
-        # Collision checks before writing.
+
+        # Protect inputs and reject collisions.
+        protected = {manifest_path, reviews_path,
+                     Path(manifest["asset_root"]).resolve()}
+        for s in manifest["sources"].values():
+            protected.add(Path(s["_path"]).resolve())
+        for r in manifest["runs"]:
+            for c in r["clips"]:
+                protected.add(Path(c["_clip_path"]).resolve())
+
+        def _check_out(p):
+            if not p:
+                return
+            rp = Path(p).resolve()
+            # Real containment: reject if inside asset root.
+            asset_root = Path(manifest["asset_root"]).resolve()
+            try:
+                rp.relative_to(asset_root)
+                raise BenchmarkError(f"output inside asset root: {p}")
+            except ValueError:
+                pass
+            if rp in protected:
+                raise BenchmarkError(f"output collides with input: {p}")
+            # Identical destinations.
+            if args.json_out and args.text_out:
+                if Path(args.json_out).resolve() == Path(
+                        args.text_out).resolve():
+                    raise BenchmarkError("json-out and text-out identical")
+            # Parent must exist or be creatable.
+            parent = rp.parent
+            if not parent.exists():
+                raise BenchmarkError(f"output parent missing: {parent}")
+
         if args.json_out:
-            _check_output_collision(args.json_out, manifest)
+            _check_out(args.json_out)
         if args.text_out:
-            _check_output_collision(args.text_out, manifest)
+            _check_out(args.text_out)
     except BenchmarkError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    except OSError as e:
+        print(f"error: I/O failure: {e}", file=sys.stderr)
+        return 1
 
-    if args.json_out:
-        Path(args.json_out).write_text(json_str, encoding="utf-8")
-    else:
-        print(json_str)
-    if args.text_out:
-        Path(args.text_out).write_text(text_str, encoding="utf-8")
-    elif not args.json_out:
-        print("\n" + text_str)
+    try:
+        if args.json_out:
+            Path(args.json_out).write_text(json_str, encoding="utf-8")
+        else:
+            print(json_str)
+        if args.text_out:
+            Path(args.text_out).write_text(text_str, encoding="utf-8")
+        elif not args.json_out:
+            print("\n" + text_str)
+    except OSError as e:
+        print(f"error: write failed: {e}", file=sys.stderr)
+        return 1
     return 0
 
 

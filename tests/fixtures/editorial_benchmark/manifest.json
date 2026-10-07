@@ -1,21 +1,22 @@
 {
   "version": 1,
-  "asset_root": ".",
+  "asset_root": "assets",
   "sources": [
     {
       "id": "syn1",
       "file": "syn1.mp4",
-      "duration": 5.0,
+      "duration": 60.0,
       "genre": "interview/podcast",
       "synthetic": true,
-      "notes": "Synthetic fixture, not real footage."
+      "fingerprint": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
     },
     {
       "id": "syn2",
       "file": "syn2.mp4",
-      "duration": 5.0,
+      "duration": 60.0,
       "genre": "reaction/comedy",
-      "synthetic": true
+      "synthetic": true,
+      "fingerprint": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
     }
   ],
   "runs": [
@@ -23,31 +24,34 @@
       "run_id": "baseline",
       "commit": "abc123",
       "settings": {
-        "model": "v1"
+        "preset": "base"
+      },
+      "source_ids": [
+        "syn1",
+        "syn2"
+      ],
+      "source_fingerprints": {
+        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d",
+        "syn2": "sha256:8abb1136c07f182f3761bbd895907c08b6167f6c331c8197a2402fa044e25e72"
       },
       "clips": [
         {
           "clip_id": "c1",
           "source_id": "syn1",
-          "start": 0.0,
-          "end": 5.0,
+          "start": 10.0,
+          "end": 25.0,
           "moment_id": "m1",
-          "file": "c1.mp4"
+          "file": "c1.mp4",
+          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8"
         },
         {
           "clip_id": "c2",
           "source_id": "syn1",
-          "start": 0.0,
-          "end": 5.0,
+          "start": 30.0,
+          "end": 45.0,
           "moment_id": "m1",
-          "file": "c2.mp4"
-        },
-        {
-          "clip_id": "c3",
-          "source_id": "syn2",
-          "start": 0.0,
-          "end": 5.0,
-          "file": "c3.mp4"
+          "file": "c2.mp4",
+          "fingerprint": "sha256:073492d49f0642df713b176255fdd6195031349da29a8059e73cc101b65c1ba8"
         }
       ]
     },
@@ -55,24 +59,23 @@
       "run_id": "candidate",
       "commit": "def456",
       "settings": {
-        "model": "v2"
+        "preset": "improved"
+      },
+      "source_ids": [
+        "syn1"
+      ],
+      "source_fingerprints": {
+        "syn1": "sha256:7d586bab5d168861a756989850bef53a9b209d7be38b5eee15eef49d41f8f49d"
       },
       "clips": [
         {
-          "clip_id": "c4",
+          "clip_id": "c3",
           "source_id": "syn1",
           "start": 0.0,
-          "end": 5.0,
-          "moment_id": "m1",
-          "file": "c4.mp4"
-        },
-        {
-          "clip_id": "c5",
-          "source_id": "syn2",
-          "start": 0.0,
-          "end": 5.0,
+          "end": 10.0,
           "moment_id": "m2",
-          "file": "c5.mp4"
+          "file": "c3.mp4",
+          "fingerprint": "sha256:c3b97555333cfd91f4758cd55c89488777587a5cfc6dc3838994ed6ba38cdd2c"
         }
       ]
     }
