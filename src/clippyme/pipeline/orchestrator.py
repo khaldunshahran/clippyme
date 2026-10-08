@@ -565,6 +565,11 @@ def _load_or_analyze(
                              if isinstance(clips_data, dict) else None)
         _candidate_store = (clips_data.get("candidate_store")
                             if isinstance(clips_data, dict) else None)
+        # Task 09: preserve the editorial funnel + plans through fallbacks.
+        _editorial_funnel = (clips_data.get("editorial_refinement")
+                             if isinstance(clips_data, dict) else None)
+        _editorial_plans = (clips_data.get("editorial_plans")
+                            if isinstance(clips_data, dict) else None)
         def _preserve_funnel(data):
             if isinstance(data, dict):
                 if _discovery_funnel is not None:
@@ -572,6 +577,10 @@ def _load_or_analyze(
                     data["candidate_discovery"]["fallback_used"] = True
                 if _candidate_store is not None:
                     data["candidate_store"] = _candidate_store
+                if _editorial_funnel is not None:
+                    data["editorial_refinement"] = _editorial_funnel
+                if _editorial_plans is not None:
+                    data["editorial_plans"] = _editorial_plans
             return data
         if not clips_data or "shorts" not in clips_data:
             if should_use_fallback(args.monitor):
@@ -615,6 +624,22 @@ def _load_or_analyze(
                 print(
                     f"?? candidate_discovery version mismatch "
                     f"(got {_cd.get('version')}, want {DISCOVERY_VERSION}); "
+                    f"keeping metadata as-is (fail-soft).",
+                    flush=True)
+        except Exception:
+            pass
+    # Task 09: fail-soft validation of editorial refinement metadata.
+    # The editorial_refinement dict (if present) flows through the
+    # existing atomic checkpoint unchanged; we only verify its version.
+    _er = clips_data.get("editorial_refinement")
+    if isinstance(_er, dict):
+        try:
+            from clippyme.pipeline.editorial_refinement import (
+                EDITORIAL_VERSION)
+            if _er.get("version") != EDITORIAL_VERSION:
+                print(
+                    f"?? editorial_refinement version mismatch "
+                    f"(got {_er.get('version')}, want {EDITORIAL_VERSION}); "
                     f"keeping metadata as-is (fail-soft).",
                     flush=True)
         except Exception:

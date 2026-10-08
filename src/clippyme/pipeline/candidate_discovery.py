@@ -793,13 +793,24 @@ def run_windowed_discovery(
     clip_type: Optional[str] = None,
     duration_mode: Optional[str] = None,
     audience_intel: Optional[Any] = None,
+    # Task 09: editorial refinement wiring (minimum). run_editorial
+    # None follows the CLIPPYME_EDITORIAL_REFINEMENT rollback flag.
+    run_editorial: Optional[bool] = None,
+    editorial_build_prompt_fn: Optional[Callable[..., str]] = None,
+    editorial_parse_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
+    editorial_generate_fn: Optional[Callable[..., Any]] = None,
+    editorial_client_factory: Optional[Callable[[], Any]] = None,
+    editorial_config: Optional[Any] = None,
+    editorial_prior_plans: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run bounded windowed discovery; return funnel + candidate store.
 
     All provider interaction goes through injected callables for tests.
     Returns {"shorts": [...], "candidate_discovery": {...}} where shorts
     holds ViralClip-shaped dicts and candidate_discovery is versioned
-    funnel metadata (no secrets, no full provider responses).
+    funnel metadata (no secrets, no full provider responses). Task 09
+    additionally attaches "editorial_refinement" (versioned funnel)
+    and "editorial_plans" (per-candidate plans) to the returned dict.
     """
     from clippyme.pipeline import gemini_request as gr
 
@@ -871,6 +882,49 @@ def run_windowed_discovery(
                    "deadline_s": cfg.deadline_s, "exhausted": False},
     }
 
+    def _attach_editorial(funnel, candidate_store):
+        # Task 09 (minimum wiring): run the editorial pass over
+        # post-dedupe kept candidates and attach its versioned funnel
+        # and per-candidate plans to the RETURNED dict (never inside
+        # the candidate_discovery funnel). Deferred import avoids a
+        # module cycle (editorial_refinement imports this module).
+        from clippyme.pipeline import editorial_refinement as er
+        enabled = (run_editorial if run_editorial is not None
+                   else er.editorial_refinement_enabled())
+        if not enabled or not candidate_store:
+            reason = ("refinement_disabled" if not enabled
+                      else "no_candidates")
+            return er.disabled_editorial_record(reason), []
+        econfig = editorial_config or er.EditorialConfig.from_env(
+            model_name=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"))
+        # Reuse the discovery factory when no editorial-specific
+        # factory is injected; the editorial pass creates its own
+        # client instance and closes it exactly once (it never
+        # double-closes a client instance the caller already owns).
+        efactory = (editorial_client_factory
+                    if editorial_client_factory is not None
+                    else client_factory)
+        ed = er.run_editorial_refinement(
+            {"candidate_store": candidate_store,
+             "candidate_discovery": funnel},
+            words, video_duration,
+            config=econfig,
+            client_factory=efactory,
+            build_prompt_fn=editorial_build_prompt_fn,
+            parse_fn=editorial_parse_fn,
+            generate_fn=editorial_generate_fn,
+            instructions=instructions,
+            clip_type=clip_type,
+            duration_mode=duration_mode,
+            audience_intel=audience_intel,
+            policy_min=_policy.min_duration,
+            policy_max=_policy.max_duration,
+            time_fn=time_fn,
+            prior_plans=editorial_prior_plans,
+            _known_client=client_holder.get("client"),
+        )
+        return ed["editorial_refinement"], ed["editorial_plans"]
+
     def _finalize(funnel, candidate_store, shorts):
         # One finalization helper for all exits: complete versioned shape,
         # zero/unknown semantics, four count equalities.
@@ -903,9 +957,12 @@ def run_windowed_discovery(
               + funnel["final_cap_removals"]
               + funnel["final_selected"])
         funnel["counts_reconcile"] = bool(c1 and c2 and c3 and c4)
+        _efunnel, _eplans = _attach_editorial(funnel, candidate_store)
         return {"shorts": shorts,
                 "candidate_discovery": funnel,
-                "candidate_store": candidate_store}
+                "candidate_store": candidate_store,
+                "editorial_refinement": _efunnel,
+                "editorial_plans": _eplans}
 
     if not windows:
         funnel["candidate_discovery_note"] = "no valid words"

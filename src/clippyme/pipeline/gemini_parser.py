@@ -567,3 +567,35 @@ def parse_discovery_payload(text):
     if not isinstance(cands, list):
         raise ValueError('"candidates" must be a list')
     return cands
+
+
+def parse_editorial_payload(text):
+    """Parse an editorial response; expect {"decision": {...}}.
+
+    Returns the raw decision dict (validated independently by the
+    caller in editorial_refinement). Raises ValueError on malformed
+    payloads so the candidate is isolated as parse_failed rather than
+    silently dropped.
+    """
+    import json as _json
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("empty editorial response")
+    body = text.strip()
+    # Strip code fences if present.
+    if body.startswith("```"):
+        body = body.strip("`").strip()
+        nl = body.find("\n")
+        if nl != -1 and body[:nl].strip().isalpha():
+            body = body[nl + 1:]
+    try:
+        data = _json.loads(body)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"editorial JSON invalid: {e}")
+    if not isinstance(data, dict):
+        raise ValueError("editorial payload must be an object")
+    decision = data.get("decision")
+    if decision is None:
+        raise ValueError('editorial payload missing "decision"')
+    if not isinstance(decision, dict):
+        raise ValueError('"decision" must be an object')
+    return decision

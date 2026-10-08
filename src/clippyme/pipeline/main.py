@@ -1045,6 +1045,11 @@ if __name__ == '__main__':
                     if isinstance(clips_data, dict) else None)
         _dstore = (clips_data.get("candidate_store")
                    if isinstance(clips_data, dict) else None)
+        # Task 09: preserve the editorial funnel + plans through fallbacks.
+        _efunnel = (clips_data.get("editorial_refinement")
+                    if isinstance(clips_data, dict) else None)
+        _eplans = (clips_data.get("editorial_plans")
+                   if isinstance(clips_data, dict) else None)
         def _keep_funnel(data):
             if isinstance(data, dict):
                 if _dfunnel is not None:
@@ -1052,6 +1057,10 @@ if __name__ == '__main__':
                     data["candidate_discovery"]["fallback_used"] = True
                 if _dstore is not None:
                     data["candidate_store"] = _dstore
+                if _efunnel is not None:
+                    data["editorial_refinement"] = _efunnel
+                if _eplans is not None:
+                    data["editorial_plans"] = _eplans
             return data
         if not clips_data or 'shorts' not in clips_data:
             if should_use_fallback(args.monitor):
