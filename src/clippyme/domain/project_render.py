@@ -758,6 +758,28 @@ async def render_project(*, job_id: str, clip_index: int,
                                 f"lineage base duration {_bdur:.2f}s does not "
                                 f"match timeline {_tl_dur:.2f}s "
                                 f"(tolerance {_dur_tol:.2f}s)")
+                        # Task 13: the project framing identity must still
+                        # match the stable sidecar before the Task 05 base is
+                        # reused. A missing/mismatched/replaced plan fails
+                        # clearly, like invalid_asset -- never a stale base.
+                        _proj_framing = _proj_dict.get("framing")
+                        if _proj_framing:
+                            try:
+                                from clippyme.domain import (
+                                    project_framing as _pf,
+                                )
+                            except ImportError:
+                                _pf = None
+                            if _pf is not None:
+                                try:
+                                    _pf.verify_framing_at_render(
+                                        job_dir=job_dir,
+                                        framing=_proj_framing,
+                                    )
+                                except _pf.FramingError as exc:
+                                    raise ProjectRenderError(
+                                        f"framing sidecar unusable: {exc}"
+                                    )
                         # Reuse validated reframed base; apply CURRENT
                         # composition/music from the project.
                         base_path = _base_path
@@ -771,6 +793,15 @@ async def render_project(*, job_id: str, clip_index: int,
                         # crop with different framing.
                         raise ProjectRenderError(
                             f"reframed base unusable: {_reason}")
+                    elif _outcome == "framing_edit":
+                        # Task 13: the automatic framing trajectory was edited
+                        # after the base was rendered. Dynamic replay is not
+                        # implemented in this task -- fail clearly instead of
+                        # silently publishing a static center crop or
+                        # pretending the edit was applied.
+                        raise ProjectRenderError(
+                            "automatic framing trajectory edited; dynamic "
+                            f"replay is not implemented (reason: {_reason})")
                     else:
                         # Geometry edit: use existing source renderer.
                         logger.info(

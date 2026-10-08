@@ -138,7 +138,7 @@ landmarks.
 
 - Observation-cap exhaustion is recorded at the actual first dropped
   observation: `ObservationLog.add()` calls `mark_exhaustion(
-  `nalysis-frame-budget-exhausted`, frame=obs.frame,
+  `analysis-frame-budget-exhausted`, frame=obs.frame,
   scene_id=obs.scene_id)` on the first drop. First-call-wins semantics
   are preserved, so pass 1 can never replace this original context after
   scene bookkeeping advances; a partially observed prior scene is never

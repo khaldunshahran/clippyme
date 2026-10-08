@@ -12,6 +12,10 @@ provides pure helpers to:
 Eligibility outcomes:
 - ("eligible", base_path): reuse the reframed base.
 - ("geometry_edit", None): genuine edit; use existing source renderer.
+- ("framing_edit", None): the automatic framing trajectory was added,
+  removed, or changed after the base was rendered; dynamic replay is not
+  implemented -- FAIL CLEARLY with the stable
+  "framing-trajectory-edit" reason, do not silently publish a center crop.
 - ("invalid_asset", None): missing/stale/malformed base or source;
   FAIL CLEARLY, do not silently publish a center crop.
 
@@ -55,6 +59,7 @@ def build_lineage(
     segments: list[dict[str, Any]],
     render: dict[str, Any],
     source_path: str | None = None,
+    framing: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Build reframed-base lineage for a newly emitted auto project.
 
@@ -139,12 +144,29 @@ def build_lineage(
         if render_baseline[k] is None:
             return None
 
+    # Task 13: framing baseline identity. The caller passes the already
+    # validated project framing dict; only its immutable identity is stored
+    # (the content hash catches same-size/same-mtime replacement). None for
+    # old projects or when the domain helper is unavailable.
+    framing_identity: dict[str, Any] | None = None
+    if framing:
+        try:
+            from clippyme.domain.project_framing import framing_baseline_identity
+        except ImportError:
+            framing_baseline_identity = None  # type: ignore[assignment]
+        if framing_baseline_identity is not None:
+            try:
+                framing_identity = framing_baseline_identity(framing)
+            except Exception:
+                framing_identity = None
+
     return {
         "base_ref": rel_ref,
         "identity": identity,
         "source": source_baseline,
         "segments": segment_baseline,
         "render": render_baseline,
+        "framing": framing_identity,
     }
 
 
@@ -222,6 +244,36 @@ def _validate_baseline(lineage: dict[str, Any]) -> str | None:
     for k in ("size", "mtime"):
         if not _is_finite_number(ident.get(k)):
             return f"lineage base identity {k} invalid"
+
+    # Task 13: framing baseline identity (optional; None for old projects).
+    # Malformed -> invalid_asset (same class as every other incomplete
+    # baseline), never a silent trust.
+    _fr = lineage.get("framing")
+    if _fr is not None:
+        if not isinstance(_fr, dict):
+            return "lineage framing malformed"
+        # Digests are plain strings; tracker_digest may legitimately be ""
+        # (see FramingPlanIdentity.tracker_digest default). Only plan_ref
+        # must be non-empty to be resolvable.
+        for _k in ("source_fingerprint", "config_digest",
+                   "tracker_digest", "timeline_digest"):
+            if not isinstance(_fr.get(_k), str):
+                return f"lineage framing {_k} invalid"
+        if not isinstance(_fr.get("plan_ref"), str) or not _fr.get("plan_ref"):
+            return "lineage framing plan_ref invalid"
+        _sha = _fr.get("sha256")
+        if not (isinstance(_sha, str) and len(_sha) == 64):
+            return "lineage framing sha256 invalid"
+        try:
+            int(_sha, 16)
+        except (TypeError, ValueError):
+            return "lineage framing sha256 invalid"
+        if not _is_finite_number(_fr.get("output_aspect")) or not (
+            _fr.get("output_aspect") > 0
+        ):
+            return "lineage framing output_aspect invalid"
+        if not isinstance(_fr.get("analysis_complete"), bool):
+            return "lineage framing analysis_complete invalid"
 
     return None
 
@@ -303,6 +355,50 @@ def check_lineage_eligible(
     for key in ("width", "height", "fps"):
         if stored_render.get(key) != proj_render.get(key):
             return ("geometry_edit", None, f"render {key} changed")
+
+    # Task 13: framing trajectory comparison (part of the geometry
+    # baseline). Both None -> ok. A set-vs-None mismatch -> framing_edit.
+    # Both set -> compare the identity keys; any difference -> framing_edit.
+    # Never silently reuse the old base under a changed trajectory, and never
+    # fall back to a static center crop.
+    stored_framing = lineage.get("framing")
+    proj_framing = _norm(project.get("framing"))
+    if stored_framing is None and proj_framing is None:
+        pass
+    elif stored_framing is None:
+        return ("framing_edit", None,
+                "framing trajectory added (reason: framing-trajectory-edit)")
+    elif proj_framing is None:
+        return ("framing_edit", None,
+                "framing trajectory removed (reason: framing-trajectory-edit)")
+    else:
+        if not isinstance(proj_framing, dict):
+            return ("invalid_asset", None, "project framing malformed")
+        proj_identity: dict[str, Any] | None = None
+        try:
+            from clippyme.domain.project_framing import (
+                framing_baseline_identity as _fbi,
+            )
+        except ImportError:
+            _fbi = None  # type: ignore[assignment]
+        if _fbi is not None:
+            try:
+                proj_identity = _fbi(proj_framing)
+            except Exception:
+                proj_identity = None
+            if not isinstance(proj_identity, dict):
+                return ("invalid_asset", None, "project framing malformed")
+        else:
+            # Domain helper unavailable: compare the flat identity keys
+            # directly (the baseline is stored flat).
+            proj_identity = proj_framing
+        for key in ("plan_ref", "sha256", "source_fingerprint",
+                    "config_digest", "tracker_digest", "output_aspect",
+                    "analysis_complete", "timeline_digest"):
+            if stored_framing.get(key) != proj_identity.get(key):
+                return ("framing_edit", None,
+                        f"framing {key} changed "
+                        f"(reason: framing-trajectory-edit)")
 
     # 3. Base asset checks (only when geometry matches).
     base_path = _safe_resolve(lineage.get("base_ref"), job_dir)

@@ -142,6 +142,281 @@
       "title": "CropBox",
       "type": "object"
     },
+    "FramingKeyframe": {
+      "description": "One crop target in clip-relative inclusive frame coordinates.",
+      "properties": {
+        "frame": {
+          "minimum": 0,
+          "title": "Frame",
+          "type": "integer"
+        },
+        "x1": {
+          "minimum": 0,
+          "title": "X1",
+          "type": "integer"
+        },
+        "y1": {
+          "minimum": 0,
+          "title": "Y1",
+          "type": "integer"
+        },
+        "x2": {
+          "minimum": 0,
+          "title": "X2",
+          "type": "integer"
+        },
+        "y2": {
+          "minimum": 0,
+          "title": "Y2",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "lock",
+            "ease"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "frame",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "kind"
+      ],
+      "title": "FramingKeyframe",
+      "type": "object"
+    },
+    "FramingPlanIdentity": {
+      "description": "Immutable identity of the promoted stable sidecar + Task 12 plan.",
+      "properties": {
+        "plan_ref": {
+          "title": "Plan Ref",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size": {
+          "minimum": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "mtime_ns": {
+          "minimum": 0,
+          "title": "Mtime Ns",
+          "type": "integer"
+        },
+        "schema_version": {
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "producer": {
+          "title": "Producer",
+          "type": "string"
+        },
+        "source_fingerprint": {
+          "title": "Source Fingerprint",
+          "type": "string"
+        },
+        "config_digest": {
+          "title": "Config Digest",
+          "type": "string"
+        },
+        "tracker_digest": {
+          "default": "",
+          "title": "Tracker Digest",
+          "type": "string"
+        },
+        "output_aspect": {
+          "exclusiveMinimum": 0,
+          "title": "Output Aspect",
+          "type": "number"
+        },
+        "analysis_complete": {
+          "title": "Analysis Complete",
+          "type": "boolean"
+        },
+        "timeline_digest": {
+          "title": "Timeline Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan_ref",
+        "sha256",
+        "size",
+        "mtime_ns",
+        "schema_version",
+        "producer",
+        "source_fingerprint",
+        "config_digest",
+        "output_aspect",
+        "analysis_complete",
+        "timeline_digest"
+      ],
+      "title": "FramingPlanIdentity",
+      "type": "object"
+    },
+    "FramingRender": {
+      "description": "Render geometry the normalized trajectory is valid for.",
+      "properties": {
+        "width": {
+          "exclusiveMinimum": 0,
+          "title": "Width",
+          "type": "integer"
+        },
+        "height": {
+          "exclusiveMinimum": 0,
+          "title": "Height",
+          "type": "integer"
+        },
+        "fps": {
+          "exclusiveMinimum": 0,
+          "title": "Fps",
+          "type": "number"
+        },
+        "aspect": {
+          "exclusiveMinimum": 0,
+          "title": "Aspect",
+          "type": "number"
+        }
+      },
+      "required": [
+        "width",
+        "height",
+        "fps",
+        "aspect"
+      ],
+      "title": "FramingRender",
+      "type": "object"
+    },
+    "FramingSceneTimeline": {
+      "description": "Normalized Task 12 scene on the clip-relative clock (inclusive frames).",
+      "properties": {
+        "scene_id": {
+          "minimum": 0,
+          "title": "Scene Id",
+          "type": "integer"
+        },
+        "strategy": {
+          "minLength": 1,
+          "title": "Strategy",
+          "type": "string"
+        },
+        "start_frame": {
+          "minimum": 0,
+          "title": "Start Frame",
+          "type": "integer"
+        },
+        "end_frame": {
+          "minimum": 0,
+          "title": "End Frame",
+          "type": "integer"
+        },
+        "applies": {
+          "title": "Applies",
+          "type": "boolean"
+        },
+        "subject_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Subject Ids",
+          "type": "array"
+        },
+        "keyframes": {
+          "items": {
+            "$ref": "#/$defs/FramingKeyframe"
+          },
+          "title": "Keyframes",
+          "type": "array"
+        },
+        "fallback_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Reason"
+        },
+        "fallback_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Detail"
+        }
+      },
+      "required": [
+        "scene_id",
+        "strategy",
+        "start_frame",
+        "end_frame",
+        "applies"
+      ],
+      "title": "FramingSceneTimeline",
+      "type": "object"
+    },
+    "FramingSource": {
+      "description": "Source slice the plan was authored against (plan header).",
+      "properties": {
+        "fingerprint": {
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "width": {
+          "exclusiveMinimum": 0,
+          "title": "Width",
+          "type": "integer"
+        },
+        "height": {
+          "exclusiveMinimum": 0,
+          "title": "Height",
+          "type": "integer"
+        },
+        "fps": {
+          "exclusiveMinimum": 0,
+          "title": "Fps",
+          "type": "number"
+        },
+        "frame_count": {
+          "exclusiveMinimum": 0,
+          "title": "Frame Count",
+          "type": "integer"
+        },
+        "slice_offset_frames": {
+          "minimum": 0,
+          "title": "Slice Offset Frames",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fingerprint",
+        "width",
+        "height",
+        "fps",
+        "frame_count",
+        "slice_offset_frames"
+      ],
+      "title": "FramingSource",
+      "type": "object"
+    },
     "Grade": {
       "properties": {
         "preset": {
@@ -197,6 +472,57 @@
         "end"
       ],
       "title": "Overlay",
+      "type": "object"
+    },
+    "ProjectFraming": {
+      "description": "Task 13 bridge: the accepted automatic camera plan as project data.\n\n``eligible=True`` means the normalized trajectory is complete and may\nbe replayed/edited by a future trajectory tool. ``eligible=False``\nwith ``ineligibility_reason`` is an audit reference only (e.g. an\nincomplete Task 12 plan): it must never be treated as a camera path.",
+      "properties": {
+        "version": {
+          "const": 1,
+          "default": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "eligible": {
+          "default": true,
+          "title": "Eligible",
+          "type": "boolean"
+        },
+        "ineligibility_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ineligibility Reason"
+        },
+        "plan": {
+          "$ref": "#/$defs/FramingPlanIdentity"
+        },
+        "source": {
+          "$ref": "#/$defs/FramingSource"
+        },
+        "render": {
+          "$ref": "#/$defs/FramingRender"
+        },
+        "scenes": {
+          "items": {
+            "$ref": "#/$defs/FramingSceneTimeline"
+          },
+          "title": "Scenes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "plan",
+        "source",
+        "render"
+      ],
+      "title": "ProjectFraming",
       "type": "object"
     },
     "ProjectSegment": {
@@ -274,6 +600,20 @@
           "description": "render geometry baseline: width/height/fps",
           "title": "Render",
           "type": "object"
+        },
+        "framing": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Task 13 framing baseline identity: plan_ref, sha256, source_fingerprint, config_digest, tracker_digest, output_aspect, analysis_complete, timeline_digest",
+          "title": "Framing"
         }
       },
       "required": [
@@ -455,6 +795,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/ReframedBase"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "framing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProjectFraming"
         },
         {
           "type": "null"

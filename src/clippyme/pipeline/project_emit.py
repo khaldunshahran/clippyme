@@ -29,6 +29,12 @@ Derivation (1:1 from existing data):
 - ``render``: width/height/fps probed from the actual final mp4; encoder
   resolved via ``domain.encode.video_encoder()`` (same as the render itself).
 - ``source``: the kept ``source_<clip>.mp4`` slice name + probed dimensions.
+- ``framing`` (Task 13): the accepted Task 12 turn-aware plan, validated and
+  normalized to clip-relative frames by ``domain.project_framing`` -- explicit
+  version, stable job-relative sidecar reference, content hash (so
+  same-size/same-mtime replacement is detected), source fingerprint, render
+  geometry, ordered scene strategies, and a normalized timeline. Absent when
+  no usable sidecar exists or the domain helper is unavailable.
 - ``version`` = 1, ``origin`` = "auto", fresh ``idempotency_key`` (uuid4).
 
 Filename convention: ``clip-project-<clip_index>.json`` (documented here;
@@ -190,6 +196,35 @@ def _build_project(
             "encoder": video_encoder(),
         },
     }
+    # Task 13: stable framing trajectory bridge. Build the project framing
+    # from the Task 12 sidecar the caller promoted to the stable final
+    # basename. Never raises: a missing/unusable sidecar or an unavailable
+    # domain helper simply leaves the field out.
+    # Built BEFORE the Task 05 lineage block so the lineage baseline can
+    # capture the framing identity.
+    framing: dict[str, Any] | None = None
+    if job_dir:
+        try:
+            from clippyme.domain import project_framing as _pf
+        except ImportError:
+            _pf = None
+        if _pf is not None:
+            try:
+                framing = _pf.build_project_framing(
+                    job_dir=job_dir,
+                    clip_final=clip_final,
+                    render_w=render_w,
+                    render_h=render_h,
+                    render_fps=render_fps,
+                    # The render used render_fps (probed from the accepted
+                    # final mp4); the clip is the already-cut source slice,
+                    # so its frame count is duration * render fps.
+                    clip_frame_count=int(round(duration * render_fps)),
+                )
+            except Exception:
+                framing = None
+    if framing:
+        result["framing"] = framing
     # Task 05: reframed-base lineage for automatic framing preservation.
     # Only for auto-emitted projects; job_dir needed for safe references.
     if job_dir:
@@ -200,6 +235,7 @@ def _build_project(
             source=_source,
             segments=result["segments"],
             render=result["render"],
+            framing=framing,
         )
         if _lineage:
             result["reframed_base"] = _lineage
@@ -282,8 +318,21 @@ def emit_clip_project(
         project = validate_project(data)
         os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, PROJECT_FILENAME_TEMPLATE.format(index=index))
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(project_to_json(project))
+        # Task 13: atomic write -- a crash mid-emit must never leave a
+        # partial project behind; the temp file is cleaned in finally on all
+        # paths. The project_has_user_edits preservation contract (checked by
+        # the caller before emission) is unchanged.
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(project_to_json(project))
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
         print(f"clip-project: wrote {os.path.basename(path)}", flush=True)
         return path
     except Exception as exc:  # never fail a good clip over the project file

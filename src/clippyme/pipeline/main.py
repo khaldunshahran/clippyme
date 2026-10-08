@@ -43,6 +43,7 @@ load_dotenv()
 # Reframe core (cv2/YOLO/MediaPipe) lives in clippyme.pipeline.reframe.
 from clippyme.pipeline import reframe  # noqa: E402,F401
 from clippyme.pipeline.reframe import (  # noqa: E402,F401
+    turn_framing_sidecar_for,
     process_video_to_vertical,
     select_cover_frame,
     analyze_scenes_strategy,
@@ -970,6 +971,15 @@ if __name__ == '__main__':
             normalize_audio(tmp_output)
             select_cover_frame(tmp_output)
             os.replace(tmp_output, final_output)
+            # Task 13: promote the attempt's turn-framing sidecar to the
+            # stable final basename. Best-effort: never fail a good render
+            # over the sidecar.
+            try:
+                _tmp_sidecar = turn_framing_sidecar_for(tmp_output)
+                if os.path.isfile(_tmp_sidecar):
+                    os.replace(_tmp_sidecar, turn_framing_sidecar_for(final_output))
+            except OSError:
+                pass
             print(f"✅ Reframe-only done in {time.time() - reframe_start:.1f}s → {final_output}")
             sys.exit(0)
         except Exception as e:
@@ -1344,9 +1354,31 @@ if __name__ == '__main__':
                             os.remove(_temp_final)
                         except OSError:
                             pass
+                        # Task 13: a failed render must not leak its temporary
+                        # sidecar. Same basename rule as
+                        # reframe.turn_framing_sidecar_for (inlined -- this
+                        # loop is AST-compiled by tests with a restricted
+                        # injected env, so no new names may be referenced).
+                        # Best-effort; never fail the clip over it.
+                        try:
+                            _bad_sidecar = os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json"
+                            if os.path.isfile(_bad_sidecar):
+                                os.remove(_bad_sidecar)
+                        except OSError:
+                            pass
                         success = False
                 if success:
                     os.replace(_temp_final, clip_final_path)
+                    # Task 13: promote the attempt's turn-framing sidecar to
+                    # the stable final basename now that the render
+                    # validated. Inlined basename rule (see comment above)
+                    # -- best-effort, never fail an accepted clip.
+                    try:
+                        _temp_sidecar = os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json"
+                        if os.path.isfile(_temp_sidecar):
+                            os.replace(_temp_sidecar, os.path.splitext(clip_final_path)[0] + ".turn_framing_plan.json")
+                    except OSError:
+                        pass
                     normalize_audio(clip_final_path)
                     select_cover_frame(clip_final_path)
                     print(f"   ✅ Clip {i+1} ready: {clip_final_path}")

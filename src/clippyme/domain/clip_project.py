@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SCHEMA_TAG = "nugget.clip-project/1"
 
@@ -218,6 +219,195 @@ class ReframedBase(BaseModel):
     render: dict = Field(
         default_factory=dict,
         description="render geometry baseline: width/height/fps")
+    # Task 13 (pipeline integration): framing trajectory baseline identity
+    # (the 8-key subset produced by
+    # domain.project_framing.framing_baseline_identity). Optional; None for
+    # old emissions. Strictly validated by
+    # domain.project_lineage._validate_baseline at eligibility time.
+    framing: Optional[dict] = Field(
+        default=None,
+        description="Task 13 framing baseline identity: plan_ref, sha256, "
+        "source_fingerprint, config_digest, tracker_digest, output_aspect, "
+        "analysis_complete, timeline_digest")
+
+
+# ---------------------------------------------------------------------------
+# Task 13: stable framing artifact bridge (additive, optional).
+# ---------------------------------------------------------------------------
+
+_TRACK_ID_RE = re.compile(r"^t-\d+$")
+
+
+def _reject_bool_numeric(v):
+    """Shared mode="before" guard: JSON true/false is never a number."""
+    if isinstance(v, bool):
+        raise ValueError("boolean is not a valid numeric value")
+    return v
+
+
+class FramingKeyframe(BaseModel):
+    """One crop target in clip-relative inclusive frame coordinates."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    frame: int = Field(ge=0)
+    x1: int = Field(ge=0)
+    y1: int = Field(ge=0)
+    x2: int = Field(ge=0)
+    y2: int = Field(ge=0)
+    kind: Literal["lock", "ease"]
+
+    @field_validator("frame", "x1", "y1", "x2", "y2", mode="before")
+    @classmethod
+    def _no_bools(cls, v):
+        return _reject_bool_numeric(v)
+
+    @model_validator(mode="after")
+    def _box_order(self):
+        if not self.x1 < self.x2:
+            raise ValueError(f"x1 ({self.x1}) must be < x2 ({self.x2})")
+        if not self.y1 < self.y2:
+            raise ValueError(f"y1 ({self.y1}) must be < y2 ({self.y2})")
+        return self
+
+
+class FramingSceneTimeline(BaseModel):
+    """Normalized Task 12 scene on the clip-relative clock (inclusive frames)."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    scene_id: int = Field(ge=0)
+    strategy: str = Field(min_length=1)
+    start_frame: int = Field(ge=0)
+    end_frame: int = Field(ge=0)
+    applies: bool
+    subject_ids: list[str] = Field(default_factory=list)
+    keyframes: list[FramingKeyframe] = Field(default_factory=list)
+    fallback_reason: Optional[str] = None
+    fallback_detail: Optional[str] = None
+
+    @field_validator("scene_id", "start_frame", "end_frame", mode="before")
+    @classmethod
+    def _no_bools(cls, v):
+        return _reject_bool_numeric(v)
+
+    @field_validator("subject_ids")
+    @classmethod
+    def _anonymous_ids(cls, v):
+        for sid in v:
+            if not isinstance(sid, str) or not _TRACK_ID_RE.match(sid):
+                raise ValueError(
+                    "subject_ids must be anonymous local ids "
+                    f"(t-<int>), got {sid!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _check_order(self):
+        if self.start_frame > self.end_frame:
+            raise ValueError(
+                f"start_frame ({self.start_frame}) must be <= end_frame "
+                f"({self.end_frame})")
+        frames = [k.frame for k in self.keyframes]
+        if any(b <= a for a, b in zip(frames, frames[1:])):
+            raise ValueError("keyframes must be ordered with unique frames")
+        return self
+
+
+class FramingPlanIdentity(BaseModel):
+    """Immutable identity of the promoted stable sidecar + Task 12 plan."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    plan_ref: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(ge=0)
+    mtime_ns: int = Field(ge=0)
+    schema_version: int = Field(ge=1)
+    producer: str
+    source_fingerprint: str
+    config_digest: str
+    tracker_digest: str = ""
+    output_aspect: float = Field(gt=0)
+    analysis_complete: bool
+    timeline_digest: str
+
+    @field_validator("size", "mtime_ns", "schema_version", "output_aspect",
+                     mode="before")
+    @classmethod
+    def _no_bools(cls, v):
+        return _reject_bool_numeric(v)
+
+
+class FramingSource(BaseModel):
+    """Source slice the plan was authored against (plan header)."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    fingerprint: str
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    fps: float = Field(gt=0)
+    frame_count: int = Field(gt=0)
+    slice_offset_frames: int = Field(ge=0)
+
+    @field_validator("width", "height", "fps", "frame_count",
+                     "slice_offset_frames", mode="before")
+    @classmethod
+    def _no_bools(cls, v):
+        return _reject_bool_numeric(v)
+
+
+class FramingRender(BaseModel):
+    """Render geometry the normalized trajectory is valid for."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    fps: float = Field(gt=0)
+    aspect: float = Field(gt=0)
+
+    @field_validator("width", "height", "fps", "aspect", mode="before")
+    @classmethod
+    def _no_bools(cls, v):
+        return _reject_bool_numeric(v)
+
+
+class ProjectFraming(BaseModel):
+    """Task 13 bridge: the accepted automatic camera plan as project data.
+
+    ``eligible=True`` means the normalized trajectory is complete and may
+    be replayed/edited by a future trajectory tool. ``eligible=False``
+    with ``ineligibility_reason`` is an audit reference only (e.g. an
+    incomplete Task 12 plan): it must never be treated as a camera path.
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    version: Literal[1] = 1
+    eligible: bool = True
+    ineligibility_reason: Optional[str] = None
+    plan: FramingPlanIdentity
+    source: FramingSource
+    render: FramingRender
+    scenes: list[FramingSceneTimeline] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_eligibility(self):
+        if self.eligible:
+            if not self.scenes:
+                raise ValueError(
+                    "eligible framing requires at least one scene")
+            for scene in self.scenes:
+                if (scene.applies and not scene.keyframes
+                        and not scene.fallback_reason):
+                    raise ValueError(
+                        f"applicable scene {scene.scene_id} needs keyframes "
+                        "or a fallback_reason")
+        elif not self.ineligibility_reason:
+            raise ValueError(
+                "ineligible framing requires ineligibility_reason")
+        return self
 
 
 class ClipProject(BaseModel):
@@ -251,6 +441,12 @@ class ClipProject(BaseModel):
     # reuses the reframed base instead of materializing a static crop.
     # Additive optional field; old projects without it use existing routes.
     reframed_base: Optional[ReframedBase] = Field(default=None)
+    # Task 13: stable framing artifact bridge. Optional; when present,
+    # records the validated Task 12 turn-aware framing plan as a
+    # normalized clip-relative trajectory plus immutable sidecar identity.
+    # Additive optional Task 13 field; old projects without it validate,
+    # save/load, undo, preview and render through existing paths.
+    framing: Optional[ProjectFraming] = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod

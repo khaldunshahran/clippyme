@@ -81,6 +81,17 @@ from clippyme.pipeline.reframe_track import (  # noqa: F401
 )
 
 
+def turn_framing_sidecar_for(video_path: str) -> str:
+    """Canonical Task 12 turn-framing sidecar path for a video path.
+
+    Task 13: both the direct CLI and the queued orchestrator render to a
+    temporary video name; the turn-aware plan is written next to that
+    attempt's video and promoted to this stable final name only after the
+    render validates.
+    """
+    return os.path.splitext(video_path)[0] + ".turn_framing_plan.json"
+
+
 # Curated COCO classes that read as a "subject" in faceless B-roll, with a pull
 # weight (animals strongest, then vehicles, then commonly-demoed held objects).
 # Person is intentionally absent — people are framed by the face/person tracker
@@ -1404,7 +1415,7 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
                 original_width, original_height, total_frames, fps,
                 split_metadata=split_metadata,
                 screen_metadata=screen_metadata,
-                plan_path=f"{base_name}.turn_framing_plan.json",
+                plan_path=turn_framing_sidecar_for(final_output_video),
             )
 
         with tqdm(total=total_frames, desc="   Processing", file=sys.stdout) as pbar:

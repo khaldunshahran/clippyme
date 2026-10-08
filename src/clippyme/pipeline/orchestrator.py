@@ -839,6 +839,19 @@ def _clip_bounds(clip: dict[str, Any]) -> tuple[float, float]:
 
 
 
+def _sidecar_for(legacy, video_path: str) -> str:
+    """Task 13: sidecar path for a video, tolerant of faked ``legacy`` modules.
+
+    Production ``legacy`` is the real ``reframe`` module (which defines the
+    canonical ``turn_framing_sidecar_for``); tests inject fakes without it,
+    so fall back to the identical basename rule.
+    """
+    fn = getattr(legacy, "turn_framing_sidecar_for", None)
+    if callable(fn):
+        return fn(video_path)
+    return os.path.splitext(video_path)[0] + ".turn_framing_plan.json"
+
+
 def _maybe_emit_clip_project(**kwargs):
     """Emit the default-edit project unless the user already edited it.
 
@@ -924,6 +937,16 @@ def _render_one_clip(
             # NEVER overwrite an existing working project that carries user
             # edits (Task 01 preservation guarantee). Additive only;
             # emit_clip_project never raises.
+            # Task 13 (resume): the stable sidecar should sit next to the
+            # reused final clip. Old clips predate Task 13 -- informational
+            # only; never rerender or fail for a missing sidecar.
+            _stable_sidecar = _sidecar_for(legacy, clip_final)
+            if not os.path.isfile(_stable_sidecar):
+                print(
+                    f"clip-project: no stable turn-framing sidecar for resumed "
+                    f"clip {index + 1}/{total} (pre-Task 13)",
+                    flush=True,
+                )
             _maybe_emit_clip_project(
                 output_dir=output_dir,
                 job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
@@ -1033,6 +1056,14 @@ def _render_one_clip(
             os.remove(temp_output)
         except FileNotFoundError:
             pass
+        # Task 13: drop a stale temp sidecar from a crashed/failed attempt so
+        # this attempt cannot leak it or promote another attempt's plan.
+        try:
+            _attempt_sidecar = _sidecar_for(legacy, temp_output)
+            if os.path.isfile(_attempt_sidecar):
+                os.remove(_attempt_sidecar)
+        except OSError:
+            pass
         success = legacy.process_video_to_vertical(
             clip_source,
             temp_output,
@@ -1063,6 +1094,18 @@ def _render_one_clip(
             )
         if last_report and not last_report.get("critical"):
             os.replace(temp_output, clip_final)
+            # Task 13: promote the attempt's turn-framing sidecar to the
+            # stable final basename (same rationale as the cover-art comment
+            # below: the artifact must live next to the final clip, never
+            # under the temporary attempt name). Best-effort: never fail an
+            # accepted clip over the sidecar.
+            try:
+                _attempt_sidecar = _sidecar_for(legacy, temp_output)
+                _stable_sidecar = _sidecar_for(legacy, clip_final)
+                if os.path.isfile(_attempt_sidecar):
+                    os.replace(_attempt_sidecar, _stable_sidecar)
+            except OSError:
+                pass
             # The cover must be based on the stable final basename; generating it
             # from the temporary render would orphan `*.render.tmp_cover.jpg`.
             legacy.select_cover_frame(clip_final)
@@ -1095,6 +1138,14 @@ def _render_one_clip(
             return True
         try:
             os.remove(temp_output)
+        except OSError:
+            pass
+        # Task 13: a failed render/QA/retry must not leak its temp sidecar;
+        # a retry must not promote another attempt's plan.
+        try:
+            _failed_sidecar = _sidecar_for(legacy, temp_output)
+            if os.path.isfile(_failed_sidecar):
+                os.remove(_failed_sidecar)
         except OSError:
             pass
         if render_attempt <= retries:
