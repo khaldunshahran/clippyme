@@ -577,8 +577,12 @@ def _get_viral_clips_windowed(
         DiscoveryConfig, run_windowed_discovery,
     )
     model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-    fb = os.getenv("GEMINI_FALLBACK_MODELS") or ""
-    fallback_models = [m.strip() for m in fb.split(",") if m.strip()]
+    _fb_env = os.getenv("GEMINI_FALLBACK_MODELS")
+    # None preserves build_model_chain defaults; explicit list overrides.
+    fallback_models = (
+        [m.strip() for m in _fb_env.split(",") if m.strip()]
+        if _fb_env else None
+    )
     config = DiscoveryConfig.from_env(
         model_name=model_name, fallback_models=fallback_models)
 
@@ -1036,15 +1040,34 @@ if __name__ == '__main__':
         # cover). If TextTiling can't find usable segments we fall through to the
         # original whole-video render. (Ported from ClipsAI — see
         # docs/clipsai-analysis.md.)
+        # Preserve discovery funnel through fallbacks (Task 08).
+        _dfunnel = (clips_data.get("candidate_discovery")
+                    if isinstance(clips_data, dict) else None)
+        _dstore = (clips_data.get("candidate_store")
+                   if isinstance(clips_data, dict) else None)
+        def _keep_funnel(data):
+            if isinstance(data, dict):
+                if _dfunnel is not None:
+                    data["candidate_discovery"] = _dfunnel
+                    data["candidate_discovery"]["fallback_used"] = True
+                if _dstore is not None:
+                    data["candidate_store"] = _dstore
+            return data
         if not clips_data or 'shorts' not in clips_data:
             if should_use_fallback(args.monitor):
-                clips_data = build_texttiling_fallback(transcript, video_title)
+                clips_data = _keep_funnel(
+                    build_texttiling_fallback(transcript, video_title))
+                if _dfunnel is not None and isinstance(clips_data, dict) \
+                        and "candidate_discovery" in clips_data:
+                    clips_data["candidate_discovery"][
+                        "fallback_strategy"] = "texttiling"
 
         if not clips_data or not clips_data.get('shorts'):
             if not should_use_fallback(args.monitor):
                 # Monitor: no hallucinated/fallback clips — write empty metadata
                 # (+ exhaustion marker if Gemini ran out of models) and exit clean.
                 empty = {'shorts': [], 'transcript': transcript, 'aspect': args.aspect}
+                empty = _keep_funnel(empty)
                 if getattr(get_viral_clips, '_last_gemini_exhausted', False):
                     empty['gemini_exhausted'] = True
                 _meta = os.path.join(output_dir, f"{video_title}_metadata.json")

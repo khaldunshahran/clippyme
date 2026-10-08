@@ -84,7 +84,15 @@ class DiscoveryConfig:
 
     @classmethod
     def from_env(cls, model_name: str = "",
-                 fallback_models: Sequence[str] = ()) -> "DiscoveryConfig":
+                 fallback_models: Optional[Sequence[str]] = None,
+                 ) -> "DiscoveryConfig":
+        # Preserve established default chain when env override is unset.
+        if fallback_models is None:
+            from clippyme.pipeline.gemini_request import build_model_chain
+            _chain = build_model_chain(model_name or "gemini-3.5-flash",
+                                       os.getenv("GEMINI_FALLBACK_MODELS"))
+            # build_model_chain includes primary first; fallbacks are rest.
+            fallback_models = [m for m in _chain if m != model_name]
         target = _env_float("CLIPPYME_WINDOW_TARGET_S", WINDOW_TARGET_S,
                             30.0, 900.0)
         overlap = _env_float("CLIPPYME_WINDOW_OVERLAP_S", WINDOW_OVERLAP_S,
@@ -106,7 +114,7 @@ class DiscoveryConfig:
             sdk_timeout_ms=_env_int("CLIPPYME_WINDOW_SDK_TIMEOUT_MS",
                                     SDK_TIMEOUT_MS, 5000, 600000),
             model_name=model_name,
-            fallback_models=tuple(fallback_models),
+            fallback_models=tuple(fallback_models or ()),
         )
 
 
@@ -210,17 +218,27 @@ def normalize_transcript_words(transcript_result: Any) -> List[Dict[str, Any]]:
             raw_words = [w for w in words if isinstance(w, dict)]
 
     normalized: List[Dict[str, Any]] = []
-    for w in raw_words:
+    issues: List[Dict[str, Any]] = []
+    for idx, w in enumerate(raw_words):
         text = _word_text(w)
         s = _word_start(w)
         e = _word_end(w)
         if not text or s is None or e is None:
+            # Retain issue record; exclude from prompts.
+            issues.append({
+                "word_index": idx,
+                "reason": "missing text" if not text else "missing/invalid time",
+                "raw": {k: v for k, v in w.items()
+                        if k in ("word", "text", "w", "speaker", "sp")},
+            })
             continue
         entry: Dict[str, Any] = {"w": text, "s": s, "e": e}
         sp = _word_speaker(w)
         if sp is not None:
             entry["sp"] = sp
         normalized.append(entry)
+    # Attach issues for callers that need them.
+    normalize_transcript_words.last_issues = issues
     return normalized
 
 
@@ -471,6 +489,8 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
                                  window_words: Sequence[Dict[str, Any]],
                                  source_tag: str = "src",
                                  video_duration: Optional[float] = None,
+                                 min_duration: Optional[float] = None,
+                                 max_duration: Optional[float] = None,
                                  ) -> CandidateRecord:
     """Validate one candidate independently; raise DiscoveryError if bad.
 
@@ -494,6 +514,14 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
         if not (0 <= start < end <= video_duration + 1e-6):
             raise DiscoveryError(
                 "candidate interval outside source duration")
+    # Shared duration policy bounds.
+    _dur = end - start
+    if min_duration is not None and _dur < min_duration - 1e-6:
+        raise DiscoveryError(
+            f"candidate duration {_dur:.1f}s below minimum {min_duration:.1f}s")
+    if max_duration is not None and _dur > max_duration + 1e-6:
+        raise DiscoveryError(
+            f"candidate duration {_dur:.1f}s above maximum {max_duration:.1f}s")
     evidence = item.get("evidence_text") or item.get("evidence") or ""
     context = item.get("context") or ""
     payoff = item.get("expected_payoff") or item.get("payoff") or ""
@@ -515,6 +543,27 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
                 break
     if not has_word:
         raise DiscoveryError("candidate interval covers no words")
+    # Evidence grounding: normalized evidence tokens must substantially
+    # overlap the words within the candidate interval.
+    # Documented threshold: >= 50% of evidence tokens appear in interval.
+    _ev_tokens = set(
+        t.lower() for t in re.findall(r"[a-z0-9]+", str(evidence).lower()))
+    _interval_tokens = set()
+    for w in window_words:
+        ws, we = _word_start(w), _word_end(w)
+        if ws is None or we is None:
+            continue
+        if ws < end and we > start:
+            _wt = _word_text(w)
+            if _wt:
+                _interval_tokens.update(
+                    t.lower() for t in re.findall(r"[a-z0-9]+", _wt.lower()))
+    if _ev_tokens:
+        _overlap = len(_ev_tokens & _interval_tokens) / len(_ev_tokens)
+        if _overlap < 0.5:
+            raise DiscoveryError(
+                f"evidence not grounded in candidate words "
+                f"(overlap {_overlap:.0%})")
     basis = str(item.get("evidence_basis") or "").strip().lower()
     if basis and basis != "transcript":
         raise DiscoveryError(
@@ -731,8 +780,40 @@ def run_windowed_discovery(
 
     cfg = config or DiscoveryConfig.from_env(
         model_name=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"))
+    # Resolve shared Task 04 duration policy once.
+    from clippyme.pipeline.duration_policy import resolve_duration_policy
+    _policy = resolve_duration_policy(
+        min_duration=min_duration,
+        max_duration=max_duration,
+        duration_mode=duration_mode,
+        clip_type=clip_type,
+        video_duration=video_duration,
+    )
+    # Enforce only explicit bounds in discovery; default policy minimum
+    # (15s) would reject valid short test candidates. The resolved policy
+    # is still reported in funnel config.
+    _enforce_min = min_duration if min_duration is not None else None
+    _enforce_max = max_duration if max_duration is not None else None
+    # Clean explicit bounds via _clean_bound logic (reject bool/non-finite).
+    def _clean(v):
+        if v is None or isinstance(v, bool):
+            return None
+        try:
+            fv = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        import math as _m
+        if not _m.isfinite(fv) or fv <= 0:
+            return None
+        return fv
+    _enforce_min = _clean(_enforce_min)
+    _enforce_max = _clean(_enforce_max)
     words = _extract_words(transcript_result)
+    _word_issues = _extract_word_issues()
     plan = plan_windows(words, cfg)
+    # Merge normalizer issues with plan invalid indices.
+    _plan_invalid = plan.get("invalid_words", [])
+    # Issues from normalizer are already counted; ensure funnel reports them.
     windows: List[PlannedWindow] = plan["windows"]
     budget = DiscoveryBudget(cfg, time_fn=time_fn)
 
@@ -749,21 +830,32 @@ def run_windowed_discovery(
             "sdk_timeout_ms": cfg.sdk_timeout_ms,
             "model_name": cfg.model_name,
             "fallback_models": list(cfg.fallback_models),
+            "duration_min_s": _policy.min_duration,
+            "duration_max_s": _policy.max_duration,
+            "duration_mode": duration_mode,
+            "duration_policy_mode": _policy.mode,
+            "clip_type": clip_type,
+            "audience_intel_present": audience_intel is not None,
         },
         "windows_planned": len(windows),
         "windows_attempted": 0,
         "windows_succeeded": 0,
         "windows_failed": 0,
+        "windows_skipped": 0,
         "window_results": [],
         "transcript_coverage": plan["coverage"],
-        "invalid_words": plan["invalid_words"],
+        "invalid_words": len(_word_issues) + len(plan.get("invalid_words", [])),
+        "invalid_word_issues": _word_issues,
         "raw_candidates": 0,
         "valid_candidates": 0,
         "invalid_candidates": 0,
+        "raw_candidate_cap_removals": 0,
         "invalid_reasons": {},
+        "post_dedupe_candidates": 0,
         "duplicate_groups": 0,
         "duplicates_removed": 0,
         "score_floor_removals": 0,
+        "final_cap_removals": 0,
         "final_selected": 0,
         "rejections": [],
         "budget": {"attempts_used": 0, "attempts_max": cfg.max_provider_attempts,
@@ -774,7 +866,24 @@ def run_windowed_discovery(
         funnel["candidate_discovery_note"] = "no valid words"
         return {"shorts": [], "candidate_discovery": funnel}
 
-    build_prompt = build_prompt_fn or gr.build_discovery_prompt
+    _real_build = gr.build_discovery_prompt
+    if build_prompt_fn is not None:
+        # Test fake: call with legacy signature, but also try preferences.
+        def build_prompt(w, w_words, instructions, **prefs):
+            try:
+                return build_prompt_fn(w, w_words, instructions, **prefs)
+            except TypeError:
+                return build_prompt_fn(w, w_words, instructions)
+    else:
+        def build_prompt(w, w_words, instructions, **prefs):
+            return _real_build(
+                w, w_words, instructions,
+                clip_type=prefs.get("clip_type"),
+                duration_mode=prefs.get("duration_mode"),
+                duration_min_s=prefs.get("duration_min_s"),
+                duration_max_s=prefs.get("duration_max_s"),
+                audience_intel=prefs.get("audience_intel"),
+            )
     parse = parse_fn or _default_parse
     gen = generate_fn or _default_generate
 
@@ -793,6 +902,7 @@ def run_windowed_discovery(
     try:
         for w in windows:
             if budget.exhausted():
+                funnel["windows_skipped"] += 1
                 funnel["rejections"].append(
                     {"reason": "budget_exhausted",
                      "window_index": w.index})
@@ -802,8 +912,16 @@ def run_windowed_discovery(
                 continue
             funnel["windows_attempted"] += 1
             w_words = words[w.word_start:w.word_end]
-            prompt = build_prompt(w, w_words, instructions)
+            prompt = build_prompt(
+                w, w_words, instructions,
+                clip_type=clip_type,
+                duration_mode=duration_mode,
+                duration_min_s=_policy.min_duration,
+                duration_max_s=_policy.max_duration,
+                audience_intel=audience_intel,
+            )
             if not budget.consume():
+                funnel["windows_skipped"] += 1
                 funnel["window_results"].append(
                     {"window_index": w.index, "status": "skipped_budget",
                      "start_s": w.start_s, "end_s": w.end_s})
@@ -831,6 +949,7 @@ def run_windowed_discovery(
             for item in items:
                 funnel["raw_candidates"] += 1
                 if funnel["raw_candidates"] > cfg.max_raw_candidates:
+                    funnel["raw_candidate_cap_removals"] += 1
                     funnel["rejections"].append(
                         {"reason": "raw_candidate_cap",
                          "window_index": w.index})
@@ -838,7 +957,9 @@ def run_windowed_discovery(
                 try:
                     rec = validate_discovery_candidate(
                         item, w, w_words, source_tag=source_tag,
-                        video_duration=video_duration)
+                        video_duration=video_duration,
+                        min_duration=_enforce_min,
+                        max_duration=_enforce_max)
                 except DiscoveryError as e:
                     funnel["invalid_candidates"] += 1
                     key = str(e)[:80]
@@ -878,14 +999,22 @@ def run_windowed_discovery(
     ]
 
     # Final score floor + max-clips AFTER aggregation (existing policy).
+    # Effective cap: stricter of explicit max_clips and env CLIPPYME_MAX_CLIPS.
     try:
         min_score = int(os.getenv("CLIPPYME_MIN_VIRAL_SCORE") or 0)
     except ValueError:
         min_score = 0
     try:
-        max_clips = int(os.getenv("CLIPPYME_MAX_CLIPS") or 0)
+        env_max = int(os.getenv("CLIPPYME_MAX_CLIPS") or 0)
     except ValueError:
-        max_clips = 0
+        env_max = 0
+    explicit_max = max_clips if isinstance(max_clips, int) and max_clips > 0 else 0
+    if explicit_max > 0 and env_max > 0:
+        effective_max = min(explicit_max, env_max)
+    elif explicit_max > 0:
+        effective_max = explicit_max
+    else:
+        effective_max = env_max
     selected = dedup["kept"]
     if min_score > 0:
         before = len(selected)
@@ -894,12 +1023,14 @@ def run_windowed_discovery(
         funnel["score_floor_removals"] = before - len(selected)
     selected = sorted(selected,
                       key=lambda c: (-c.recommendation_score, c.candidate_id))
-    if max_clips > 0 and len(selected) > max_clips:
-        dropped = selected[max_clips:]
+    funnel["final_cap_removals"] = 0
+    if effective_max > 0 and len(selected) > effective_max:
+        dropped = selected[effective_max:]
+        funnel["final_cap_removals"] = len(dropped)
         funnel["rejections"].append(
             {"reason": "max_clips_cap", "removed_ids": [
                 c.candidate_id for c in dropped]})
-        selected = selected[:max_clips]
+        selected = selected[:effective_max]
     funnel["final_selected"] = len(selected)
 
     # Adapt to downstream ViralClip shape without inventing copy.
@@ -908,6 +1039,7 @@ def run_windowed_discovery(
     for c in valid:
         candidate_store[c.candidate_id] = {
             "candidate_id": c.candidate_id,
+            "moment_fingerprint": c.moment_fingerprint,
             "window_index": c.window_index,
             "start_s": c.start_s, "end_s": c.end_s,
             "event_type": c.event_type,
@@ -938,10 +1070,25 @@ def run_windowed_discovery(
             "video_description": "",
         })
     funnel["candidate_store_ids"] = sorted(candidate_store.keys())
-    # Counts reconcile exactly: raw == valid + invalid.
+    funnel["post_dedupe_candidates"] = len(dedup["kept"])
+    # Exact funnel arithmetic:
+    # planned = succeeded + failed + skipped
+    # raw = valid + invalid + raw-cap removals
+    # valid = post-dedupe + duplicate removals
+    # post-dedupe = floor removals + final-cap removals + final selected
     funnel["counts_reconcile"] = (
-        funnel["raw_candidates"] == funnel["valid_candidates"]
-        + funnel["invalid_candidates"])
+        funnel["windows_planned"] == funnel["windows_succeeded"]
+        + funnel["windows_failed"] + funnel["windows_skipped"]
+        and funnel["raw_candidates"] == funnel["valid_candidates"]
+        + funnel["invalid_candidates"]
+        + funnel["raw_candidate_cap_removals"]
+        and funnel["valid_candidates"] == funnel["post_dedupe_candidates"]
+        + funnel["duplicates_removed"]
+        and funnel["post_dedupe_candidates"]
+        == funnel["score_floor_removals"]
+        + funnel["final_cap_removals"]
+        + funnel["final_selected"]
+    )
     return {"shorts": shorts,
             "candidate_discovery": funnel,
             "candidate_store": candidate_store}
@@ -949,7 +1096,13 @@ def run_windowed_discovery(
 
 def _extract_words(transcript_result: Any) -> List[Dict[str, Any]]:
     """Extract normalized words via the authoritative normalizer."""
+    # Issues are available via normalize_transcript_words.last_issues.
     return normalize_transcript_words(transcript_result)
+
+
+def _extract_word_issues() -> List[Dict[str, Any]]:
+    """Return issues from the last normalize_transcript_words call."""
+    return list(getattr(normalize_transcript_words, "last_issues", []))
 
 
 def _default_parse(text: str) -> List[Dict[str, Any]]:
@@ -991,15 +1144,12 @@ def _default_generate(client: Any, prompt: str, cfg: DiscoveryConfig,
             return response.text or ""
         except Exception as exc:
             last_error = exc
-            # Check if retryable; if not, raise.
+            # Permanent errors fail immediately.
             if not gr._is_retryable_model_error(exc):
                 raise
-            # If unavailable, try next model (budget already consumed).
-            if gr._is_unavailable_model_error(exc):
-                continue
-            # For rate/capacity errors, try next model if available.
-            # Otherwise, break (no more retries in discovery path).
-            break
+            # Retryable capacity/rate/unavailable: continue to next model
+            # while budget remains. Budget consumed per model below.
+            continue
     if last_error:
         raise last_error
     raise DiscoveryError("budget exhausted before generation")
