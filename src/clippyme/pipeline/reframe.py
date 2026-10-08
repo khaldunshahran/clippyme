@@ -41,6 +41,19 @@ from clippyme.pipeline.reframe_ops import (
     salient_crop_center,
     weighted_interest_center,
 )
+from clippyme.pipeline.framing_plan import (
+    FaceObservation,
+    ObservationLog,
+    ObservationRejected,
+    build_framing_plan,
+    config_from_env,
+    crop_at_frame,
+    load_plan,
+    plan_matches,
+    save_plan_atomic,
+    source_fingerprint,
+    turn_aware_enabled,
+)
 from clippyme.pipeline.scene_detection import detect_scenes, get_video_resolution
 
 # Moved pieces, re-exported for back-compat: main.py and the integration tests
@@ -615,10 +628,81 @@ def _reframe_comfort_enabled() -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def _turn_aware_framing_active(static_auto: bool) -> bool:
+    """Task 12: turn-aware framing plans for automatic TRACK/WIDE scenes.
+
+    Enabled by default via ``CLIPPYME_TURN_AWARE_FRAMING``; the explicit
+    negatives ``0``/``false``/``no``/``off`` restore the accepted static
+    comfort behavior (whole-scene median collapse). Only the quality two-pass
+    path with static framing takes part — the legacy moving-camera opt-out
+    (``REFRAME_STATIC_AUTO=0``) keeps its Savitzky-Golay trajectory untouched,
+    and explicit disabled/subject/split/screencast modes never reach this path
+    (so they incur no framing-plan analysis cost).
+    """
+    return turn_aware_enabled() and bool(static_auto)
+
+
+def _record_decision_observations(recorder, decision, frame_number, fps,
+                                  scene_index):
+    """Record one validated observation per matched face-track candidate.
+
+    Track ids come from the tracker's anonymous identity matching, rendered as
+    opaque ``t-<id>`` strings; mouth-motion evidence is the tracker's bounded
+    variance measure. Rejections are noted as diagnostics, never raised.
+    """
+    t = frame_number / fps if fps > 0 else 0.0
+    area_scale = max(1.0, recorder.frame_w * recorder.frame_h * 0.02)
+    for tr in decision.tracks:
+        x, y, w, h = (float(v) for v in tr.box)
+        visibility = min(1.0, max(0.0, w * h) / area_scale)
+        try:
+            recorder.add(FaceObservation(
+                frame=int(frame_number), time_s=float(t),
+                scene_id=int(scene_index), track_id=f"t-{int(tr.track_id)}",
+                box=(x, y, w, h), visibility=visibility,
+                mouth_motion=float(tr.mouth), provenance="tracker",
+                reason=str(decision.reason)[:64] or "tracker-decision",
+            ))
+        except ObservationRejected as exc:
+            recorder.note(f"frame {frame_number}: rejected observation ({exc})")
+
+
+def _attach_plan_fallback_crops(plan, targets, scene_ids, strategies,
+                                original_width, original_height,
+                                snap_center_dist):
+    """Attach accepted static-collapse crops to invalid plan scenes.
+
+    Scenes the plan could not segment keep the accepted whole-scene median
+    behavior: reuse ``collapse_scene_targets`` on the recorded pass-1 targets
+    and store one ``(cx, cy, zoom)`` per invalid scene inside the plan itself,
+    so the reuse path (which skips detection) still renders them identically.
+    """
+    if plan is None:
+        return
+    need = [sp for sp in plan.scenes
+            if sp.applies and sp.fallback is not None]
+    if not need:
+        return
+    collapsed = collapse_scene_targets(
+        targets, scene_ids, strategies,
+        x_max=original_width, y_max=original_height,
+        wide_zoom=1.0, snap_center_dist=snap_center_dist,
+    )
+    by_scene = {}
+    for i, sid in enumerate(scene_ids):
+        if collapsed[i] is not None and sid not in by_scene:
+            by_scene[sid] = collapsed[i]
+    for sp in need:
+        tgt = by_scene.get(sp.scene_id)
+        if tgt is not None:
+            sp.fallback_crop = [float(tgt[0]), float(tgt[1]), float(tgt[2])]
+
+
 def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracker,
                           detection_smoother, scene_boundaries, scene_strategies,
                           output_width, output_height, original_width, original_height,
-                          total_frames, fps, split_metadata=None, screen_metadata=None):
+                          total_frames, fps, split_metadata=None, screen_metadata=None,
+                          plan_path=None):
     """Two-stage track-then-render reframe (opt-in via REFRAME_GLOBAL_SMOOTH).
 
     Pass 1 decodes the clip and records the raw per-frame camera target
@@ -636,6 +720,48 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
     if win % 2 == 0:
         win += 1
     win = max(5, win)
+
+    # AUTO static-framing policy flag (default ON) — parsed before pass 1 so
+    # the turn-aware plan path can gate on it. The legacy REFRAME_STATIC_AUTO=0
+    # moving-camera trajectory is untouched by Task 12.
+    _static = (os.getenv("REFRAME_STATIC_AUTO") or "").strip().lower()
+    static_auto = (_static in ("1", "true", "yes", "on")) if _static else True
+
+    # Task 12: one turn-aware framing plan for the whole clip, built in pass 1
+    # and rendered verbatim in pass 2.
+    turn_cfg = config_from_env()
+    turn_aware = _turn_aware_framing_active(static_auto)
+    plan = None
+    plan_reused = False
+    if turn_aware and plan_path:
+        try:
+            _candidate = load_plan(plan_path)
+        except FileNotFoundError:
+            _candidate = None
+        except ValueError as exc:
+            print(f"   ⚠️ turn-aware framing plan malformed ({exc}) — rebuilding.")
+            _candidate = None
+        if _candidate is not None:
+            _ok, _why = plan_matches(
+                _candidate,
+                source_fingerprint=source_fingerprint(input_video),
+                frame_w=original_width, frame_h=original_height,
+                fps=fps, frame_count=total_frames,
+                # scene_boundaries ends are exclusive (PySceneDetect);
+                # the plan module uses inclusive ends.
+                scene_intervals=[(s, max(s, e - 1)) for s, e in scene_boundaries],
+                config_digest=turn_cfg.config_digest(),
+            )
+            if _ok:
+                plan, plan_reused = _candidate, True
+                print("   ♻️ Reusing persisted turn-aware framing plan (identity match).")
+            else:
+                print(f"   ♻️ turn-aware framing plan stale ({_why}) — rebuilding.")
+    recorder = None
+    if turn_aware and not plan_reused:
+        recorder = ObservationLog(
+            original_width, original_height,
+            max_observations=turn_cfg.max_analysis_frames)
 
     # --- Pass 1: record raw trajectory -------------------------------------
     targets, scene_ids, strategies = [], [], []
@@ -664,7 +790,7 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                         speaker_tracker.reset(frame_number)
                         detection_smoother.reset()
                 strat = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
-                needs_pixels = strat not in ('DISABLED', 'GENERAL', 'SPLIT', 'SCREENCAST') and frame_number % 2 == 0
+                needs_pixels = strat not in ('DISABLED', 'GENERAL', 'SPLIT', 'SCREENCAST') and frame_number % 2 == 0 and not plan_reused
                 if needs_pixels:
                     ret, frame = cap.read()
                 else:
@@ -681,7 +807,17 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                         candidates = detection_smoother.smooth(candidates, frame_number)
                         for cand in candidates:
                             cand['mar'] = compute_mouth_aspect_ratio(frame, cand['box'])
-                        target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
+                        if recorder is not None:
+                            # Turn-aware route: the explainable decision feeds
+                            # both the cameraman target and the plan's
+                            # observation record (identical box to get_target).
+                            decision = speaker_tracker.decide(candidates, frame_number, original_width)
+                            target_box = decision.box
+                            _record_decision_observations(
+                                recorder, decision, frame_number, fps,
+                                current_scene_index)
+                        else:
+                            target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
                         if target_box:
                             cameraman.update_target(target_box)
                         elif strat == 'TRACK':
@@ -725,9 +861,7 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
     # locks zoomed-out and centred between the faces / a roaming subject. This is
     # the deterministic end-state of comfort mode; set REFRAME_STATIC_AUTO=0 to
     # fall back to the per-frame Savitzky-Golay smoother (legacy moving-but-eased
-    # camera), still A/B-able.
-    _static = (os.getenv("REFRAME_STATIC_AUTO") or "").strip().lower()
-    static_auto = (_static in ("1", "true", "yes", "on")) if _static else True
+    # camera), still A/B-able. (Flag parsed before pass 1 for the plan gate.)
     if static_auto:
         smoothed = collapse_scene_targets(
             targets, scene_ids, strategies,
@@ -742,6 +876,45 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
             stationary_threshold=stationary_thresh, snap_center_dist=snap_center_dist,
             lock_zoom=lock_zoom,
         )
+
+    # --- Task 12: build + persist the turn-aware framing plan ----------------
+    # One plan per clip: pass 1 recorded the observations, the plan is built
+    # once here, persisted atomically, and pass 2 renders from the persisted
+    # artifact (re-loaded from disk, never the in-memory object).
+    plan_scenes = {}
+    if turn_aware:
+        if plan is None:
+            _build_t0 = time.time()
+            try:
+                plan = build_framing_plan(
+                    log=recorder if recorder is not None else ObservationLog(
+                        original_width, original_height),
+                    # scene_boundaries ends are exclusive (PySceneDetect);
+                    # the plan module uses inclusive ends.
+                    scenes=[(s, max(s, e - 1)) for s, e in scene_boundaries],
+                    strategies=scene_strategies,
+                    config=turn_cfg, fps=fps,
+                    frame_w=original_width, frame_h=original_height,
+                    frame_count=total_frames,
+                    source_fingerprint=source_fingerprint(input_video),
+                )
+                _attach_plan_fallback_crops(
+                    plan, targets, scene_ids, strategies,
+                    original_width, original_height, snap_center_dist)
+                if plan_path:
+                    save_plan_atomic(plan, plan_path)
+                    plan = load_plan(plan_path)
+                    print(f"   📋 turn-aware framing plan persisted: {plan_path}")
+                _n_seg = sum(len(sp.segments) for sp in plan.scenes
+                             if sp.usable)
+                print(f"   📋 turn-aware framing plan: {_n_seg} segments "
+                      f"({time.time() - _build_t0:.2f}s analysis)")
+            except Exception as exc:
+                print(f"   ⚠️ framing-plan build failed ({exc}) — falling back "
+                      f"to static comfort crops.")
+                plan = None
+        if plan is not None:
+            plan_scenes = {sp.scene_id: sp for sp in plan.scenes}
 
     # --- Pass 2: render from the smoothed trajectory -----------------------
     print("   🔁 Global-smooth pass 2/2: rendering...")
@@ -783,16 +956,40 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                         )
                         output_frame = create_screencast_frame(frame, output_width, output_height, face_c)
                     else:
-                        tgt = smoothed[frame_number] if frame_number < len(smoothed) else None
-                        if tgt is None:
-                            output_frame = cv2.resize(frame, (output_width, output_height))
-                        else:
-                            cx, cy, zoom = tgt
+                        # TRACK/WIDE: the persisted turn-aware plan governs when
+                        # usable; invalid scenes keep the accepted static/wide
+                        # crop stored in the plan; otherwise the legacy
+                        # smoothed trajectory renders (rollback path).
+                        _rendered = False
+                        _plan_scene = plan_scenes.get(current_scene_idx)
+                        if _plan_scene is not None and _plan_scene.usable:
+                            _crop = crop_at_frame(_plan_scene, frame_number)
+                            if _crop is not None:
+                                x1, y1, x2, y2 = (int(v) for v in _crop)
+                                if y2 > y1 and x2 > x1:
+                                    output_frame = _resize_to_output(frame[y1:y2, x1:x2], output_width, output_height)
+                                else:
+                                    output_frame = cv2.resize(frame, (output_width, output_height))
+                                _rendered = True
+                        if not _rendered and _plan_scene is not None and _plan_scene.fallback_crop:
+                            cx, cy, zoom = _plan_scene.fallback_crop
                             x1, y1, x2, y2 = cameraman.crop_box_at(cx, cy, zoom)
                             if y2 > y1 and x2 > x1:
                                 output_frame = _resize_to_output(frame[y1:y2, x1:x2], output_width, output_height)
                             else:
                                 output_frame = cv2.resize(frame, (output_width, output_height))
+                            _rendered = True
+                        if not _rendered:
+                            tgt = smoothed[frame_number] if frame_number < len(smoothed) else None
+                            if tgt is None:
+                                output_frame = cv2.resize(frame, (output_width, output_height))
+                            else:
+                                cx, cy, zoom = tgt
+                                x1, y1, x2, y2 = cameraman.crop_box_at(cx, cy, zoom)
+                                if y2 > y1 and x2 > x1:
+                                    output_frame = _resize_to_output(frame[y1:y2, x1:x2], output_width, output_height)
+                                else:
+                                    output_frame = cv2.resize(frame, (output_width, output_height))
                     last_output_frame = output_frame
                 except Exception:
                     dropped_frames += 1
@@ -818,6 +1015,8 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
         print(f"   ⚠️ {dropped_frames} frame(s) ({pct:.1f}%) failed processing and were duplicated from the previous good frame.")
         if pct >= 25.0:
             print(f"   ❗ High drop rate ({pct:.1f}%) — likely a systemic bug, not isolated corrupt frames. Re-run with REFRAME_DEBUG_EXC=1 for full tracebacks.", file=sys.stderr)
+    return {"turn_aware": turn_aware, "plan_reused": plan_reused,
+            "plan_path": plan_path}
 
 
 def process_video_to_vertical(input_video, final_output_video, reframe_mode='auto',
@@ -1066,6 +1265,7 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
                 original_width, original_height, total_frames, fps,
                 split_metadata=split_metadata,
                 screen_metadata=screen_metadata,
+                plan_path=f"{base_name}.turn_framing_plan.json",
             )
 
         with tqdm(total=total_frames, desc="   Processing", file=sys.stdout) as pbar:

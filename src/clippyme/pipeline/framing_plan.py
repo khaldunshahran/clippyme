@@ -1,0 +1,1246 @@
+"""Evidence-backed turn-aware framing plans for automatic TRACK/WIDE scenes.
+
+This module is the pure, host-testable core of Task 12. It does NOT detect
+faces, decode video, or call any provider: it consumes validated face
+observations (absolute frame/time, scene id, anonymous track id, box,
+visibility, bounded mouth-motion evidence, provenance/reason) and produces a
+deterministic, versioned, auditable *framing plan* — ordered non-overlapping
+scene-local segments with fixed crop targets — which the two-pass renderer in
+``reframe.py`` persists atomically and renders from verbatim.
+
+Design rules (see docs/turn-aware-framing.md for the full contract):
+
+* Observations are strictly validated. Booleans, non-finite values, bad boxes,
+  duplicate ``(frame, track_id)`` ids, regressing times and cross-scene
+  identity carryover are rejected with an ``ObservationRejected`` code. Track
+  ids are opaque (``t-<int>``) — a name or diarization label can never validate.
+* In multi-face scenes size alone cannot prove the active speaker: a switch
+  requires *sustained* mouth-motion evidence over ``evidence_duration_s`` plus
+  a relative ``switch_margin`` over the incumbent, after ``min_dwell_s`` and
+  ``cooldown_s`` have elapsed. Weak evidence yields group/wide or held-safe
+  framing, never a bounce.
+* The crop is fixed within each stable segment. Only a short bounded ease
+  (``ease_frames``) interpolates between accepted turns; travel is capped, zoom
+  is held unless widening, crops are clamped in-bounds with headroom/padding.
+* Plans are versioned (``SCHEMA_VERSION``) and reused only when source
+  fingerprint, dimensions/FPS/frame count, scene plan, schema version and
+  config digest all match. No pixels, embeddings, names, provider responses or
+  raw mouth landmarks are ever persisted.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+import time
+from dataclasses import dataclass, field
+
+
+SCHEMA_VERSION = 1
+PLAN_PRODUCER = "clippyme-turn-framing-plan"
+
+# Bound for per-observation mouth-motion evidence. Mirrors the tracker's
+# ``min(variance * 200.0, 3.0)`` scale so injected and tracker-supplied
+# evidence share one range.
+MOUTH_MOTION_MAX = 3.0
+
+# Opaque anonymous track ids. Anything else (a name, a diarization label,
+# a provider id) fails validation by construction.
+TRACK_ID_RE = re.compile(r"^t-\d+$")
+
+PROVENANCE_VALUES = ("detector", "tracker", "injected-test", "smoother-hold")
+REASON_MAX_LEN = 64
+
+# Scene strategies the plan governs. GENERAL/SPLIT/SCREENCAST/DISABLED keep
+# their existing renderers and never reach the plan builder.
+FACE_STRATEGIES = ("TRACK", "WIDE")
+
+
+# --- flag + config ----------------------------------------------------------
+
+def turn_aware_enabled() -> bool:
+    """``CLIPPYME_TURN_AWARE_FRAMING`` — enabled by default on this branch.
+
+    Only the explicit negatives ``0``/``false``/``no``/``off`` restore the
+    accepted static comfort behavior (whole-scene median collapse). Unset,
+    empty, or anything else means on. Documented in docs/turn-aware-framing.md.
+    """
+    val = (os.getenv("CLIPPYME_TURN_AWARE_FRAMING") or "").strip().lower()
+    if not val:
+        return True
+    return val not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(v):
+        return default
+    return min(max(v, lo), hi)
+
+
+def _env_int(name: str, default: int, lo: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(v, lo)
+
+
+@dataclass(frozen=True)
+class TurnFramingConfig:
+    """Tunable turn-segmentation / crop policy. All durations in seconds."""
+
+    evidence_duration_s: float = 0.8   # sustained mouth-motion window to accept a turn
+    min_dwell_s: float = 1.0           # a turn must hold this long before switching away
+    cooldown_s: float = 1.5            # no new switch within this of the last accepted one
+    switch_margin: float = 1.25        # challenger evidence must beat incumbent * margin
+    merge_window_s: float = 0.5        # sub-window oscillation blips are merged away
+    occlusion_hold_s: float = 1.0      # short occlusion holds the framing safely
+    ease_frames: int = 6               # short bounded ease between accepted turns
+    max_travel_frac: float = 0.5       # cap crop-centre travel per switch (fraction of frame)
+    headroom_frac: float = 0.15        # headroom above the subject, fraction of crop height
+    padding_frac: float = 0.35         # padding around the subject union box
+    hold_zoom: bool = True             # never zoom in mid-scene; only widen
+    group_ratio: float = 0.88          # two-subject ambiguity threshold (runner-up / leader)
+    group_min_separation_frac: float = 0.05  # min face-centre separation: guards against
+                                             # near-duplicate detections of one face
+    mouth_evidence_threshold: float = 0.5    # sustained evidence floor to acquire/switch
+    target_face_occupancy: float = 0.4       # face height / crop height target
+    min_zoom: float = 1.0
+    max_zoom: float = 1.6
+    max_analysis_frames: int = 20000   # hard cap on recorded observations
+
+    def to_dict(self) -> dict:
+        return {
+            "evidence_duration_s": self.evidence_duration_s,
+            "min_dwell_s": self.min_dwell_s,
+            "cooldown_s": self.cooldown_s,
+            "switch_margin": self.switch_margin,
+            "merge_window_s": self.merge_window_s,
+            "occlusion_hold_s": self.occlusion_hold_s,
+            "ease_frames": self.ease_frames,
+            "max_travel_frac": self.max_travel_frac,
+            "headroom_frac": self.headroom_frac,
+            "padding_frac": self.padding_frac,
+            "hold_zoom": self.hold_zoom,
+            "group_ratio": self.group_ratio,
+            "group_min_separation_frac": self.group_min_separation_frac,
+            "mouth_evidence_threshold": self.mouth_evidence_threshold,
+            "target_face_occupancy": self.target_face_occupancy,
+            "min_zoom": self.min_zoom,
+            "max_zoom": self.max_zoom,
+            "max_analysis_frames": self.max_analysis_frames,
+        }
+
+    def config_digest(self) -> str:
+        """Stable identity of the config for plan reuse matching."""
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def config_from_env() -> TurnFramingConfig:
+    """Build the config from ``CLIPPYME_TURN_*`` overrides; garbage → default."""
+    return TurnFramingConfig(
+        evidence_duration_s=_env_float("CLIPPYME_TURN_EVIDENCE_S", 0.8, 0.05, 10.0),
+        min_dwell_s=_env_float("CLIPPYME_TURN_MIN_DWELL_S", 1.0, 0.0, 30.0),
+        cooldown_s=_env_float("CLIPPYME_TURN_COOLDOWN_S", 1.5, 0.0, 30.0),
+        switch_margin=_env_float("CLIPPYME_TURN_SWITCH_MARGIN", 1.25, 1.0, 10.0),
+        merge_window_s=_env_float("CLIPPYME_TURN_MERGE_S", 0.5, 0.0, 10.0),
+        occlusion_hold_s=_env_float("CLIPPYME_TURN_OCCLUSION_S", 1.0, 0.0, 10.0),
+        ease_frames=_env_int("CLIPPYME_TURN_EASE_FRAMES", 6, 0),
+        max_analysis_frames=_env_int("CLIPPYME_TURN_MAX_ANALYSIS_FRAMES", 20000, 1),
+    )
+
+
+# --- observation record -----------------------------------------------------
+
+class ObservationRejected(ValueError):
+    """Raised when a face observation fails strict validation.
+
+    The message is prefixed with a machine-readable code
+    (``duplicate-observation``, ``time-regression``, ...).
+    """
+
+
+@dataclass(frozen=True)
+class FaceObservation:
+    """One validated face observation.
+
+    ``frame``/``time_s`` are absolute (source) coordinates, ``scene_id`` the
+    scene index, ``track_id`` an opaque anonymous id (``t-<int>`` — never a
+    name or diarization id), ``box`` a finite in-bounds ``(x, y, w, h)``,
+    ``visibility`` in [0, 1], ``mouth_motion`` bounded in [0, 3.0],
+    ``provenance`` one of ``PROVENANCE_VALUES``, and ``reason`` a short
+    machine-readable token.
+    """
+
+    frame: int
+    time_s: float
+    scene_id: int
+    track_id: str
+    box: tuple
+    visibility: float
+    mouth_motion: float
+    provenance: str
+    reason: str
+
+
+def _is_num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+class ObservationLog:
+    """Validating, order-preserving store of face observations.
+
+    Rejects booleans, non-finite values, bad boxes, duplicate
+    ``(frame, track_id)`` ids, regressing times and cross-scene identity
+    carryover. Rejections are counted in ``diagnostics`` by the caller; the
+    log itself raises ``ObservationRejected``.
+    """
+
+    def __init__(self, frame_w: float, frame_h: float, max_observations: int = 20000):
+        self.frame_w = float(frame_w)
+        self.frame_h = float(frame_h)
+        self.max_observations = max(1, int(max_observations))
+        self._obs: list[FaceObservation] = []
+        self._seen: set[tuple[int, str]] = set()
+        self._last_time: dict[str, float] = {}
+        self._track_scene: dict[str, int] = {}
+        self.diagnostics: list[str] = []
+        self.dropped = 0
+
+    def add(self, obs: FaceObservation) -> None:
+        self._validate(obs)
+        if len(self._obs) >= self.max_observations:
+            self.dropped += 1
+            if self.dropped == 1:
+                self.diagnostics.append("analysis-frame-budget-exhausted")
+            return
+        self._obs.append(obs)
+        self._seen.add((obs.frame, obs.track_id))
+        self._last_time[obs.track_id] = obs.time_s
+        self._track_scene.setdefault(obs.track_id, obs.scene_id)
+
+    def note(self, message: str) -> None:
+        self.diagnostics.append(message)
+
+    def observations_for_scene(self, scene_id: int) -> list[FaceObservation]:
+        out = [o for o in self._obs if o.scene_id == scene_id]
+        out.sort(key=lambda o: (o.frame, o.track_id))
+        return out
+
+    def track_summary(self, scene_id: int) -> list[dict]:
+        first: dict[str, int] = {}
+        last: dict[str, int] = {}
+        count: dict[str, int] = {}
+        for o in self._obs:
+            if o.scene_id != scene_id:
+                continue
+            tid = o.track_id
+            first.setdefault(tid, o.frame)
+            last[tid] = o.frame
+            count[tid] = count.get(tid, 0) + 1
+        return [
+            {"id": tid, "first_frame": first[tid], "last_frame": last[tid],
+             "n_obs": count[tid]}
+            for tid in sorted(first)
+        ]
+
+    # -- validation ------------------------------------------------------
+    def _validate(self, obs: FaceObservation) -> None:
+        def bad(code: str, detail: str = "") -> ObservationRejected:
+            return ObservationRejected(f"{code}{(': ' + detail) if detail else ''}")
+
+        if isinstance(obs.frame, bool) or not isinstance(obs.frame, int) or obs.frame < 0:
+            raise bad("bad-frame", repr(obs.frame))
+        if (not _is_num(obs.time_s) or not math.isfinite(obs.time_s)
+                or obs.time_s < 0):
+            raise bad("bad-time", repr(obs.time_s))
+        if (isinstance(obs.scene_id, bool) or not isinstance(obs.scene_id, int)
+                or obs.scene_id < 0):
+            raise bad("bad-scene-id", repr(obs.scene_id))
+        if not isinstance(obs.track_id, str) or not TRACK_ID_RE.match(obs.track_id):
+            # Deliberately strict: only opaque generated ids validate, so a
+            # name or diarization label can never enter the plan.
+            raise bad("bad-track-id", repr(obs.track_id))
+        box = obs.box
+        if (not isinstance(box, (tuple, list)) or len(box) != 4
+                or not all(_is_num(v) and math.isfinite(v) for v in box)):
+            raise bad("bad-box", repr(box))
+        x, y, w, h = (float(v) for v in box)
+        if w <= 0 or h <= 0 or x < 0 or y < 0:
+            raise bad("bad-box", repr(box))
+        if x + w > self.frame_w + 1e-6 or y + h > self.frame_h + 1e-6:
+            raise bad("box-out-of-bounds", repr(box))
+        if (not _is_num(obs.visibility) or not math.isfinite(obs.visibility)
+                or not 0.0 <= obs.visibility <= 1.0):
+            raise bad("bad-visibility", repr(obs.visibility))
+        if (not _is_num(obs.mouth_motion) or not math.isfinite(obs.mouth_motion)
+                or not 0.0 <= obs.mouth_motion <= MOUTH_MOTION_MAX):
+            raise bad("bad-mouth-motion", repr(obs.mouth_motion))
+        if obs.provenance not in PROVENANCE_VALUES:
+            raise bad("bad-provenance", repr(obs.provenance))
+        if (not isinstance(obs.reason, str) or not obs.reason
+                or len(obs.reason) > REASON_MAX_LEN):
+            raise bad("bad-reason", repr(obs.reason))
+        if (obs.frame, obs.track_id) in self._seen:
+            raise bad("duplicate-observation",
+                      f"frame={obs.frame} track={obs.track_id}")
+        prev_t = self._last_time.get(obs.track_id)
+        if prev_t is not None and obs.time_s < prev_t - 1e-9:
+            raise bad("time-regression",
+                      f"track={obs.track_id} {prev_t} -> {obs.time_s}")
+        prev_scene = self._track_scene.get(obs.track_id)
+        if prev_scene is not None and prev_scene != obs.scene_id:
+            raise bad("cross-scene-identity",
+                      f"track={obs.track_id} scenes {prev_scene} -> {obs.scene_id}")
+
+
+# --- turn segmentation ------------------------------------------------------
+
+@dataclass
+class FramingSegment:
+    """One stable, scene-local framing segment.
+
+    ``subject_ids`` holds one anonymous id, two for an ambiguous-dialogue
+    pair crop, or ``()`` for a wide/fallback segment. ``crop`` is the segment's
+    fixed lock crop ``[x1, y1, x2, y2]`` (filled in by the keyframe builder).
+    """
+
+    scene_id: int
+    start_frame: int
+    end_frame: int
+    subject_ids: tuple
+    kind: str  # "single" | "two-subject" | "wide"
+    confidence: float
+    evidence: dict = field(default_factory=dict)
+    reason: str = ""
+    crop: list = field(default_factory=list)
+
+
+def _clamp01(v: float) -> float:
+    return min(1.0, max(0.0, v))
+
+
+def segment_turns(log: ObservationLog, *, scene_id: int, scene_start: int,
+                  scene_end: int, config: TurnFramingConfig, fps: float,
+                  frame_w: float, frame_h: float, aspect: float = 9 / 16):
+    """Segment one scene's observations into ordered non-overlapping segments.
+
+    Returns ``(segments, diagnostics)``. Raises ``_PlanBuildError`` when the
+    scene has no usable observations. Never raises on data quirks beyond that:
+    callers isolate per-scene failures.
+    """
+    obs = [o for o in log.observations_for_scene(scene_id)
+           if scene_start <= o.frame <= scene_end]
+    if not obs:
+        raise _PlanBuildError("no-observations",
+                              f"scene {scene_id}: no usable face observations")
+    if fps <= 0:
+        raise _PlanBuildError("bad-fps", f"scene {scene_id}: fps={fps}")
+
+    frames = sorted({o.frame for o in obs})
+    by_frame: dict[int, dict[str, FaceObservation]] = {}
+    for o in obs:
+        by_frame.setdefault(o.frame, {})[o.track_id] = o
+    t_of = {f: by_frame[f][next(iter(by_frame[f]))].time_s for f in frames}
+    track_obs: dict[str, list[FaceObservation]] = {}
+    for o in obs:
+        track_obs.setdefault(o.track_id, []).append(o)
+
+    def sustained(tid: str, t: float) -> float:
+        vals = [o.mouth_motion for o in track_obs[tid]
+                if t - config.evidence_duration_s - 1e-9 <= o.time_s <= t + 1e-9]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    def try_two_subject(cands: dict[str, float],
+                        fobs: dict[str, FaceObservation]):
+        """Ambiguous dialogue: two strong, close, separable subjects.
+
+        Returns the pair ``(a, b)`` or ``None``. Size alone never qualifies —
+        both tracks need sustained mouth-motion evidence within ``group_ratio``
+        of each other, and the padded union must fit the widest 9:16 crop
+        (``crop_for_subjects`` re-checks precisely; this is the fast path).
+        """
+        if len(cands) < 2:
+            return None
+        top = sorted(cands.items(), key=lambda kv: kv[1], reverse=True)[:2]
+        (a, sa), (b, sb) = top
+        if sb < config.mouth_evidence_threshold or sa <= 0:
+            return None
+        if sb / sa < config.group_ratio:
+            return None
+        boxa, boxb = fobs[a].box, fobs[b].box
+        cxa = boxa[0] + boxa[2] / 2.0
+        cxb = boxb[0] + boxb[2] / 2.0
+        if abs(cxa - cxb) / frame_w < config.group_min_separation_frac:
+            return None
+        ux1 = min(boxa[0], boxb[0])
+        ux2 = max(boxa[0] + boxa[2], boxb[0] + boxb[2])
+        need_w = (ux2 - ux1) * (1.0 + config.padding_frac)
+        if need_w > frame_w * aspect:
+            return None
+        return (a, b)
+
+    def pair_close(cands, fobs):
+        """True when the top two candidates are ambiguous-close (evidence +
+        separation) REGARDLESS of whether they fit one 9:16 crop. Used to
+        fall back to wide when a pair crop is geometrically impossible."""
+        if len(cands) < 2:
+            return False
+        top = sorted(cands.items(), key=lambda kv: kv[1], reverse=True)[:2]
+        (a, sa), (b, sb) = top
+        if sb < config.mouth_evidence_threshold or sa <= 0:
+            return False
+        if sb / sa < config.group_ratio:
+            return False
+        boxa, boxb = fobs[a].box, fobs[b].box
+        cxa = boxa[0] + boxa[2] / 2.0
+        cxb = boxb[0] + boxb[2] / 2.0
+        return abs(cxa - cxb) / frame_w >= config.group_min_separation_frac
+
+    diagnostics: list[str] = []
+
+    # Segment under construction: dicts until boundaries are final.
+    cur: dict | None = None
+    closed: list[dict] = []
+    last_switch_t = float("-inf")
+    last_seen: dict[str, float] = {}
+
+    def open_segment(kind, subject_ids, frame, t, reason):
+        return {"kind": kind, "subject_ids": tuple(subject_ids),
+                "start_frame": frame, "start_time": t, "reason": reason,
+                "frames": [], "occluded_frames": 0}
+
+    def close_segment(seg, end_frame):
+        if seg is None:
+            return
+        if end_frame < seg["start_frame"]:
+            diagnostics.append(f"dropped-empty-segment@{seg['start_frame']}")
+            return
+        seg["end_frame"] = end_frame
+        closed.append(seg)
+
+    def transition(kind, subject_ids, frame, t, reason):
+        nonlocal cur
+        close_segment(cur, frame - 1)
+        cur = open_segment(kind, subject_ids, frame, t, reason)
+
+    def accumulate(seg, sus, cands, fobs, occluded):
+        seg["frames"].append(cur_frame)
+        if occluded:
+            seg["occluded_frames"] += 1
+        if seg["kind"] == "wide":
+            return
+        ids = seg["subject_ids"]
+        vals = [sus.get(i, 0.0) for i in ids]
+        seg.setdefault("mouth_vals", []).append(
+            sum(vals) / len(vals) if vals else 0.0)
+        runner = max([s for tid, s in cands.items() if tid not in ids],
+                     default=0.0)
+        chosen = sum(vals) / len(vals) if vals else 0.0
+        seg.setdefault("margins", []).append(
+            min(chosen / max(runner, 1e-6), 100.0) if chosen > 0 else 0.0)
+
+    for cur_frame in frames:
+        t = t_of[cur_frame]
+        fobs = by_frame[cur_frame]
+        for tid in fobs:
+            last_seen[tid] = t
+        # At most one reprocess per frame (occlusion-drop -> fresh evaluation).
+        for _ in range(2):
+            sus = {tid: sustained(tid, t) for tid in fobs}
+            cands = {tid: s for tid, s in sus.items()
+                     if s >= config.mouth_evidence_threshold}
+            if cur is None:
+                pair = try_two_subject(cands, fobs)
+                if pair:
+                    cur = open_segment("two-subject", pair, cur_frame, t,
+                                       "ambiguous-dialogue-two-subject")
+                    last_switch_t = t
+                elif cands:
+                    if pair_close(cands, fobs):
+                        # Ambiguous dialogue that cannot share one 9:16
+                        # crop: stay wide rather than crowning one speaker
+                        # on ambiguity (mid-segment the incumbent holds).
+                        cur = open_segment("wide", (), cur_frame, t,
+                                           "ambiguous-dialogue-wide")
+                    else:
+                        best = max(cands, key=cands.get)
+                        cur = open_segment("single", (best,), cur_frame, t,
+                                           "acquired-speaker")
+                        last_switch_t = t
+                else:
+                    cur = open_segment("wide", (), cur_frame, t,
+                                       "no-speaker-wide")
+                accumulate(cur, sus, cands, fobs, False)
+                break
+            if cur["kind"] == "wide":
+                pair = try_two_subject(cands, fobs)
+                if pair:
+                    transition("two-subject", pair, cur_frame, t,
+                               "ambiguous-dialogue-two-subject")
+                    last_switch_t = t
+                elif cands:
+                    if pair_close(cands, fobs):
+                        transition("wide", (), cur_frame, t,
+                                   "ambiguous-dialogue-wide")
+                    else:
+                        best = max(cands, key=cands.get)
+                        transition("single", (best,), cur_frame, t,
+                                   "acquired-speaker")
+                        last_switch_t = t
+                accumulate(cur, sus, cands, fobs, False)
+                break
+            # single / two-subject: occlusion, then challenger evaluation.
+            held = cur["subject_ids"]
+            max_gap = max(t - last_seen.get(h, t) for h in held)
+            held_visible = all(h in fobs for h in held)
+            if not held_visible and max_gap > config.occlusion_hold_s:
+                # Prolonged loss widens; the reprocess below re-evaluates.
+                transition("wide", (), cur_frame, t, "speaker-lost-widen")
+                cur = None
+                continue
+            occluded = not held_visible  # within the hold window: keep framing
+            others = {tid: s for tid, s in cands.items() if tid not in held}
+            inc_sus = min([sus.get(h, 0.0) for h in held] or [0.0])
+            switched = False
+            if others:
+                best_id = max(others, key=others.get)
+                best_sus = others[best_id]
+                decisive = (best_sus >= max(config.mouth_evidence_threshold,
+                                           inc_sus * config.switch_margin))
+                cooled = (t - last_switch_t) >= config.cooldown_s - 1e-9
+                dwelled = (t - cur["start_time"]) >= config.min_dwell_s - 1e-9
+                if decisive and cooled and dwelled:
+                    pair = None
+                    if inc_sus >= config.mouth_evidence_threshold:
+                        pair = try_two_subject(
+                            {**{h: sus.get(h, 0.0) for h in held},
+                             best_id: best_sus}, fobs)
+                    if pair and set(pair) != set(held):
+                        transition("two-subject", pair, cur_frame, t,
+                                   "ambiguous-dialogue-two-subject")
+                    else:
+                        transition("single", (best_id,), cur_frame, t,
+                                   "turn-switch-sustained-evidence")
+                    last_switch_t = t
+                    switched = True
+                elif (not decisive
+                        and inc_sus >= config.mouth_evidence_threshold
+                        and best_sus >= config.mouth_evidence_threshold):
+                    pair = try_two_subject(
+                        {**{h: sus.get(h, 0.0) for h in held},
+                         best_id: best_sus}, fobs)
+                    if pair and set(pair) != set(held):
+                        transition("two-subject", pair, cur_frame, t,
+                                   "ambiguous-dialogue-two-subject")
+                        last_switch_t = t
+                        switched = True
+            if not switched:
+                if cur["kind"] == "two-subject":
+                    a, b = held
+                    if min(sus.get(a, 0.0), sus.get(b, 0.0)) < \
+                            config.mouth_evidence_threshold * 0.5:
+                        transition("wide", (), cur_frame, t,
+                                   "dialogue-pair-lost")
+                        cur = None
+                        continue
+                accumulate(cur, sus, cands, fobs, occluded)
+            else:
+                accumulate(cur, sus, cands, fobs, False)
+            break
+
+    # Trailing prolonged-loss widening: when the held subject(s) were last
+    # seen more than occlusion_hold_s before the scene end, the framing must
+    # not freeze on empty space — split off a trailing wide segment. (A short
+    # trailing gap simply extends the hold, via the close below.)
+    t_end = scene_end / fps
+    if cur is not None and cur["kind"] in ("single", "two-subject"):
+        held = cur["subject_ids"]
+        last = max((last_seen.get(h, float("-inf")) for h in held),
+                   default=float("-inf"))
+        if last > float("-inf") \
+                and t_end - last > config.occlusion_hold_s + 1e-9:
+            last_frame = max(cur["frames"]) if cur["frames"] \
+                else cur["start_frame"]
+            close_segment(cur, last_frame)
+            if last_frame + 1 <= scene_end:
+                cur = open_segment("wide", (), last_frame + 1, t_end,
+                                   "speaker-lost-widen")
+            else:
+                cur = None
+    close_segment(cur, scene_end)
+
+    # --- boundary normalization: ordered, non-overlapping, full coverage ---
+    closed.sort(key=lambda s: s["start_frame"])
+    merged: list[dict] = []
+    for seg in closed:
+        if merged and merged[-1]["kind"] == seg["kind"] \
+                and merged[-1]["subject_ids"] == seg["subject_ids"]:
+            prev = merged[-1]
+            prev["frames"].extend(seg["frames"])
+            prev["occluded_frames"] += seg["occluded_frames"]
+            prev.setdefault("mouth_vals", []).extend(seg.get("mouth_vals", []))
+            prev.setdefault("margins", []).extend(seg.get("margins", []))
+            diagnostics.append(f"merged-adjacent@{seg['start_frame']}")
+        else:
+            merged.append(seg)
+    # Tiny-oscillation merging: a sub-merge-window blip between two stable
+    # framings is absorbed by its predecessor (it can never be a real turn:
+    # min_dwell already exceeds the merge window by default).
+    final: list[dict] = []
+    for seg in merged:
+        dur_s = (seg["end_frame"] - seg["start_frame"] + 1) / fps
+        if final and dur_s < config.merge_window_s and seg["kind"] != "wide":
+            prev = final[-1]
+            prev["frames"].extend(seg["frames"])
+            prev["occluded_frames"] += seg["occluded_frames"]
+            prev.setdefault("mouth_vals", []).extend(seg.get("mouth_vals", []))
+            prev.setdefault("margins", []).extend(seg.get("margins", []))
+            diagnostics.append(
+                f"merged-oscillation-blip@{seg['start_frame']}")
+        else:
+            final.append(seg)
+    if not final:
+        raise _PlanBuildError("no-segments",
+                              f"scene {scene_id}: segmentation produced nothing")
+
+    # Full scene coverage: first segment starts at scene_start, each segment
+    # ends where the next begins, the last ends at scene_end.
+    final[0]["start_frame"] = min(final[0]["start_frame"], scene_start)
+    for i in range(len(final) - 1):
+        final[i]["end_frame"] = final[i + 1]["start_frame"] - 1
+    final[-1]["end_frame"] = scene_end
+    final = [s for s in final if s["end_frame"] >= s["start_frame"]]
+    if not final:
+        raise _PlanBuildError("no-segments",
+                              f"scene {scene_id}: no non-empty segments")
+
+    # --- evidence / confidence -------------------------------------------
+    out: list[FramingSegment] = []
+    for seg in final:
+        mouth_vals = seg.get("mouth_vals", [])
+        margins = seg.get("margins", [])
+        mouth_mean = sum(mouth_vals) / len(mouth_vals) if mouth_vals else 0.0
+        margin_mean = sum(margins) / len(margins) if margins else 0.0
+        if seg["kind"] == "wide":
+            confidence = 0.2
+        else:
+            # 1.5 = strong sustained mouth-motion evidence (half the cap).
+            confidence = _clamp01(0.25 + 0.75 * min(1.0, mouth_mean / 1.5))
+        out.append(FramingSegment(
+            scene_id=scene_id,
+            start_frame=int(seg["start_frame"]),
+            end_frame=int(seg["end_frame"]),
+            subject_ids=tuple(seg["subject_ids"]),
+            kind=seg["kind"],
+            confidence=round(confidence, 4),
+            evidence={
+                "mouth_mean": round(mouth_mean, 4),
+                "margin_mean": round(margin_mean, 4),
+                "n_evidence_frames": len(mouth_vals),
+                "occluded_frames": int(seg["occluded_frames"]),
+            },
+            reason=seg["reason"],
+        ))
+    return out, diagnostics
+
+
+class _PlanBuildError(Exception):
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+# --- crop targets -----------------------------------------------------------
+
+@dataclass
+class CropKeyframe:
+    frame: int
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    kind: str  # "lock" | "ease"
+
+
+def _median_box(boxes: list[tuple]) -> tuple:
+    xs = sorted(b[0] for b in boxes)
+    ys = sorted(b[1] for b in boxes)
+    ws = sorted(b[2] for b in boxes)
+    hs = sorted(b[3] for b in boxes)
+    n = len(boxes)
+    mid = n // 2
+    if n % 2 == 1:
+        return (xs[mid], ys[mid], ws[mid], hs[mid])
+    return ((xs[mid - 1] + xs[mid]) / 2.0, (ys[mid - 1] + ys[mid]) / 2.0,
+            (ws[mid - 1] + ws[mid]) / 2.0, (hs[mid - 1] + hs[mid]) / 2.0)
+
+
+def crop_for_subjects(boxes: list[tuple], frame_w: float, frame_h: float,
+                      aspect: float, config: TurnFramingConfig,
+                      prev_crop_h: float | None = None) -> list | None:
+    """Fixed crop for a subject union box.
+
+    Zoom targets ``target_face_occupancy`` of the crop height (the same
+    convention as the cameraman's ``zoom_for_face_height``), clamped to
+    ``[min_zoom, max_zoom]``. The padded union width is a preference the
+    crop widens toward (down to ``min_zoom``); only the raw union must
+    fit, otherwise the caller falls back to wide. With ``hold_zoom``
+    the crop never tightens
+    relative to ``prev_crop_h`` — it holds or widens. The centre sits on the
+    union centre pushed down by ``headroom_frac`` of the crop height so the
+    subject keeps headroom; the box is clamped in-bounds. Returns ``None``
+    when the raw subject union cannot fit the crop (caller falls back
+    to wide).
+    """
+    if not boxes or aspect <= 0 or frame_w <= 0 or frame_h <= 0:
+        return None
+    ux1 = min(b[0] for b in boxes)
+    uy1 = min(b[1] for b in boxes)
+    ux2 = max(b[0] + b[2] for b in boxes)
+    uy2 = max(b[1] + b[3] for b in boxes)
+    uw, uh = ux2 - ux1, uy2 - uy1
+    if uh <= 0 or uw <= 0:
+        return None
+    # Zoom from the height occupancy target. The padded union width is a
+    # preference: widen (never tighten) toward fitting it, down to min_zoom.
+    # Hard feasibility is the RAW union fitting the crop - a huge face gets a
+    # tight-but-complete crop rather than a wide fallback.
+    zoom = min(max(frame_h * config.target_face_occupancy / uh,
+                   config.min_zoom),
+               config.max_zoom)
+    padded_w = uw * (1.0 + config.padding_frac)
+    crop_w_at = (frame_h / zoom) * aspect
+    if padded_w > crop_w_at + 1e-6:
+        z_fit = (frame_h * aspect) / padded_w
+        if z_fit >= config.min_zoom - 1e-9:
+            zoom = max(config.min_zoom, min(zoom, z_fit))
+    if config.hold_zoom and prev_crop_h:
+        zoom = min(zoom, frame_h / prev_crop_h)  # hold unless widening
+    crop_h = frame_h / zoom
+    crop_w = crop_h * aspect
+    if crop_w > frame_w:
+        crop_w = float(frame_w)
+        crop_h = crop_w / aspect
+    if uw > crop_w + 1e-6 or uh > crop_h + 1e-6:
+        return None  # the subject itself cannot fit: caller falls back wide
+    cx = ux1 + uw / 2.0
+    cy = uy1 + uh / 2.0 + config.headroom_frac * crop_h
+    cx = min(max(cx, crop_w / 2.0), frame_w - crop_w / 2.0)
+    cy = min(max(cy, crop_h / 2.0), frame_h - crop_h / 2.0)
+    x1 = int(round(cx - crop_w / 2.0))
+    y1 = int(round(cy - crop_h / 2.0))
+    x2 = int(round(cx + crop_w / 2.0))
+    y2 = int(round(cy + crop_h / 2.0))
+    x1 = max(0, min(int(frame_w) - 1, x1))
+    y1 = max(0, min(int(frame_h) - 1, y1))
+    x2 = max(x1 + 1, min(int(frame_w), x2))
+    y2 = max(y1 + 1, min(int(frame_h), y2))
+    return [x1, y1, x2, y2]
+
+
+def _wide_crop(median_cx: float | None, frame_w: float, frame_h: float,
+               aspect: float) -> list:
+    """Accepted wide behavior: full 9:16 window at zoom 1.0, centred on the
+    segment's median subject centre (frame centre when unknown)."""
+    crop_h = float(frame_h)
+    crop_w = crop_h * aspect
+    if crop_w > frame_w:
+        crop_w = float(frame_w)
+        crop_h = crop_w / aspect
+    cx = frame_w / 2.0 if median_cx is None else median_cx
+    cx = min(max(cx, crop_w / 2.0), frame_w - crop_w / 2.0)
+    cy = frame_h / 2.0
+    cy = min(max(cy, crop_h / 2.0), frame_h - crop_h / 2.0)
+    x1 = max(0, int(round(cx - crop_w / 2.0)))
+    y1 = max(0, int(round(cy - crop_h / 2.0)))
+    x2 = min(int(frame_w), int(round(cx + crop_w / 2.0)))
+    y2 = min(int(frame_h), int(round(cy + crop_h / 2.0)))
+    return [x1, y1, max(x1 + 1, x2), y2]
+
+
+def _lerp_box(a: list, b: list, t: float, frame_w: float,
+              frame_h: float) -> list:
+    box = [int(round(av + (bv - av) * t)) for av, bv in zip(a, b)]
+    box[0] = max(0, min(int(frame_w) - 1, box[0]))
+    box[1] = max(0, min(int(frame_h) - 1, box[1]))
+    box[2] = max(box[0] + 1, min(int(frame_w), box[2]))
+    box[3] = max(box[1] + 1, min(int(frame_h), box[3]))
+    return box
+
+
+def build_scene_keyframes(segments: list[FramingSegment], log: ObservationLog,
+                          scene_id: int, config: TurnFramingConfig,
+                          frame_w: float, frame_h: float,
+                          aspect: float) -> tuple[list[FramingSegment], list[CropKeyframe], list[str]]:
+    """Attach fixed lock crops to segments and build bounded ease keyframes.
+
+    One stable subject (or pair) keeps ONE crop for the whole segment. Between
+    accepted turns, ``ease_frames`` keyframes interpolate linearly from the
+    previous lock crop — the only camera motion the plan ever emits — with
+    per-switch travel capped at ``max_travel_frac`` of the frame dimension.
+    Segments whose subjects cannot fit a crop become ``wide`` with a reason.
+    Returns ``(segments, keyframes, diagnostics)``.
+    """
+    diagnostics: list[str] = []
+    keyframes: list[CropKeyframe] = []
+    out_segments: list[FramingSegment] = []
+    prev_lock: list | None = None
+    prev_crop_h: float | None = None
+    prev_kind: str | None = None
+
+    for idx, seg in enumerate(segments):
+        seg_obs = [o for o in log.observations_for_scene(scene_id)
+                   if seg.start_frame <= o.frame <= seg.end_frame]
+        lock: list | None = None
+        kind = seg.kind
+        reason = seg.reason
+        if kind in ("single", "two-subject"):
+            boxes = []
+            ok = True
+            for tid in seg.subject_ids:
+                tb = [o.box for o in seg_obs if o.track_id == tid]
+                if not tb:
+                    ok = False
+                    break
+                boxes.append(_median_box(tb))
+            if ok:
+                # Hold-zoom ratchet applies only within continuous subject
+                # framing. A transition OUT of wide is a deliberate reframe
+                # (like a cut to a closer shot) and resets the baseline -
+                # otherwise a wide opening would pin every later single.
+                hold_h = prev_crop_h \
+                    if prev_kind in ("single", "two-subject") else None
+                lock = crop_for_subjects(boxes, frame_w, frame_h, aspect,
+                                         config, hold_h)
+            if lock is None:
+                kind = "wide"
+                reason = "subjects-too-wide-for-crop"
+                diagnostics.append(
+                    f"scene {scene_id} segment @{seg.start_frame}: {reason}")
+        if kind == "wide":
+            # Centre between the observed faces (mean of centres): the 9:16
+            # window at zoom 1.0 is the widest accepted framing.
+            cxs = [o.box[0] + o.box[2] / 2.0 for o in seg_obs]
+            mean_cx = sum(cxs) / len(cxs) if cxs else None
+            lock = _wide_crop(mean_cx, frame_w, frame_h, aspect)
+
+        # Travel cap vs the previous lock crop.
+        if prev_lock is not None and lock is not None:
+            pcx = (prev_lock[0] + prev_lock[2]) / 2.0
+            pcy = (prev_lock[1] + prev_lock[3]) / 2.0
+            ncx = (lock[0] + lock[2]) / 2.0
+            ncy = (lock[1] + lock[3]) / 2.0
+            capx = config.max_travel_frac * frame_w
+            capy = config.max_travel_frac * frame_h
+            dx, dy = ncx - pcx, ncy - pcy
+            if abs(dx) > capx or abs(dy) > capy:
+                if abs(dx) > capx:
+                    ncx = pcx + math.copysign(capx, dx)
+                if abs(dy) > capy:
+                    ncy = pcy + math.copysign(capy, dy)
+                shx = int(round(ncx - (lock[0] + lock[2]) / 2.0))
+                shy = int(round(ncy - (lock[1] + lock[3]) / 2.0))
+                lock = [lock[0] + shx, lock[1] + shy,
+                        lock[2] + shx, lock[3] + shy]
+                lock[0] = max(0, min(int(frame_w) - 1, lock[0]))
+                lock[1] = max(0, min(int(frame_h) - 1, lock[1]))
+                lock[2] = max(lock[0] + 1, min(int(frame_w), lock[2]))
+                lock[3] = max(lock[1] + 1, min(int(frame_h), lock[3]))
+                diagnostics.append(
+                    f"scene {scene_id} segment @{seg.start_frame}: travel-capped")
+
+        # Bounded ease: the only motion the plan emits.
+        if idx > 0 and prev_lock is not None and config.ease_frames > 0:
+            for i in range(config.ease_frames):
+                fr = seg.start_frame + i
+                if fr > seg.end_frame:
+                    break
+                tt = (i + 1) / (config.ease_frames + 1)
+                eb = _lerp_box(prev_lock, lock, tt, frame_w, frame_h)
+                keyframes.append(CropKeyframe(frame=fr, x1=eb[0], y1=eb[1],
+                                              x2=eb[2], y2=eb[3], kind="ease"))
+        out_segments.append(FramingSegment(
+            scene_id=seg.scene_id, start_frame=seg.start_frame,
+            end_frame=seg.end_frame, subject_ids=seg.subject_ids, kind=kind,
+            confidence=seg.confidence, evidence=seg.evidence, reason=reason,
+            crop=lock))
+        prev_lock = lock
+        prev_crop_h = float(lock[3] - lock[1])
+        prev_kind = kind
+
+    keyframes.sort(key=lambda k: k.frame)
+    return out_segments, keyframes, diagnostics
+
+
+def crop_at_frame(scene_plan: "ScenePlan", frame: int) -> list | None:
+    """Deterministic crop lookup: exact ease keyframe hit wins, otherwise the
+    containing segment's fixed lock crop. No decisions are (re)computed here —
+    everything was decided when the plan was built.
+    """
+    if not scene_plan.applies or scene_plan.fallback is not None:
+        return None
+    for kf in scene_plan.keyframes:
+        if kf.frame == frame:
+            return [kf.x1, kf.y1, kf.x2, kf.y2]
+    for seg in scene_plan.segments:
+        if seg.start_frame <= frame <= seg.end_frame:
+            return list(seg.crop) if seg.crop else None
+    return None
+
+
+# --- plan container / identity / serialization -------------------------------
+
+@dataclass
+class ScenePlan:
+    scene_id: int
+    strategy: str
+    start_frame: int
+    end_frame: int
+    applies: bool
+    tracks: list = field(default_factory=list)
+    segments: list = field(default_factory=list)   # FramingSegment
+    keyframes: list = field(default_factory=list)  # CropKeyframe
+    fallback: dict | None = None                   # {"reason", "detail"}
+    fallback_crop: list | None = None              # [cx, cy, zoom] static crop
+
+    @property
+    def usable(self) -> bool:
+        return self.applies and self.fallback is None
+
+
+@dataclass
+class FramingPlan:
+    schema_version: int
+    producer: str
+    source_fingerprint: str
+    frame_w: int
+    frame_h: int
+    fps: float
+    frame_count: int
+    scene_intervals: list
+    config_digest: str
+    scenes: list = field(default_factory=list)  # ScenePlan
+    created_at: str = ""
+
+
+def _segment_to_dict(seg: FramingSegment) -> dict:
+    return {
+        "scene_id": seg.scene_id,
+        "start_frame": seg.start_frame,
+        "end_frame": seg.end_frame,
+        "subject_ids": list(seg.subject_ids),
+        "kind": seg.kind,
+        "confidence": seg.confidence,
+        "evidence": dict(seg.evidence),
+        "reason": seg.reason,
+        "crop": list(seg.crop),
+    }
+
+
+def _keyframe_to_dict(kf: CropKeyframe) -> dict:
+    return {"frame": kf.frame, "x1": kf.x1, "y1": kf.y1, "x2": kf.x2,
+            "y2": kf.y2, "kind": kf.kind}
+
+
+def plan_to_dict(plan: FramingPlan) -> dict:
+    return {
+        "schema_version": plan.schema_version,
+        "producer": plan.producer,
+        "source_fingerprint": plan.source_fingerprint,
+        "frame_w": plan.frame_w,
+        "frame_h": plan.frame_h,
+        "fps": plan.fps,
+        "frame_count": plan.frame_count,
+        "scene_intervals": [list(iv) for iv in plan.scene_intervals],
+        "config_digest": plan.config_digest,
+        "created_at": plan.created_at,
+        "scenes": [
+            {
+                "scene_id": sp.scene_id,
+                "strategy": sp.strategy,
+                "start_frame": sp.start_frame,
+                "end_frame": sp.end_frame,
+                "applies": sp.applies,
+                "tracks": [dict(t) for t in sp.tracks],
+                "segments": [_segment_to_dict(s) for s in sp.segments],
+                "keyframes": [_keyframe_to_dict(k) for k in sp.keyframes],
+                "fallback": dict(sp.fallback) if sp.fallback else None,
+                "fallback_crop": list(sp.fallback_crop)
+                if sp.fallback_crop else None,
+            }
+            for sp in plan.scenes
+        ],
+    }
+
+
+def _req(d: dict, key: str, types, ctx: str):
+    if key not in d or not isinstance(d[key], types):
+        raise ValueError(f"malformed-plan: {ctx} missing/invalid '{key}'")
+    return d[key]
+
+
+def plan_from_dict(d: dict) -> FramingPlan:
+    """Strict parse. Anything unexpected → ``ValueError`` (caller rebuilds)."""
+    if not isinstance(d, dict):
+        raise ValueError("malformed-plan: top-level object must be a dict")
+    if _req(d, "schema_version", int, "plan") != SCHEMA_VERSION:
+        raise ValueError(
+            f"malformed-plan: unsupported schema_version "
+            f"{d.get('schema_version')!r} (expected {SCHEMA_VERSION})")
+    frame_w = _req(d, "frame_w", int, "plan")
+    frame_h = _req(d, "frame_h", int, "plan")
+    frame_count = _req(d, "frame_count", int, "plan")
+    fps = d.get("fps")
+    if not _is_num(fps) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError("malformed-plan: invalid 'fps'")
+    if frame_w <= 0 or frame_h <= 0 or frame_count <= 0:
+        raise ValueError("malformed-plan: non-positive dimensions/frame_count")
+    intervals = _req(d, "scene_intervals", list, "plan")
+    for iv in intervals:
+        if (not isinstance(iv, (list, tuple)) or len(iv) != 2
+                or not all(isinstance(v, int) for v in iv)
+                or not 0 <= iv[0] < iv[1] <= frame_count):
+            raise ValueError(f"malformed-plan: bad scene interval {iv!r}")
+    scenes = []
+    for s in _req(d, "scenes", list, "plan"):
+        if not isinstance(s, dict):
+            raise ValueError("malformed-plan: scene must be a dict")
+        scene_id = _req(s, "scene_id", int, "scene")
+        applies = _req(s, "applies", bool, "scene")
+        start_frame = _req(s, "start_frame", int, "scene")
+        end_frame = _req(s, "end_frame", int, "scene")
+        if not 0 <= start_frame <= end_frame < frame_count:
+            raise ValueError("malformed-plan: scene frames out of range")
+        segments = []
+        prev_end = -1
+        for g in s.get("segments", []):
+            if not isinstance(g, dict):
+                raise ValueError("malformed-plan: segment must be a dict")
+            gs, ge = _req(g, "start_frame", int, "segment"), _req(
+                g, "end_frame", int, "segment")
+            if not (start_frame <= gs <= ge <= end_frame) or gs <= prev_end:
+                raise ValueError("malformed-plan: segments overlap/out of order")
+            prev_end = ge
+            kind = _req(g, "kind", str, "segment")
+            if kind not in ("single", "two-subject", "wide"):
+                raise ValueError(f"malformed-plan: bad kind {kind!r}")
+            sids = _req(g, "subject_ids", list, "segment")
+            if any(not isinstance(i, str) or not TRACK_ID_RE.match(i)
+                   for i in sids):
+                raise ValueError("malformed-plan: non-anonymous subject id")
+            if kind == "wide" and sids:
+                raise ValueError("malformed-plan: wide segment with subjects")
+            conf = _req(g, "confidence", (int, float), "segment")
+            if isinstance(conf, bool) or not 0.0 <= conf <= 1.0:
+                raise ValueError("malformed-plan: bad confidence")
+            crop = _req(g, "crop", list, "segment")
+            if len(crop) != 4 or not all(isinstance(v, int) for v in crop):
+                raise ValueError("malformed-plan: bad crop")
+            x1, y1, x2, y2 = crop
+            if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
+                raise ValueError("malformed-plan: crop out of bounds")
+            segments.append(FramingSegment(
+                scene_id=scene_id, start_frame=gs, end_frame=ge,
+                subject_ids=tuple(sids), kind=kind,
+                confidence=float(conf), evidence=_req(g, "evidence", dict, "segment"),
+                reason=_req(g, "reason", str, "segment"), crop=list(crop)))
+        keyframes = []
+        for k in s.get("keyframes", []):
+            if not isinstance(k, dict):
+                raise ValueError("malformed-plan: keyframe must be a dict")
+            kf_frame = _req(k, "frame", int, "keyframe")
+            if not start_frame <= kf_frame <= end_frame:
+                raise ValueError("malformed-plan: keyframe outside scene")
+            kk = _req(k, "kind", str, "keyframe")
+            if kk not in ("lock", "ease"):
+                raise ValueError(f"malformed-plan: bad keyframe kind {kk!r}")
+            coords = [_req(k, c, int, "keyframe") for c in ("x1", "y1", "x2", "y2")]
+            if not (0 <= coords[0] < coords[2] <= frame_w
+                    and 0 <= coords[1] < coords[3] <= frame_h):
+                raise ValueError("malformed-plan: keyframe out of bounds")
+            keyframes.append(CropKeyframe(frame=kf_frame, x1=coords[0],
+                                          y1=coords[1], x2=coords[2],
+                                          y2=coords[3], kind=kk))
+        keyframes.sort(key=lambda k: k.frame)
+        fallback = s.get("fallback")
+        if fallback is not None:
+            if not isinstance(fallback, dict) or "reason" not in fallback:
+                raise ValueError("malformed-plan: bad fallback")
+        scenes.append(ScenePlan(
+            scene_id=scene_id, strategy=_req(s, "strategy", str, "scene"),
+            start_frame=start_frame, end_frame=end_frame, applies=applies,
+            tracks=s.get("tracks", []), segments=segments, keyframes=keyframes,
+            fallback=dict(fallback) if fallback else None,
+            fallback_crop=list(s["fallback_crop"])
+            if s.get("fallback_crop") else None))
+    return FramingPlan(
+        schema_version=SCHEMA_VERSION,
+        producer=_req(d, "producer", str, "plan"),
+        source_fingerprint=_req(d, "source_fingerprint", str, "plan"),
+        frame_w=frame_w, frame_h=frame_h, fps=float(fps),
+        frame_count=frame_count,
+        scene_intervals=[list(iv) for iv in intervals],
+        config_digest=_req(d, "config_digest", str, "plan"),
+        scenes=scenes,
+        created_at=d.get("created_at", ""),
+    )
+
+
+def save_plan_atomic(plan: FramingPlan, path: str) -> str:
+    """Persist the plan atomically (temp file + ``os.replace``).
+
+    Readers never see a half-written plan. Returns ``path``.
+    """
+    payload = json.dumps(plan_to_dict(plan), sort_keys=True,
+                         separators=(",", ":"))
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+    os.replace(tmp, path)
+    return path
+
+
+def load_plan(path: str) -> FramingPlan:
+    """Load a persisted plan. ``FileNotFoundError`` when missing;
+    ``ValueError`` when malformed — both mean "rebuild or safe fallback"."""
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = fh.read()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"malformed-plan: invalid JSON ({e})") from e
+    return plan_from_dict(data)
+
+
+def plan_matches(plan: FramingPlan, *, source_fingerprint: str, frame_w: int,
+                 frame_h: int, fps: float, frame_count: int,
+                 scene_intervals: list, config_digest: str) -> tuple[bool, str]:
+    """Reuse gate: every identity input must match, else rebuild.
+
+    Returns ``(True, "match")`` or ``(False, "<stale-field>")``.
+    """
+    if plan.schema_version != SCHEMA_VERSION:
+        return False, f"stale-schema:{plan.schema_version}"
+    if plan.source_fingerprint != source_fingerprint:
+        return False, "stale-source"
+    if plan.frame_w != int(frame_w) or plan.frame_h != int(frame_h):
+        return False, "stale-dimensions"
+    if abs(plan.fps - float(fps)) > 1e-6:
+        return False, "stale-fps"
+    if plan.frame_count != int(frame_count):
+        return False, "stale-frame-count"
+    want = [[int(s), int(e)] for s, e in scene_intervals]
+    if plan.scene_intervals != want:
+        return False, "stale-scenes"
+    if plan.config_digest != config_digest:
+        return False, "stale-config"
+    return True, "match"
+
+
+def source_fingerprint(path: str) -> str:
+    """Sampled source identity for plan reuse matching.
+
+    sha256 over ``(size, mtime_ns, first 64 KiB, last 64 KiB)``. This is an
+    *identity* check so a plan is never reused for a different source — not a
+    content proof and not a substitute for byte preservation (the source is
+    never modified).
+    """
+    st = os.stat(path)
+    h = hashlib.sha256()
+    h.update(struct.pack(">QQ", st.st_size, st.st_mtime_ns))
+    with open(path, "rb") as fh:
+        h.update(fh.read(65536))
+        if st.st_size > 65536:
+            fh.seek(-65536, os.SEEK_END)
+            h.update(fh.read(65536))
+    return h.hexdigest()
+
+
+# --- plan build --------------------------------------------------------------
+
+def build_scene_plan(log: ObservationLog, *, scene_id: int, strategy: str,
+                     scene_start: int, scene_end: int,
+                     config: TurnFramingConfig, fps: float, frame_w: float,
+                     frame_h: float, aspect: float) -> ScenePlan:
+    """Segment one face scene and attach crops/keyframes.
+
+    Raises ``_PlanBuildError`` when the scene cannot be planned (the caller
+    records a fallback with the reason and keeps the accepted static/wide
+    behavior for that scene).
+    """
+    segments, seg_diag = segment_turns(
+        log, scene_id=scene_id, scene_start=scene_start, scene_end=scene_end,
+        config=config, fps=fps, frame_w=frame_w, frame_h=frame_h,
+        aspect=aspect)
+    segments, keyframes, kf_diag = build_scene_keyframes(
+        segments, log, scene_id, config, frame_w, frame_h, aspect)
+    diagnostics = seg_diag + kf_diag
+    return ScenePlan(
+        scene_id=scene_id, strategy=strategy, start_frame=scene_start,
+        end_frame=scene_end, applies=True,
+        tracks=log.track_summary(scene_id), segments=segments,
+        keyframes=keyframes, fallback=None)
+
+
+def build_framing_plan(*, log: ObservationLog, scenes: list,
+                       strategies: list, config: TurnFramingConfig, fps: float,
+                       frame_w: float, frame_h: float, frame_count: int,
+                       source_fingerprint: str,
+                       aspect: float = 9 / 16) -> FramingPlan:
+    """Build one versioned plan for the whole clip.
+
+    Only ``TRACK``/``WIDE`` scenes are planned; every other strategy keeps its
+    existing renderer (``applies=False``). Per-scene failures are isolated: an
+    invalid face scene gets a fallback entry with the reason and the renderer
+    keeps the accepted static/wide behavior for it.
+    """
+    scene_plans: list[ScenePlan] = []
+    for idx, (start, end) in enumerate(scenes):
+        strategy = strategies[idx] if idx < len(strategies) else "TRACK"
+        if strategy not in FACE_STRATEGIES:
+            scene_plans.append(ScenePlan(
+                scene_id=idx, strategy=strategy, start_frame=int(start),
+                end_frame=int(end), applies=False))
+            continue
+        try:
+            sp = build_scene_plan(
+                log, scene_id=idx, strategy=strategy, scene_start=int(start),
+                scene_end=int(end), config=config, fps=fps, frame_w=frame_w,
+                frame_h=frame_h, aspect=aspect)
+        except _PlanBuildError as e:
+            sp = ScenePlan(
+                scene_id=idx, strategy=strategy, start_frame=int(start),
+                end_frame=int(end), applies=True,
+                tracks=log.track_summary(idx), fallback={
+                    "reason": e.reason, "detail": e.detail})
+        except Exception as e:  # isolate scene failures, never abort the clip
+            sp = ScenePlan(
+                scene_id=idx, strategy=strategy, start_frame=int(start),
+                end_frame=int(end), applies=True,
+                tracks=log.track_summary(idx), fallback={
+                    "reason": "segmentation-failed",
+                    "detail": type(e).__name__})
+        scene_plans.append(sp)
+    return FramingPlan(
+        schema_version=SCHEMA_VERSION,
+        producer=PLAN_PRODUCER,
+        source_fingerprint=source_fingerprint,
+        frame_w=int(frame_w), frame_h=int(frame_h), fps=float(fps),
+        frame_count=int(frame_count),
+        scene_intervals=[[int(s), int(e)] for s, e in scenes],
+        config_digest=config.config_digest(),
+        scenes=scene_plans,
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+    )
