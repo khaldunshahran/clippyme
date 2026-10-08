@@ -499,6 +499,49 @@ def _whole_video_fallback(video_title: str, duration: float) -> dict[str, Any]:
     }
 
 
+def _analysis_checkpoint_reusable(saved, input_video, duration,
+                                   transcript, run_analysis=True):
+    """Task 11: is a resumed analysis checkpoint reusable?
+
+    A resumed record is reusable only when the audiovisual identity
+    still matches (source fingerprint, AV config/version, window plan,
+    evidence manifest); otherwise the caller re-runs and marks the
+    stale record superseded -- never silently reused.
+    """
+    if not run_analysis:
+        return True, "analysis_skipped"
+    try:
+        from clippyme.pipeline.candidate_discovery import (
+            av_resume_reusable)
+        return av_resume_reusable(
+            (saved or {}).get("candidate_discovery"),
+            source_path=input_video, source_duration=duration,
+            transcript_result=transcript)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never reuse
+        return False, f"resume_check_failed:{type(exc).__name__}"
+
+
+def _supersede_analysis_checkpoint(metadata_file, reason):
+    """Rename a stale analysis checkpoint so it is never silently reused.
+
+    Returns the new path (or None). The fresh analysis run records this
+    under clips_data["analysis_checkpoint_superseded"].
+    """
+    try:
+        if metadata_file and os.path.isfile(metadata_file):
+            stamped = (f"{metadata_file}.superseded-"
+                       f"{int(time.time())}.json")
+            os.replace(metadata_file, stamped)
+            print(f"   🗄️ stale analysis checkpoint superseded "
+                  f"→ {os.path.basename(stamped)} ({reason})",
+                  flush=True)
+            return stamped
+    except OSError as exc:
+        print(f"⚠️ could not supersede stale analysis checkpoint: "
+              f"{exc}", flush=True)
+    return None
+
+
 def _load_or_analyze(
     args,
     input_video: str,
@@ -509,6 +552,7 @@ def _load_or_analyze(
     state: RuntimeState,
     legacy,
 ):
+    _superseded_checkpoint = None
     prior_metadata = _safe_output_artifact(state.artifact("metadata"), output_dir)
     safe_title = sanitize_windows_basename(video_title, max_len=100) or "video"
     default_metadata = os.path.join(output_dir, f"{safe_title}_metadata.json")
@@ -524,8 +568,20 @@ def _load_or_analyze(
                 "steering arrived too late to affect moment selection")
         saved = _load_json(metadata_file)
         if saved and isinstance(saved.get("shorts"), list):
-            print("♻️ Resume: reusing analysis metadata checkpoint", flush=True)
-            return saved, metadata_file
+            _ok, _why = _analysis_checkpoint_reusable(
+                saved, input_video, duration, transcript,
+                run_analysis=not args.skip_analysis)
+            if _ok:
+                print("♻️ Resume: reusing analysis metadata checkpoint", flush=True)
+                return saved, metadata_file
+            print(f"♻️ Resume: analysis checkpoint not reusable "
+                  f"({_why}); re-running analysis", flush=True)
+            _superseded_path = _supersede_analysis_checkpoint(
+                metadata_file, _why)
+            _superseded_checkpoint = (
+                {"previous": _superseded_path, "reason": _why}
+                if _superseded_path else {"previous": None,
+                                          "reason": _why})
 
     state.start("analyzing", "selecting and validating clip candidates")
     # Phase B: mid-job steering. Consume pending user prompts here --
@@ -559,6 +615,9 @@ def _load_or_analyze(
             clip_type=args.clip_type,
             duration_mode=getattr(args, "duration_mode", None),
             audience_intel=audience_intel,
+            # Task 11: the queued path discovers from the real source
+            # video (optional; keeps Task 10 behavior when omitted).
+            source_path=input_video,
         )
         # Preserve discovery funnel through fallbacks (Task 08 Fix 6).
         _discovery_funnel = (clips_data.get("candidate_discovery")
@@ -736,6 +795,9 @@ def _load_or_analyze(
     source_info = _load_json(os.path.join(output_dir, "source_info.json"))
     if source_info:
         clips_data["source_info"] = source_info
+    if _superseded_checkpoint is not None:
+        clips_data["analysis_checkpoint_superseded"] = (
+            _superseded_checkpoint)
     _save_metadata(metadata_file, clips_data)
     state.set_clip_total(len(shorts))
     state.complete_stage(

@@ -1163,6 +1163,35 @@ def _close_quietly(client: Any) -> None:
         pass
 
 
+# Evidence bases that mark a candidate as audiovisual (Task 11).
+_AV_WORDLESS_BASES = ("visual", "audio_event", "multimodal")
+
+
+def _is_speech_free_av_candidate(candidate: Mapping[str, Any],
+                                 words: Sequence[Dict[str, Any]]) -> bool:
+    """True for a valid wordless audiovisual candidate.
+
+    Such a candidate carries visual/audio evidence but has no transcript
+    words overlapping its interval, so transcript-only editorial
+    refinement cannot decide it. It must stay selected as explicitly
+    unrefined (never dropped, never editor-approved); Task 10 retains
+    the discovery interval. Transcript candidates never match this.
+    """
+    basis = str((candidate or {}).get("evidence_basis") or "")
+    if basis.strip().lower() not in _AV_WORDLESS_BASES:
+        return False
+    try:
+        start_s = float(candidate["start_s"])
+        end_s = float(candidate["end_s"])
+    except (TypeError, ValueError, KeyError):
+        return False
+    for w in words or []:
+        if (_valid_word(w) and _word_start(w) < end_s
+                and _word_end(w) > start_s):
+            return False
+    return True
+
+
 def run_editorial_refinement(
     discovery_result: Optional[Mapping[str, Any]],
     words: Sequence[Dict[str, Any]],
@@ -1471,6 +1500,23 @@ def run_editorial_refinement(
     _sort_plans()
 
     unresolved = [cid for cid in kept_ids if cid not in resolved]
+    # Task 11: valid wordless audiovisual candidates can never receive
+    # transcript-grounded editorial refinement (no words to ground
+    # quotes or decisions). Classify them up front so they never burn
+    # a provider attempt or wait on client creation: they stay selected
+    # as explicitly unrefined with an exact reason and keep the
+    # discovery interval. Transcript refinement behavior is unchanged.
+    _needs_provider = []
+    for _cid in unresolved:
+        _cand = candidates_by_id[_cid]
+        if _is_speech_free_av_candidate(_cand, words):
+            plans.append(_unrefined(
+                _cand, "speech_free_av_no_transcript_evidence"))
+            funnel["packets_skipped"] += 1
+            _count_verdict(plans[-1])
+        else:
+            _needs_provider.append(_cid)
+    unresolved = _needs_provider
     if not unresolved:
         # Every candidate resolved from priors: no provider client is
         # ever created. Still run the common post-processing so

@@ -526,6 +526,9 @@ def get_viral_clips(
     clip_type=None,
     duration_mode=None,
     audience_intel=None,
+    # Task 11: optional source video for audiovisual discovery.
+    # Keyword-only; omitted keeps the accepted Task 10 behavior.
+    source_path=None,
 ):
     print("🤖  Analyzing with Gemini...")
     get_viral_clips._last_gemini_exhausted = False
@@ -547,6 +550,7 @@ def get_viral_clips(
             max_duration=max_duration, min_clips=min_clips,
             max_clips=max_clips, clip_type=clip_type,
             duration_mode=duration_mode, audience_intel=audience_intel,
+            source_path=source_path,
         )
 
     # Legacy single-pass path; client closed exactly once.
@@ -571,6 +575,8 @@ def _get_viral_clips_windowed(
     instructions=None, min_duration=None, max_duration=None,
     min_clips=None, max_clips=None, clip_type=None,
     duration_mode=None, audience_intel=None,
+    # Task 11: optional source video for audiovisual discovery.
+    source_path=None,
 ):
     """Windowed discovery path (Task 08)."""
     from clippyme.pipeline.candidate_discovery import (
@@ -597,6 +603,7 @@ def _get_viral_clips_windowed(
         min_clips=min_clips, max_clips=max_clips,
         clip_type=clip_type, duration_mode=duration_mode,
         audience_intel=audience_intel,
+        source_path=source_path,
     )
     # Preserve exhaustion semantics for the orchestrator.
     funnel = result.get("candidate_discovery", {})
@@ -1047,6 +1054,10 @@ if __name__ == '__main__':
             clip_type=args.clip_type,
             duration_mode=getattr(args, "duration_mode", None),
             audience_intel=audience_intel,
+            # Task 11: thread the real source video through so
+            # audiovisual discovery can sample it (optional; omitted
+            # keeps the accepted Task 10 transcript behavior).
+            source_path=input_video,
         )
 
         # Smarter no-AI fallback: when Gemini is unavailable (no key) or its

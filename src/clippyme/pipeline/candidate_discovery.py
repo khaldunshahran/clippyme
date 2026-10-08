@@ -1,4 +1,5 @@
-"""Windowed candidate discovery (Task 08).
+"""Windowed candidate discovery (Task 08) with bounded audiovisual
+discovery (Task 11).
 
 Replaces the single whole-transcript discovery call with bounded
 overlapping transcript windows. Each window is searched independently
@@ -6,6 +7,15 @@ for candidate moments; candidates are validated per-item, deduplicated
 globally by event key / evidence similarity (never by time overlap
 alone), and finally capped by the existing score floor / max-clips
 policy *after* aggregation.
+
+Task 11 adds an optional audiovisual path: when a readable source video
+is supplied (and CLIPPYME_AV_DISCOVERY is not disabled), deterministic
+media windows tile [0, source_duration), each attempted window samples a
+bounded set of frames through an injectable sampler seam, and the
+provider is called through the existing request/parse path with the AV
+evidence-packet addition. Without a readable source (or with the flag
+off) the accepted Task 10 transcript behavior runs with zero media
+sampling and no audiovisual provider parts.
 
 All provider calls go through an injected client factory so tests use
 deterministic fakes; no live SDK calls happen in this module's tests.
@@ -20,7 +30,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-DISCOVERY_VERSION = 1
+from clippyme.pipeline import av_discovery as avd
+
+DISCOVERY_VERSION = 2
 
 # Defaults are bounded for ~1h sources: 3600/195 ~= 19 windows.
 WINDOW_TARGET_S = 240.0
@@ -664,6 +676,21 @@ def _evidence_similarity(a: str, b: str) -> float:
 DEDUP_SIMILARITY_THRESHOLD = 0.55
 DEDUP_ADJACENCY_TOL_S = 5.0
 
+# Evidence bases that mark a candidate as audiovisual (Task 11). AV
+# candidates carry local avcand-/avmoment- identity; their dedupe key
+# is the stable moment fingerprint (source identity + interval +
+# evidence basis + evidence identity), never time overlap alone.
+_AV_DEDUPE_BASES = ("visual", "audio_event", "multimodal")
+
+
+def _is_av_candidate(c: CandidateRecord) -> bool:
+    """True for Task 11 audiovisual candidates (never provider IDs)."""
+    cid = getattr(c, "candidate_id", "") or ""
+    if isinstance(cid, str) and cid.startswith("avcand-"):
+        return True
+    basis = str(getattr(c, "evidence_basis", "") or "").strip().lower()
+    return basis in _AV_DEDUPE_BASES
+
 
 def dedupe_candidates(candidates: Sequence[CandidateRecord]
                       ) -> Dict[str, Any]:
@@ -684,6 +711,23 @@ def dedupe_candidates(candidates: Sequence[CandidateRecord]
         dup_of = None
         basis = None
         for k in kept:
+            if _is_av_candidate(cand) or _is_av_candidate(k):
+                # Audiovisual dedupe is keyed ONLY on the stable moment
+                # fingerprint (source identity, interval, evidence
+                # basis, stable evidence references). Time overlap alone
+                # never removes an AV candidate, and transcript evidence
+                # similarity never applies to AV pairs: two different
+                # visual moments sharing time survive, while a genuine
+                # repeated moment with matching evidence identity
+                # collapses.
+                if (_is_av_candidate(cand) and _is_av_candidate(k)
+                        and cand.moment_fingerprint
+                        and cand.moment_fingerprint
+                        == k.moment_fingerprint):
+                    dup_of = k.candidate_id
+                    basis = "av_moment_fingerprint"
+                    break
+                continue
             same_key = (cand.event_key and k.event_key
                         and cand.event_key == k.event_key)
             overlap = _intervals_overlap(cand.start_s, cand.end_s,
@@ -774,6 +818,525 @@ def _window_words_text(window: PlannedWindow,
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Task 11: audiovisual discovery plumbing
+#
+# The AV path is enabled only when a readable source video is supplied
+# (and CLIPPYME_AV_DISCOVERY is not disabled). Media windows tile
+# [0, source_duration) deterministically; each attempted window samples
+# a bounded set of frames through the injectable sampler seam and calls
+# the provider through the existing request/parse path with the AV
+# evidence-packet addition. The disabled path is byte-compatible with
+# the accepted Task 10 transcript behavior (zero media sampling, no AV
+# provider parts); only the new "av_discovery" disabled record is added.
+# ---------------------------------------------------------------------------
+
+
+def _extract_audio_events(transcript_result: Any) -> List[Dict[str, Any]]:
+    """Transcript-supplied audio events (never inferred from loudness)."""
+    if isinstance(transcript_result, dict):
+        ev = transcript_result.get("audio_events")
+        if isinstance(ev, list):
+            return [e for e in ev if isinstance(e, dict)]
+    return []
+
+
+def _event_overlaps(raw: Any, ws: float, we: float) -> bool:
+    """True when a raw audio-event dict overlaps [ws, we)."""
+    if not isinstance(raw, dict):
+        return False
+    s = raw.get("start_s", raw.get("start"))
+    e = raw.get("end_s", raw.get("end"))
+    if isinstance(s, bool) or isinstance(e, bool):
+        return False
+    if not (_is_finite_number(s) and _is_finite_number(e)):
+        return False
+    return float(s) < we and float(e) > ws
+
+
+def _setup_av_discovery(*, source_path: Optional[str],
+                        av_config: Optional["avd.AVDiscoveryConfig"],
+                        video_duration: float,
+                        transcript_result: Any,
+                        transcript_windows: Sequence[PlannedWindow],
+                        frame_sampler: Optional[Callable],
+                        time_fn: Callable[[], float],
+                        ) -> Dict[str, Any]:
+    """Decide whether the audiovisual path runs; gather its inputs.
+
+    Returns {"active": bool, "reason": str, ...}. Inactive reasons:
+    "flag_disabled" (CLIPPYME_AV_DISCOVERY=0/false/no), "no_source",
+    "source_unreadable", "invalid_source_duration". The transcript path
+    is untouched when inactive; the sampler is never invoked then.
+    """
+    cfg = av_config or avd.AVDiscoveryConfig.from_env()
+    if not cfg.enabled:
+        return {"active": False, "reason": "flag_disabled", "config": cfg}
+    if not source_path:
+        return {"active": False, "reason": "no_source", "config": cfg}
+    if not avd.source_media_usable(source_path):
+        return {"active": False, "reason": "source_unreadable",
+                "config": cfg}
+    if not (_is_finite_number(video_duration) and video_duration > 0):
+        return {"active": False, "reason": "invalid_source_duration",
+                "config": cfg}
+    try:
+        src_fp = avd.fingerprint_source(source_path)
+    except Exception:
+        return {"active": False, "reason": "source_unreadable",
+                "config": cfg}
+    media_plan = avd.plan_media_windows(
+        float(video_duration), transcript_windows, cfg)
+    return {
+        "active": True,
+        "reason": "enabled",
+        "config": cfg,
+        "source_path": source_path,
+        "source_fingerprint": src_fp,
+        "limits": avd.FrameLimits.from_config(cfg),
+        "sampling_budget": avd.SamplingBudget(cfg, time_fn=time_fn),
+        "sampler": frame_sampler or avd.ffmpeg_frame_sampler,
+        "media_plan": media_plan,
+        "media_windows": media_plan["windows"],
+        "raw_audio_events": _extract_audio_events(transcript_result),
+    }
+
+
+def _new_av_funnel_section(av: Dict[str, Any], cfg: DiscoveryConfig,
+                           transcript_windows: Sequence[PlannedWindow]
+                           ) -> Dict[str, Any]:
+    """Fresh Task 11 funnel section (counts are filled during the run)."""
+    cfg_obj = av["config"]
+    media_plan = av["media_plan"]
+    return {
+        "enabled": True,
+        "version": avd.AV_DISCOVERY_VERSION,
+        "source_fingerprint": av["source_fingerprint"],
+        "source_path": av["source_path"],
+        "config": {
+            "media_window_target_s": cfg_obj.media_window_target_s,
+            "media_window_overlap_s": cfg_obj.media_window_overlap_s,
+            "max_media_windows": cfg_obj.max_media_windows,
+            "max_total_sampled_frames":
+                cfg_obj.max_total_sampled_frames,
+            "frames_per_window": cfg_obj.frames_per_window,
+            "frame_max_width": cfg_obj.frame_max_width,
+            "frame_max_pixels": cfg_obj.frame_max_pixels,
+            "max_frame_bytes": cfg_obj.max_frame_bytes,
+            "max_window_bytes": cfg_obj.max_window_bytes,
+            "max_invocation_bytes": cfg_obj.max_invocation_bytes,
+            "sampling_timeout_s": cfg_obj.sampling_timeout_s,
+            "max_audio_event_label_chars":
+                cfg_obj.max_audio_event_label_chars,
+            "max_visual_description_chars":
+                cfg_obj.max_visual_description_chars,
+            "max_manifest_frames": cfg_obj.max_manifest_frames,
+            "max_manifest_events": cfg_obj.max_manifest_events,
+            "model_name": cfg.model_name,
+            "fallback_models": list(cfg.fallback_models),
+        },
+        "identity": {},  # filled via av_checkpoint_identity
+        "transcript_windows_planned": len(transcript_windows),
+        "media_windows_planned": len(media_plan["windows"]),
+        "media_windows_unattempted": [
+            {"window_index": u["window_index"],
+             "start_s": u["start_s"], "end_s": u["end_s"],
+             "reason": u["reason"]}
+            for u in media_plan["unattempted_windows"]
+        ],
+        "media_windows_attempted": 0,
+        "media_windows_succeeded": 0,
+        "media_windows_failed": 0,
+        "media_windows_skipped": 0,
+        "transcript_only_fallbacks": 0,
+        "fallback_details": [],
+        "window_results": [],
+        "frames_sampled_total": 0,
+        "frame_bytes_total": 0,
+        "audio_events_normalized": 0,
+        "audio_event_issues": 0,
+        "raw_av_candidates": 0,
+        "raw_by_basis": {},
+        "valid_by_basis": {},
+        "invalid_av_candidates": 0,
+        "invalid_reasons": {},
+        "duplicates_removed_av": 0,
+        "final_selected_av": 0,
+        "final_selected_by_basis": {},
+        "counts_reconcile": False,
+    }
+
+
+def av_checkpoint_identity(*, source_fingerprint: str,
+                           av_config: "avd.AVDiscoveryConfig",
+                           discovery_config: DiscoveryConfig,
+                           source_duration: float,
+                           transcript_result: Any) -> Dict[str, Any]:
+    """Deterministic identity digests gating checkpoint/resume reuse.
+
+    A resumed candidate_discovery record is reusable only when the
+    source fingerprint, AV config/version, window plan, and evidence
+    manifest identities still match. Everything here is pure and
+    deterministic (no sampling, no provider calls): frame timestamps
+    come from the planner and audio events from the transcript.
+    """
+    words, _ = normalize_transcript_words(transcript_result)
+    tplan = plan_windows(words, discovery_config)
+    media = avd.plan_media_windows(
+        float(source_duration), tplan["windows"], av_config)
+
+    h_cfg = hashlib.sha256()
+    h_cfg.update(str(avd.AV_DISCOVERY_VERSION).encode("utf-8"))
+    h_cfg.update(repr((
+        av_config.enabled,
+        av_config.media_window_target_s,
+        av_config.media_window_overlap_s,
+        av_config.max_media_windows,
+        av_config.max_total_sampled_frames,
+        av_config.frames_per_window,
+        av_config.frame_max_width,
+        av_config.frame_max_pixels,
+        av_config.max_frame_bytes,
+        av_config.max_window_bytes,
+        av_config.max_invocation_bytes,
+        av_config.sampling_timeout_s,
+        av_config.fingerprint_probe_bytes,
+        av_config.max_audio_event_label_chars,
+        av_config.max_visual_description_chars,
+        av_config.max_manifest_frames,
+        av_config.max_manifest_events,
+    )).encode("utf-8"))
+
+    h_plan = hashlib.sha256()
+    for w in media["windows"]:
+        h_plan.update(
+            f"{w.index}:{w.start_s:.3f}:{w.end_s:.3f}:{w.kind}:"
+            f"{w.planned_frame_count};".encode("utf-8"))
+    for u in media["unattempted_windows"]:
+        h_plan.update(
+            f"u{u['window_index']}:{u['start_s']:.3f}:"
+            f"{u['end_s']:.3f}:{u['reason']};".encode("utf-8"))
+
+    h_man = hashlib.sha256()
+    raw_events = _extract_audio_events(transcript_result)
+    for w in media["windows"]:
+        for seq, ts in enumerate(
+                avd.window_frame_timestamps(w, w.planned_frame_count)):
+            h_man.update(
+                f"{avd.make_frame_id(w.index, seq)}:{ts:.3f};".encode(
+                    "utf-8"))
+        win_raw = [e for e in raw_events
+                   if _event_overlaps(e, w.start_s, w.end_s)]
+        evs, _ = avd.normalize_audio_events(
+            win_raw, float(source_duration),
+            id_prefix=f"ae_w{w.index}",
+            max_label_chars=av_config.max_audio_event_label_chars)
+        for e in evs:
+            h_man.update(
+                f"{e['event_id']}:{e['label']}:"
+                f"{e['start_s']:.3f}:{e['end_s']:.3f};".encode("utf-8"))
+
+    return {
+        "source_fingerprint": str(source_fingerprint),
+        "av_discovery_version": avd.AV_DISCOVERY_VERSION,
+        "av_config_digest": h_cfg.hexdigest()[:32],
+        "window_plan_digest": h_plan.hexdigest()[:32],
+        "evidence_manifest_digest": h_man.hexdigest()[:32],
+    }
+
+
+def _discovery_config_from_mapping(m: Optional[Dict[str, Any]]
+                                   ) -> DiscoveryConfig:
+    """Rebuild a DiscoveryConfig from a persisted funnel config block."""
+    m = m or {}
+    return DiscoveryConfig(
+        window_target_s=float(m.get("window_target_s", WINDOW_TARGET_S)),
+        window_overlap_s=float(m.get("window_overlap_s",
+                                     WINDOW_OVERLAP_S)),
+        boundary_tolerance_s=float(m.get("boundary_tolerance_s",
+                                         BOUNDARY_TOLERANCE_S)),
+        max_windows=int(m.get("max_windows", MAX_WINDOWS)),
+        max_raw_candidates=int(m.get("max_raw_candidates",
+                                     MAX_RAW_CANDIDATES)),
+        max_provider_attempts=int(m.get("max_provider_attempts",
+                                        MAX_PROVIDER_ATTEMPTS)),
+        deadline_s=float(m.get("deadline_s", DISCOVERY_DEADLINE_S)),
+        sdk_timeout_ms=int(m.get("sdk_timeout_ms", SDK_TIMEOUT_MS)),
+        model_name=str(m.get("model_name", "")),
+        fallback_models=tuple(m.get("fallback_models") or ()),
+    )
+
+
+def migrate_candidate_discovery_record(record: Any) -> Any:
+    """Read-path migration for persisted candidate_discovery records.
+
+    v1 (Task 10 shape): bump to the current version and add the AV
+    section with disabled defaults. Current version: pass through,
+    filling a missing AV section defensively. Unknown versions are
+    returned as-is (fail-soft; the caller decides).
+    """
+    if not isinstance(record, dict):
+        return {} if record is None else record
+    rec = dict(record)
+    ver = rec.get("version")
+    if ver == DISCOVERY_VERSION:
+        if not isinstance(rec.get("av_discovery"), dict):
+            rec["av_discovery"] = {
+                "enabled": False, "reason": "record_predates_av",
+                "version": avd.AV_DISCOVERY_VERSION}
+        return rec
+    if ver == 1:
+        rec["version"] = DISCOVERY_VERSION
+        rec.setdefault("av_discovery", {
+            "enabled": False, "reason": "task10_record",
+            "version": avd.AV_DISCOVERY_VERSION})
+        return rec
+    return rec
+
+
+def av_resume_reusable(saved_funnel: Any, *,
+                       source_path: Optional[str] = None,
+                       source_duration: Optional[float] = None,
+                       transcript_result: Any = None,
+                       av_config: Optional["avd.AVDiscoveryConfig"] = None,
+                       discovery_config: Optional[DiscoveryConfig] = None
+                       ) -> "tuple[bool, str]":
+    """Decide whether a persisted discovery record may be reused.
+
+    Returns (reusable, reason). A resumed record is reusable only when
+    the AV enablement matches and -- when enabled -- the source
+    fingerprint, AV config/version, window plan, and evidence manifest
+    identities still match. Anything else means re-run and mark the
+    stale record superseded; a stale record is never silently reused.
+    """
+    saved = migrate_candidate_discovery_record(saved_funnel)
+    saved_av = saved.get("av_discovery") or {}
+    saved_enabled = bool(saved_av.get("enabled"))
+    cfg = av_config or avd.AVDiscoveryConfig.from_env()
+    cur_enabled = bool(cfg.enabled and avd.source_media_usable(
+        source_path))
+    if not saved_enabled and not cur_enabled:
+        return True, "av_disabled_both"
+    if saved_enabled != cur_enabled:
+        return False, "av_enablement_changed"
+    # Both enabled: every identity must match.
+    try:
+        cur_fp = avd.fingerprint_source(source_path or "")
+    except Exception:
+        return False, "source_unreadable"
+    dcfg = (discovery_config
+            or _discovery_config_from_mapping(saved.get("config")))
+    try:
+        cur_identity = av_checkpoint_identity(
+            source_fingerprint=cur_fp, av_config=cfg,
+            discovery_config=dcfg,
+            source_duration=float(source_duration or 0.0),
+            transcript_result=transcript_result)
+    except Exception as e:  # noqa: BLE001 - fail closed, never reuse
+        return False, f"identity_compute_failed:{type(e).__name__}"
+    saved_identity = saved_av.get("identity") or {}
+    for key in ("source_fingerprint", "av_discovery_version",
+                "av_config_digest", "window_plan_digest",
+                "evidence_manifest_digest"):
+        if str(saved_identity.get(key)) != str(cur_identity.get(key)):
+            return False, f"av_identity_mismatch:{key}"
+    return True, "av_identity_match"
+
+
+def _validated_av_to_dict(rec: Any) -> Dict[str, Any]:
+    """ValidatedAVCandidate -> the parser's candidate dict shape."""
+    return {
+        "candidate_id": rec.candidate_id,
+        "moment_fingerprint": rec.moment_fingerprint,
+        "window_index": rec.window_index,
+        "start_s": rec.start_s,
+        "end_s": rec.end_s,
+        "evidence_basis": rec.evidence_basis,
+        "evidence_text": rec.evidence_text,
+        "visual_description": rec.visual_description,
+        "visual_frame_ids": list(rec.visual_frame_ids),
+        "audio_event_ids": list(rec.audio_event_ids),
+        "context": rec.context,
+        "expected_payoff": rec.expected_payoff,
+        "event_type": rec.event_type,
+        "confidence": rec.confidence,
+        "recommendation_score": rec.recommendation_score,
+        "speaker_ids": list(rec.speaker_ids),
+        "event_key": rec.event_key,
+    }
+
+
+def _parse_items_with_av_validation(
+        items: Any, evidence_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt a legacy parse_fn's item list through strict AV validation.
+
+    Used only when a caller injects the transcript-path parse_fn while
+    running the AV path without an av_parse_fn: every item is validated
+    independently via validate_av_evidence so rejections stay isolated
+    with exact reasons (same dict shape as parse_av_discovery_payload).
+    """
+    w = evidence_context.get("window")
+    widx = int(getattr(w, "index", 0) or 0)
+    wstart = float(getattr(w, "start_s", 0.0))
+    wend = float(getattr(w, "end_s", 0.0))
+    frames_by_id: Dict[str, Any] = {}
+    for f in evidence_context.get("frames") or []:
+        if isinstance(f, dict) and f.get("frame_id"):
+            frames_by_id[str(f["frame_id"])] = f
+    events_by_id: Dict[str, Any] = {}
+    for e in evidence_context.get("audio_events") or []:
+        if isinstance(e, dict) and e.get("event_id"):
+            events_by_id[str(e["event_id"])] = e
+    accepted: List[Dict[str, Any]] = []
+    rejections: List[Dict[str, Any]] = []
+    items = items if isinstance(items, list) else []
+    for idx, item in enumerate(items):
+        try:
+            rec = avd.validate_av_evidence(
+                item,
+                window_start_s=wstart,
+                window_end_s=wend,
+                window_index=widx,
+                source_duration=evidence_context.get("source_duration"),
+                frames_by_id=frames_by_id,
+                audio_events_by_id=events_by_id,
+                window_words=evidence_context.get("window_words") or (),
+                min_duration=evidence_context.get("min_duration"),
+                max_duration=evidence_context.get("max_duration"),
+                source_fingerprint=evidence_context.get(
+                    "source_fingerprint") or "src",
+                max_visual_description_chars=evidence_context.get(
+                    "max_visual_description_chars",
+                    avd.AV_MAX_VISUAL_DESCRIPTION_CHARS),
+            )
+        except avd.EvidenceValidationError as e:
+            rejections.append({"index": idx, "reason": e.reason,
+                               "detail": e.detail})
+            continue
+        accepted.append(_validated_av_to_dict(rec))
+    return {
+        "candidates": accepted,
+        "rejections": rejections,
+        "manifest": {
+            "window_index": widx,
+            "frames_supplied": len(frames_by_id),
+            "audio_events_supplied": len(events_by_id),
+            "manifest_frame_issues": [],
+            "raw_items": len(items),
+            "accepted": len(accepted),
+            "rejected": len(rejections),
+        },
+    }
+
+
+def _default_av_generate(client: Any, prompt: str,
+                         image_parts: Sequence[Dict[str, Any]],
+                         cfg: DiscoveryConfig,
+                         budget: DiscoveryBudget) -> str:
+    """Budget-aware AV generation: mirrors _default_generate.
+
+    Every primary/fallback attempt consumes the shared provider budget;
+    SDK-internal retries are disabled (attempts=1); the SDK timeout
+    never exceeds the remaining deadline. Image parts convert to SDK
+    parts lazily at this call site, which owns the client.
+    """
+    from clippyme.pipeline import gemini_request as gr
+    models = [cfg.model_name] + list(cfg.fallback_models)
+    models = [m for m in models if m] or ["gemini-3.5-flash"]
+    last_error = None
+    first = True
+    sdk_parts = None
+    for model_name in models:
+        # Primary already consumed by the window loop; fallbacks
+        # consume the shared budget before each attempt.
+        if not first:
+            if budget.exhausted():
+                break
+            if not budget.consume():
+                break
+        first = False
+        timeout_ms = budget.sdk_timeout_ms()
+        if timeout_ms <= 0:
+            break
+        try:
+            if image_parts:
+                if sdk_parts is None:
+                    sdk_parts = gr.av_image_parts_to_sdk(image_parts)
+                contents: Any = [prompt] + sdk_parts
+            else:
+                contents = prompt
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config={"http_options": {
+                    "timeout": int(timeout_ms),
+                    "retry_options": {"attempts": 1},
+                }},
+            )
+            return response.text or ""
+        except Exception as exc:
+            last_error = exc
+            # Retryable capacity/rate errors AND unavailable-model (404)
+            # errors continue to the next model while budget remains.
+            # Permanent errors fail immediately.
+            if not (gr._is_retryable_model_error(exc)
+                    or gr._is_unavailable_model_error(exc)):
+                raise
+            continue
+    if last_error:
+        raise last_error
+    raise DiscoveryError("budget exhausted before generation")
+
+
+def _default_av_parse(raw_text: str,
+                      evidence_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Default AV parse: strict per-item validation via the AV parser."""
+    from clippyme.pipeline import gemini_parser as gp
+    return gp.parse_av_discovery_payload(
+        raw_text, evidence_context=evidence_context)
+
+
+def _av_dict_to_record(d: Dict[str, Any], mw: Any,
+                       w_words: Sequence[Dict[str, Any]],
+                       src_fp: str) -> CandidateRecord:
+    """Parser candidate dict -> CandidateRecord (local identity kept)."""
+    start = float(d["start_s"])
+    end = float(d["end_s"])
+    has_words = False
+    for w in w_words:
+        ws, we = _word_start(w), _word_end(w)
+        if ws is None or we is None:
+            continue
+        if ws < end and we > start and _word_text(w).strip():
+            has_words = True
+            break
+    return CandidateRecord(
+        candidate_id=str(d["candidate_id"]),
+        window_index=int(d.get("window_index", mw.index)),
+        start_s=start,
+        end_s=end,
+        event_type=str(d.get("event_type") or "moment"),
+        evidence_text=str(d.get("evidence_text") or ""),
+        evidence_basis=str(d.get("evidence_basis") or "visual"),
+        context=str(d.get("context") or ""),
+        expected_payoff=str(d.get("expected_payoff") or ""),
+        event_key=(str(d["event_key"]).strip()
+                   if d.get("event_key") else None),
+        confidence=float(d.get("confidence", 0.5)),
+        recommendation_score=float(d.get("recommendation_score", 50)),
+        speaker_ids=list(d.get("speaker_ids") or []),
+        moment_fingerprint=str(d.get("moment_fingerprint") or ""),
+        raw={
+            "visual_frame_ids": list(d.get("visual_frame_ids") or []),
+            "audio_event_ids": list(d.get("audio_event_ids") or []),
+            "visual_description": d.get("visual_description"),
+            "source_fingerprint": src_fp,
+            "wordless": not has_words,
+            "window_kind": getattr(mw, "kind", "media"),
+        },
+    )
+
+
 def run_windowed_discovery(
     transcript_result: Any,
     video_duration: float,
@@ -802,6 +1365,16 @@ def run_windowed_discovery(
     editorial_client_factory: Optional[Callable[[], Any]] = None,
     editorial_config: Optional[Any] = None,
     editorial_prior_plans: Optional[Dict[str, Dict[str, Any]]] = None,
+    # Task 11: optional source video for audiovisual discovery. All
+    # keyword-only with defaults so existing positional callers stay
+    # compatible; omitted/unreadable source (or a disabled flag) keeps
+    # the accepted Task 10 transcript behavior.
+    source_path: Optional[str] = None,
+    frame_sampler: Optional[Callable[..., Any]] = None,
+    av_generate_fn: Optional[Callable[..., Any]] = None,
+    av_parse_fn: Optional[Callable[[str, Dict[str, Any]],
+                                   Dict[str, Any]]] = None,
+    av_config: Optional["avd.AVDiscoveryConfig"] = None,
 ) -> Dict[str, Any]:
     """Run bounded windowed discovery; return funnel + candidate store.
 
@@ -837,6 +1410,16 @@ def run_windowed_discovery(
     windows: List[PlannedWindow] = plan["windows"]
     budget = DiscoveryBudget(cfg, time_fn=time_fn)
 
+    # Task 11: decide the audiovisual path before any provider work.
+    # Inactive (no readable source / flag off) leaves every transcript
+    # field below exactly as the Task 10 path produced it.
+    _av = _setup_av_discovery(
+        source_path=source_path, av_config=av_config,
+        video_duration=video_duration, transcript_result=transcript_result,
+        transcript_windows=windows, frame_sampler=frame_sampler,
+        time_fn=time_fn)
+    _av_windows: List[Any] = _av["media_windows"] if _av["active"] else []
+
     funnel: Dict[str, Any] = {
         "version": DISCOVERY_VERSION,
         "config": {
@@ -857,7 +1440,8 @@ def run_windowed_discovery(
             "clip_type": clip_type,
             "audience_intel_present": audience_intel is not None,
         },
-        "windows_planned": len(windows),
+        "windows_planned": (len(_av_windows) if _av["active"]
+                              else len(windows)),
         "windows_attempted": 0,
         "windows_succeeded": 0,
         "windows_failed": 0,
@@ -881,6 +1465,14 @@ def run_windowed_discovery(
         "budget": {"attempts_used": 0, "attempts_max": cfg.max_provider_attempts,
                    "deadline_s": cfg.deadline_s, "exhausted": False},
     }
+
+    if _av["active"]:
+        funnel["av_discovery"] = _new_av_funnel_section(_av, cfg, windows)
+        funnel["av_discovery"]["identity"] = av_checkpoint_identity(
+            source_fingerprint=_av["source_fingerprint"],
+            av_config=_av["config"], discovery_config=cfg,
+            source_duration=video_duration,
+            transcript_result=transcript_result)
 
     def _attach_editorial(funnel, candidate_store):
         # Task 09 (minimum wiring): run the editorial pass over
@@ -957,6 +1549,15 @@ def run_windowed_discovery(
               + funnel["final_cap_removals"]
               + funnel["final_selected"])
         funnel["counts_reconcile"] = bool(c1 and c2 and c3 and c4)
+        # Task 11: the AV section is always present. When the path is
+        # disabled the record is just the disabled marker, so every
+        # other field stays byte-compatible with the Task 10 shape.
+        if "av_discovery" not in funnel:
+            funnel["av_discovery"] = {
+                "enabled": False,
+                "reason": _av["reason"],
+                "version": avd.AV_DISCOVERY_VERSION,
+            }
         _efunnel, _eplans = _attach_editorial(funnel, candidate_store)
         # Task 10: apply validated editorial plans to the final shorts
         # exactly once, after Task 09 returns plans and before the
@@ -976,7 +1577,7 @@ def run_windowed_discovery(
                 "editorial_plans": _eplans,
                 "editorial_application": _app_record}
 
-    if not windows:
+    if not windows and not _av_windows:
         funnel["candidate_discovery_note"] = "no valid words"
         # Mark all planned (zero) as reconciled; no windows to skip.
         return _finalize(funnel, {}, [])
@@ -998,6 +1599,7 @@ def run_windowed_discovery(
                 duration_min_s=prefs.get("duration_min_s"),
                 duration_max_s=prefs.get("duration_max_s"),
                 audience_intel=prefs.get("audience_intel"),
+                evidence_packet=prefs.get("evidence_packet"),
             )
     parse = parse_fn or _default_parse
     gen = generate_fn or _default_generate
@@ -1013,16 +1615,254 @@ def run_windowed_discovery(
                 {"reason": "client_setup_failed", "detail": str(e)[:200]})
             # Mark all planned windows as skipped (structured reason).
             funnel["windows_skipped"] = funnel["windows_planned"]
+            _attempt = _av_windows if _av["active"] else windows
             funnel["window_results"] = [
                 {"window_index": w.index, "status": "skipped",
                  "reason": "client_setup_failed"}
-                for w in windows
+                for w in _attempt
             ]
             return _finalize(funnel, {}, [])
 
+    def _process_av_window(mw: Any) -> None:
+        """Attempt one Task 11 media window (nested: shares all state).
+
+        Bounded local sampling through the injectable seam, then one
+        provider attempt from the SHARED DiscoveryBudget (attempts +
+        deadline). A per-window sampling failure falls back to
+        transcript-only evidence for that window: reported, never
+        visual coverage, never erasing other candidates.
+        """
+        avf = funnel["av_discovery"]
+        avcfg = _av["config"]
+        sampling_budget = _av["sampling_budget"]
+        src_fp = _av["source_fingerprint"]
+
+        if av_generate_fn is not None:
+            av_gen = av_generate_fn
+        elif generate_fn is not None:
+            _legacy_gen = generate_fn
+
+            def av_gen(client, prompt, image_parts, cfg, budget):
+                # Legacy transcript-path generator: reused without
+                # image parts (documented adaptation).
+                return _legacy_gen(client, prompt, cfg, budget)
+        else:
+            av_gen = _default_av_generate
+
+        if av_parse_fn is not None:
+            av_parse = av_parse_fn
+        elif parse_fn is not None:
+            _legacy_parse = parse_fn
+
+            def av_parse(raw_text, evidence_context):
+                return _parse_items_with_av_validation(
+                    _legacy_parse(raw_text), evidence_context)
+        else:
+            av_parse = _default_av_parse
+
+        def _fallback(reason: str, error: Any = "") -> None:
+            avf["transcript_only_fallbacks"] += 1
+            avf["fallback_details"].append({
+                "window_index": mw.index,
+                "window_kind": getattr(mw, "kind", "media"),
+                "reason": reason,
+                "error": str(error)[:200] if error else "",
+            })
+
+        if budget.exhausted() or sampling_budget.exhausted():
+            funnel["windows_skipped"] += 1
+            avf["media_windows_skipped"] += 1
+            funnel["rejections"].append(
+                {"reason": "budget_exhausted",
+                 "window_index": mw.index})
+            _wr = {"window_index": mw.index, "status": "skipped_budget",
+                   "start_s": mw.start_s, "end_s": mw.end_s,
+                   "window_kind": getattr(mw, "kind", "media")}
+            funnel["window_results"].append(_wr)
+            avf["window_results"].append(dict(_wr))
+            return
+        funnel["windows_attempted"] += 1
+        avf["media_windows_attempted"] += 1
+        w_words = [
+            w for w in words
+            if _word_start(w) is not None
+            and _word_start(w) < mw.end_s
+            and _word_end(w) > mw.start_s
+        ]
+        # --- bounded local sampling (injectable seam) ---
+        try:
+            sample = avd.sample_media_window(
+                source_path, mw, _av["sampler"], _av["limits"])
+        except Exception as e:  # noqa: BLE001 - isolate per window
+            sample = avd.WindowSample(
+                window_index=mw.index, status="failed",
+                reason="sampling_exception",
+                error=f"{type(e).__name__}: {e}"[:200])
+        frame_meta = sample.metadata()  # timestamps/counts only, no bytes
+        win_raw_events = [
+            e for e in _av["raw_audio_events"]
+            if _event_overlaps(e, mw.start_s, mw.end_s)
+        ]
+        win_events, win_issues = avd.normalize_audio_events(
+            win_raw_events, float(video_duration),
+            id_prefix=f"ae_w{mw.index}",
+            max_label_chars=avcfg.max_audio_event_label_chars)
+        avf["audio_events_normalized"] += len(win_events)
+        avf["audio_event_issues"] += len(win_issues)
+        wres: Dict[str, Any] = {
+            "window_index": mw.index,
+            "window_kind": getattr(mw, "kind", "media"),
+            "start_s": mw.start_s, "end_s": mw.end_s,
+            "sampling_status": sample.status,
+            "sampling_reason": sample.reason,
+            "frames": frame_meta["frames"],
+            "frame_count": frame_meta["frame_count"],
+            "frame_bytes": frame_meta["total_bytes"],
+            "audio_event_count": len(win_events),
+            "audio_event_issue_count": len(win_issues),
+        }
+        evidence_packet = None
+        image_parts: List[Dict[str, Any]] = []
+        if sample.status == "ok":
+            sampling_budget.charge(len(sample.frames), sample.total_bytes)
+            avf["frames_sampled_total"] += len(sample.frames)
+            avf["frame_bytes_total"] += sample.total_bytes
+            try:
+                image_parts = gr.build_av_image_parts(
+                    sample.frames,
+                    max_parts=avcfg.max_manifest_frames)
+                manifest = gr.build_av_evidence_manifest(
+                    mw, frame_meta["frames"], win_events,
+                    max_frames=avcfg.max_manifest_frames,
+                    max_events=avcfg.max_manifest_events)
+                evidence_packet = {"manifest": manifest,
+                                   "frame_count": len(sample.frames)}
+            except Exception as e:  # noqa: BLE001 - fall back honestly
+                evidence_packet = None
+                image_parts = []
+                _fallback("evidence_packet_failed", e)
+            finally:
+                # Frame bytes are transient request material: never
+                # persisted in job metadata or the candidate store.
+                sample.frames.clear()
+        else:
+            _fallback(sample.reason or "sampling_failed", sample.error)
+        wres["evidence_packet"] = (
+            "audiovisual" if evidence_packet else "transcript_only")
+        # --- one shared provider-attempt budget ---
+        prompt = build_prompt(
+            mw, w_words, instructions,
+            clip_type=clip_type,
+            duration_mode=duration_mode,
+            duration_min_s=_policy.min_duration,
+            duration_max_s=_policy.max_duration,
+            audience_intel=audience_intel,
+            evidence_packet=evidence_packet,
+        )
+        if not budget.consume():
+            funnel["windows_skipped"] += 1
+            avf["media_windows_skipped"] += 1
+            _wr2 = {"window_index": mw.index,
+                    "status": "skipped_budget",
+                    "start_s": mw.start_s, "end_s": mw.end_s,
+                    "window_kind": getattr(mw, "kind", "media")}
+            funnel["window_results"].append(_wr2)
+            wres["status"] = "skipped_budget"
+            avf["window_results"].append(wres)
+            return
+        evidence_ctx = {
+            "window": mw,
+            "source_duration": float(video_duration),
+            "frames": frame_meta["frames"],
+            "audio_events": win_events,
+            "window_words": w_words,
+            "min_duration": _enforce_min,
+            "max_duration": _enforce_max,
+            "source_fingerprint": src_fp,
+            "max_visual_description_chars":
+                avcfg.max_visual_description_chars,
+        }
+        try:
+            raw_text = av_gen(client, prompt, image_parts, cfg, budget)
+        except Exception as e:  # noqa: BLE001 - isolate per window
+            funnel["windows_failed"] += 1
+            avf["media_windows_failed"] += 1
+            funnel["window_results"].append(
+                {"window_index": mw.index, "status": "failed",
+                 "start_s": mw.start_s, "end_s": mw.end_s,
+                 "window_kind": getattr(mw, "kind", "media"),
+                 "error": str(e)[:200]})
+            wres["status"] = "failed"
+            avf["window_results"].append(wres)
+            return
+        try:
+            parsed = av_parse(raw_text, evidence_ctx)
+        except Exception as e:  # noqa: BLE001 - isolate per window
+            funnel["windows_failed"] += 1
+            avf["media_windows_failed"] += 1
+            funnel["window_results"].append(
+                {"window_index": mw.index, "status": "parse_failed",
+                 "start_s": mw.start_s, "end_s": mw.end_s,
+                 "window_kind": getattr(mw, "kind", "media"),
+                 "error": str(e)[:200]})
+            wres["status"] = "parse_failed"
+            avf["window_results"].append(wres)
+            return
+        funnel["windows_succeeded"] += 1
+        avf["media_windows_succeeded"] += 1
+        n_valid = 0
+        for d in parsed.get("candidates") or []:
+            funnel["raw_candidates"] += 1
+            avf["raw_av_candidates"] += 1
+            basis = str(d.get("evidence_basis") or "unknown")
+            avf["raw_by_basis"][basis] = \
+                avf["raw_by_basis"].get(basis, 0) + 1
+            if funnel["raw_candidates"] > cfg.max_raw_candidates:
+                funnel["raw_candidate_cap_removals"] += 1
+                funnel["rejections"].append(
+                    {"reason": "raw_candidate_cap",
+                     "window_index": mw.index})
+                continue
+            rec = _av_dict_to_record(d, mw, w_words, src_fp)
+            valid.append(rec)
+            n_valid += 1
+            funnel["valid_candidates"] += 1
+            avf["valid_by_basis"][basis] = \
+                avf["valid_by_basis"].get(basis, 0) + 1
+        n_invalid = 0
+        for r in parsed.get("rejections") or []:
+            funnel["raw_candidates"] += 1
+            avf["raw_av_candidates"] += 1
+            if funnel["raw_candidates"] > cfg.max_raw_candidates:
+                funnel["raw_candidate_cap_removals"] += 1
+                funnel["rejections"].append(
+                    {"reason": "raw_candidate_cap",
+                     "window_index": mw.index})
+                continue
+            funnel["invalid_candidates"] += 1
+            avf["invalid_av_candidates"] += 1
+            n_invalid += 1
+            key = str(r.get("reason") or "unknown")[:80]
+            funnel["invalid_reasons"][key] = \
+                funnel["invalid_reasons"].get(key, 0) + 1
+            avf["invalid_reasons"][key] = \
+                avf["invalid_reasons"].get(key, 0) + 1
+        funnel["window_results"].append(
+            {"window_index": mw.index, "status": "ok",
+             "start_s": mw.start_s, "end_s": mw.end_s,
+             "window_kind": getattr(mw, "kind", "media"),
+             "valid": n_valid, "invalid": n_invalid})
+        wres["status"] = "ok"
+        wres["valid"] = n_valid
+        wres["invalid"] = n_invalid
+        avf["window_results"].append(wres)
+
     valid: List[CandidateRecord] = []
     try:
-        for w in windows:
+        for w in (_av_windows if _av["active"] else windows):
+            if _av["active"]:
+                _process_av_window(w)
+                continue
             if budget.exhausted():
                 funnel["windows_skipped"] += 1
                 funnel["rejections"].append(
@@ -1159,7 +1999,7 @@ def run_windowed_discovery(
     shorts = []
     candidate_store = {}
     for c in valid:
-        candidate_store[c.candidate_id] = {
+        _entry: Dict[str, Any] = {
             "candidate_id": c.candidate_id,
             "moment_fingerprint": c.moment_fingerprint,
             "window_index": c.window_index,
@@ -1174,6 +2014,21 @@ def run_windowed_discovery(
             "recommendation_score": c.recommendation_score,
             "speaker_ids": c.speaker_ids,
         }
+        if c.candidate_id.startswith("avcand-"):
+            # Task 11: persist evidence refs and modality in the
+            # candidate store (no raw images or full responses).
+            _raw = c.raw or {}
+            _entry.update({
+                "visual_frame_ids": list(
+                    _raw.get("visual_frame_ids") or []),
+                "audio_event_ids": list(
+                    _raw.get("audio_event_ids") or []),
+                "visual_description": _raw.get("visual_description"),
+                "source_fingerprint": _raw.get("source_fingerprint"),
+                "wordless": bool(_raw.get("wordless")),
+                "window_kind": _raw.get("window_kind"),
+            })
+        candidate_store[c.candidate_id] = _entry
     for c in selected:
         reason = f"{c.evidence_text.strip()} {c.context.strip()}".strip()
         if len(reason) < 20:
@@ -1193,6 +2048,37 @@ def run_windowed_discovery(
         })
     funnel["candidate_store_ids"] = sorted(candidate_store.keys())
     funnel["post_dedupe_candidates"] = len(dedup["kept"])
+    if _av["active"]:
+        avf = funnel["av_discovery"]
+        avf["duplicates_removed_av"] = sum(
+            1 for _rid, _info in dedup["removed"].items()
+            if str((_info or {}).get("candidate_id", _rid)).startswith(
+                "avcand-"))
+        _sel_by_basis: Dict[str, int] = {}
+        for _c in selected:
+            if _c.candidate_id.startswith("avcand-"):
+                _b = _c.evidence_basis or "unknown"
+                _sel_by_basis[_b] = _sel_by_basis.get(_b, 0) + 1
+        avf["final_selected_by_basis"] = _sel_by_basis
+        avf["final_selected_av"] = sum(_sel_by_basis.values())
+        # AV sub-funnel reconciliation (mirrors the global equalities;
+        # the whole pool is AV when this branch runs, so the shared
+        # score-floor / final-cap removals belong to it).
+        avf["counts_reconcile"] = bool(
+            avf["media_windows_planned"]
+            == avf["media_windows_succeeded"]
+            + avf["media_windows_failed"]
+            + avf["media_windows_skipped"]
+            and avf["raw_av_candidates"]
+            == sum(avf["valid_by_basis"].values())
+            + avf["invalid_av_candidates"]
+            + funnel["raw_candidate_cap_removals"]
+            and sum(avf["valid_by_basis"].values())
+            == avf["final_selected_av"]
+            + avf["duplicates_removed_av"]
+            + funnel["score_floor_removals"]
+            + funnel["final_cap_removals"]
+        )
     # Exact funnel arithmetic:
     # planned = succeeded + failed + skipped
     # raw = valid + invalid + raw-cap removals

@@ -531,6 +531,9 @@ __all__ = [
     "validate_and_dedupe",
     "backfill_hook_text",
     "drop_wordless_clips",
+    "parse_discovery_payload",
+    "parse_editorial_payload",
+    "parse_av_discovery_payload",
 ]
 
 
@@ -599,3 +602,151 @@ def parse_editorial_payload(text):
     if not isinstance(decision, dict):
         raise ValueError('"decision" must be an object')
     return decision
+
+
+# ---------------------------------------------------------------------------
+# Task 11: audiovisual discovery payload parsing + strict evidence validation.
+# ---------------------------------------------------------------------------
+
+def parse_av_discovery_payload(text, *, evidence_context):
+    """Parse an audiovisual discovery response and validate every item.
+
+    Expects ``{"candidates": [...]}`` (same envelope as
+    ``parse_discovery_payload``). Each item is validated independently
+    against ``evidence_context`` via
+    ``av_discovery.validate_av_evidence``; failures become structured
+    rejection records instead of nuking the batch.
+
+    ``evidence_context`` (required) keys:
+      - window: MediaWindow / dict / (start, end[, index]) with absolute
+        source timestamps;
+      - source_duration: float (authoritative bound);
+      - frames: sequence of {"frame_id", "requested_ts", "decoded_ts"}
+        supplied to the provider for THIS window (absolute timestamps);
+      - audio_events: normalized events {"event_id", "label",
+        "start_s", "end_s"} overlapping validation is per interval;
+      - window_words: transcript words for grounding (may be empty for
+        wordless ranges);
+      - min_duration / max_duration: resolved Task 04 policy bounds
+        (applied, not re-resolved);
+      - source_fingerprint: opaque source identity for local IDs;
+      - max_visual_description_chars: cap for model-produced descriptions.
+
+    Returns {"candidates": [validated dicts...], "rejections":
+    [{"index", "reason", "detail"}...], "manifest": {...counts...}}.
+    Visual descriptions are returned labeled as model-produced, never
+    verified fact. Raises ValueError on malformed payloads (mirroring
+    ``parse_discovery_payload``) so the window is isolated as
+    parse_failed rather than silently dropped.
+    """
+    from clippyme.pipeline import av_discovery as avd
+
+    if not isinstance(evidence_context, dict):
+        raise ValueError("evidence_context must be a dict")
+    items = parse_discovery_payload(text)
+
+    window = evidence_context.get("window")
+    if hasattr(window, "start_s") and hasattr(window, "end_s"):
+        widx = int(getattr(window, "index", 0))
+        wstart, wend = float(window.start_s), float(window.end_s)
+    elif isinstance(window, dict):
+        widx = int(window.get("index", window.get("window_index", 0)))
+        wstart = float(window.get("start_s", window.get("start", 0.0)))
+        wend = float(window.get("end_s", window.get("end", 0.0)))
+    elif isinstance(window, (list, tuple)):
+        wstart, wend = float(window[0]), float(window[1])
+        widx = int(window[2]) if len(window) > 2 else 0
+    else:
+        raise ValueError("evidence_context missing a valid window")
+
+    source_duration = evidence_context.get("source_duration")
+    frames_by_id = {}
+    manifest_frame_issues = []
+    for f in evidence_context.get("frames") or []:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("frame_id") or "").strip()
+        if not fid:
+            continue
+        try:
+            dts = float(f.get("decoded_ts"))
+        except (TypeError, ValueError):
+            manifest_frame_issues.append(
+                {"frame_id": fid, "reason": "frame_missing_decoded_ts"})
+            continue
+        # Frames are scoped to this window: a decoded timestamp outside
+        # the window means the manifest itself is inconsistent (e.g. a
+        # rebased timestamp) — exclude it so any reference fails closed
+        # with unknown_frame_id instead of grounding on wrong evidence.
+        if not (wstart - 1e-6 <= dts <= wend + 1e-6):
+            manifest_frame_issues.append(
+                {"frame_id": fid,
+                 "reason": "frame_timestamp_out_of_window"})
+            continue
+        frames_by_id[fid] = f
+    events_by_id = {}
+    for e in evidence_context.get("audio_events") or []:
+        if not isinstance(e, dict):
+            continue
+        eid = str(e.get("event_id") or "").strip()
+        if eid:
+            events_by_id[eid] = e
+
+    accepted = []
+    rejections = []
+    for idx, item in enumerate(items):
+        try:
+            rec = avd.validate_av_evidence(
+                item,
+                window_start_s=wstart,
+                window_end_s=wend,
+                window_index=widx,
+                source_duration=source_duration,
+                frames_by_id=frames_by_id,
+                audio_events_by_id=events_by_id,
+                window_words=evidence_context.get("window_words") or (),
+                min_duration=evidence_context.get("min_duration"),
+                max_duration=evidence_context.get("max_duration"),
+                source_fingerprint=evidence_context.get(
+                    "source_fingerprint") or "src",
+                max_visual_description_chars=evidence_context.get(
+                    "max_visual_description_chars",
+                    avd.AV_MAX_VISUAL_DESCRIPTION_CHARS),
+            )
+        except avd.EvidenceValidationError as e:
+            rejections.append({"index": idx, "reason": e.reason,
+                               "detail": e.detail})
+            continue
+        d = {
+            "candidate_id": rec.candidate_id,
+            "moment_fingerprint": rec.moment_fingerprint,
+            "window_index": rec.window_index,
+            "start_s": rec.start_s,
+            "end_s": rec.end_s,
+            "evidence_basis": rec.evidence_basis,
+            "evidence_text": rec.evidence_text,
+            "visual_description": rec.visual_description,
+            "visual_frame_ids": list(rec.visual_frame_ids),
+            "audio_event_ids": list(rec.audio_event_ids),
+            "context": rec.context,
+            "expected_payoff": rec.expected_payoff,
+            "event_type": rec.event_type,
+            "confidence": rec.confidence,
+            "recommendation_score": rec.recommendation_score,
+            "speaker_ids": list(rec.speaker_ids),
+            "event_key": rec.event_key,
+        }
+        accepted.append(d)
+    return {
+        "candidates": accepted,
+        "rejections": rejections,
+        "manifest": {
+            "window_index": widx,
+            "frames_supplied": len(frames_by_id),
+            "audio_events_supplied": len(events_by_id),
+            "manifest_frame_issues": manifest_frame_issues,
+            "raw_items": len(items),
+            "accepted": len(accepted),
+            "rejected": len(rejections),
+        },
+    }
