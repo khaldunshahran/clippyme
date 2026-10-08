@@ -543,12 +543,14 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
                 break
     if not has_word:
         raise DiscoveryError("candidate interval covers no words")
-    # Evidence grounding: normalized evidence tokens must substantially
-    # overlap the words within the candidate interval.
-    # Documented threshold: >= 50% of evidence tokens appear in interval.
-    _ev_tokens = set(
-        t.lower() for t in re.findall(r"[a-z0-9]+", str(evidence).lower()))
-    _interval_tokens = set()
+    # Evidence grounding: require genuinely verbatim match.
+    # Rule: normalized evidence must be a contiguous substring of the
+    # normalized interval text, OR >=80% of evidence tokens (preserving
+    # order and multiplicity) must appear as a subsequence in order.
+    # Common words alone never validate a fabricated quote.
+    _ev_norm = _normalize_evidence(str(evidence))
+    _ev_tokens = _ev_norm.split()
+    _interval_words = []
     for w in window_words:
         ws, we = _word_start(w), _word_end(w)
         if ws is None or we is None:
@@ -556,14 +558,31 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
         if ws < end and we > start:
             _wt = _word_text(w)
             if _wt:
-                _interval_tokens.update(
-                    t.lower() for t in re.findall(r"[a-z0-9]+", _wt.lower()))
-    if _ev_tokens:
-        _overlap = len(_ev_tokens & _interval_tokens) / len(_ev_tokens)
-        if _overlap < 0.5:
-            raise DiscoveryError(
-                f"evidence not grounded in candidate words "
-                f"(overlap {_overlap:.0%})")
+                _interval_words.append(_normalize_evidence(_wt))
+    _interval_text = " ".join(_interval_words)
+    _grounded = False
+    if _ev_tokens and _interval_text:
+        # Contiguous substring match.
+        if _ev_norm in _interval_text:
+            _grounded = True
+        else:
+            # Ordered subsequence with multiplicity: >=80% of evidence
+            # tokens appear in order in interval.
+            _it = _interval_text.split()
+            _matched = 0
+            _pos = 0
+            for _tok in _ev_tokens:
+                while _pos < len(_it) and _it[_pos] != _tok:
+                    _pos += 1
+                if _pos < len(_it):
+                    _matched += 1
+                    _pos += 1
+            if len(_ev_tokens) > 0 and _matched / len(_ev_tokens) >= 0.8:
+                _grounded = True
+    if _ev_tokens and not _grounded:
+        raise DiscoveryError(
+            f"evidence not grounded in candidate words: "
+            f"{str(evidence)[:60]!r}")
     basis = str(item.get("evidence_basis") or "").strip().lower()
     if basis and basis != "transcript":
         raise DiscoveryError(
@@ -789,25 +808,10 @@ def run_windowed_discovery(
         clip_type=clip_type,
         video_duration=video_duration,
     )
-    # Enforce only explicit bounds in discovery; default policy minimum
-    # (15s) would reject valid short test candidates. The resolved policy
-    # is still reported in funnel config.
-    _enforce_min = min_duration if min_duration is not None else None
-    _enforce_max = max_duration if max_duration is not None else None
-    # Clean explicit bounds via _clean_bound logic (reject bool/non-finite).
-    def _clean(v):
-        if v is None or isinstance(v, bool):
-            return None
-        try:
-            fv = float(v)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        import math as _m
-        if not _m.isfinite(fv) or fv <= 0:
-            return None
-        return fv
-    _enforce_min = _clean(_enforce_min)
-    _enforce_max = _clean(_enforce_max)
+    # Enforce resolved policy bounds (handles defaults, modes,
+    # source clamps, contradictory inputs consistently).
+    _enforce_min = _policy.min_duration
+    _enforce_max = _policy.max_duration
     words = _extract_words(transcript_result)
     _word_issues = _extract_word_issues()
     plan = plan_windows(words, cfg)
@@ -862,9 +866,46 @@ def run_windowed_discovery(
                    "deadline_s": cfg.deadline_s, "exhausted": False},
     }
 
+    def _finalize(funnel, candidate_store, shorts):
+        # One finalization helper for all exits: complete versioned shape,
+        # zero/unknown semantics, four count equalities.
+        funnel.setdefault("version", DISCOVERY_VERSION)
+        funnel.setdefault("candidate_store", None)
+        # Ensure all count fields exist.
+        for k, v in [("windows_planned", 0), ("windows_succeeded", 0),
+                     ("windows_failed", 0), ("windows_skipped", 0),
+                     ("raw_candidates", 0), ("valid_candidates", 0),
+                     ("invalid_candidates", 0),
+                     ("raw_candidate_cap_removals", 0),
+                     ("post_dedupe_candidates", 0),
+                     ("duplicates_removed", 0),
+                     ("score_floor_removals", 0),
+                     ("final_cap_removals", 0),
+                     ("final_selected", len(shorts))]:
+            funnel.setdefault(k, v)
+        # Four required equalities.
+        c1 = (funnel["windows_planned"] ==
+              funnel["windows_succeeded"] + funnel["windows_failed"]
+              + funnel["windows_skipped"])
+        c2 = (funnel["raw_candidates"] ==
+              funnel["valid_candidates"] + funnel["invalid_candidates"]
+              + funnel["raw_candidate_cap_removals"])
+        c3 = (funnel["valid_candidates"] ==
+              funnel["post_dedupe_candidates"]
+              + funnel["duplicates_removed"])
+        c4 = (funnel["post_dedupe_candidates"] ==
+              funnel["score_floor_removals"]
+              + funnel["final_cap_removals"]
+              + funnel["final_selected"])
+        funnel["counts_reconcile"] = bool(c1 and c2 and c3 and c4)
+        return {"shorts": shorts,
+                "candidate_discovery": funnel,
+                "candidate_store": candidate_store}
+
     if not windows:
         funnel["candidate_discovery_note"] = "no valid words"
-        return {"shorts": [], "candidate_discovery": funnel}
+        # Mark all planned (zero) as reconciled; no windows to skip.
+        return _finalize(funnel, {}, [])
 
     _real_build = gr.build_discovery_prompt
     if build_prompt_fn is not None:
@@ -896,7 +937,14 @@ def run_windowed_discovery(
         except Exception as e:
             funnel["rejections"].append(
                 {"reason": "client_setup_failed", "detail": str(e)[:200]})
-            return {"shorts": [], "candidate_discovery": funnel}
+            # Mark all planned windows as skipped (structured reason).
+            funnel["windows_skipped"] = funnel["windows_planned"]
+            funnel["window_results"] = [
+                {"window_index": w.index, "status": "skipped",
+                 "reason": "client_setup_failed"}
+                for w in windows
+            ]
+            return _finalize(funnel, {}, [])
 
     valid: List[CandidateRecord] = []
     try:
@@ -1089,9 +1137,7 @@ def run_windowed_discovery(
         + funnel["final_cap_removals"]
         + funnel["final_selected"]
     )
-    return {"shorts": shorts,
-            "candidate_discovery": funnel,
-            "candidate_store": candidate_store}
+    return _finalize(funnel, candidate_store, shorts)
 
 
 def _extract_words(transcript_result: Any) -> List[Dict[str, Any]]:
@@ -1139,16 +1185,21 @@ def _default_generate(client: Any, prompt: str, cfg: DiscoveryConfig,
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
-                config={"http_options": {"timeout": int(timeout_ms)}},
+                config={"http_options": {
+                    "timeout": int(timeout_ms),
+                    "retry_options": {"attempts": 1},
+                }},
             )
             return response.text or ""
         except Exception as exc:
             last_error = exc
+            # Retryable capacity/rate errors AND unavailable-model (404)
+            # errors continue to the next model while budget remains.
             # Permanent errors fail immediately.
-            if not gr._is_retryable_model_error(exc):
+            if not (gr._is_retryable_model_error(exc)
+                    or gr._is_unavailable_model_error(exc)):
                 raise
-            # Retryable capacity/rate/unavailable: continue to next model
-            # while budget remains. Budget consumed per model below.
+            # Continue to next model; budget consumed per model above.
             continue
     if last_error:
         raise last_error

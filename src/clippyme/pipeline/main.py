@@ -1081,6 +1081,17 @@ if __name__ == '__main__':
                 output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
                 process_video_to_vertical(input_video, output_file, reframe_mode=args.reframe_mode,
                                           aspect_ratio=aspect_ratio, letterbox_zoom=letterbox_zoom)
+                # Persist funnel/store atomically for whole-video fallback.
+                _wv_data = _keep_funnel({'shorts': [], 'transcript': transcript,
+                                        'aspect': args.aspect})
+                if _dfunnel is not None:
+                    _wv_data['candidate_discovery']['fallback_strategy'] = 'whole_video'
+                    _wv_data['candidate_discovery']['fallback_result'] = 'rendered_whole_video'
+                _wv_meta = os.path.join(output_dir, f"{video_title}_metadata.json")
+                _wv_tmp = _wv_meta + '.tmp'
+                with open(_wv_tmp, 'w', encoding='utf-8') as _f:
+                    json.dump(_wv_data, _f, indent=2)
+                os.replace(_wv_tmp, _wv_meta)
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
             
