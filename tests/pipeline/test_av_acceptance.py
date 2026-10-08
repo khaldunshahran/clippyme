@@ -302,6 +302,27 @@ class FakeGenaiClient:
 # -- provider item builders (raw provider shapes; the strict production
 # -- parser assigns local candidate IDs / moment fingerprints) --------------
 
+def _manifest_frame_timestamps(prompt):
+    """Parse the AV evidence manifest in the prompt -> {frame_id: ts}.
+
+    The fake provider is a COMPLIANT provider: it only references
+    frames whose manifest timestamp lies inside its candidate interval
+    (review-01 half-open boundary [start_s, end_s)).
+    """
+    out = {}
+    for line in prompt.splitlines():
+        m = re.search(r"(\S+): observed at ([0-9]+(?:\.[0-9]+)?)s", line)
+        if m:
+            out[m.group(1)] = float(m.group(2))
+    return out
+
+
+def _in_interval_fids(prompt, fids, start_s, end_s):
+    ts = _manifest_frame_timestamps(prompt)
+    return [f for f in fids
+            if f in ts and start_s <= ts[f] < end_s]
+
+
 def visual_candidate(prompt, fids, *, score=80.0,
                      desc="a person raises both arms in celebration",
                      n_refs=2, start_off=2.0, dur=20.0, basis="visual",
@@ -315,7 +336,7 @@ def visual_candidate(prompt, fids, *, score=80.0,
         "event_type": "moment",
         "evidence_basis": basis,
         "evidence_text": "",
-        "visual_frame_ids": list(fids[:n_refs]),
+        "visual_frame_ids": _in_interval_fids(prompt, fids, s, e)[:n_refs],
         "visual_description": desc,
         "context": "a clear visual moment with a beginning and an end",
         "expected_payoff": "the visual payoff lands inside the interval",
@@ -346,7 +367,8 @@ def multimodal_candidate(prompt, fids, start_s, end_s, *, score=80.0,
                          desc="a speaker gestures at a whiteboard"):
     item = av_transcript_candidate(prompt, start_s, end_s, score=score)
     item["evidence_basis"] = "multimodal"
-    item["visual_frame_ids"] = list(fids[:2])
+    item["visual_frame_ids"] = _in_interval_fids(
+        prompt, fids, start_s, end_s)[:2]
     item["visual_description"] = desc
     return item
 
@@ -367,7 +389,16 @@ def av_generate_from_plan(plan_fn):
 def one_visual_per_window(prompt, fids):
     if not fids:
         return []
-    return [visual_candidate(prompt, fids)]
+    # Anchor the candidate interval on the first supplied frame so the
+    # review-01 inside-interval gate always sees at least one in-interval
+    # reference, even for tail-absorbed windows whose frames sit further
+    # from the window start.
+    ts = _manifest_frame_timestamps(prompt)
+    first_ts = min(ts[f] for f in fids if f in ts)
+    ws, _we = prompt_window_range(prompt)
+    s = round(max(ws, first_ts - 2.0), 3)
+    return [visual_candidate(prompt, fids,
+                             start_s=s, end_s=round(s + 20.0, 3))]
 
 
 def run_av(transcript, duration, source_path, sampler, item_plan, *,
@@ -807,9 +838,11 @@ class TestDedupeOverlapNeverDedupes:
             a = visual_candidate(prompt, fids, score=80.0,
                                  desc="a person raises both arms",
                                  n_refs=1, start_off=2.0, dur=20.0)
-            # Different visual moment sharing time: different frame,
-            # different description -> different evidence identity.
-            b = visual_candidate(prompt, fids[1:], score=78.0,
+            # Different visual moment sharing time: different interval,
+            # different description -> different evidence identity (the
+            # review-01 inside-interval gate requires the cited frame to
+            # lie inside the candidate interval).
+            b = visual_candidate(prompt, fids[0:1], score=78.0,
                                  desc="the crowd waves flags wildly",
                                  n_refs=1, start_off=10.0, dur=20.0)
             # Genuine repeat of A: same interval, same refs, same text.
@@ -840,10 +873,12 @@ class TestDedupeOverlapNeverDedupes:
     def test_overlap_alone_never_dedupes_av(self, tmp_path, clean_av_env):
         # Direct production dedupe entry point: two AV records with
         # heavily overlapping intervals but different evidence identity.
+        # Moment fingerprints hash canonical ABSOLUTE evidence identity
+        # (review-01): ("frame", "<decoded_ts:.3f>") refs, never local IDs.
         recs = []
-        for i, (desc, fid, score) in enumerate(
-                [("red car passes", "vf_0_0", 80.0),
-                 ("blue car passes", "vf_0_1", 79.0)]):
+        for i, (desc, ts, score) in enumerate(
+                [("red car passes", 20.0, 80.0),
+                 ("blue car passes", 40.0, 79.0)]):
             recs.append(cd.CandidateRecord(
                 candidate_id=f"avcand-test{i:02d}",
                 window_index=0, start_s=10.0, end_s=40.0,
@@ -852,8 +887,9 @@ class TestDedupeOverlapNeverDedupes:
                 event_key=None, confidence=0.8,
                 recommendation_score=score, speaker_ids=[],
                 moment_fingerprint=avd.make_av_moment_fingerprint(
-                    "src-x", 10.0, 40.0, "visual", [fid], desc),
-                raw={"visual_frame_ids": [fid]},
+                    "src-x", 10.0, 40.0, "visual",
+                    [("frame", f"{ts:.3f}")], desc),
+                raw={"visual_frame_ids": [f"vf_0_{i}"]},
             ))
         dedup = cd.dedupe_candidates(recs)
         assert len(dedup["kept"]) == 2, \
@@ -1041,9 +1077,17 @@ def _direct_av_produce(contents):
     fids = prompt_frame_ids(prompt)
     items = []
     if fids:
-        items.append(visual_candidate(prompt, fids, score=80.0))
-        bad = visual_candidate(prompt, fids, score=95.0,
-                               desc="an invented spectacular moment")
+        # Anchor the candidate interval on the first sampled frame: a
+        # compliant provider only cites frames inside its interval
+        # (review-01 half-open boundary).
+        t0 = _manifest_frame_timestamps(prompt).get(fids[0], 0.0)
+        items.append(visual_candidate(
+            prompt, fids, score=80.0,
+            start_s=max(0.0, t0 - 10.0), end_s=t0 + 10.0))
+        bad = visual_candidate(
+            prompt, fids, score=95.0,
+            desc="an invented spectacular moment",
+            start_s=max(0.0, t0 - 10.0), end_s=t0 + 10.0)
         bad["visual_frame_ids"] = ["vf_99_9"]
         items.append(bad)
     return json.dumps({"candidates": items})
@@ -1197,14 +1241,15 @@ class TestRenderSelectionReachability:
 # ---------------------------------------------------------------------------
 
 class TestCheckpointResumeIdentity:
-    def _run_and_save(self, tmp_path, src_name="resume_src.mp4"):
+    def _run_and_save(self, tmp_path, src_name="resume_src.mp4",
+                      **dcfg_kw):
         src = make_source_file(tmp_path, name=src_name)
         sampler = FakeSampler()
         # NOTE: av_config=None -> AVDiscoveryConfig.from_env(), exactly
         # what the production direct/queued entry points use, so the
         # orchestrator resume wrapper (which also recomputes from env)
         # sees matching identities.
-        dcfg = make_discovery_config()
+        dcfg = make_discovery_config(**dcfg_kw)
         transcript = {"words": []}
         result = run_av(transcript, 240.0, src, sampler,
                         one_visual_per_window,
@@ -1283,8 +1328,21 @@ class TestCheckpointResumeIdentity:
         assert (ok, why) == (True, "av_disabled_both")
 
     def test_queued_wrapper_rejects_stale_source(self, tmp_path,
-                                                 clean_av_env):
-        result, src, transcript, acfg, dcfg = self._run_and_save(tmp_path)
+                                                 clean_av_env,
+                                                 monkeypatch):
+        # The queued wrapper rebuilds the CURRENT discovery config from
+        # the environment (like the fresh run); the saved checkpoint was
+        # produced under make_discovery_config()'s "fake-model", so the
+        # env must agree for the identities to match. Production fills
+        # the default fallback chain when GEMINI_FALLBACK_MODELS is
+        # unset, so the saved config uses the same chain.
+        monkeypatch.setenv("GEMINI_MODEL", "fake-model")
+        monkeypatch.delenv("GEMINI_FALLBACK_MODELS", raising=False)
+        from clippyme.pipeline.gemini_request import build_model_chain
+        fb = [m for m in build_model_chain("fake-model", None)
+              if m != "fake-model"]
+        result, src, transcript, acfg, dcfg = self._run_and_save(
+            tmp_path, fallback_models=fb)
         saved_meta = {"shorts": result["shorts"],
                       "candidate_discovery": result["candidate_discovery"]}
         ok, why = orch._analysis_checkpoint_reusable(
@@ -1296,6 +1354,55 @@ class TestCheckpointResumeIdentity:
             saved_meta, src2, 240.0, transcript, run_analysis=True)
         assert ok2 is False
         assert why2 == "av_identity_mismatch:source_fingerprint"
+
+    def test_queued_wrapper_reruns_when_provider_model_changes(
+            self, tmp_path, clean_av_env, monkeypatch):
+        # Checkpoint saved under model-a; the queued resume path must
+        # NOT reuse it once the model changes to model-b — it re-runs.
+        # The save-time config is env-derived, exactly like the fresh
+        # run, so an unchanged environment matches.
+        monkeypatch.setenv("GEMINI_MODEL", "model-a")
+        monkeypatch.delenv("GEMINI_FALLBACK_MODELS", raising=False)
+        dcfg = cd.DiscoveryConfig.from_env(model_name="model-a")
+        src = make_source_file(tmp_path, name="resume_model.mp4")
+        sampler = FakeSampler()
+        result = run_av({"words": []}, 240.0, src, sampler,
+                        one_visual_per_window,
+                        av_config=None, discovery_config=dcfg)
+        saved_meta = {"shorts": result["shorts"],
+                      "candidate_discovery": result["candidate_discovery"]}
+        transcript = {"words": []}
+        ok, why = orch._analysis_checkpoint_reusable(
+            saved_meta, src, 240.0, transcript, run_analysis=True)
+        assert (ok, why) == (True, "av_identity_match")
+        monkeypatch.setenv("GEMINI_MODEL", "model-b")
+        ok2, why2 = orch._analysis_checkpoint_reusable(
+            saved_meta, src, 240.0, transcript, run_analysis=True)
+        assert ok2 is False
+        assert why2 == "av_identity_mismatch:provider_contract_digest"
+
+    def test_queued_wrapper_reruns_when_fallback_chain_changes(
+            self, tmp_path, clean_av_env, monkeypatch):
+        # Same primary model, different fallback chain -> re-run.
+        monkeypatch.setenv("GEMINI_MODEL", "model-a")
+        monkeypatch.delenv("GEMINI_FALLBACK_MODELS", raising=False)
+        dcfg = cd.DiscoveryConfig.from_env(model_name="model-a")
+        src = make_source_file(tmp_path, name="resume_fb.mp4")
+        sampler = FakeSampler()
+        result = run_av({"words": []}, 240.0, src, sampler,
+                        one_visual_per_window,
+                        av_config=None, discovery_config=dcfg)
+        saved_meta = {"shorts": result["shorts"],
+                      "candidate_discovery": result["candidate_discovery"]}
+        transcript = {"words": []}
+        ok, why = orch._analysis_checkpoint_reusable(
+            saved_meta, src, 240.0, transcript, run_analysis=True)
+        assert (ok, why) == (True, "av_identity_match")
+        monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "model-fb1,model-fb2")
+        ok2, why2 = orch._analysis_checkpoint_reusable(
+            saved_meta, src, 240.0, transcript, run_analysis=True)
+        assert ok2 is False
+        assert why2 == "av_identity_mismatch:provider_contract_digest"
 
     def test_migrated_task10_record_never_silently_enabled(
             self, clean_av_env):
@@ -1362,8 +1469,9 @@ class TestFailureIsolationAndLifecycle:
         assert all(u["reason"] == "frame_budget_cap" for u in un)
         assert all(u["end_s"] > u["start_s"] for u in un)
         assert funnel_reconciles(result)
-        # Byte cap enforced at runtime: later windows skip once the
-        # sampling budget is exhausted.
+        # Strict byte cap at runtime: a charge that would exceed the cap
+        # is declined BEFORE applying, the over-budget evidence is never
+        # sent, and the window falls back to transcript-only (reported).
         sampler2 = FakeSampler()
         result2 = run_av(
             {"words": []}, 360.0, src, sampler2, one_visual_per_window,
@@ -1372,8 +1480,11 @@ class TestFailureIsolationAndLifecycle:
                 max_provider_attempts=30))
         avf2 = av_funnel(result2)
         assert avf2["media_windows_planned"] == 4
-        assert avf2["media_windows_skipped"] >= 1
-        assert avf2["frame_bytes_total"] <= 100 + 3 * 68
+        assert avf2["frame_bytes_total"] <= 100, \
+            "strict cap: never over the invocation byte total"
+        assert avf2["transcript_only_fallbacks"] >= 1
+        assert any(d["reason"] == "sampling_budget_declined"
+                   for d in avf2["fallback_details"])
         assert funnel_reconciles(result2)
 
     def test_decode_failure_isolates_window(self, tmp_path, clean_av_env):
@@ -1687,14 +1798,17 @@ class TestMutationGates:
             a = visual_candidate(prompt, fids, score=80.0,
                                  desc="a person raises both arms",
                                  n_refs=1, start_off=2.0, dur=20.0)
-            b = visual_candidate(prompt, fids[1:], score=78.0,
+            b = visual_candidate(prompt, fids[0:1], score=78.0,
                                  desc="the crowd waves flags wildly",
                                  n_refs=1, start_off=10.0, dur=20.0)
             return [a, b]
 
         def run_and_assert_both_survive():
             src = make_source_file(tmp_path, name="gate_d.mp4")
-            result = run_av({"words": []}, 240.0, src, FakeSampler(),
+            # Single 120s window: a=[2,22] and b=[10,30] overlap, so the
+            # overlap-keyed mutant must drop b while the correct
+            # fingerprint-keyed dedupe keeps both.
+            result = run_av({"words": []}, 120.0, src, FakeSampler(),
                             plan)
             # Post-dedupe selection (shorts), not the store: the store
             # keeps every valid candidate including deduped ones.

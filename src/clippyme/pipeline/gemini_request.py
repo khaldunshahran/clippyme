@@ -856,13 +856,14 @@ def build_discovery_prompt(window, window_words, instructions=None,
     Safe preferences (clip type, duration mode/bounds, audience topics)
     guide discovery without inventing copy.
 
-    ``evidence_packet`` (Task 11, optional): when supplied, appends the
-    bounded audiovisual evidence contract — the packet is a dict with
-    "manifest" (from ``build_av_evidence_manifest``) and optionally
-    "frame_count"; the provider must then declare ``evidence_basis`` in
-    {transcript, visual, audio_event, multimodal} and reference local
-    ``visual_frame_ids`` / ``audio_event_ids``. ``None`` preserves the
-    exact Task 08 transcript-only prompt.
+    ``evidence_packet`` (Task 11, optional): when supplied, the prompt
+    carries ONE conditional, non-contradictory audiovisual contract —
+    multimodal discovery identity, the bounded evidence manifest, and a
+    JSON schema declaring ``evidence_basis`` in
+    {transcript, visual, audio_event, multimodal} with ``visual_description``,
+    ``visual_frame_ids`` and ``audio_event_ids`` fields; the transcript-only
+    final mandate is removed. ``None`` preserves the exact Task 08
+    transcript-only prompt.
     """
     lines = []
     for w in window_words:
@@ -928,7 +929,10 @@ def build_discovery_prompt(window, window_words, instructions=None,
                         + "; ".join(_prefs) + "\n\n")
     # Task 11: optional audiovisual evidence contract. Appended only when
     # the caller supplies a bounded evidence packet; the transcript-only
-    # prompt above is byte-identical when evidence_packet is None.
+    # prompt is byte-identical when evidence_packet is None. Review-01:
+    # with evidence the prompt carries ONE conditional, non-contradictory
+    # schema — multimodal discovery identity, visual/audio fields in the
+    # actual JSON schema, and no transcript-only final mandate.
     _av_block = ""
     if evidence_packet:
         _man = evidence_packet.get("manifest") or {}
@@ -950,16 +954,85 @@ def build_discovery_prompt(window, window_words, instructions=None,
             "transcript, visual, audio_event, multimodal — and it MUST "
             "match the references: transcript = verbatim quote, no frame/"
             "event IDs; visual = >= 1 visual_frame_ids from the manifest "
-            "above, no event IDs; audio_event = >= 1 audio_event_ids "
+            "above, no event IDs, plus a visual_description of what you "
+            "observe in those frames; audio_event = >= 1 audio_event_ids "
             "overlapping your interval, no frame IDs; multimodal = verbatim "
-            "quote PLUS >= 1 frame or event ID. A wordless range is "
+            "quote PLUS >= 1 frame or event ID (visual_description required "
+            "when you cite frames). A wordless range is "
             "eligible ONLY with >= 1 valid visual or audio-event reference. "
             "Never invent frame/event IDs."
         )
+    if evidence_packet:
+        _identity = (
+            "You are a multimodal moment DISCOVERY engine. Find candidate "
+            "moments worth clipping, using the transcript AND the supplied "
+            "video frames. Do NOT write hooks, captions, titles, hashtags, "
+            "speaker names, virality probabilities, retention estimates, or "
+            "platform copy - discovery only.\n\n"
+        )
+        _schema = (
+            '{"candidates": [{"start_s": <float>, "end_s": <float>, '
+            '"event_type": "<str>", '
+            '"evidence_basis": "<transcript|visual|audio_event|multimodal>", '
+            '"evidence_text": "<for transcript/multimodal: concise VERBATIM '
+            'transcript quote, min 10 chars; for visual/audio_event: may be '
+            'empty or a short note>", '
+            '"visual_description": "<for visual/multimodal with frame refs: '
+            'concise description of what you observe in the referenced '
+            'frames ONLY — labeled as your observation, max 500 chars>", '
+            '"visual_frame_ids": ["<frame IDs from the manifest, same window '
+            'only>"], '
+            '"audio_event_ids": ["<event IDs from the manifest overlapping '
+            'your interval>"], '
+            '"context": "<why this moment matters, min 10 chars>", '
+            '"expected_payoff": "<what the viewer gets, min 10 chars>", '
+            '"event_key": "<optional explicit continuity key or null>", '
+            '"confidence": <0.0-1.0>, '
+            '"recommendation_score": <1-100>}]}'
+        )
+        _rules = (
+            "Rules: straight double quotes only, no trailing commas. "
+            "evidence_basis MUST be one of transcript, visual, audio_event, "
+            "multimodal, and MUST match your references: transcript = "
+            "grounded verbatim quote and no frame/event IDs; visual = >= 1 "
+            "frame ID from this window's manifest, no event IDs, and a "
+            "visual_description of what you observe in those frames; "
+            "audio_event = >= 1 event ID overlapping your interval and no "
+            "frame IDs; multimodal = grounded verbatim quote PLUS >= 1 "
+            "frame or event ID (visual_description required when you cite "
+            "frames). A range with no transcript words is eligible ONLY "
+            "with >= 1 valid visual or audio-event reference. Referencing "
+            "a frame proves only that you observed that sampled frame; "
+            "never claim continuous action, camera movement, or events "
+            "between samples. Never invent frame or event IDs, speaker "
+            "names, identities, or facts unavailable from the supplied "
+            "evidence."
+        )
+    else:
+        _identity = (
+            "You are a transcript moment DISCOVERY engine. Find candidate "
+            "moments worth clipping. Do NOT write hooks, captions, titles, "
+            "or platform copy - discovery only.\n\n"
+        )
+        _schema = (
+            '{"candidates": [{"start_s": <float>, "end_s": <float>, '
+            '"event_type": "<str>", '
+            '"evidence_text": "<concise verbatim transcript quote, min 10 chars>", '
+            '"evidence_basis": "transcript", '
+            '"context": "<why this moment matters, min 10 chars>", '
+            '"expected_payoff": "<what the viewer gets, min 10 chars>", '
+            '"event_key": "<optional explicit continuity key or null>", '
+            '"confidence": <0.0-1.0>, '
+            '"recommendation_score": <1-100>}]}'
+        )
+        _rules = (
+            "Rules: straight double quotes only, no trailing commas. "
+            "Do not fabricate visual/audio evidence, speaker names, virality "
+            "probability, retention estimates, or human acceptance. Every "
+            "candidate MUST say evidence_basis is transcript."
+        )
     return (
-        "You are a transcript moment DISCOVERY engine. Find candidate "
-        "moments worth clipping. Do NOT write hooks, captions, titles, "
-        "or platform copy - discovery only.\n\n"
+        _identity
         + _prefs_block +
         f"Window absolute time range: {window.start_s:.1f}s to "
         f"{window.end_s:.1f}s. All timestamps you emit MUST be absolute "
@@ -970,19 +1043,8 @@ def build_discovery_prompt(window, window_words, instructions=None,
         fenced_instructions + _av_block +
         "\n\nRespond with STRICT JSON only, no prose, no markdown, no code "
         "fences:\n"
-        '{"candidates": [{"start_s": <float>, "end_s": <float>, '
-        '"event_type": "<str>", '
-        '"evidence_text": "<concise verbatim transcript quote, min 10 chars>", '
-        '"evidence_basis": "transcript", '
-        '"context": "<why this moment matters, min 10 chars>", '
-        '"expected_payoff": "<what the viewer gets, min 10 chars>", '
-        '"event_key": "<optional explicit continuity key or null>", '
-        '"confidence": <0.0-1.0>, '
-        '"recommendation_score": <1-100>}]}'
-        "\n\nRules: straight double quotes only, no trailing commas. "
-        "Do not fabricate visual/audio evidence, speaker names, virality "
-        "probability, retention estimates, or human acceptance. Every "
-        "candidate MUST say evidence_basis is transcript."
+        + _schema +
+        "\n\n" + _rules
     )
 
 
@@ -1155,6 +1217,14 @@ AV_SPARSE_OBSERVATION_DISCLAIMER = (
     "continuous action, camera movement, or events you did not directly "
     "observe in a supplied frame."
 )
+
+# Version of the Task 11 audiovisual discovery prompt / JSON-schema
+# contract. Bump this whenever the AV prompt text, the candidate JSON
+# schema, or the evidence contract changes. It is part of the persisted
+# checkpoint identity (candidate_discovery.av_checkpoint_identity): a
+# contract change forces resume to re-run instead of silently reusing
+# results produced under a different contract.
+AV_PROMPT_SCHEMA_VERSION = 1
 
 AV_MAX_MANIFEST_FRAMES = 12
 AV_MAX_MANIFEST_EVENTS = 20

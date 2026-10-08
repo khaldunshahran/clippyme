@@ -27,7 +27,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from clippyme.pipeline import av_discovery as avd
@@ -861,6 +861,7 @@ def _setup_av_discovery(*, source_path: Optional[str],
                         transcript_windows: Sequence[PlannedWindow],
                         frame_sampler: Optional[Callable],
                         time_fn: Callable[[], float],
+                        deadline_s: Optional[float] = None,
                         ) -> Dict[str, Any]:
     """Decide whether the audiovisual path runs; gather its inputs.
 
@@ -868,6 +869,8 @@ def _setup_av_discovery(*, source_path: Optional[str],
     "flag_disabled" (CLIPPYME_AV_DISCOVERY=0/false/no), "no_source",
     "source_unreadable", "invalid_source_duration". The transcript path
     is untouched when inactive; the sampler is never invoked then.
+    ``deadline_s`` anchors the single shared sampling deadline (the
+    discovery deadline in production).
     """
     cfg = av_config or avd.AVDiscoveryConfig.from_env()
     if not cfg.enabled:
@@ -894,7 +897,8 @@ def _setup_av_discovery(*, source_path: Optional[str],
         "source_path": source_path,
         "source_fingerprint": src_fp,
         "limits": avd.FrameLimits.from_config(cfg),
-        "sampling_budget": avd.SamplingBudget(cfg, time_fn=time_fn),
+        "sampling_budget": avd.SamplingBudget(
+            cfg, time_fn=time_fn, deadline_s=deadline_s),
         "sampler": frame_sampler or avd.ffmpeg_frame_sampler,
         "media_plan": media_plan,
         "media_windows": media_plan["windows"],
@@ -975,11 +979,16 @@ def av_checkpoint_identity(*, source_fingerprint: str,
     """Deterministic identity digests gating checkpoint/resume reuse.
 
     A resumed candidate_discovery record is reusable only when the
-    source fingerprint, AV config/version, window plan, and evidence
-    manifest identities still match. Everything here is pure and
-    deterministic (no sampling, no provider calls): frame timestamps
-    come from the planner and audio events from the transcript.
+    source fingerprint, AV config/version, window plan, evidence
+    manifest, and provider contract identities still match. The provider
+    contract covers the discovery model name, the fallback chain, and
+    the explicit AV prompt/schema contract version: a model or contract
+    change re-runs instead of silently reusing results produced under a
+    different contract. Everything here is pure and deterministic (no
+    sampling, no provider calls): frame timestamps come from the
+    planner and audio events from the transcript.
     """
+    from clippyme.pipeline.gemini_request import AV_PROMPT_SCHEMA_VERSION
     words, _ = normalize_transcript_words(transcript_result)
     tplan = plan_windows(words, discovery_config)
     media = avd.plan_media_windows(
@@ -1036,12 +1045,25 @@ def av_checkpoint_identity(*, source_fingerprint: str,
                 f"{e['event_id']}:{e['label']}:"
                 f"{e['start_s']:.3f}:{e['end_s']:.3f};".encode("utf-8"))
 
+    # Provider contract: discovery model name, fallback chain, and the
+    # explicit AV prompt/schema contract version. Any of these changing
+    # means the checkpoint's candidates were produced under a different
+    # model contract and must not be reused.
+    h_contract = hashlib.sha256()
+    h_contract.update(str(AV_PROMPT_SCHEMA_VERSION).encode("utf-8"))
+    h_contract.update(
+        str(discovery_config.model_name or "").encode("utf-8"))
+    h_contract.update(
+        repr(tuple(discovery_config.fallback_models or ())).encode(
+            "utf-8"))
+
     return {
         "source_fingerprint": str(source_fingerprint),
         "av_discovery_version": avd.AV_DISCOVERY_VERSION,
         "av_config_digest": h_cfg.hexdigest()[:32],
         "window_plan_digest": h_plan.hexdigest()[:32],
         "evidence_manifest_digest": h_man.hexdigest()[:32],
+        "provider_contract_digest": h_contract.hexdigest()[:32],
     }
 
 
@@ -1105,9 +1127,10 @@ def av_resume_reusable(saved_funnel: Any, *,
 
     Returns (reusable, reason). A resumed record is reusable only when
     the AV enablement matches and -- when enabled -- the source
-    fingerprint, AV config/version, window plan, and evidence manifest
-    identities still match. Anything else means re-run and mark the
-    stale record superseded; a stale record is never silently reused.
+    fingerprint, AV config/version, window plan, evidence manifest, and
+    provider contract (model name, fallback chain, AV prompt/schema
+    version) identities still match. Anything else means re-run and mark
+    the stale record superseded; a stale record is never silently reused.
     """
     saved = migrate_candidate_discovery_record(saved_funnel)
     saved_av = saved.get("av_discovery") or {}
@@ -1137,7 +1160,7 @@ def av_resume_reusable(saved_funnel: Any, *,
     saved_identity = saved_av.get("identity") or {}
     for key in ("source_fingerprint", "av_discovery_version",
                 "av_config_digest", "window_plan_digest",
-                "evidence_manifest_digest"):
+                "evidence_manifest_digest", "provider_contract_digest"):
         if str(saved_identity.get(key)) != str(cur_identity.get(key)):
             return False, f"av_identity_mismatch:{key}"
     return True, "av_identity_match"
@@ -1417,7 +1440,7 @@ def run_windowed_discovery(
         source_path=source_path, av_config=av_config,
         video_duration=video_duration, transcript_result=transcript_result,
         transcript_windows=windows, frame_sampler=frame_sampler,
-        time_fn=time_fn)
+        time_fn=time_fn, deadline_s=cfg.deadline_s)
     _av_windows: List[Any] = _av["media_windows"] if _av["active"] else []
 
     funnel: Dict[str, Any] = {
@@ -1690,9 +1713,18 @@ def run_windowed_discovery(
             and _word_end(w) > mw.start_s
         ]
         # --- bounded local sampling (injectable seam) ---
+        # Cap every sampling attempt by the CURRENT shared remaining
+        # discovery time: one sampling deadline across frames/retries —
+        # never a fixed AV timeout when the shared deadline has nearly
+        # expired.
+        _remaining = budget.remaining_s()
+        _attempt_limits = replace(
+            _av["limits"],
+            sampling_timeout_s=max(
+                0.0, min(_av["limits"].sampling_timeout_s, _remaining)))
         try:
             sample = avd.sample_media_window(
-                source_path, mw, _av["sampler"], _av["limits"])
+                source_path, mw, _av["sampler"], _attempt_limits)
         except Exception as e:  # noqa: BLE001 - isolate per window
             sample = avd.WindowSample(
                 window_index=mw.index, status="failed",
@@ -1724,27 +1756,38 @@ def run_windowed_discovery(
         evidence_packet = None
         image_parts: List[Dict[str, Any]] = []
         if sample.status == "ok":
-            sampling_budget.charge(len(sample.frames), sample.total_bytes)
-            avf["frames_sampled_total"] += len(sample.frames)
-            avf["frame_bytes_total"] += sample.total_bytes
-            try:
-                image_parts = gr.build_av_image_parts(
-                    sample.frames,
-                    max_parts=avcfg.max_manifest_frames)
-                manifest = gr.build_av_evidence_manifest(
-                    mw, frame_meta["frames"], win_events,
-                    max_frames=avcfg.max_manifest_frames,
-                    max_events=avcfg.max_manifest_events)
-                evidence_packet = {"manifest": manifest,
-                                   "frame_count": len(sample.frames)}
-            except Exception as e:  # noqa: BLE001 - fall back honestly
-                evidence_packet = None
-                image_parts = []
-                _fallback("evidence_packet_failed", e)
-            finally:
-                # Frame bytes are transient request material: never
-                # persisted in job metadata or the candidate store.
+            if not sampling_budget.charge(len(sample.frames),
+                                          sample.total_bytes):
+                # Strict budget: a declined charge is never sent. The
+                # sampled frames are discarded and this window falls
+                # back to transcript-only evidence, reported honestly.
+                _fallback(
+                    "sampling_budget_declined",
+                    f"{len(sample.frames)} frames / "
+                    f"{sample.total_bytes} bytes would exceed the "
+                    "sampling budget")
                 sample.frames.clear()
+            else:
+                avf["frames_sampled_total"] += len(sample.frames)
+                avf["frame_bytes_total"] += sample.total_bytes
+                try:
+                    image_parts = gr.build_av_image_parts(
+                        sample.frames,
+                        max_parts=avcfg.max_manifest_frames)
+                    manifest = gr.build_av_evidence_manifest(
+                        mw, frame_meta["frames"], win_events,
+                        max_frames=avcfg.max_manifest_frames,
+                        max_events=avcfg.max_manifest_events)
+                    evidence_packet = {"manifest": manifest,
+                                       "frame_count": len(sample.frames)}
+                except Exception as e:  # noqa: BLE001 - fall back honestly
+                    evidence_packet = None
+                    image_parts = []
+                    _fallback("evidence_packet_failed", e)
+                finally:
+                    # Frame bytes are transient request material: never
+                    # persisted in job metadata or the candidate store.
+                    sample.frames.clear()
         else:
             _fallback(sample.reason or "sampling_failed", sample.error)
         wres["evidence_packet"] = (

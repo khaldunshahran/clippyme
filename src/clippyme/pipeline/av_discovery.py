@@ -740,21 +740,26 @@ class SamplingBudget:
 
     Pure helper for the orchestration layer; mirrors the
     ``DiscoveryBudget`` shape from Task 08 without sharing state.
+    ``deadline_s`` anchors ONE sampling deadline across frames/retries:
+    production passes the shared discovery deadline so sampling never
+    outlives it; when omitted, the historical sampling-timeout scale is
+    kept for direct unit use.
     """
 
     def __init__(self, config: AVDiscoveryConfig,
-                 time_fn: Callable[[], float] = time.monotonic):
+                 time_fn: Callable[[], float] = time.monotonic,
+                 deadline_s: Optional[float] = None):
         self.config = config
         self.time_fn = time_fn
         self.start = time_fn()
+        self.deadline_s = (float(deadline_s)
+                           if deadline_s is not None
+                           else config.sampling_timeout_s * 10)
         self.frames_used = 0
         self.bytes_used = 0
 
     def remaining_s(self) -> float:
-        # Sampling shares wall-clock pressure but has no separate
-        # deadline knob; bound it by the sampling timeout scale.
-        return max(0.0, self.config.sampling_timeout_s * 10
-                   - (self.time_fn() - self.start))
+        return max(0.0, self.deadline_s - (self.time_fn() - self.start))
 
     def exhausted(self) -> bool:
         return (self.frames_used >= self.config.max_total_sampled_frames
@@ -762,8 +767,21 @@ class SamplingBudget:
                 or self.remaining_s() <= 0)
 
     def charge(self, frames: int, byte_count: int) -> bool:
-        """Charge frames/bytes; False when the budget is exhausted."""
-        if self.exhausted():
+        """Charge frames/bytes against the invocation caps.
+
+        Strict: declines (returns False) BEFORE a charge would exceed
+        ``max_total_sampled_frames`` or ``max_invocation_bytes``;
+        ``frames_used``/``bytes_used`` are left unchanged on decline.
+        A charge is never partially applied — the caller must not send
+        declined evidence.
+        """
+        if frames < 0 or byte_count < 0:
+            return False
+        if (self.frames_used + frames
+                > self.config.max_total_sampled_frames):
+            return False
+        if (self.bytes_used + byte_count
+                > self.config.max_invocation_bytes):
             return False
         self.frames_used += frames
         self.bytes_used += byte_count
@@ -807,7 +825,10 @@ def normalize_audio_events(
         if not isinstance(raw, dict):
             issues.append({"index": idx, "reason": "event_not_object"})
             continue
-        label = raw.get("label", raw.get("name", raw.get("type")))
+        # ElevenLabs emits audio events as {text, start, end}; accept the
+        # "text" label shape alongside label/name/type.
+        label = raw.get("label", raw.get("name", raw.get("type",
+                                                        raw.get("text"))))
         if (not isinstance(label, str) or isinstance(label, bool)
                 or not label.strip()
                 or len(label.strip()) > max_label_chars):
@@ -855,8 +876,8 @@ def _normalize_evidence_text(text: str) -> str:
 def _evidence_ref_key(evidence_refs: Sequence[Any]) -> str:
     parts = []
     for r in evidence_refs or []:
-        if isinstance(r, (list, tuple)) and len(r) == 2:
-            parts.append(f"{r[0]}:{r[1]}")
+        if isinstance(r, (list, tuple)):
+            parts.append(":".join(str(x) for x in r))
         else:
             parts.append(str(r))
     return "|".join(sorted(parts))
@@ -872,10 +893,17 @@ def make_av_moment_fingerprint(
 ) -> str:
     """Stable moment fingerprint across windows; for semantic dedupe.
 
-    Built from source identity, interval, evidence basis, stable
-    evidence references, and normalized evidence text — never provider
-    IDs. Two windows observing the same moment with the same evidence
-    share this fingerprint; time overlap alone does not create one.
+    Built from canonical ABSOLUTE evidence identity: source identity,
+    interval, evidence basis, normalized model observation / transcript
+    evidence, and stable absolute evidence references — ``("frame",
+    "<decoded_ts:.3f>")`` for visual frames, ``("audio", "<label>",
+    "<start_s:.3f>", "<end_s:.3f>")`` for audio events. Window-local IDs
+    (``vf_0_0``, ``ae_w0_0``) must NEVER be hashed here: overlapping
+    windows assign different local IDs to the same absolute evidence,
+    which would make genuine cross-window repeats impossible to
+    collapse. Two windows observing the same moment with the same
+    absolute evidence share this fingerprint; different model
+    observations sharing time remain distinct.
     """
     h = hashlib.sha256()
     h.update(str(source_fingerprint).encode("utf-8"))
@@ -1070,6 +1098,16 @@ def validate_av_evidence(
     ``duration_policy.resolve_duration_policy`` upstream).
 
     Rejection reasons are exact stable strings (see docs).
+
+    Visual grounding (review-01): every referenced frame's finite
+    authoritative ``decoded_ts`` must lie inside the candidate interval
+    under the documented half-open boundary
+    ``start_s <= decoded_ts < end_s`` — reason
+    ``visual_frame_outside_candidate:<frame_id>`` otherwise. Whenever a
+    candidate uses visual frame evidence (basis ``visual``, or
+    ``multimodal`` with frame refs), a bounded nonempty model-produced
+    ``visual_description`` is required — reason
+    ``missing_visual_description`` when absent.
     """
     if not isinstance(item, dict):
         raise EvidenceValidationError("candidate_not_object")
@@ -1142,6 +1180,23 @@ def validate_av_evidence(
                 f"unknown_frame_id:{fid}",
                 "visual reference must name a supplied frame from the "
                 "same window")
+    for fid in visual_ids:
+        dts = frames[fid].get("decoded_ts")
+        if not _is_finite_number(dts):
+            raise EvidenceValidationError(
+                f"visual_frame_outside_candidate:{fid}",
+                "referenced frame has no finite authoritative decoded "
+                "timestamp")
+        dts_f = float(dts)
+        # Documented half-open boundary: the frame's authoritative
+        # decoded timestamp must satisfy start_s <= decoded_ts < end_s.
+        # A same-window frame decoded outside the proposed clip cannot
+        # ground it.
+        if not (start_f <= dts_f < end_f):
+            raise EvidenceValidationError(
+                f"visual_frame_outside_candidate:{fid}",
+                f"frame decoded at {dts_f:.3f}s lies outside the "
+                f"candidate [{start_f:.3f}, {end_f:.3f})")
     for eid in audio_ids:
         ev = events.get(eid)
         if ev is None:
@@ -1228,6 +1283,14 @@ def validate_av_evidence(
         if audio_ids:
             raise EvidenceValidationError("unexpected_audio_reference",
                                           "visual basis takes no events")
+        if visual_desc_rec is None:
+            # A candidate that uses visual frame evidence must carry
+            # the model-produced observation: the store must never
+            # hold bare frame IDs with no auditable description.
+            raise EvidenceValidationError(
+                "missing_visual_description",
+                "visual frame evidence requires a bounded nonempty "
+                "model-produced visual_description")
     elif basis == "audio_event":
         if not audio_ids:
             raise EvidenceValidationError(
@@ -1246,6 +1309,11 @@ def validate_av_evidence(
             raise EvidenceValidationError(
                 "multimodal_missing_media_reference",
                 "multimodal basis requires >= 1 visual or audio reference")
+        if visual_ids and visual_desc_rec is None:
+            raise EvidenceValidationError(
+                "missing_visual_description",
+                "visual frame evidence requires a bounded nonempty "
+                "model-produced visual_description")
 
     # --- confidence / score --------------------------------------------
     # (wordless eligibility was decided above, before basis agreement)
@@ -1279,16 +1347,35 @@ def validate_av_evidence(
 
     # Local identity from source identity, interval, evidence basis,
     # and stable evidence references — never provider IDs. A provider
-    # "id"/"candidate_id" field is ignored on purpose.
+    # "id"/"candidate_id" field is ignored on purpose. The occurrence
+    # (candidate) ID stays window-specific; the moment fingerprint is
+    # built from canonical ABSOLUTE evidence identity (stable decoded
+    # timestamps for frames, label/start/end for audio events — never
+    # window-local IDs), plus the normalized model observation, so the
+    # same absolute evidence in overlapping windows shares one
+    # fingerprint while different observations stay distinct.
     stable_refs: List[Tuple[str, str]] = (
         [("vf", fid) for fid in visual_ids]
         + [("ae", eid) for eid in audio_ids])
+    absolute_refs: List[Tuple[str, ...]] = []
+    for fid in visual_ids:
+        absolute_refs.append(
+            ("frame", f"{float(frames[fid]['decoded_ts']):.3f}"))
+    for eid in audio_ids:
+        _ev = events[eid]
+        absolute_refs.append(
+            ("audio", str(_ev.get("label", "")),
+             f"{float(_ev['start_s']):.3f}",
+             f"{float(_ev['end_s']):.3f}"))
+    observation = visual_desc_rec["text"] if visual_desc_rec else ""
+    moment_evidence = "\n".join(
+        part for part in (evidence_s, observation) if part)
     cid = make_av_candidate_id(
         source_fingerprint, start_f, end_f, basis, stable_refs,
         window_index, evidence_s)
     mfp = make_av_moment_fingerprint(
-        source_fingerprint, start_f, end_f, basis, stable_refs,
-        evidence_s)
+        source_fingerprint, start_f, end_f, basis, absolute_refs,
+        moment_evidence)
     return ValidatedAVCandidate(
         candidate_id=cid,
         moment_fingerprint=mfp,

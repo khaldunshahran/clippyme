@@ -481,11 +481,16 @@ class TestSamplingBudget:
         assert b.charge(1, 1) is False
 
     def test_byte_exhaustion(self):
+        # Strict charge: a charge that would exceed the byte cap is
+        # declined BEFORE applying, leaving counters unchanged.
         cfg = make_config(max_total_sampled_frames=100,
                           max_invocation_bytes=50)
         b = avd.SamplingBudget(cfg)
-        assert b.charge(1, 60) is True
-        assert b.exhausted() is True
+        assert b.charge(1, 40) is True
+        assert b.charge(1, 20) is False  # 40 + 20 > 50: declined
+        assert b.frames_used == 1
+        assert b.bytes_used == 40
+        assert b.exhausted() is False
 
 
 FFMPEG = shutil.which("ffmpeg")
@@ -616,25 +621,41 @@ class TestParseAvDiscoveryPayload:
         assert res["manifest"]["accepted"] == 1
 
     def test_mixed_candidate_quote_plus_frames(self):
+        # Only frames decoded inside the candidate interval [10, 20)
+        # may ground it (review-01 half-open boundary): vf_0_0 at
+        # 16.667s is inside; vf_0_1 at 50.0s is not.
         item = valid_transcript_item(
             evidence_basis="multimodal",
-            visual_frame_ids=["vf_0_0", "vf_0_1"],
+            visual_frame_ids=["vf_0_0"],
             visual_description="a person gesturing at the whiteboard")
         res, _ = parse_one(item)
         assert len(res["candidates"]) == 1
         c = res["candidates"][0]
         assert c["evidence_basis"] == "multimodal"
-        assert c["visual_frame_ids"] == ["vf_0_0", "vf_0_1"]
+        assert c["visual_frame_ids"] == ["vf_0_0"]
         assert c["visual_description"] == {
             "text": "a person gesturing at the whiteboard",
             "model_produced": True}
 
+    def test_frame_outside_candidate_interval_rejected(self):
+        # vf_0_1 decodes at 50.0s, outside the [10, 20) candidate.
+        item = valid_transcript_item(
+            evidence_basis="multimodal",
+            visual_frame_ids=["vf_0_0", "vf_0_1"],
+            visual_description="a person gesturing at the whiteboard")
+        res, _ = parse_one(item)
+        assert res["candidates"] == []
+        assert res["rejections"][0]["reason"] == \
+            "visual_frame_outside_candidate:vf_0_1"
+
     def test_visual_wordless_candidate_accepted(self):
+        # vf_0_1 decodes at 200.0s, inside the [200, 210) candidate
+        # (half-open: start-inclusive).
         item = valid_transcript_item(
             start_s=200.0, end_s=210.0,
             evidence_basis="visual",
             evidence_text="",
-            visual_frame_ids=["vf_0_2"],
+            visual_frame_ids=["vf_0_1"],
             visual_description="crowd cheering with hands up")
         res, _ = parse_one(item, window=(150.0, 250.0), words=[])
         assert len(res["candidates"]) == 1
@@ -787,11 +808,13 @@ class TestParseAvDiscoveryPayload:
                                      evidence_text="")
         res, _ = parse_one(item)
         assert res["rejections"][0]["reason"] == "missing_audio_reference"
-        # audio_event basis must not carry frame refs
+        # audio_event basis must not carry frame refs (frame at 16.667s
+        # is inside the [16, 26) interval, so the basis-agreement gate
+        # is the one that fires)
         item = valid_transcript_item(
             evidence_basis="audio_event", evidence_text="",
             audio_event_ids=["ae_0"], visual_frame_ids=["vf_0_0"],
-            start_s=18.0, end_s=28.0)
+            start_s=16.0, end_s=26.0)
         res, _ = parse_one(item, words=[])
         assert res["rejections"][0]["reason"] == "unexpected_visual_reference"
 
@@ -987,5 +1010,8 @@ class TestAvRequestContract:
         assert "AUDIOVISUAL EVIDENCE" in with_packet
         assert "evidence_basis" in with_packet
         assert "SPARSE OBSERVATION" in with_packet
-        # Transcript prompt still present underneath.
-        assert "transcript moment DISCOVERY engine" in with_packet
+        # Review-01: with evidence the prompt carries ONE conditional,
+        # non-contradictory schema — multimodal discovery identity, not
+        # the transcript-only identity.
+        assert "multimodal moment DISCOVERY engine" in with_packet
+        assert "transcript moment DISCOVERY engine" not in with_packet

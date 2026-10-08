@@ -505,18 +505,32 @@ def _analysis_checkpoint_reusable(saved, input_video, duration,
 
     A resumed record is reusable only when the audiovisual identity
     still matches (source fingerprint, AV config/version, window plan,
-    evidence manifest); otherwise the caller re-runs and marks the
-    stale record superseded -- never silently reused.
+    evidence manifest, and the provider contract: discovery model name,
+    fallback chain, AV prompt/schema version); otherwise the caller
+    re-runs and marks the stale record superseded -- never silently
+    reused. The CURRENT discovery config is rebuilt from the environment
+    exactly like the fresh run (main._get_viral_clips_windowed), so a
+    model/config change between the checkpoint and the resume is
+    detected instead of being masked by the saved config.
     """
     if not run_analysis:
         return True, "analysis_skipped"
     try:
         from clippyme.pipeline.candidate_discovery import (
-            av_resume_reusable)
+            av_resume_reusable, DiscoveryConfig)
+        _model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        _fb_env = os.getenv("GEMINI_FALLBACK_MODELS")
+        _fallbacks = (
+            [m.strip() for m in _fb_env.split(",") if m.strip()]
+            if _fb_env else None
+        )
+        current_dcfg = DiscoveryConfig.from_env(
+            model_name=_model, fallback_models=_fallbacks)
         return av_resume_reusable(
             (saved or {}).get("candidate_discovery"),
             source_path=input_video, source_duration=duration,
-            transcript_result=transcript)
+            transcript_result=transcript,
+            discovery_config=current_dcfg)
     except Exception as exc:  # noqa: BLE001 - fail closed, never reuse
         return False, f"resume_check_failed:{type(exc).__name__}"
 
