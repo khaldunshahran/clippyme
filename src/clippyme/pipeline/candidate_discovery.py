@@ -177,7 +177,7 @@ def _word_speaker(w: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def normalize_transcript_words(transcript_result: Any) -> List[Dict[str, Any]]:
+def normalize_transcript_words(transcript_result: Any) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """One authoritative normalizer for all transcript contracts.
 
     Handles:
@@ -185,9 +185,10 @@ def normalize_transcript_words(transcript_result: Any) -> List[Dict[str, Any]]:
     - Task 04 flattened: [{"w","s","e","sp"}] (list) or {"words": [...]}
     - Words shape: {"words": [{"text","start","end","speaker"}]}
 
-    Returns list of {"w","s","e"} plus "sp" if speaker present.
-    Preserves absolute timestamps (never rebases) and speaker ID 0.
-    Invalid words are omitted here; plan_windows reports them.
+    Returns (words, issues) tuple. Words are {"w","s","e"} plus "sp"
+    if speaker present. Preserves absolute timestamps (never rebases)
+    and speaker ID 0. Invalid words are omitted from words; their
+    issue records are returned alongside for per-invocation reporting.
     """
     raw_words: List[Dict[str, Any]] = []
 
@@ -237,9 +238,9 @@ def normalize_transcript_words(transcript_result: Any) -> List[Dict[str, Any]]:
         if sp is not None:
             entry["sp"] = sp
         normalized.append(entry)
-    # Attach issues for callers that need them.
-    normalize_transcript_words.last_issues = issues
-    return normalized
+    # Return words and issues together so each invocation carries its
+    # own diagnostics (no process-global mutable state).
+    return normalized, issues
 
 
 def plan_windows(words: Sequence[Dict[str, Any]],
@@ -561,14 +562,19 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
                 _interval_words.append(_normalize_evidence(_wt))
     _interval_text = " ".join(_interval_words)
     _grounded = False
-    if _ev_tokens and _interval_text:
-        # Contiguous substring match.
-        if _ev_norm in _interval_text:
+    _it = _interval_text.split()
+    _n = len(_ev_tokens)
+    if _ev_tokens and _it:
+        # Contiguous token-slice match: the evidence token sequence must
+        # appear as a contiguous slice of complete interval tokens.
+        # Character substrings (e.g. "state" inside "statement") do NOT
+        # count; token boundaries are respected.
+        if any(_it[i:i + _n] == _ev_tokens
+               for i in range(len(_it) - _n + 1)):
             _grounded = True
         else:
             # Ordered subsequence with multiplicity: >=80% of evidence
-            # tokens appear in order in interval.
-            _it = _interval_text.split()
+            # tokens appear in order in interval (complete tokens only).
             _matched = 0
             _pos = 0
             for _tok in _ev_tokens:
@@ -577,7 +583,7 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
                 if _pos < len(_it):
                     _matched += 1
                     _pos += 1
-            if len(_ev_tokens) > 0 and _matched / len(_ev_tokens) >= 0.8:
+            if _n > 0 and _matched / _n >= 0.8:
                 _grounded = True
     if _ev_tokens and not _grounded:
         raise DiscoveryError(
@@ -812,8 +818,7 @@ def run_windowed_discovery(
     # source clamps, contradictory inputs consistently).
     _enforce_min = _policy.min_duration
     _enforce_max = _policy.max_duration
-    words = _extract_words(transcript_result)
-    _word_issues = _extract_word_issues()
+    words, _word_issues = _extract_words(transcript_result)
     plan = plan_windows(words, cfg)
     # Merge normalizer issues with plan invalid indices.
     _plan_invalid = plan.get("invalid_words", [])
@@ -1140,15 +1145,14 @@ def run_windowed_discovery(
     return _finalize(funnel, candidate_store, shorts)
 
 
-def _extract_words(transcript_result: Any) -> List[Dict[str, Any]]:
-    """Extract normalized words via the authoritative normalizer."""
-    # Issues are available via normalize_transcript_words.last_issues.
+def _extract_words(transcript_result: Any
+                 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Extract (words, issues) via the authoritative normalizer.
+
+    Returns both together so each run_windowed_discovery invocation
+    carries its own invalid-word diagnostics; no global state.
+    """
     return normalize_transcript_words(transcript_result)
-
-
-def _extract_word_issues() -> List[Dict[str, Any]]:
-    """Return issues from the last normalize_transcript_words call."""
-    return list(getattr(normalize_transcript_words, "last_issues", []))
 
 
 def _default_parse(text: str) -> List[Dict[str, Any]]:
