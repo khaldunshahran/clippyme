@@ -116,6 +116,20 @@ def _ordered_interval(start_v: Any, end_v: Any) -> Optional[Tuple[float, float]]
     return (ss, se)
 
 
+def _strict_count(rec: Mapping[str, Any], key: str) -> Optional[int]:
+    """Non-boolean nonnegative integer count, or None when malformed.
+
+    Booleans, strings, floats, and missing values never coerce: only an
+    actual integer count is trusted.
+    """
+    value = rec.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
 def is_intentional_editorial_empty(clips_data: Any) -> bool:
     """Whether enabled editorial application honestly reduced a non-empty
     selection to zero shorts.
@@ -123,21 +137,52 @@ def is_intentional_editorial_empty(clips_data: Any) -> bool:
     Such results must be persisted as zero shorts with no fallback
     rendering: the empty set is the validated editorial outcome, not a
     discovery/provider failure.
+
+    Strict contract: only a current APPLICATION_VERSION record with
+    exact boolean flags, non-boolean nonnegative integer counts, an
+    actual empty shorts list, and independently verified zero-output
+    arithmetic may suppress fallback. Every original selection must
+    have been actually rejected; nothing may be retained, adjusted, or
+    grouped. Stale versions, type-coerced counts, or inconsistent
+    metadata never suppress fallback.
     """
-    rec = (clips_data.get("editorial_application")
-           if isinstance(clips_data, dict) else None)
+    if not isinstance(clips_data, dict):
+        return False
+    shorts = clips_data.get("shorts")
+    if not isinstance(shorts, list) or len(shorts) != 0:
+        return False
+    rec = clips_data.get("editorial_application")
     if not isinstance(rec, Mapping):
+        return False
+    if rec.get("version") != APPLICATION_VERSION:
         return False
     if rec.get("enabled") is not True:
         return False
     if rec.get("counts_reconcile") is not True:
         return False
-    try:
-        orig = int(rec.get("original_selected_count") or 0)
-        final = int(rec.get("final_selected_count") or 0)
-    except (TypeError, ValueError):
+    orig = _strict_count(rec, "original_selected_count")
+    final = _strict_count(rec, "final_selected_count")
+    accepts = _strict_count(rec, "accepts_retained")
+    adjustments = _strict_count(rec, "adjustments_applied")
+    rejects = _strict_count(rec, "rejects_removed")
+    unrefined = _strict_count(rec, "unrefined_retained")
+    legacy = _strict_count(rec, "legacy_no_id_retained")
+    grouped = _strict_count(rec, "groups_applied")
+    counts = (orig, final, accepts, adjustments, rejects, unrefined,
+              legacy, grouped)
+    if any(c is None for c in counts):
         return False
-    return orig > 0 and final == 0
+    if not orig > 0:
+        return False
+    if final != 0:
+        return False
+    # Independently verified zero-output arithmetic: every original
+    # selection was actually rejected and nothing was retained,
+    # adjusted, or grouped. counts_reconcile alone is not trusted.
+    if rejects != orig:
+        return False
+    return (accepts == 0 and adjustments == 0 and unrefined == 0
+            and legacy == 0 and grouped == 0)
 
 
 def disabled_application_record(reason: str,
@@ -283,6 +328,9 @@ def _validate_group_plan(group: Mapping[str, Any],
                              Optional[str]]:
     """Validate one continuity group plan against current shorts."""
     gid = group.get("candidate_id")
+    if not source_checked:
+        # No group may apply without a valid source duration.
+        return None, "invalid_source_duration"
     if group.get("status") != "refined":
         return None, "group_not_refined"
     if group.get("verdict") != "adjust":
@@ -448,6 +496,12 @@ def apply_editorial_plans(
             out.append(s)
             legacy += 1
             continue
+        if not source_checked:
+            # A missing, boolean, non-finite, zero, or negative source
+            # duration cannot approve or change any Task 10 clip: retain
+            # each original short with an exact reason.
+            _skip(s, cid, "invalid_source_duration")
+            continue
         if id_counts[cid] > 1:
             _skip(s, cid, "duplicate_candidate_id")
             continue
@@ -473,6 +527,14 @@ def apply_editorial_plans(
             continue
         if short_iv != store_iv:
             _skip(s, cid, "short_store_interval_mismatch")
+            continue
+        # Current evidence must sit inside the source: a candidate whose
+        # selected short or store interval escapes [0, source_duration]
+        # is not authoritative. (source_checked is True here, so src_dur
+        # is a finite positive number.)
+        if (store_iv[0] < 0.0 or store_iv[1] > src_dur
+                or short_iv[0] < 0.0 or short_iv[1] > src_dur):
+            _skip(s, cid, "candidate_boundaries_out_of_source")
             continue
         matches = base_by_id.get(cid, [])
         if not matches:

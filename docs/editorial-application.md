@@ -31,7 +31,13 @@ no provider calls):
   plan interval not describing the current candidate
   (`plan_interval_mismatch` for accept/reject/unrefined,
   `plan_interval_disjoint_from_candidate` for adjust), and non-adjust
-  group verdicts (`group_invalid_verdict`). The store record must carry
+  group verdicts (`group_invalid_verdict`). Since review 02, an
+  invalid source duration (missing, boolean, non-finite, zero, or
+  negative) blocks every applicable Task 10 clip: each original
+  short is retained with `invalid_source_duration` and no group
+  may apply. Selected short and store intervals must also sit
+  inside `[0, source_duration]`; escaping current evidence is
+  skipped with `candidate_boundaries_out_of_source`. The store record must carry
   the exact `candidate_id`; store and short intervals must each be
   finite, non-boolean, and ordered, and must agree; accept/reject/
   unrefined plans retain the exact candidate interval while adjust plans
@@ -104,3 +110,13 @@ This applies continuous editorial boundaries to newly rendered clips.
 It does not execute discontinuous interval removals, discover silent
 audiovisual moments, improve active-speaker/action framing, finish
 hooks/captions, or establish quality on real paired footage.
+
+## Strict intentional-empty detection (review 02)
+
+Only a current APPLICATION_VERSION record with exact boolean
+flags, non-boolean nonnegative integer counts, an actual empty
+shorts list, and independently verified zero-output arithmetic
+(every original selection actually rejected; nothing retained,
+adjusted, or grouped) may suppress TextTiling/whole-video
+fallback. Stale versions, type-coerced counts (booleans,
+strings, floats), or inconsistent metadata never do.

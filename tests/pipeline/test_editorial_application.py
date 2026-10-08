@@ -727,7 +727,13 @@ def test_unknown_source_duration_skips_only_source_check():
              make_plan("c2", "accept", 40.0, 60.0)]
     out, rec = ea.apply_editorial_plans(shorts, store, plans,
                                         0.0, 15.0, 120.0)
-    assert (out[0]["start"], out[0]["end"]) == (12.0, 32.0)
+    # Review 02: an invalid source duration cannot approve or change
+    # any applicable Task 10 clip; each original short is retained.
+    assert [s["application_skipped"] for s in out] == [
+        "invalid_source_duration", "invalid_source_duration"]
+    assert rec["application_skips"] == {"invalid_source_duration": 2}
+    assert rec["accepts_retained"] == 0
+    assert rec["adjustments_applied"] == 0
     assert rec["source_bounds_checked"] is False
     assert rec["counts_reconcile"] is True
 
@@ -1450,8 +1456,10 @@ def test_r1_all_editorial_rejections_do_not_render_whole_video_fallback(
                     "fail_soft": False,
                     "original_selected_count": 1,
                     "accepts_retained": 0,
-                    "adjusts_applied": 0,
+                    "adjustments_applied": 0,
                     "rejects_removed": 1,
+                    "unrefined_retained": 0,
+                    "legacy_no_id_retained": 0,
                     "groups_applied": 0,
                     "groups_rejected": 0,
                     "application_skips": {},
@@ -1490,7 +1498,12 @@ def _r1_editorial_empty_record(**kw):
         "counts_reconcile": True,
         "original_selected_count": 2,
         "final_selected_count": 0,
+        "accepts_retained": 0,
+        "adjustments_applied": 0,
         "rejects_removed": 2,
+        "unrefined_retained": 0,
+        "legacy_no_id_retained": 0,
+        "groups_applied": 0,
     }
     rec.update(kw)
     return {"shorts": [], "editorial_application": rec}
@@ -1579,3 +1592,253 @@ def test_r1_reject_plan_must_retain_exact_candidate_interval():
     )
     _r1_assert_skipped(out, rec, original, "plan_interval_mismatch")
     assert rec["rejects_removed"] == 0
+
+
+# --- review-02: promoted probes (strict source + strict empty) ---
+
+def _r2_short(cid="c1", start=10.0, end=30.0):
+    return {
+        "candidate_id": cid,
+        "start": start,
+        "end": end,
+        "viral_score": 80,
+        "viral_reason": "grounded candidate reason",
+    }
+
+
+def _r2_store(cid="c1", start=10.0, end=30.0, fp="fp-1"):
+    return {
+        cid: {
+            "candidate_id": cid,
+            "moment_fingerprint": fp,
+            "start_s": start,
+            "end_s": end,
+        }
+    }
+
+
+def _r2_plan(cid="c1", verdict="accept", start=10.0, end=30.0,
+             fp="fp-1", **extra):
+    item = {
+        "plan_version": er.EDITORIAL_VERSION,
+        "candidate_id": cid,
+        "verdict": verdict,
+        "status": "refined" if verdict != "unrefined" else "unrefined",
+        "start_s": start,
+        "end_s": end,
+        "moment_fingerprint": fp,
+        "reason": "validated editorial decision",
+        "components": [],
+    }
+    item.update(extra)
+    return item
+
+
+def _r2_apply(shorts, store, plans, source_duration):
+    return ea.apply_editorial_plans(
+        shorts, store, plans, source_duration, 15.0, 120.0,
+        enabled=True, editorial_ran=True,
+    )
+
+
+def _r2_assert_one_skip(output, record, reason):
+    assert len(output) == 1
+    assert output[0]["application_skipped"] == reason
+    assert record["application_skips"] == {reason: 1}
+    assert record["accepts_retained"] == 0
+    assert record["adjustments_applied"] == 0
+    assert record["rejects_removed"] == 0
+    assert record["counts_reconcile"] is True
+
+
+def test_r2_invalid_source_duration_skips_even_nonnegative_accept():
+    output, record = _r2_apply(
+        [_r2_short()], _r2_store(), [_r2_plan()], source_duration=0.0)
+    _r2_assert_one_skip(output, record, "invalid_source_duration")
+
+
+def test_r2_negative_current_candidate_interval_is_not_authoritative():
+    output, record = _r2_apply(
+        [_r2_short(start=-5.0, end=15.0)],
+        _r2_store(start=-5.0, end=15.0),
+        [_r2_plan(verdict="adjust", start=0.0, end=20.0)],
+        source_duration=100.0,
+    )
+    _r2_assert_one_skip(output, record, "candidate_boundaries_out_of_source")
+
+
+def test_r2_current_candidate_interval_past_source_is_not_authoritative():
+    output, record = _r2_apply(
+        [_r2_short(start=90.0, end=110.0)],
+        _r2_store(start=90.0, end=110.0),
+        [_r2_plan(verdict="adjust", start=80.0, end=100.0)],
+        source_duration=100.0,
+    )
+    _r2_assert_one_skip(output, record, "candidate_boundaries_out_of_source")
+
+
+def test_r2_invalid_source_duration_cannot_authorize_group_application():
+    shorts = [_r2_short("c1", 10.0, 30.0), _r2_short("c2", 40.0, 60.0)]
+    store = {}
+    store.update(_r2_store("c1", 10.0, 30.0, "fp-1"))
+    store.update(_r2_store("c2", 40.0, 60.0, "fp-2"))
+    plans = [
+        _r2_plan("c1", "accept", 10.0, 30.0, "fp-1"),
+        _r2_plan("c2", "accept", 40.0, 60.0, "fp-2"),
+        _r2_plan(
+            "group:c1+c2", "adjust", -5.0, 60.0, "",
+            components=["c1", "c2"],
+        ),
+    ]
+    output, record = _r2_apply(shorts, store, plans, source_duration=0.0)
+    assert [item["candidate_id"] for item in output] == ["c1", "c2"]
+    assert all(item["application_skipped"] == "invalid_source_duration"
+               for item in output)
+    assert record["groups_applied"] == 0
+    assert record["counts_reconcile"] is True
+
+
+def _r2_empty_record(**overrides):
+    record = {
+        "version": ea.APPLICATION_VERSION,
+        "enabled": True,
+        "counts_reconcile": True,
+        "original_selected_count": 1,
+        "final_selected_count": 0,
+        "accepts_retained": 0,
+        "adjustments_applied": 0,
+        "rejects_removed": 1,
+        "unrefined_retained": 0,
+        "legacy_no_id_retained": 0,
+        "application_skips": {},
+        "groups_applied": 0,
+    }
+    record.update(overrides)
+    return {"shorts": [], "editorial_application": record}
+
+
+def test_r2_only_current_strictly_reconciled_record_suppresses_fallback():
+    assert ea.is_intentional_editorial_empty(_r2_empty_record()) is True
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(version="stale")) is False
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(original_selected_count=True)) is False
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(original_selected_count="1")) is False
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(rejects_removed=0)) is False
+
+
+# --- review-02 mutation coverage ---
+
+@pytest.mark.parametrize("bad_duration", [None, True, False, 0.0, -5.0,
+                                          float("nan"), float("inf")])
+def test_r2_missing_or_bad_source_duration_blocks_all_verdicts(bad_duration):
+    for verdict in ("accept", "adjust", "reject"):
+        start, end = (10.0, 30.0) if verdict != "adjust" else (12.0, 28.0)
+        output, record = _r2_apply(
+            [_r2_short()], _r2_store(),
+            [_r2_plan(verdict=verdict, start=start, end=end)],
+            source_duration=bad_duration)
+        assert output[0]["application_skipped"] == \
+            "invalid_source_duration"
+        assert record["accepts_retained"] == 0
+        assert record["adjustments_applied"] == 0
+        assert record["rejects_removed"] == 0
+
+
+def test_r2_source_duration_zero_blocks_group_even_positive_bounds():
+    shorts = [_r2_short("c1", 10.0, 30.0), _r2_short("c2", 40.0, 60.0)]
+    store = {}
+    store.update(_r2_store("c1", 10.0, 30.0, "fp-1"))
+    store.update(_r2_store("c2", 40.0, 60.0, "fp-2"))
+    plans = [
+        _r2_plan("c1", "accept", 10.0, 30.0, "fp-1"),
+        _r2_plan("c2", "accept", 40.0, 60.0, "fp-2"),
+        _r2_plan("group:c1+c2", "adjust", 10.0, 60.0, "",
+                 components=["c1", "c2"]),
+    ]
+    output, record = _r2_apply(shorts, store, plans, source_duration=0.0)
+    assert record["groups_applied"] == 0
+    assert record["groups_rejected"] == 1
+    assert (record["group_rejections"][0]["reason"]
+            == "invalid_source_duration")
+
+
+def test_r2_store_interval_out_of_source_is_not_authoritative():
+    store = _r2_store(start=90.0, end=130.0)
+    output, record = _r2_apply(
+        [_r2_short(start=90.0, end=130.0)], store, [_r2_plan()],
+        source_duration=120.0)
+    _r2_assert_one_skip(output, record, "candidate_boundaries_out_of_source")
+
+
+def test_r2_plan_interval_out_of_source_still_rejected():
+    output, record = _r2_apply(
+        [_r2_short()], _r2_store(),
+        [_r2_plan(verdict="adjust", start=90.0, end=150.0)],
+        source_duration=120.0)
+    _r2_assert_one_skip(output, record, "plan_boundaries_out_of_source")
+
+
+def test_r2_group_interval_out_of_source_still_rejected():
+    shorts = [_r2_short("c1", 10.0, 30.0), _r2_short("c2", 40.0, 60.0)]
+    store = {}
+    store.update(_r2_store("c1", 10.0, 30.0, "fp-1"))
+    store.update(_r2_store("c2", 40.0, 60.0, "fp-2"))
+    plans = [
+        _r2_plan("c1", "accept", 10.0, 30.0, "fp-1"),
+        _r2_plan("c2", "accept", 40.0, 60.0, "fp-2"),
+        _r2_plan("group:c1+c2", "adjust", 10.0, 130.0, "",
+                 components=["c1", "c2"]),
+    ]
+    output, record = _r2_apply(shorts, store, plans, source_duration=120.0)
+    assert record["groups_applied"] == 0
+    assert record["groups_rejected"] == 1
+    assert (record["group_rejections"][0]["reason"]
+            == "group_boundaries_out_of_source")
+    # Components stay individual.
+    assert [s["candidate_id"] for s in output] == ["c1", "c2"]
+
+
+@pytest.mark.parametrize("bad_flag", [1, "yes", None])
+def test_r2_non_boolean_enabled_flag_never_suppresses_fallback(bad_flag):
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(enabled=bad_flag)) is False
+
+
+@pytest.mark.parametrize("bad_count", [True, "2", 2.0, -1, None])
+def test_r2_coerced_or_negative_counts_never_suppress_fallback(bad_count):
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(original_selected_count=bad_count)) is False
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(rejects_removed=bad_count)) is False
+
+
+def test_r2_inconsistent_zero_output_arithmetic_keeps_fallback():
+    # Claims 2 rejects for 1 original selection.
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(rejects_removed=2)) is False
+    # Retained output claimed with zero final count.
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(accepts_retained=1)) is False
+    # Grouped output present.
+    assert ea.is_intentional_editorial_empty(
+        _r2_empty_record(groups_applied=1)) is False
+    # Non-empty shorts list despite an empty-claiming funnel.
+    bad = _r2_empty_record()
+    bad["shorts"] = [_r2_short()]
+    assert ea.is_intentional_editorial_empty(bad) is False
+
+
+def test_r2_real_all_rejected_record_still_suppresses_fallback():
+    output, record = _r2_apply(
+        [_r2_short("c1", 10.0, 30.0), _r2_short("c2", 40.0, 60.0)],
+        {**_r2_store("c1", 10.0, 30.0, "fp-1"),
+         **_r2_store("c2", 40.0, 60.0, "fp-2")},
+        [_r2_plan("c1", "reject", 10.0, 30.0, "fp-1"),
+         _r2_plan("c2", "reject", 40.0, 60.0, "fp-2")],
+        source_duration=200.0)
+    assert output == []
+    clips_data = {"shorts": output, "editorial_application": record}
+    assert ea.is_intentional_editorial_empty(clips_data) is True
