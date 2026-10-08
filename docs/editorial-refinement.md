@@ -77,11 +77,22 @@ decision never erases other candidates (the runner isolates it).
   cover ≥1 real word; boundaries word-aligned within
   `WORD_ALIGN_TOL_S = 0.5`s — strictly inside a word beyond tolerance
   is "cut through a word".
+- Snapping stores safe exact edges: a tolerated boundary snaps to the
+  nearest word edge within tolerance that is **not strictly inside any
+  valid word**. For overlapping speech an exact edge of one word may
+  sit inside another speaker's word — such edges are unsafe and never
+  stored. If no safe edge exists within tolerance, the decision is kept
+  `unrefined` with conflict `boundary_conflict` (kept discovery
+  interval) instead of storing a boundary that cuts content. All
+  context/source/overlap/duration/neighbor/quote/payoff checks re-run
+  against the snapped interval.
 - Quotes: each of the four evidence fields non-empty and a contiguous
   normalized token-slice match inside the proposed interval
-  (fabricated → `quote not grounded: <field>`); `evidence_basis`, if
-  present, must be `"transcript"`; title-cased tokens absent verbatim
-  from the interval words are `invented name`.
+  (fabricated → `quote not grounded: <field>`); `evidence_basis` is
+  **required** and must be `"transcript"` for every verdict, and
+  `decision_reason` must be a non-empty bounded string — including for
+  `reject` (no manufactured reasons); title-cased tokens absent
+  verbatim from the interval words are `invented name`.
 - `accept` requires the proposed interval to equal the candidate
   within 1e-6 (else it is an `adjust`).
 - `adjust` content preservation: every quote span inside the proposed
@@ -108,10 +119,12 @@ rounded to 1 decimal (`None` when none validated). It is an **editorial
 recommendation score** for sorting — never labeled virality
 probability or measured audience response.
 
-Accept gates: `context_sufficiency` and `payoff_delivery` must both be
-present and ≥ 0.5, else an `accept` degrades to `unrefined` with reason
-`gate_failed: context/payoff incomplete`. A strong opening cannot hide
-an incomplete clip. No quota padding: sparse inputs stay sparse.
+Selection gates: `context_sufficiency` and `payoff_delivery` must
+both be present and ≥ 0.5, else the decision degrades to `unrefined`
+with reason `gate_failed: context/payoff incomplete`. The gates cover
+`accept` **and** `adjust` — a strong opening cannot hide an incomplete
+clip, and continuity groups are built only from refined plans that
+passed them. No quota padding: sparse inputs stay sparse.
 
 ## Continuity rules (`plan_continuity_group`)
 
@@ -134,6 +147,14 @@ Accepted merges append a `group:<id>+<id>` plan; rejected merges are
 recorded with reasons. Candidates sharing a `moment_fingerprint` are
 **variants** of one distinct moment (`group_variants`) and never
 inflate `distinct_moments`.
+
+Final metrics describe selected editorial outcomes only:
+`distinct_moments` / `selected_variants` exclude `reject` verdicts,
+retain explicit `unrefined` discovery candidates (they remain selected
+per failure semantics), and collapse each accepted continuity group
+exactly once. Candidates with a missing/empty fingerprint are never
+collapsed together — each unknown identity stays its own distinct
+moment.
 
 ## Budgets, flag, failure semantics
 
@@ -174,12 +195,21 @@ No secrets or full provider responses in metadata.
 ## Resume semantics
 
 `run_editorial_refinement(..., prior_plans={candidate_id: plan_dict})`
-reuses completed plans verbatim (counted as `skipped` with reason
-`already_planned`, verdict still counted) and never repeats their
-provider calls. The queued orchestrator resume path returns saved
-metadata as-is — plans preserved, not repeated. Both direct CLI and
-queued paths persist `editorial_refinement` + `editorial_plans`
-through the atomic metadata writes (`_keep_funnel` /
+reuses a completed plan (counted as `skipped`, verdict still counted)
+**only after revalidating it against the current transcript packet and
+candidate** with the same material invariants as a fresh result:
+overlap-safe exact word edges; `accept` interval equals the candidate
+interval; `adjust` interval overlaps the candidate and stays inside the
+packet bounds; source and resolved duration bounds; grounded quotes,
+payoff preservation, and neighbor guards; status/verdict consistency;
+non-empty reason; and the context/payoff selection gates for every
+refined `accept`/`adjust`. Invalid prior data is never trusted as
+completed work and never feeds continuity: it is retained as
+`unrefined` with an exact `invalid_prior_plan:<detail>` reason
+(recorded in `rejections`). The queued orchestrator resume path
+returns saved metadata as-is — plans preserved, not repeated. Both
+direct CLI and queued paths persist `editorial_refinement` +
+`editorial_plans` through the atomic metadata writes (`_keep_funnel` /
 `_preserve_funnel`).
 
 ## Honesty statement

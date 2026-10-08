@@ -382,6 +382,77 @@ def _validate_prior_plan(raw: Any, candidate: Mapping[str, Any],
     return None
 
 
+def _revalidate_prior_material(
+        plan: "EditorialPlan",
+        candidate: Mapping[str, Any],
+        packet: Mapping[str, Any],
+        words: Sequence[Dict[str, Any]],
+        video_duration: float,
+        policy_min: float,
+        policy_max: float,
+        neighbor_guards: Sequence[Sequence[float]]) -> Optional[str]:
+    """Revalidate a refined prior plan against the current packet.
+
+    A completed plan may skip provider work only if it still satisfies
+    the same material invariants as a fresh result. Returns None when
+    the stored plan may be reused, else a short reason. Stale or
+    invalid data is never trusted as completed work.
+    """
+    if (plan.status == "refined") != (
+            plan.verdict in ("accept", "adjust", "reject")):
+        return "status/verdict inconsistent"
+    if not (plan.reason or "").strip():
+        return "empty reason"
+    if plan.verdict == "reject":
+        # Rejections carry no interval semantics beyond identity.
+        return None
+    valid = [w for w in words if _valid_word(w)]
+    ps, pe = float(plan.start_s), float(plan.end_s)
+    for v, kind in ((ps, "start"), (pe, "end")):
+        # Stored edges must already be exact overlap-safe word edges.
+        if not any(abs(v - _word_start(w)) <= 1e-6
+                   or abs(v - _word_end(w)) <= 1e-6 for w in valid):
+            return f"{kind} not an exact word edge"
+        if not _edge_is_safe(v, valid):
+            return f"{kind} cuts through overlapping speech"
+    orig_start = float(candidate["start_s"])
+    orig_end = float(candidate["end_s"])
+    if plan.verdict == "accept":
+        if abs(ps - orig_start) > 1e-6 or abs(pe - orig_end) > 1e-6:
+            return "accept interval does not equal candidate interval"
+    else:  # adjust
+        if not (ps < orig_end and orig_start < pe):
+            return "adjusted interval does not overlap candidate"
+        ctx_start = float(packet["context_start_s"])
+        ctx_end = float(packet["context_end_s"])
+        if not (ctx_start - 1e-6 <= ps and pe <= ctx_end + 1e-6):
+            return "adjusted interval outside packet context"
+    if video_duration and video_duration > 0:
+        if not (0 <= ps and pe <= video_duration + 1e-6):
+            return "interval outside source duration"
+    dur = pe - ps
+    if dur < policy_min - 1e-6 or dur > policy_max + 1e-6:
+        return "duration policy violation"
+    if not _passes_selection_gates(plan.quality or {}):
+        return "selection gates failed"
+    for f in QUOTE_FIELDS:
+        q = (plan.quotes or {}).get(f)
+        if not isinstance(q, str) or not q.strip():
+            return f"quote missing: {f}"
+        if _ground_quote_in_interval(q, words, ps, pe) is None:
+            return f"quote not grounded: {f}"
+        try:
+            _check_no_invented_names(q, words, ps, pe, f)
+        except EditorialError as e:
+            return str(e)
+    for g in neighbor_guards or []:
+        gs, ge = float(g[0]), float(g[1])
+        if ps < ge and gs < pe:
+            if not (orig_start < ge and gs < orig_end):
+                return "violates neighbor guard"
+    return None
+
+
 def _blank_quality() -> Dict[str, Optional[float]]:
     return {f: None for f in QUALITY_FIELDS}
 
@@ -477,22 +548,33 @@ def _check_no_invented_names(quote: str, words: Sequence[Dict[str, Any]],
                 raise EditorialError(f"invented name in {field}: {tok}")
 
 
+def _edge_is_safe(v: float, valid: Sequence[Dict[str, Any]]) -> bool:
+    """An edge is safe only if not strictly inside any valid word.
+
+    An exact edge of one word may sit inside another speaker's word
+    (overlapping speech); storing it would still cut through content.
+    """
+    return not any(
+        _word_start(w) < v < _word_end(w) for w in valid)
+
+
 def _snap_boundary(p: float, words: Sequence[Dict[str, Any]],
                    is_start: bool) -> float:
-    """Snap a proposed boundary to the nearest exact word edge.
+    """Snap a proposed boundary to the nearest overlap-safe word edge.
 
     The contract tolerates recognizing the intended edge within
     WORD_ALIGN_TOL_S, but the persisted plan must never store a
-    mid-word fractional value: the boundary is stored as the exact
-    edge. Anything farther than tolerance from every edge (or
-    strictly inside a word beyond tolerance from both edges) raises
-    EditorialError.
+    mid-word fractional value — and for overlapping speech, never an
+    edge that sits strictly inside another valid word. Only safe
+    edges within tolerance qualify; if none exists, raises
+    EditorialError. Anything farther than tolerance from every edge
+    (or strictly inside a word beyond tolerance from both edges)
+    also raises.
     """
     kind = "start" if is_start else "end"
+    valid = [w for w in words if _valid_word(w)]
     edges: List[float] = []
-    for w in words:
-        if not _valid_word(w):
-            continue
+    for w in valid:
         s, e = _word_start(w), _word_end(w)
         edges.append(s)
         edges.append(e)
@@ -500,10 +582,15 @@ def _snap_boundary(p: float, words: Sequence[Dict[str, Any]],
             raise EditorialError("proposed boundary cuts through a word")
     if not edges:
         raise EditorialError("proposed interval covers no words")
-    best = min(edges, key=lambda v: abs(v - p))
-    if abs(best - p) > WORD_ALIGN_TOL_S + 1e-9:
+    near = [v for v in edges
+            if abs(v - p) <= WORD_ALIGN_TOL_S + 1e-9]
+    if not near:
         raise EditorialError(f"proposed {kind} not word-aligned")
-    return best
+    safe = [v for v in near if _edge_is_safe(v, valid)]
+    if not safe:
+        raise EditorialError(
+            f"proposed {kind} has no overlap-safe word edge")
+    return min(safe, key=lambda v: abs(v - p))
 
 
 def _unrefined_plan(candidate: Mapping[str, Any],
@@ -636,10 +723,34 @@ def validate_editorial_decision(
     if not any(_valid_word(w) and _word_start(w) < pe
                and _word_end(w) > ps for w in words):
         raise EditorialError("proposed interval covers no words")
-    # Snap tolerated boundaries to exact word edges: the persisted plan
-    # must never store a mid-word fractional value.
-    ps = _snap_boundary(ps, words, is_start=True)
-    pe = _snap_boundary(pe, words, is_start=False)
+    # Snap tolerated boundaries to exact overlap-safe word edges: the
+    # persisted plan must never store a mid-word fractional value or an
+    # edge that cuts through overlapping speech. When no safe edge
+    # exists the decision is kept unrefined on the discovery interval
+    # rather than storing a boundary that cuts content.
+    if verdict == "adjust":
+        # Payoff preservation is about the proposed interval: ending
+        # before the grounded payoff is a content violation regardless
+        # of whether the boundary can later be snapped safely.
+        _payoff_q = decision.get("payoff_evidence")
+        if isinstance(_payoff_q, str) and _payoff_q.strip():
+            _payoff_span = _ground_quote_in_interval(
+                _payoff_q, words, ps, pe)
+            if (_payoff_span is not None
+                    and pe < _payoff_span[1] - WORD_ALIGN_TOL_S):
+                raise EditorialError("ends before grounded payoff")
+
+    try:
+        ps = _snap_boundary(ps, words, is_start=True)
+        pe = _snap_boundary(pe, words, is_start=False)
+    except EditorialError as e:
+        if "overlap-safe" in str(e):
+            return _unrefined_plan(
+                candidate, quality, score,
+                reason=("boundary_conflict: no overlap-safe word edge "
+                        "within tolerance; kept discovery interval"),
+                conflict="boundary_conflict")
+        raise
     if not ps < pe:
         raise EditorialError("proposed interval reversed or empty")
     # Re-run the spatial checks against the snapped interval (snapping
@@ -1222,8 +1333,34 @@ def run_editorial_refinement(
                 raw = prior_plans[cid]
                 bad = _validate_prior_plan(raw, cand, video_duration,
                                            policy_min, policy_max)
+                plan = None
                 if bad is None:
                     plan = EditorialPlan.from_dict(raw)
+                    if plan.status == "refined":
+                        # A completed plan may skip provider work only
+                        # after it is revalidated against the current
+                        # transcript packet and candidate with the same
+                        # material invariants as a fresh result.
+                        try:
+                            packet = build_context_packet(
+                                cand, all_cands, words, video_duration,
+                                policy_min, policy_max, cfg)
+                        except Exception as e:
+                            bad = (f"packet:{type(e).__name__}:"
+                                   f"{str(e)[:60]}")
+                        if bad is None:
+                            neighbor_guards = [
+                                (float(candidates_by_id[o]["start_s"]),
+                                 float(candidates_by_id[o]["end_s"]))
+                                for o in kept_ids if o != cid
+                            ]
+                            bad = _revalidate_prior_material(
+                                plan, cand, packet, words,
+                                video_duration, policy_min, policy_max,
+                                neighbor_guards)
+                    # A verdict-"unrefined" prior is already explicitly
+                    # unrefined; identity checks suffice to reuse it.
+                if bad is None:
                     plans.append(plan)
                     funnel["packets_skipped"] += 1
                     _count_verdict(plan)
@@ -1231,6 +1368,11 @@ def run_editorial_refinement(
                 funnel["rejections"].append(
                     {"candidate_id": cid,
                      "reason": f"invalid_prior_plan:{bad}"})
+                plans.append(_unrefined(
+                    cand, f"invalid_prior_plan:{bad}"))
+                funnel["packets_skipped"] += 1
+                _count_verdict(plans[-1])
+                continue
             try:
                 packet = build_context_packet(
                     cand, all_cands, words, video_duration,

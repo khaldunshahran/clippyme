@@ -1121,10 +1121,17 @@ def test_run_budget_exhaustion_skips_rest():
 def test_run_prior_plans_resume_no_repeat():
     words = story_words()
     store = _trio_store(words)
+    # A genuinely valid prior (exact safe edges, grounded quotes,
+    # passing gates, interval overlapping the candidate): resume reuses
+    # it without repeating provider work.
     prior = {"c2": er.EditorialPlan(
         candidate_id="c2", verdict="adjust", start_s=0.0, end_s=5.0,
-        quotes={}, quality={f: None for f in er.QUALITY_FIELDS},
-        recommendation_score=None, reason="done earlier",
+        quotes={"opening_evidence": "welcome to",
+                "premise_evidence": "the show",
+                "payoff_evidence": "listen closely",
+                "ending_evidence": "the setup begins"},
+        quality=good_quality(),
+        recommendation_score=70.0, reason="done earlier",
         status="refined", moment_fingerprint="fp-2").to_dict()}
     result, _, calls = _editorial_run(
         words, store, _trio_decisions(), prior_plans=prior)
@@ -2068,3 +2075,285 @@ def test_stale_prior_plan_identity_is_not_trusted():
         "resume data must be reprocessed or rejected against the current "
         "candidate, not trust another candidate's stale identity"
     )
+# --- Promoted from coordinator-review2-remaining.py (4 tests) -------------
+# Durable regression tests for Task 09 review-02 corrections.
+
+
+def _r2_quality(context=0.9, payoff=0.9):
+    return {
+        "opening_strength": 0.9,
+        "context_sufficiency": context,
+        "payoff_delivery": payoff,
+        "useful_value": 0.8,
+        "entertaining_value": 0.7,
+        "transcript_support": 1.0,
+        "editability": 0.9,
+        "confidence": 0.9,
+    }
+
+
+def _r2_candidate(cid="c1", start=0.0, end=4.0, fp="fp-1", event=None):
+    return {
+        "candidate_id": cid,
+        "moment_fingerprint": fp,
+        "start_s": start,
+        "end_s": end,
+        "evidence_text": "grounded evidence",
+        "context": "grounded context",
+        "expected_payoff": "grounded payoff",
+        "event_key": event,
+        "speaker_ids": [0],
+    }
+
+
+def _r2_words(count=20):
+    return [
+        {"w": f"w{i}", "s": float(i), "e": float(i + 1), "sp": 0}
+        for i in range(count)
+    ]
+
+
+def _r2_decision(cid="c1", verdict="accept", start=0.0, end=4.0,
+                q=None, offset=0):
+    return {
+        "candidate_id": cid,
+        "verdict": verdict,
+        "proposed_start_s": start,
+        "proposed_end_s": end,
+        "opening_evidence": f"w{offset}",
+        "premise_evidence": f"w{offset + 1}",
+        "payoff_evidence": f"w{offset + 2}",
+        "ending_evidence": f"w{offset + 3}",
+        "evidence_basis": "transcript",
+        "decision_reason": "grounded decision",
+        "quality": q or _r2_quality(),
+        "continuity_links": [],
+    }
+
+
+def _r2_packet(cand, transcript_words, duration=20.0):
+    return er.build_context_packet(
+        cand, [cand], transcript_words, duration, 1.0, 20.0,
+        er.EditorialConfig(model_name="editor"),
+    )
+
+
+def test_snapped_boundary_cannot_remain_inside_overlapping_word():
+    transcript_words = [
+        {"w": "alpha", "s": 0.0, "e": 1.0, "sp": 0},
+        {"w": "beta", "s": 0.75, "e": 1.75, "sp": 1},
+        {"w": "gamma", "s": 2.0, "e": 3.0, "sp": 0},
+        {"w": "delta", "s": 3.0, "e": 4.0, "sp": 0},
+    ]
+    cand = _r2_candidate()
+    d = {
+        "candidate_id": "c1",
+        "verdict": "adjust",
+        "proposed_start_s": 0.8,
+        "proposed_end_s": 4.0,
+        "opening_evidence": "beta",
+        "premise_evidence": "beta",
+        "payoff_evidence": "gamma",
+        "ending_evidence": "delta",
+        "evidence_basis": "transcript",
+        "decision_reason": "remove the lead-in",
+        "quality": _r2_quality(),
+        "continuity_links": [],
+    }
+    plan = er.validate_editorial_decision(
+        d, _r2_packet(cand, transcript_words, 4.0), {"c1": cand},
+        transcript_words, 4.0, 1.0, 20.0, [],
+    )
+    assert not any(
+        float(w["s"]) < plan.start_s < float(w["e"])
+        for w in transcript_words
+    ), f"snapped start {plan.start_s} still cuts through overlapping speech"
+
+
+def _r2_run_with_prior(cand, prior):
+    transcript_words = _r2_words(20)
+
+    def prompt(pkt, *_args, **_kwargs):
+        return f"Candidate: {pkt['candidate_id']}"
+
+    def generate(_client, text, *_args, **_kwargs):
+        cid = re.search(r"Candidate: (\S+)", text).group(1)
+        return json.dumps({"decision": _r2_decision(cid, "accept", 0.0, 4.0)})
+
+    return er.run_editorial_refinement(
+        {"candidate_store": {"c1": cand}, "candidate_discovery": {}},
+        transcript_words, 20.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        build_prompt_fn=prompt,
+        generate_fn=generate,
+        prior_plans={"c1": prior},
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+
+
+def test_resume_revalidates_word_alignment_before_trusting_plan():
+    cand = _r2_candidate()
+    prior = er.EditorialPlan(
+        "c1", "adjust", 0.4, 4.0,
+        quotes={
+            "opening_evidence": "w0",
+            "premise_evidence": "w1",
+            "payoff_evidence": "w2",
+            "ending_evidence": "w3",
+        },
+        quality=_r2_quality(),
+        recommendation_score=88.0,
+        reason="stored plan",
+        status="refined",
+        moment_fingerprint="fp-1",
+    ).to_dict()
+    result = _r2_run_with_prior(cand, prior)
+    plan = result["editorial_plans"][0]
+    assert plan["start_s"] == 0.0, (
+        "a resumed plan bypassed the exact word-boundary contract"
+    )
+
+
+def test_resume_revalidates_interval_against_current_candidate():
+    cand = _r2_candidate()
+    prior = er.EditorialPlan(
+        "c1", "accept", 10.0, 14.0,
+        quotes={
+            "opening_evidence": "w10",
+            "premise_evidence": "w11",
+            "payoff_evidence": "w12",
+            "ending_evidence": "w13",
+        },
+        quality=_r2_quality(),
+        recommendation_score=88.0,
+        reason="stored plan",
+        status="refined",
+        moment_fingerprint="fp-1",
+    ).to_dict()
+    result = _r2_run_with_prior(cand, prior)
+    plan = result["editorial_plans"][0]
+    assert (plan["start_s"], plan["end_s"]) == (0.0, 4.0), (
+        "an accept plan for an unrelated interval was trusted solely because "
+        "its ID and fingerprint matched"
+    )
+
+
+def test_resumed_gate_failed_plans_cannot_feed_continuity():
+    transcript_words = _r2_words(12)
+    c1 = _r2_candidate("c1", 0.0, 4.0, "fp-1", "event")
+    c2 = _r2_candidate("c2", 5.0, 9.0, "fp-2", "event")
+    low = _r2_quality(context=0.1, payoff=0.1)
+    p1 = er.EditorialPlan(
+        "c1", "accept", 0.0, 4.0,
+        quotes={
+            "opening_evidence": "w0",
+            "premise_evidence": "w1",
+            "payoff_evidence": "w2",
+            "ending_evidence": "w3",
+        },
+        quality=low,
+        reason="stored low-quality plan",
+        continuity_links=["c2"],
+        bridge_evidence="w4",
+        status="refined",
+        moment_fingerprint="fp-1",
+    ).to_dict()
+    p2 = er.EditorialPlan(
+        "c2", "accept", 5.0, 9.0,
+        quotes={
+            "opening_evidence": "w5",
+            "premise_evidence": "w6",
+            "payoff_evidence": "w7",
+            "ending_evidence": "w8",
+        },
+        quality=low,
+        reason="stored low-quality plan",
+        status="refined",
+        moment_fingerprint="fp-2",
+    ).to_dict()
+    result = er.run_editorial_refinement(
+        {"candidate_store": {"c1": c1, "c2": c2},
+         "candidate_discovery": {}},
+        transcript_words, 12.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        prior_plans={"c1": p1, "c2": p2},
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+    assert result["editorial_refinement"]["continuity_accepted"] == 0, (
+        "resumed low-context/low-payoff plans bypassed the selection gates "
+        "and were accepted into continuity"
+    )
+
+
+# --- Mutation tests for review-02 findings --------------------------------
+
+def test_mutation_snap_prefers_safe_edge_over_nearer_unsafe():
+    """Within tolerance, an unsafe nearer edge must lose to a safe one."""
+    words = [
+        {"w": "a", "s": 0.0, "e": 1.0, "sp": 0},
+        {"w": "b", "s": 0.6, "e": 1.1, "sp": 1},
+    ]
+    # 1.0 is nearer (0.35) but strictly inside b; 1.1 is farther (0.45)
+    # yet safe. The safe edge must win.
+    assert er._snap_boundary(0.65, words, is_start=True) == 1.1
+
+
+def test_mutation_snap_rejects_when_all_near_edges_unsafe():
+    """Edges in tolerance but all inside overlapping words -> reject."""
+    words = [
+        {"w": "alpha", "s": 0.0, "e": 1.0, "sp": 0},
+        {"w": "beta", "s": 0.75, "e": 1.75, "sp": 1},
+    ]
+    with pytest.raises(er.EditorialError, match="overlap-safe"):
+        er._snap_boundary(0.8, words, is_start=True)
+
+
+def test_mutation_prior_plan_empty_reason_is_invalid():
+    """A refined prior without a decision reason is never trusted."""
+    words = _r2_words(20)
+    cand = _r2_candidate()
+    prior = er.EditorialPlan(
+        "c1", "accept", 0.0, 4.0,
+        quotes={
+            "opening_evidence": "w0",
+            "premise_evidence": "w1",
+            "payoff_evidence": "w2",
+            "ending_evidence": "w3",
+        },
+        quality=_r2_quality(),
+        reason="",
+        status="refined",
+        moment_fingerprint="fp-1",
+    ).to_dict()
+    result = _r2_run_with_prior(cand, prior)
+    plan = result["editorial_plans"][0]
+    assert plan["status"] == "unrefined"
+    assert plan["reason"].startswith("invalid_prior_plan")
+
+
+def test_mutation_prior_plan_ungrounded_quote_is_invalid():
+    """A refined prior whose quotes do not ground is never trusted."""
+    words = _r2_words(20)
+    cand = _r2_candidate()
+    prior = er.EditorialPlan(
+        "c1", "accept", 0.0, 4.0,
+        quotes={
+            "opening_evidence": "fabricated quote here",
+            "premise_evidence": "w1",
+            "payoff_evidence": "w2",
+            "ending_evidence": "w3",
+        },
+        quality=_r2_quality(),
+        reason="stored plan",
+        status="refined",
+        moment_fingerprint="fp-1",
+    ).to_dict()
+    result = _r2_run_with_prior(cand, prior)
+    plan = result["editorial_plans"][0]
+    assert plan["status"] == "unrefined"
+    assert plan["reason"].startswith("invalid_prior_plan")
+    assert result["editorial_refinement"]["counts_reconcile"] is True
