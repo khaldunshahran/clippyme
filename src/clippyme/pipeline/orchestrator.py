@@ -1094,48 +1094,86 @@ def _render_one_clip(
             )
         if last_report and not last_report.get("critical"):
             os.replace(temp_output, clip_final)
-            # Task 13: promote the attempt's turn-framing sidecar to the
-            # stable final basename (same rationale as the cover-art comment
-            # below: the artifact must live next to the final clip, never
-            # under the temporary attempt name). Best-effort: never fail an
-            # accepted clip over the sidecar.
+            # Task 13 review-01: coordinated video + sidecar publication.
+            # The video is published first; the sidecar half is coordinated
+            # by publish_attempt_sidecar (promotion / retire /
+            # preserved-project skip). A promotion OSError is NEVER
+            # swallowed: the just-published video is rolled back and the
+            # attempt fails, so an accepted clip can never pair a new video
+            # with a stale plan.
+            from clippyme.domain import project_framing as _pf13
+            _promotion_ok = True
+            _pub_outcome = _pf13.PUBLISH_NO_SIDECAR
             try:
-                _attempt_sidecar = _sidecar_for(legacy, temp_output)
-                _stable_sidecar = _sidecar_for(legacy, clip_final)
-                if os.path.isfile(_attempt_sidecar):
-                    os.replace(_attempt_sidecar, _stable_sidecar)
-            except OSError:
-                pass
-            # The cover must be based on the stable final basename; generating it
-            # from the temporary render would orphan `*.render.tmp_cover.jpg`.
-            legacy.select_cover_frame(clip_final)
-            clip["qa"] = last_report
-            status = _qa_status(last_report)
-            state.mark_clip(index, status, last_report)
-            _save_metadata(metadata_file, clips_data)
-            # Phase 1 (clip editor): emit the default-edit project. Additive
-            # only -- emit_clip_project never raises.
-            _maybe_emit_clip_project(
-                output_dir=output_dir,
-                job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
-                index=index,
-                start=start,
-                end=end,
-                clip=clip,
-                clips_data=clips_data,
-                clip_source=clip_source,
-                clip_final=clip_final,
-            )
-            warning_text = (
-                f" with {len(last_report.get('warnings') or [])} warning(s)"
-                if status == "warning"
-                else ""
-            )
-            print(
-                f"✅ Clip {index + 1}/{total} ready{warning_text}: {clip_filename}",
-                flush=True,
-            )
-            return True
+                _pub_outcome = _pf13.publish_attempt_sidecar(
+                    attempt_sidecar=_sidecar_for(legacy, temp_output),
+                    stable_sidecar=_sidecar_for(legacy, clip_final),
+                    source_path=clip_source,
+                    job_dir=output_dir,
+                )
+            except OSError as _pub_exc:
+                _promotion_ok = False
+                print(
+                    f"   Task 13: sidecar promotion failed ({_pub_exc}); "
+                    f"rolling back accepted video for clip {index + 1}/{total}",
+                    flush=True,
+                )
+                try:
+                    os.remove(clip_final)
+                except OSError:
+                    pass
+                try:
+                    _abandoned = _sidecar_for(legacy, temp_output)
+                    if os.path.isfile(_abandoned):
+                        os.remove(_abandoned)
+                except OSError:
+                    pass
+            if not _promotion_ok:
+                # Fall through to the attempt-failure handling below: the
+                # retry loop may try again; exhaustion returns False.
+                last_report = {
+                    "ok": False,
+                    "critical": True,
+                    "issues": ["sidecar promotion failed; video rolled back"],
+                    "warnings": [],
+                }
+            else:
+                if _pub_outcome != _pf13.PUBLISH_PROMOTED:
+                    print(
+                        f"   Task 13: sidecar publish outcome "
+                        f"'{_pub_outcome}' for clip {index + 1}/{total}",
+                        flush=True,
+                    )
+                # The cover must be based on the stable final basename; generating it
+                # from the temporary render would orphan `*.render.tmp_cover.jpg`.
+                legacy.select_cover_frame(clip_final)
+                clip["qa"] = last_report
+                status = _qa_status(last_report)
+                state.mark_clip(index, status, last_report)
+                _save_metadata(metadata_file, clips_data)
+                # Phase 1 (clip editor): emit the default-edit project. Additive
+                # only -- emit_clip_project never raises.
+                _maybe_emit_clip_project(
+                    output_dir=output_dir,
+                    job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
+                    index=index,
+                    start=start,
+                    end=end,
+                    clip=clip,
+                    clips_data=clips_data,
+                    clip_source=clip_source,
+                    clip_final=clip_final,
+                )
+                warning_text = (
+                    f" with {len(last_report.get('warnings') or [])} warning(s)"
+                    if status == "warning"
+                    else ""
+                )
+                print(
+                    f"✅ Clip {index + 1}/{total} ready{warning_text}: {clip_filename}",
+                    flush=True,
+                )
+                return True
         try:
             os.remove(temp_output)
         except OSError:

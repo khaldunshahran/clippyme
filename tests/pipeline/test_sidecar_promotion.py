@@ -269,10 +269,12 @@ def direct_reframe_only_block():
     return compile(ast.Module(body=[blocks[0]], type_ignores=[]), str(main_path), "exec")
 
 
-def _direct_env(tmp_path, monkey_mode="success"):
+def _direct_env(tmp_path, monkey_mode="success", write_sidecar=True):
     """Injected env for the AST-compiled direct loop (mirrors the real names).
 
     monkey_mode: "success" | "render-invalid".
+    write_sidecar: when False the fake render writes no sidecar
+        (sidecar-less attempt simulation).
     """
     source = tmp_path / "input.mp4"
     sl = tmp_path / "source_clip_clip_1.mp4"
@@ -289,7 +291,8 @@ def _direct_env(tmp_path, monkey_mode="success"):
 
     def render(source_path, output_path, **kwargs):
         Path(output_path).write_bytes(VIDEO_BYTES)
-        write_task12_sidecar(output_path, "direct")
+        if write_sidecar:
+            write_task12_sidecar(output_path, "direct")
         return True
 
     def validate(path, duration):
@@ -301,6 +304,7 @@ def _direct_env(tmp_path, monkey_mode="success"):
         run=encode, DEVNULL=subprocess.DEVNULL,
         PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
     clip = {"start": 0.0, "end": 2.0}
+    from clippyme.domain import project_framing as _pf_module
     env = dict(
         os=os, json=json, subprocess=subprocess_stub,
         clips_data={"shorts": [clip]}, video_title="clip",
@@ -315,6 +319,9 @@ def _direct_env(tmp_path, monkey_mode="success"):
         write_slice_provenance=ops.write_slice_provenance,
         validate_cut_output=validate, process_video_to_vertical=render,
         normalize_audio=lambda path: None, select_cover_frame=lambda path: None,
+        # Task 13 review-01: the coordinated publication helper referenced
+        # by the AST-compiled loop.
+        _project_framing=_pf_module,
     )
     return SimpleNamespace(
         env=env, source=source, sl=sl, final=final, render=render)
@@ -359,6 +366,7 @@ def test_direct_reframe_only_promotes_sidecar(tmp_path, direct_reframe_only_bloc
             raise SystemExit(code)
 
     import time as _time
+    from clippyme.domain import project_framing as _pf_module
     env = dict(
         os=os, sys=_Sys(), time=_time,
         args=argparse.Namespace(
@@ -368,6 +376,9 @@ def test_direct_reframe_only_promotes_sidecar(tmp_path, direct_reframe_only_bloc
         normalize_audio=lambda p: None, select_cover_frame=lambda p: None,
         turn_framing_sidecar_for=sidecar_for,
         aspect_ratio=9 / 16, letterbox_zoom=0,
+        # Task 13 review-01: the coordinated publication helper referenced
+        # by the AST-compiled reframe-only block.
+        _project_framing=_pf_module,
     )
     with pytest.raises(SystemExit) as exc:
         exec(direct_reframe_only_block, env)

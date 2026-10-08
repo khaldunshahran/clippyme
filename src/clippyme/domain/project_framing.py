@@ -25,15 +25,29 @@ Lifecycle (pipeline side promotes the artifact; this module reads it)
 ---------------------------------------------------------------------
 1. Render produces a TEMPORARY sidecar next to the temp video.
 2. After render validation the pipeline promotes it to the stable,
-   job-relative name ``<clip_final stem>.turn_framing_plan.json``.
+   job-relative name ``<clip_final stem>.turn_framing_plan.json`` via
+   :func:`publish_attempt_sidecar` -- video first, then the sidecar, as
+   one coordinated pair. Promotion also rebinds the plan's Task 12
+   ``source_fingerprint`` to the actual render input
+   (:func:`rebind_sidecar_source`; a no-op in production, where reframe
+   already stamps the true identity). A promotion failure is never
+   swallowed: the caller rolls the published video back. A sidecar-less
+   attempt retires the previous stable binding. A stable sidecar
+   referenced by a preserved user project is never clobbered
+   (:func:`stable_sidecar_protected`).
 3. :func:`build_project_framing` resolves, validates and normalizes the
    stable sidecar into the project ``framing`` field. Any sidecar
-   problem (missing, malformed, temp-named, escape, aspect mismatch)
-   yields ``None`` -- the project is emitted WITHOUT the field (the
-   pre-Task-13 behavior), never with a lying field.
+   problem (missing, malformed, temp-named, escape, aspect mismatch,
+   cross-source) yields ``None`` -- the project is emitted WITHOUT the
+   field (the pre-Task-13 behavior), never with a lying field. When the
+   caller passes ``expected_source_fingerprint`` (the actual current
+   source slice), a structurally valid plan from a different source is
+   rejected.
 4. At render, the pipeline calls :func:`verify_framing_at_render` in the
    eligible-base branch: the sidecar must still exist and match the
-   recorded sha256 + source_fingerprint + size.
+   recorded sha256 + source_fingerprint + size. The verified plan is
+   returned so the caller can recheck its source identity against the
+   actual current source slice before reusing the base.
 
 Identity notes
 --------------
@@ -66,6 +80,7 @@ REASON_MALFORMED = "framing-plan-malformed"
 REASON_MISMATCH = "framing-sidecar-mismatch"
 REASON_INCOMPLETE = "analysis-incomplete"
 REASON_TRAJECTORY_EDIT = "framing-trajectory-edit"
+REASON_CROSS_SOURCE = "framing-cross-source"
 
 #: Basename infixes that mark a temporary (unpromoted) render attempt.
 #: A persisted project reference must never contain one of these.
@@ -516,23 +531,36 @@ def build_project_framing(
     render_fps: float,
     slice_offset_frames: int = 0,
     clip_frame_count: int,
+    expected_source_fingerprint: str | None = None,
 ) -> Optional[dict]:
     """Build the project ``framing`` field from the stable sidecar.
 
     Full bridge: stable ref -> resolve -> production-parse -> normalize ->
     identity/digest -> ProjectFraming-validated dict.
 
+    When ``expected_source_fingerprint`` is given (the actual current
+    source slice's Task 12 identity), a structurally valid plan naming a
+    different source is rejected with ``None`` (``framing-cross-source``)
+    -- cross-source plans are never trusted.
+
     Returns ``None`` (old behavior: project emitted WITHOUT the field)
     whenever the sidecar is missing, unresolvable, malformed, incomplete
-    beyond audit, aspect-incompatible with this render, or fails model
-    validation. Never raises for sidecar problems and never emits a lying
-    field.
+    beyond audit, aspect-incompatible with this render, cross-source, or
+    fails model validation. Never raises for sidecar problems and never
+    emits a lying field.
     """
     try:
         ref = stable_sidecar_ref(clip_final)
         resolved = resolve_sidecar(job_dir, ref)
         plan = load_validated_plan(resolved)
     except FramingError:
+        return None
+
+    # Review-01: the sidecar's Task 12 source identity must match the
+    # ACTUAL current source slice. A valid plan from a different source
+    # is rejected, not trusted.
+    if (expected_source_fingerprint is not None
+            and plan["source_fingerprint"] != expected_source_fingerprint):
         return None
 
     geom = _render_geometry(render_w, render_h, render_fps)
@@ -611,13 +639,17 @@ def build_project_framing(
     })
 
 
-def verify_framing_at_render(*, job_dir: str, framing: dict) -> None:
+def verify_framing_at_render(*, job_dir: str, framing: dict) -> dict:
     """Re-verify the stored framing against the live sidecar before render.
 
     Re-resolves ``framing["plan"]["plan_ref"]`` inside ``job_dir`` and
     compares sha256 AND source_fingerprint AND size against the recorded
     identity. Same-size/same-mtime content replacement is detected via
     the content hash.
+
+    Returns the validated canonical plan dict, so the caller can recheck
+    the plan's source identity against the actual current source slice
+    before reusing a reframed base.
 
     Raises:
         FramingError: ``framing-sidecar-missing`` when the ref or file is
@@ -637,6 +669,7 @@ def verify_framing_at_render(*, job_dir: str, framing: dict) -> None:
     if plan_id.get("source_fingerprint") != plan["source_fingerprint"]:
         raise FramingError(
             f"{REASON_MISMATCH}: source_fingerprint changed for {ref!r}")
+    return plan
 
 
 def framing_baseline_identity(framing: dict) -> dict:
@@ -659,3 +692,241 @@ def framing_baseline_identity(framing: dict) -> dict:
         raise FramingError(
             f"{REASON_MALFORMED}: plan identity missing {missing!r}")
     return {k: plan_id[k] for k in _BASELINE_KEYS}
+
+
+# --- coordinated video + sidecar publication --------------------------------
+# Review-01: the accepted video and its stable sidecar are published as ONE
+# coordinated pair. The caller publishes the video first (os.replace temp
+# -> final) and then calls publish_attempt_sidecar() exactly once.
+#
+# - Promotion failure is NEVER swallowed: the OSError propagates so the
+#   caller can roll the just-published video back. An accepted attempt
+#   must never pair a new video with a stale plan.
+# - A sidecar-less attempt retires the previous stable binding, so the
+#   new video cannot inherit a stale plan.
+# - A stable sidecar referenced by a preserved user project (Task 01) is
+#   never clobbered: promotion/retire skip it, keeping the preserved
+#   project verifiable.
+# - Promotion rebinds the plan's Task 12 source_fingerprint to the actual
+#   render input (rebind_sidecar_source). Production reframe already
+#   stamps the true identity, so this is a byte-identity no-op there; it
+#   repairs test doubles or foreign artifacts.
+
+#: Outcomes of :func:`publish_attempt_sidecar`.
+PUBLISH_PROMOTED = "promoted"
+PUBLISH_RETIRED = "retired"
+PUBLISH_NO_SIDECAR = "no-sidecar"
+PUBLISH_SKIPPED_PRESERVED = "skipped-preserved"
+
+
+def _task12_source_fingerprint(path: str) -> str:
+    from clippyme.pipeline.framing_plan import (  # noqa: E402
+        source_fingerprint,
+    )
+    return source_fingerprint(path)
+
+
+def rebind_sidecar_source(sidecar_path: str, *, source_path: str) -> bool:
+    """Rebind a sidecar's Task 12 ``source_fingerprint`` to a source file.
+
+    Production ``reframe`` stamps ``source_fingerprint(input_video)`` --
+    the render input -- when it writes the plan. This repairs test
+    doubles or foreign artifacts so a promoted plan always names the
+    true render input it was produced from. In production it is a
+    byte-identity no-op.
+
+    Atomic (temp file + ``os.replace``). No-op returning False when the
+    file already names the fingerprint. Returns True when rewritten.
+
+    Raises:
+        FramingError: the sidecar is missing or not a production-valid
+            plan, or the source file cannot be fingerprinted.
+    """
+    if not os.path.isfile(sidecar_path):
+        raise FramingError(f"{REASON_MISSING}: {sidecar_path!r}")
+    try:
+        fingerprint = _task12_source_fingerprint(source_path)
+    except OSError as exc:
+        raise FramingError(
+            f"{REASON_MISSING}: cannot fingerprint source: {exc}")
+    api = _task12()
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FramingError(f"{REASON_MALFORMED}: unreadable sidecar: {exc}")
+    try:
+        plan = api["plan_from_dict"](data)
+    except ValueError as exc:
+        raise FramingError(f"{REASON_MALFORMED}: {exc}")
+    if plan.source_fingerprint == fingerprint:
+        return False
+    plan.source_fingerprint = fingerprint
+    canonical = api["plan_to_dict"](plan)
+    tmp = sidecar_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(canonical, fh, sort_keys=True)
+        os.replace(tmp, sidecar_path)
+    finally:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    return True
+
+
+def _sha256_file(path: str) -> str | None:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _same_bytes(a: str, b: str) -> bool:
+    ha, hb = _sha256_file(a), _sha256_file(b)
+    return ha is not None and ha == hb
+
+
+def _preserved_project_refs_sidecar(job_dir: str, stable_basename: str,
+                                    stable_sha256: str) -> bool:
+    """True when a preserved user project references this exact sidecar.
+
+    Scans ``clip-project-*.json`` (working + versioned) for a project the
+    pipeline would preserve (``project_has_user_edits`` signals:
+    ``origin == "user"`` or ``version > 1``) whose ``framing.plan``
+    names this sidecar basename with a matching content hash. Unreadable
+    files are ignored -- a reference that cannot be established cannot
+    protect.
+    """
+    try:
+        names = os.listdir(job_dir)
+    except OSError:
+        return False
+    for name in names:
+        if not (name.startswith("clip-project-") and name.endswith(".json")):
+            continue
+        path = os.path.join(job_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            preserved = (data.get("origin") == "user"
+                         or int(data.get("version", 1)) > 1)
+        except (TypeError, ValueError):
+            preserved = True
+        if not preserved:
+            continue
+        framing = data.get("framing")
+        plan_id = (framing.get("plan")
+                   if isinstance(framing, dict) else None)
+        if not isinstance(plan_id, dict):
+            continue
+        ref = plan_id.get("plan_ref")
+        if not isinstance(ref, str) or _ref_basename(ref) != stable_basename:
+            continue
+        if plan_id.get("sha256") == stable_sha256:
+            return True
+    return False
+
+
+def stable_sidecar_protected(*, job_dir: str, stable_path: str) -> bool:
+    """True when the stable sidecar must not be clobbered.
+
+    A preserved user project (Task 01 preservation) that references this
+    exact sidecar (plan_ref basename + sha256) pins the artifact:
+    promotion and retire must leave it in place so the preserved project
+    stays verifiable via :func:`verify_framing_at_render`.
+    """
+    if not os.path.isfile(stable_path):
+        return False
+    digest = _sha256_file(stable_path)
+    if digest is None:
+        return False
+    return _preserved_project_refs_sidecar(
+        job_dir, os.path.basename(stable_path), digest)
+
+
+def _retire_stable_sidecar(*, job_dir: str, stable_sidecar: str) -> str:
+    """Retire a stale stable binding for a sidecar-less attempt."""
+    if not os.path.isfile(stable_sidecar):
+        return PUBLISH_NO_SIDECAR
+    if stable_sidecar_protected(job_dir=job_dir, stable_path=stable_sidecar):
+        return PUBLISH_SKIPPED_PRESERVED
+    try:
+        os.remove(stable_sidecar)
+    except OSError:
+        pass
+    return PUBLISH_RETIRED
+
+
+def publish_attempt_sidecar(*, attempt_sidecar: str, stable_sidecar: str,
+                            source_path: str, job_dir: str) -> str:
+    """Coordinate the sidecar half of video+sidecar publication.
+
+    The caller publishes the accepted video FIRST (``os.replace`` temp ->
+    final) and then calls this exactly once.
+
+    - No usable attempt sidecar: the previous stable binding is retired
+      (unless a preserved user project references it) so the new video
+      never inherits a stale plan. Returns ``"retired"`` /
+      ``"no-sidecar"`` / ``"skipped-preserved"``.
+    - Attempt sidecar present: its Task 12 source identity is rebound to
+      ``source_path`` (:func:`rebind_sidecar_source`), then it is
+      promoted atomically. When the stable sidecar holds different bytes
+      that a preserved user project references, promotion is SKIPPED
+      (the attempt temp file is removed) and ``"skipped-preserved"`` is
+      returned. Otherwise returns ``"promoted"``.
+
+    A promotion ``os.replace`` failure is NEVER swallowed: the
+    :exc:`OSError` propagates so the caller can roll the just-published
+    video back -- no success with a stale mixed pair.
+
+    Raises:
+        OSError: the promotion ``os.replace`` failed AFTER the video was
+            published; the caller must roll the video back.
+    """
+    usable = os.path.isfile(attempt_sidecar)
+    if usable:
+        try:
+            rebind_sidecar_source(attempt_sidecar, source_path=source_path)
+        except FramingError:
+            # Unusable attempt plan: treat the attempt as sidecar-less and
+            # retire the stale binding rather than promoting garbage.
+            try:
+                os.remove(attempt_sidecar)
+            except OSError:
+                pass
+            usable = False
+    if not usable:
+        return _retire_stable_sidecar(
+            job_dir=job_dir, stable_sidecar=stable_sidecar)
+    if os.path.isfile(stable_sidecar):
+        if _same_bytes(attempt_sidecar, stable_sidecar):
+            # Byte-identical re-promotion: nothing to protect, and the
+            # content a preserved project references is unchanged.
+            try:
+                os.remove(attempt_sidecar)
+            except OSError:
+                pass
+            return PUBLISH_PROMOTED
+        if stable_sidecar_protected(job_dir=job_dir,
+                                    stable_path=stable_sidecar):
+            # A preserved user project pins the current artifact: the new
+            # attempt's different plan must not overwrite it.
+            try:
+                os.remove(attempt_sidecar)
+            except OSError:
+                pass
+            return PUBLISH_SKIPPED_PRESERVED
+    os.replace(attempt_sidecar, stable_sidecar)
+    return PUBLISH_PROMOTED

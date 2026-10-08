@@ -634,6 +634,28 @@ async def _mix_music(composed_path: str, project: ClipProject,
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _require_framing_lineage_base(project: ClipProject) -> None:
+    """Task 13 review-01: framing without a lineage base cannot render.
+
+    A project that carries ``framing`` but no ``reframed_base`` records an
+    automatic trajectory with no validated pixel base to replay it onto.
+    Dynamic replay is not implemented in this task: fail clearly with the
+    stable ``framing-trajectory-edit`` reason BEFORE any static
+    materialization, instead of silently publishing a center crop
+    disconnected from the recorded camera plan.
+
+    Genuinely old projects (no ``framing`` field at all) and accepted
+    explicit static edits on a project WITH a lineage base
+    (``geometry_edit``) are unaffected -- only ``framing`` WITHOUT its
+    validated lineage base fails.
+    """
+    if project.framing is not None and project.reframed_base is None:
+        raise ProjectRenderError(
+            "project carries framing but no reframed_base lineage; "
+            "dynamic trajectory replay is not implemented "
+            "(reason: framing-trajectory-edit)")
+
+
 async def render_project(*, job_id: str, clip_index: int,
                          project: ClipProject, job_dir: str,
                          metadata: dict, clip_info: dict,
@@ -701,6 +723,17 @@ async def render_project(*, job_id: str, clip_index: int,
                                    if "drop_ranges" in legacy else drop_ranges)
                 _used_lineage_base = False
             else:
+                # Task 13 review-01: framing without a lineage base cannot
+                # be rendered. A project that carries ``framing`` but no
+                # ``reframed_base`` records an automatic trajectory with no
+                # validated pixel base to replay it onto; dynamic replay is
+                # not implemented. Fail clearly BEFORE any static
+                # materialization instead of silently publishing a center
+                # crop disconnected from the recorded camera plan.
+                # Genuinely old projects (no framing field) and explicit
+                # static edits on a project WITH a lineage base
+                # (geometry_edit below) keep their accepted paths.
+                _require_framing_lineage_base(project)
                 # Task 05: check reframed-base lineage for unchanged projects.
                 _used_lineage_base = False
                 _lineage = (project.reframed_base.model_dump()
@@ -772,7 +805,7 @@ async def render_project(*, job_id: str, clip_index: int,
                                 _pf = None
                             if _pf is not None:
                                 try:
-                                    _pf.verify_framing_at_render(
+                                    _live_plan = _pf.verify_framing_at_render(
                                         job_dir=job_dir,
                                         framing=_proj_framing,
                                     )
@@ -780,6 +813,30 @@ async def render_project(*, job_id: str, clip_index: int,
                                     raise ProjectRenderError(
                                         f"framing sidecar unusable: {exc}"
                                     )
+                                # Task 13 review-01: recheck the binding
+                                # before base reuse. The live sidecar's Task
+                                # 12 source identity must match the ACTUAL
+                                # current source slice -- not just the stored
+                                # record -- so a cross-source sidecar swap
+                                # the stored record predates is rejected.
+                                _src_path = os.path.join(
+                                    job_dir, project.source.file)
+                                try:
+                                    from clippyme.pipeline.framing_plan import (
+                                        source_fingerprint as _task12_fp,
+                                    )
+                                    _actual_fp = _task12_fp(_src_path)
+                                except Exception as _fp_exc:
+                                    raise ProjectRenderError(
+                                        "cannot verify framing source "
+                                        f"identity: {_fp_exc}")
+                                if (_live_plan.get("source_fingerprint")
+                                        != _actual_fp):
+                                    raise ProjectRenderError(
+                                        "framing sidecar source identity "
+                                        "does not match the current source "
+                                        "slice (cross-source sidecar "
+                                        "rejected)")
                         # Reuse validated reframed base; apply CURRENT
                         # composition/music from the project.
                         base_path = _base_path

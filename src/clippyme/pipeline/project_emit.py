@@ -43,6 +43,7 @@ Phase 2 serves it via ``GET /api/project/{job_id}/{clip_index}``).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -209,6 +210,18 @@ def _build_project(
         except ImportError:
             _pf = None
         if _pf is not None:
+            # Task 13 review-01: bind the sidecar's Task 12 source identity
+            # to the ACTUAL current source slice. A structurally valid plan
+            # from a different source is rejected (no framing field), never
+            # trusted.
+            _expected_fp = None
+            try:
+                from clippyme.pipeline.framing_plan import (
+                    source_fingerprint as _task12_fp,
+                )
+                _expected_fp = _task12_fp(clip_source)
+            except Exception:
+                _expected_fp = None
             try:
                 framing = _pf.build_project_framing(
                     job_dir=job_dir,
@@ -220,6 +233,7 @@ def _build_project(
                     # final mp4); the clip is the already-cut source slice,
                     # so its frame count is duration * render fps.
                     clip_frame_count=int(round(duration * render_fps)),
+                    expected_source_fingerprint=_expected_fp,
                 )
             except Exception:
                 framing = None
@@ -322,10 +336,19 @@ def emit_clip_project(
         # partial project behind; the temp file is cleaned in finally on all
         # paths. The project_has_user_edits preservation contract (checked by
         # the caller before emission) is unchanged.
+        # Task 13 review-01: when there is no usable sidecar the framing
+        # field is ABSENT from the emitted JSON (not null) -- the
+        # pre-Task-13 shape. model_dump_json would otherwise serialize
+        # `"framing": null`, which still counts as "present".
+        payload = project_to_json(project)
+        if project.framing is None:
+            _doc = json.loads(payload)
+            _doc.pop("framing", None)
+            payload = json.dumps(_doc, indent=2, ensure_ascii=False)
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(project_to_json(project))
+                f.write(payload)
             os.replace(tmp_path, path)
         finally:
             try:

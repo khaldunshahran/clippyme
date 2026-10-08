@@ -40,16 +40,25 @@ STABLE_SIDECAR = "clip_final_0.turn_framing_plan.json"
 
 def _write_source(job_dir):
     src = os.path.join(job_dir, "source_0.mp4")
-    Path(src).write_bytes(SOURCE_BYTES)
+    # Write-once: the Task 12 source fingerprint samples mtime_ns, so a
+    # rewrite between bind and check would invalidate the binding.
+    if not os.path.isfile(src):
+        Path(src).write_bytes(SOURCE_BYTES)
     return src
 
 
 def _real_framing(job_dir, base_clip, marker="plan-1"):
     """Build a real framing record the way pipeline/project_emit does."""
-    write_task12_sidecar(base_clip, marker)
+    src = _write_source(job_dir)
+    sidecar, _ = write_task12_sidecar(base_clip, marker)
+    # Mirror the pipeline: promotion rebinds the plan's Task 12 source
+    # identity to the actual render input before the project is emitted.
+    pf.rebind_sidecar_source(sidecar, source_path=src)
+    from clippyme.pipeline.framing_plan import source_fingerprint as _fp12
     framing = pf.build_project_framing(
         job_dir=job_dir, clip_final=base_clip,
-        render_w=608, render_h=1080, render_fps=30, clip_frame_count=60)
+        render_w=608, render_h=1080, render_fps=30, clip_frame_count=60,
+        expected_source_fingerprint=_fp12(src))
     assert framing is not None, "test plan must bridge to a framing record"
     assert framing["eligible"] is True
     return framing

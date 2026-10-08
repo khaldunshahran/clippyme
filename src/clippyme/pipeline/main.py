@@ -36,6 +36,13 @@ from clippyme.pipeline.reframe_ops import (
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
 
+# Task 13 review-01: coordinated video + sidecar publication helper. The
+# direct clip loop and the reframe-only block below are AST-compiled by
+# tests/pipeline/test_sidecar_promotion.py (and test_task13_review1.py)
+# with a restricted injected env -- `_project_framing` is provided there,
+# so it may be referenced inside those blocks.
+from clippyme.domain import project_framing as _project_framing  # noqa: E402,F401
+
 # Load environment variables
 load_dotenv()
 
@@ -971,15 +978,27 @@ if __name__ == '__main__':
             normalize_audio(tmp_output)
             select_cover_frame(tmp_output)
             os.replace(tmp_output, final_output)
-            # Task 13: promote the attempt's turn-framing sidecar to the
-            # stable final basename. Best-effort: never fail a good render
-            # over the sidecar.
+            # Task 13 review-01: coordinated video + sidecar publication.
+            # A promotion failure rolls the published video back and exits
+            # non-zero -- never a success with a stale mixed pair.
             try:
-                _tmp_sidecar = turn_framing_sidecar_for(tmp_output)
-                if os.path.isfile(_tmp_sidecar):
-                    os.replace(_tmp_sidecar, turn_framing_sidecar_for(final_output))
-            except OSError:
-                pass
+                _pub_outcome = _project_framing.publish_attempt_sidecar(
+                    attempt_sidecar=turn_framing_sidecar_for(tmp_output),
+                    stable_sidecar=turn_framing_sidecar_for(final_output),
+                    source_path=args.input,
+                    job_dir=os.path.dirname(os.path.abspath(final_output)) or ".",
+                )
+            except OSError as _pub_exc:
+                print(f"❌ Reframe-only: sidecar promotion failed ({_pub_exc}); rolled back.")
+                for _p in (final_output, turn_framing_sidecar_for(tmp_output)):
+                    try:
+                        if os.path.isfile(_p):
+                            os.remove(_p)
+                    except OSError:
+                        pass
+                sys.exit(1)
+            if _pub_outcome != _project_framing.PUBLISH_PROMOTED:
+                print(f"Task 13: sidecar publish outcome: {_pub_outcome}")
             print(f"✅ Reframe-only done in {time.time() - reframe_start:.1f}s → {final_output}")
             sys.exit(0)
         except Exception as e:
@@ -1369,20 +1388,49 @@ if __name__ == '__main__':
                         success = False
                 if success:
                     os.replace(_temp_final, clip_final_path)
-                    # Task 13: promote the attempt's turn-framing sidecar to
-                    # the stable final basename now that the render
-                    # validated. Inlined basename rule (see comment above)
-                    # -- best-effort, never fail an accepted clip.
+                    # Task 13 review-01: coordinated video + sidecar
+                    # publication (same contract as
+                    # orchestrator._render_one_clip). A promotion failure
+                    # rolls the published video back and fails the clip --
+                    # never a success with a stale mixed pair. A
+                    # sidecar-less render retires the previous stable
+                    # binding. Inlined basename rule (see comment above):
+                    # this loop is AST-compiled by tests with a restricted
+                    # injected env, and `_project_framing` is provided
+                    # there.
+                    _pub_ok = True
                     try:
-                        _temp_sidecar = os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json"
-                        if os.path.isfile(_temp_sidecar):
-                            os.replace(_temp_sidecar, os.path.splitext(clip_final_path)[0] + ".turn_framing_plan.json")
-                    except OSError:
-                        pass
-                    normalize_audio(clip_final_path)
-                    select_cover_frame(clip_final_path)
-                    print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
-                    print(f"      📼 Source slice preserved at: {clip_source_path}")
+                        _pub_outcome = _project_framing.publish_attempt_sidecar(
+                            attempt_sidecar=os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json",
+                            stable_sidecar=os.path.splitext(clip_final_path)[0] + ".turn_framing_plan.json",
+                            source_path=clip_source_path,
+                            job_dir=output_dir,
+                        )
+                    except OSError as _pub_exc:
+                        _pub_ok = False
+                        print(f"   Task 13: sidecar promotion failed ({_pub_exc}); rolling back clip {i+1}", flush=True)
+                        try:
+                            os.remove(clip_final_path)
+                        except OSError:
+                            pass
+                        try:
+                            _abandoned = os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json"
+                            if os.path.isfile(_abandoned):
+                                os.remove(_abandoned)
+                        except OSError:
+                            pass
+                    if _pub_ok:
+                        if _pub_outcome != _project_framing.PUBLISH_PROMOTED:
+                            print(f"   Task 13: sidecar publish outcome: {_pub_outcome} (clip {i+1})", flush=True)
+                        normalize_audio(clip_final_path)
+                        select_cover_frame(clip_final_path)
+                        print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+                        print(f"      📼 Source slice preserved at: {clip_source_path}")
+                    else:
+                        # Without this line the clip is simply ABSENT from the
+                        # results grid with zero breadcrumb in the job log.
+                        print(f"   ❌ Clip {i+1} reframe failed — skipping "
+                              f"(source slice kept at {clip_source_path})", flush=True)
                 else:
                     # Without this line the clip is simply ABSENT from the
                     # results grid with zero breadcrumb in the job log.

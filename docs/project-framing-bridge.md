@@ -25,25 +25,57 @@ render → verify_framing_at_render      domain, called in the
 1. **Temporary sidecar.** Each render attempt writes its Task 12 plan next
    to the temporary video. A failed render/QA/retry removes its temporary
    sidecar and never promotes; a retry promotes only its own plan.
-2. **Promotion.** Only after render validation succeeds, the pipeline
-   promotes the attempt's sidecar to the deterministic final name
-   `<clip_final stem>.turn_framing_plan.json`, job-relative. A project
-   must never reference `*.render.tmp*` / `*.reframe.tmp*` basenames —
-   `resolve_sidecar` rejects them with `framing-sidecar-temp-name`.
+2. **Promotion (coordinated pair).** Only after render validation succeeds,
+   the pipeline publishes the video first and then coordinates the sidecar
+   half via `publish_attempt_sidecar` (`project_framing.py`) — promotion,
+   retire, or preserved-project skip — in the queued orchestrator, the
+   direct CLI clip loop, and the reframe-only path alike. Promotion
+   rebinds the plan's Task 12 `source_fingerprint` to the actual render
+   input (`rebind_sidecar_source`; a byte-identity no-op in production,
+   where reframe already stamps the true identity). A promotion failure
+   is **never swallowed**: the just-published video is rolled back and
+   the attempt fails, so an accepted clip can never pair a new video
+   with a stale plan. A project must never reference `*.render.tmp*` /
+   `*.reframe.tmp*` basenames — `resolve_sidecar` rejects them with
+   `framing-sidecar-temp-name`.
+3. **Retire rule.** A sidecar-less attempt (render produced no plan)
+   retires the previous stable binding instead of inheriting it: the
+   stale sidecar is deleted and the emitted project carries no `framing`
+   field. A stable sidecar pinned by a preserved user project is left
+   in place.
+4. **Preserved projects pin their plan.** A stable sidecar referenced by
+   a preserved user project (Task 01: `origin == "user"` or `version >
+   1`, matching `plan_ref` basename + `sha256`) is immutable: a later
+   attempt that produces a *different* plan does not overwrite it
+   (promotion is skipped, the attempt temp file removed), so
+   `verify_framing_at_render` keeps passing on the preserved project.
 3. **Emission.** `build_project_framing` resolves the stable sidecar
    inside the job dir (real containment; traversal/symlink escape →
    `framing-sidecar-escape`), parses it through the Task 12 production
    parser, normalizes it, and stores the result as the additive optional
    `framing` project field. Any sidecar problem (missing, malformed,
-   temp-named, escape, aspect mismatch) yields **no field at all** — the
-   pre-Task-13 behavior — never a lying field, and never an overwrite of
-   an existing good project.
+   temp-named, escape, aspect mismatch, **cross-source**) yields **no field
+   at all** — the pre-Task-13 behavior — never a lying field, and never an
+   overwrite of an existing good project. When the caller supplies the
+   actual current source slice's Task 12 identity
+   (`expected_source_fingerprint`), a structurally valid plan from a
+   different source is rejected (`framing-cross-source`).
 4. **Render.** In the eligible-base branch the pipeline calls
    `verify_framing_at_render`, which re-resolves the recorded
    `plan_ref` and compares **sha256 AND source_fingerprint AND size**.
    Same-size/same-mtime content replacement is caught by the content
    hash (`framing-sidecar-mismatch`); a deleted sidecar fails with
-   `framing-sidecar-missing`.
+   `framing-sidecar-missing`. Before the Task 05 base is reused, the
+   verified plan's source identity is rechecked against the **actual
+   current source slice** — a cross-source sidecar swap the stored
+   record predates is rejected with a clear `ProjectRenderError`.
+   A project that carries `framing` but **no** `reframed_base` lineage
+   fails clearly before any static materialization
+   (`framing-trajectory-edit`): dynamic replay is not implemented, so
+   the renderer never silently publishes a center crop disconnected from
+   the recorded camera plan. Genuinely old projects (no `framing` field)
+   and explicit static edits on a project *with* a lineage base keep
+   their accepted paths.
 
 ## Identity fields
 
