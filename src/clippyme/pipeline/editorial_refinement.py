@@ -1325,171 +1325,16 @@ def run_editorial_refinement(
     def _sort_plans() -> None:
         plans.sort(key=lambda p: _order[p.candidate_id])
 
-    # Phase 1 -- resume: validate and reuse prior plans FIRST, with no
-    # provider client required. Completed plans stay reusable even when
-    # no client can be created; invalid priors become unrefined on the
-    # current discovery interval (never trusted as completed work).
-    resolved: set = set()
-    for cid in kept_ids:
-        cand = candidates_by_id[cid]
-        if not (prior_plans and cid in prior_plans):
-            continue
-        raw = prior_plans[cid]
-        bad = _validate_prior_plan(raw, cand, video_duration,
-                                   policy_min, policy_max)
-        plan = None
-        if bad is None:
-            plan = EditorialPlan.from_dict(raw)
-            if plan.status == "refined":
-                # A completed plan may skip provider work only after it
-                # is revalidated against the current transcript packet
-                # and candidate with the same material invariants as a
-                # fresh result.
-                try:
-                    packet = build_context_packet(
-                        cand, all_cands, words, video_duration,
-                        policy_min, policy_max, cfg)
-                except Exception as e:
-                    bad = (f"packet:{type(e).__name__}:"
-                           f"{str(e)[:60]}")
-                if bad is None:
-                    neighbor_guards = [
-                        (float(candidates_by_id[o]["start_s"]),
-                         float(candidates_by_id[o]["end_s"]))
-                        for o in kept_ids if o != cid
-                    ]
-                    bad = _revalidate_prior_material(
-                        plan, cand, packet, words,
-                        video_duration, policy_min, policy_max,
-                        neighbor_guards)
-        if bad is None:
-            plans.append(plan)
-            funnel["packets_skipped"] += 1
-            _count_verdict(plan)
-            resolved.add(cid)
-            continue
-        funnel["rejections"].append(
-            {"candidate_id": cid,
-             "reason": f"invalid_prior_plan:{bad}"})
-        plans.append(_unrefined(
-            cand, f"invalid_prior_plan:{bad}"))
-        funnel["packets_skipped"] += 1
-        _count_verdict(plans[-1])
-        resolved.add(cid)
-    _sort_plans()
+    def _run_postprocessing() -> None:
+        """Continuity grouping and final selected-metrics computation.
 
-    unresolved = [cid for cid in kept_ids if cid not in resolved]
-    if not unresolved:
-        # Every candidate resolved from priors: no provider client is
-        # ever created.
-        return _finish(plans)
-
-    # Phase 2 -- lazy client: create exactly one owned client via the
-    # factory only when an unresolved candidate needs generation.
-    # Close it exactly once on all exits. A factory result identical to
-    # the caller's already-owned instance is borrowed, never closed.
-    client = None
-    owned = False
-    if client_factory is not None:
-        try:
-            client = client_factory()
-            owned = True
-        except Exception as e:
-            for cid in unresolved:
-                plans.append(_unrefined(candidates_by_id[cid],
-                                        "client_setup_failed"))
-                funnel["packets_skipped"] += 1
-                _count_verdict(plans[-1])
-            funnel["rejections"].append(
-                {"reason": "client_setup_failed",
-                 "detail": str(e)[:200]})
-            _sort_plans()
-            return _finish(plans)
-    if client is None:
-        # Enabled but no client available: zero provider calls. Valid
-        # priors resolved above are retained; only unresolved
-        # candidates are marked.
-        for cid in unresolved:
-            plans.append(_unrefined(candidates_by_id[cid],
-                                    "no_client_factory"))
-            funnel["packets_skipped"] += 1
-            _count_verdict(plans[-1])
+        Single common post-processing path for every enabled outcome:
+        all priors resolved, no client factory, setup failure, or normal
+        provider processing. Runs continuity grouping and the final
+        distinct_moments/selected_variants computation before _finish.
+        Never skipped on the enabled path.
+        """
         _sort_plans()
-        return _finish(plans)
-
-    try:
-        _sort_plans()
-        for cid in unresolved:
-            cand = candidates_by_id[cid]
-            try:
-                packet = build_context_packet(
-                    cand, all_cands, words, video_duration,
-                    policy_min, policy_max, cfg)
-            except Exception as e:
-                plans.append(_unrefined(
-                    cand, f"error:packet:{type(e).__name__}:{str(e)[:80]}"))
-                funnel["packets_failed"] += 1
-                _count_verdict(plans[-1])
-                continue
-            if not budget.consume():
-                plans.append(_unrefined(cand, "budget_skipped"))
-                funnel["packets_skipped"] += 1
-                _count_verdict(plans[-1])
-                continue
-            funnel["packets_attempted"] += 1
-            try:
-                prompt = build_prompt(
-                    packet, instructions,
-                    clip_type=clip_type, duration_mode=duration_mode,
-                    audience_intel=audience_intel)
-            except Exception as e:
-                plans.append(_unrefined(
-                    cand, f"prompt_failed:{type(e).__name__}:"
-                          f"{str(e)[:100]}"))
-                funnel["packets_failed"] += 1
-                _count_verdict(plans[-1])
-                continue
-            try:
-                raw_text = gen(client, prompt, cfg, budget)
-            except Exception as e:
-                plans.append(_unrefined(
-                    cand, f"generate_failed:{type(e).__name__}:"
-                          f"{str(e)[:100]}"))
-                funnel["packets_failed"] += 1
-                _count_verdict(plans[-1])
-                continue
-            try:
-                decision = parse(raw_text)
-            except Exception:
-                plans.append(_unrefined(cand, "parse_failed"))
-                funnel["packets_failed"] += 1
-                _count_verdict(plans[-1])
-                continue
-            neighbor_guards = [
-                (float(candidates_by_id[o]["start_s"]),
-                 float(candidates_by_id[o]["end_s"]))
-                for o in kept_ids if o != cid
-            ]
-            try:
-                plan = validate_editorial_decision(
-                    decision, packet, candidates_by_id, words,
-                    video_duration, policy_min, policy_max,
-                    neighbor_guards)
-            except EditorialError as e:
-                plans.append(_unrefined(
-                    cand, f"invalid_decision:{e}"))
-                funnel["packets_failed"] += 1
-                _count_verdict(plans[-1])
-                continue
-            plans.append(plan)
-            _count_verdict(plan)
-            if plan.status == "refined":
-                funnel["packets_succeeded"] += 1
-            else:
-                funnel["packets_failed"] += 1
-            if plan.conflict == "duration_conflict":
-                funnel["duration_conflicts"] += 1
-
         # Continuity: explicit links between refined accept/adjust plans.
         refined = [p for p in plans
                    if p.status == "refined"
@@ -1571,6 +1416,175 @@ def run_editorial_refinement(
             gv["distinct_moments"] + len(group_plans))
         funnel["selected_variants"] = sum(
             len(v) - 1 for v in gv["variants"].values())
+
+    # Phase 1 -- resume: validate and reuse prior plans FIRST, with no
+    # provider client required. Completed plans stay reusable even when
+    # no client can be created; invalid priors become unrefined on the
+    # current discovery interval (never trusted as completed work).
+    resolved: set = set()
+    for cid in kept_ids:
+        cand = candidates_by_id[cid]
+        if not (prior_plans and cid in prior_plans):
+            continue
+        raw = prior_plans[cid]
+        bad = _validate_prior_plan(raw, cand, video_duration,
+                                   policy_min, policy_max)
+        plan = None
+        if bad is None:
+            plan = EditorialPlan.from_dict(raw)
+            if plan.status == "refined":
+                # A completed plan may skip provider work only after it
+                # is revalidated against the current transcript packet
+                # and candidate with the same material invariants as a
+                # fresh result.
+                try:
+                    packet = build_context_packet(
+                        cand, all_cands, words, video_duration,
+                        policy_min, policy_max, cfg)
+                except Exception as e:
+                    bad = (f"packet:{type(e).__name__}:"
+                           f"{str(e)[:60]}")
+                if bad is None:
+                    neighbor_guards = [
+                        (float(candidates_by_id[o]["start_s"]),
+                         float(candidates_by_id[o]["end_s"]))
+                        for o in kept_ids if o != cid
+                    ]
+                    bad = _revalidate_prior_material(
+                        plan, cand, packet, words,
+                        video_duration, policy_min, policy_max,
+                        neighbor_guards)
+        if bad is None:
+            plans.append(plan)
+            funnel["packets_skipped"] += 1
+            _count_verdict(plan)
+            resolved.add(cid)
+            continue
+        funnel["rejections"].append(
+            {"candidate_id": cid,
+             "reason": f"invalid_prior_plan:{bad}"})
+        plans.append(_unrefined(
+            cand, f"invalid_prior_plan:{bad}"))
+        funnel["packets_skipped"] += 1
+        _count_verdict(plans[-1])
+        resolved.add(cid)
+    _sort_plans()
+
+    unresolved = [cid for cid in kept_ids if cid not in resolved]
+    if not unresolved:
+        # Every candidate resolved from priors: no provider client is
+        # ever created. Still run the common post-processing so
+        # continuity and selected metrics reflect the resumed plans.
+        _run_postprocessing()
+        return _finish(plans + group_plans)
+
+    # Phase 2 -- lazy client: create exactly one owned client via the
+    # factory only when an unresolved candidate needs generation.
+    # Close it exactly once on all exits. A factory result identical to
+    # the caller's already-owned instance is borrowed, never closed.
+    client = None
+    owned = False
+    if client_factory is not None:
+        try:
+            client = client_factory()
+            owned = True
+        except Exception as e:
+            for cid in unresolved:
+                plans.append(_unrefined(candidates_by_id[cid],
+                                        "client_setup_failed"))
+                funnel["packets_skipped"] += 1
+                _count_verdict(plans[-1])
+            funnel["rejections"].append(
+                {"reason": "client_setup_failed",
+                 "detail": str(e)[:200]})
+            _run_postprocessing()
+            return _finish(plans + group_plans)
+    if client is None:
+        # Enabled but no client available: zero provider calls. Valid
+        # priors resolved above are retained; only unresolved
+        # candidates are marked.
+        for cid in unresolved:
+            plans.append(_unrefined(candidates_by_id[cid],
+                                    "no_client_factory"))
+            funnel["packets_skipped"] += 1
+            _count_verdict(plans[-1])
+        _run_postprocessing()
+        return _finish(plans + group_plans)
+
+    try:
+        _sort_plans()
+        for cid in unresolved:
+            cand = candidates_by_id[cid]
+            try:
+                packet = build_context_packet(
+                    cand, all_cands, words, video_duration,
+                    policy_min, policy_max, cfg)
+            except Exception as e:
+                plans.append(_unrefined(
+                    cand, f"error:packet:{type(e).__name__}:{str(e)[:80]}"))
+                funnel["packets_failed"] += 1
+                _count_verdict(plans[-1])
+                continue
+            if not budget.consume():
+                plans.append(_unrefined(cand, "budget_skipped"))
+                funnel["packets_skipped"] += 1
+                _count_verdict(plans[-1])
+                continue
+            funnel["packets_attempted"] += 1
+            try:
+                prompt = build_prompt(
+                    packet, instructions,
+                    clip_type=clip_type, duration_mode=duration_mode,
+                    audience_intel=audience_intel)
+            except Exception as e:
+                plans.append(_unrefined(
+                    cand, f"prompt_failed:{type(e).__name__}:"
+                          f"{str(e)[:100]}"))
+                funnel["packets_failed"] += 1
+                _count_verdict(plans[-1])
+                continue
+            try:
+                raw_text = gen(client, prompt, cfg, budget)
+            except Exception as e:
+                plans.append(_unrefined(
+                    cand, f"generate_failed:{type(e).__name__}:"
+                          f"{str(e)[:100]}"))
+                funnel["packets_failed"] += 1
+                _count_verdict(plans[-1])
+                continue
+            try:
+                decision = parse(raw_text)
+            except Exception:
+                plans.append(_unrefined(cand, "parse_failed"))
+                funnel["packets_failed"] += 1
+                _count_verdict(plans[-1])
+                continue
+            neighbor_guards = [
+                (float(candidates_by_id[o]["start_s"]),
+                 float(candidates_by_id[o]["end_s"]))
+                for o in kept_ids if o != cid
+            ]
+            try:
+                plan = validate_editorial_decision(
+                    decision, packet, candidates_by_id, words,
+                    video_duration, policy_min, policy_max,
+                    neighbor_guards)
+            except EditorialError as e:
+                plans.append(_unrefined(
+                    cand, f"invalid_decision:{e}"))
+                funnel["packets_failed"] += 1
+                _count_verdict(plans[-1])
+                continue
+            plans.append(plan)
+            _count_verdict(plan)
+            if plan.status == "refined":
+                funnel["packets_succeeded"] += 1
+            else:
+                funnel["packets_failed"] += 1
+            if plan.conflict == "duration_conflict":
+                funnel["duration_conflicts"] += 1
+
+        _run_postprocessing()
     finally:
         if owned and client is not None and client is not _known_client:
             _close_quietly(client)

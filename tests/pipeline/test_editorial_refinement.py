@@ -2596,3 +2596,195 @@ def test_r3_mutation_valid_reject_prior_is_reused():
     assert plan["status"] == "refined"
     assert plan["reason"] == "rejected earlier"
     assert result["editorial_refinement"]["packets_attempted"] == 0
+
+
+# --- Review 04: common post-processing on every enabled exit -------------
+
+
+def _r4_words():
+    return [
+        {"w": f"w{i}", "s": float(i), "e": float(i + 1), "sp": 0}
+        for i in range(20)
+    ]
+
+
+def _r4_candidate(cid, start, end, fp):
+    offset = int(start)
+    return {
+        "candidate_id": cid,
+        "start_s": start,
+        "end_s": end,
+        "moment_fingerprint": fp,
+        "event_key": "story-1",
+        "evidence_text": " ".join(f"w{i}" for i in range(offset, offset + 4)),
+        "context": "test",
+        "expected_payoff": f"w{offset + 2}",
+        "speaker_ids": [0],
+    }
+
+
+def _r4_quality():
+    return {name: 0.9 for name in er.QUALITY_FIELDS}
+
+
+def _r4_prior(cid, start, end, fp, links=None, bridge=None):
+    offset = int(start)
+    return er.EditorialPlan(
+        candidate_id=cid,
+        verdict="accept",
+        start_s=start,
+        end_s=end,
+        quotes={
+            "opening_evidence": f"w{offset}",
+            "premise_evidence": f"w{offset + 1}",
+            "payoff_evidence": f"w{offset + 2}",
+            "ending_evidence": f"w{offset + 3}",
+        },
+        quality=_r4_quality(),
+        recommendation_score=90.0,
+        reason="validated earlier",
+        continuity_links=list(links or []),
+        bridge_evidence=bridge,
+        status="refined",
+        moment_fingerprint=fp,
+    ).to_dict()
+
+
+def _r4_run(store, priors, client_factory=None):
+    os.environ["CLIPPYME_EDITORIAL_REFINEMENT"] = "1"
+    return er.run_editorial_refinement(
+        {"candidate_store": store, "candidate_discovery": {}},
+        _r4_words(),
+        20.0,
+        config=er.EditorialConfig(model_name="editor", fallback_models=()),
+        client_factory=client_factory,
+        prior_plans=priors,
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+
+
+def test_r4_all_prior_resume_still_computes_selected_metrics():
+    c1 = _r4_candidate("c1", 0.0, 4.0, "fp-1")
+    result = _r4_run({"c1": c1}, {"c1": _r4_prior("c1", 0.0, 4.0, "fp-1")})
+    funnel = result["editorial_refinement"]
+    assert funnel["distinct_moments"] == 1
+    assert funnel["selected_variants"] == 0
+    assert funnel["counts_reconcile"] is True
+
+
+def test_r4_all_prior_resume_still_executes_grounded_continuity():
+    c1 = _r4_candidate("c1", 0.0, 4.0, "fp-1")
+    c2 = _r4_candidate("c2", 6.0, 10.0, "fp-2")
+    p1 = _r4_prior("c1", 0.0, 4.0, "fp-1", ["c2"], "w4 w5")
+    p2 = _r4_prior("c2", 6.0, 10.0, "fp-2", ["c1"])
+    result = _r4_run({"c1": c1, "c2": c2}, {"c1": p1, "c2": p2})
+    funnel = result["editorial_refinement"]
+    assert funnel["continuity_proposed"] == 1
+    assert funnel["continuity_accepted"] == 1
+    assert funnel["continuity_rejected"] == 0
+    assert funnel["distinct_moments"] == 1
+    groups = [p for p in result["editorial_plans"]
+              if p["candidate_id"].startswith("group:")]
+    assert len(groups) == 1
+
+
+def test_r4_setup_failure_keeps_prior_and_finalizes_selected_metrics():
+    c1 = _r4_candidate("c1", 0.0, 4.0, "fp-1")
+    c2 = _r4_candidate("c2", 6.0, 10.0, "fp-2")
+
+    def fail_factory():
+        raise RuntimeError("provider unavailable")
+
+    result = _r4_run(
+        {"c1": c1, "c2": c2},
+        {"c1": _r4_prior("c1", 0.0, 4.0, "fp-1")},
+        client_factory=fail_factory,
+    )
+    funnel = result["editorial_refinement"]
+    assert funnel["distinct_moments"] == 2
+    assert funnel["selected_variants"] == 0
+    assert funnel["counts_reconcile"] is True
+
+
+# Mutation regressions: post-processing cannot be bypassed on the three
+# exits. Each test spies on a post-processing-only function; if an exit
+# skipped _run_postprocessing, the spy would never fire.
+
+
+def test_r4_postprocessing_invoked_on_all_prior_exit(monkeypatch):
+    calls = []
+    real = er.plan_continuity_group
+
+    def spy(ids, by_id, *args, **kwargs):
+        calls.append(set(ids))
+        return real(ids, by_id, *args, **kwargs)
+
+    monkeypatch.setattr(er, "plan_continuity_group", spy)
+
+    def boom():
+        raise AssertionError("factory must not be called on all-prior exit")
+
+    c1 = _r4_candidate("c1", 0.0, 4.0, "fp-1")
+    c2 = _r4_candidate("c2", 6.0, 10.0, "fp-2")
+    p1 = _r4_prior("c1", 0.0, 4.0, "fp-1", ["c2"], "w4 w5")
+    p2 = _r4_prior("c2", 6.0, 10.0, "fp-2", ["c1"])
+    result = _r4_run({"c1": c1, "c2": c2}, {"c1": p1, "c2": p2},
+                     client_factory=boom)
+    funnel = result["editorial_refinement"]
+    assert calls == [{"c1", "c2"}]
+    assert funnel["continuity_accepted"] == 1
+    assert funnel["distinct_moments"] == 1
+
+
+def test_r4_postprocessing_invoked_on_no_client_exit(monkeypatch):
+    calls = []
+    real = er.group_variants
+
+    def spy(plans):
+        calls.append(len(plans))
+        return real(plans)
+
+    monkeypatch.setattr(er, "group_variants", spy)
+    c1 = _r4_candidate("c1", 0.0, 4.0, "fp-1")
+    c2 = _r4_candidate("c2", 6.0, 10.0, "fp-2")
+    result = _r4_run({"c1": c1, "c2": c2},
+                     {"c1": _r4_prior("c1", 0.0, 4.0, "fp-1")},
+                     client_factory=None)
+    funnel = result["editorial_refinement"]
+    plans = {p["candidate_id"]: p for p in result["editorial_plans"]}
+    assert calls == [2]
+    assert funnel["distinct_moments"] == 2
+    assert funnel["selected_variants"] == 0
+    assert plans["c2"]["verdict"] == "unrefined"
+    assert "no_client_factory" in plans["c2"]["reason"]
+    assert funnel["counts_reconcile"] is True
+
+
+def test_r4_postprocessing_invoked_on_setup_failure_exit(monkeypatch):
+    calls = []
+    real = er.group_variants
+
+    def spy(plans):
+        calls.append(len(plans))
+        return real(plans)
+
+    monkeypatch.setattr(er, "group_variants", spy)
+    c1 = _r4_candidate("c1", 0.0, 4.0, "fp-1")
+    c2 = _r4_candidate("c2", 6.0, 10.0, "fp-2")
+
+    def fail_factory():
+        raise RuntimeError("provider unavailable")
+
+    result = _r4_run({"c1": c1, "c2": c2},
+                     {"c1": _r4_prior("c1", 0.0, 4.0, "fp-1")},
+                     client_factory=fail_factory)
+    funnel = result["editorial_refinement"]
+    plans = {p["candidate_id"]: p for p in result["editorial_plans"]}
+    assert calls == [2]
+    assert plans["c1"]["verdict"] == "accept"
+    assert plans["c1"]["status"] == "refined"
+    assert plans["c2"]["verdict"] == "unrefined"
+    assert "client_setup_failed" in plans["c2"]["reason"]
+    assert funnel["distinct_moments"] == 2
+    assert funnel["counts_reconcile"] is True
