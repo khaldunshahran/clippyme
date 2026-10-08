@@ -2357,3 +2357,242 @@ def test_mutation_prior_plan_ungrounded_quote_is_invalid():
     assert plan["status"] == "unrefined"
     assert plan["reason"].startswith("invalid_prior_plan")
     assert result["editorial_refinement"]["counts_reconcile"] is True
+
+
+# --- Promoted from coordinator-review3-remaining.py (5 tests) -------------
+# Durable regression tests for Task 09 review-03 corrections.
+
+
+def _r3_words():
+    return [
+        {"w": f"w{i}", "s": float(i), "e": float(i + 1), "sp": 0}
+        for i in range(20)
+    ]
+
+
+def _r3_candidate(cid="c1", start=0.0, end=4.0, fp="fp-1",
+                  evidence="w0 w1 w2 w3"):
+    return {
+        "candidate_id": cid,
+        "start_s": start,
+        "end_s": end,
+        "moment_fingerprint": fp,
+        "evidence_text": evidence,
+        "context": "test",
+        "expected_payoff": "w2",
+        "speaker_ids": [0],
+    }
+
+
+def _r3_quality():
+    return {name: 0.9 for name in er.QUALITY_FIELDS}
+
+
+def _r3_valid_prior():
+    return er.EditorialPlan(
+        candidate_id="c1",
+        verdict="accept",
+        start_s=0.0,
+        end_s=4.0,
+        quotes={
+            "opening_evidence": "w0",
+            "premise_evidence": "w1",
+            "payoff_evidence": "w2",
+            "ending_evidence": "w3",
+        },
+        quality=_r3_quality(),
+        recommendation_score=90.0,
+        reason="validated earlier",
+        status="refined",
+        moment_fingerprint="fp-1",
+    ).to_dict()
+
+
+def _r3_run(prior, client_factory=None):
+    os.environ["CLIPPYME_EDITORIAL_REFINEMENT"] = "1"
+    return er.run_editorial_refinement(
+        {"candidate_store": {"c1": _r3_candidate()},
+         "candidate_discovery": {}},
+        _r3_words(),
+        20.0,
+        config=er.EditorialConfig(model_name="editor", fallback_models=()),
+        client_factory=client_factory,
+        prior_plans={"c1": prior},
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+
+
+def test_r3_valid_completed_prior_reuses_without_provider_client():
+    result = _r3_run(_r3_valid_prior(), client_factory=None)
+    plan = result["editorial_plans"][0]
+    assert plan["verdict"] == "accept"
+    assert plan["reason"] == "validated earlier"
+    assert result["editorial_refinement"]["packets_attempted"] == 0
+    assert result["editorial_refinement"]["packets_skipped"] == 1
+
+
+def test_r3_partial_resume_preserves_valid_prior_when_client_setup_fails():
+    words = _r3_words()
+    c1 = _r3_candidate()
+    c2 = _r3_candidate(cid="c2", start=5.0, end=9.0, fp="fp-2",
+                       evidence="w5 w6 w7 w8")
+
+    def fail_factory():
+        raise RuntimeError("provider unavailable")
+
+    os.environ["CLIPPYME_EDITORIAL_REFINEMENT"] = "1"
+    result = er.run_editorial_refinement(
+        {"candidate_store": {"c1": c1, "c2": c2},
+         "candidate_discovery": {}},
+        words,
+        20.0,
+        config=er.EditorialConfig(model_name="editor", fallback_models=()),
+        client_factory=fail_factory,
+        prior_plans={"c1": _r3_valid_prior()},
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+    plans = {p["candidate_id"]: p for p in result["editorial_plans"]}
+    assert plans["c1"]["verdict"] == "accept"
+    assert plans["c1"]["reason"] == "validated earlier"
+    assert plans["c2"]["verdict"] == "unrefined"
+    assert plans["c2"]["reason"] == "client_setup_failed"
+
+
+class _r3_Client:
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    "mutate, expected_fragment",
+    [
+        (lambda p: p.update(start_s=10.0, end_s=14.0),
+         "invalid_prior_plan"),
+        (lambda p: p.update(status="unrefined", verdict="accept"),
+         "invalid_prior_plan"),
+    ],
+)
+def test_r3_unrefined_or_inconsistent_prior_cannot_bypass_material_validation(
+        mutate, expected_fragment):
+    prior = _r3_valid_prior()
+    prior.update(
+        verdict="unrefined",
+        status="unrefined",
+        quotes={},
+        quality={},
+        recommendation_score=None,
+        reason="earlier provider failure",
+    )
+    mutate(prior)
+    result = _r3_run(prior, client_factory=_r3_Client)
+    plan = result["editorial_plans"][0]
+    assert (plan["start_s"], plan["end_s"]) == (0.0, 4.0)
+    assert expected_fragment in plan["reason"]
+
+
+def test_r3_reject_prior_must_retain_current_candidate_interval():
+    prior = _r3_valid_prior()
+    prior.update(
+        verdict="reject",
+        status="refined",
+        start_s=10.0,
+        end_s=14.0,
+        quotes={},
+        quality={},
+        recommendation_score=None,
+        reason="rejected earlier",
+    )
+    result = _r3_run(prior, client_factory=_r3_Client)
+    plan = result["editorial_plans"][0]
+    assert (plan["start_s"], plan["end_s"]) == (0.0, 4.0)
+    assert "invalid_prior_plan" in plan["reason"]
+
+
+# --- Mutation regressions for review-03 findings -------------------------
+
+
+def test_r3_mutation_factory_never_called_when_all_priors_resolve():
+    """Lazy client: the factory must not run when priors cover everything."""
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        return _r3_Client()
+
+    result = _r3_run(_r3_valid_prior(), client_factory=factory)
+    assert calls["n"] == 0
+    assert result["editorial_plans"][0]["verdict"] == "accept"
+    assert result["editorial_refinement"]["packets_attempted"] == 0
+
+
+def test_r3_mutation_partial_resume_invalid_prior_and_failed_factory():
+    """Invalid prior -> invalid_prior_plan; unresolved -> client_setup_failed."""
+    words = _r3_words()
+    c1 = _r3_candidate()
+    c2 = _r3_candidate(cid="c2", start=5.0, end=9.0, fp="fp-2",
+                       evidence="w5 w6 w7 w8")
+    stale = _r3_valid_prior()
+    stale.update(start_s=10.0, end_s=14.0)
+
+    def fail_factory():
+        raise RuntimeError("provider unavailable")
+
+    os.environ["CLIPPYME_EDITORIAL_REFINEMENT"] = "1"
+    result = er.run_editorial_refinement(
+        {"candidate_store": {"c1": c1, "c2": c2},
+         "candidate_discovery": {}},
+        words,
+        20.0,
+        config=er.EditorialConfig(model_name="editor", fallback_models=()),
+        client_factory=fail_factory,
+        prior_plans={"c1": stale},
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+    plans = {p["candidate_id"]: p for p in result["editorial_plans"]}
+    assert plans["c1"]["verdict"] == "unrefined"
+    assert "invalid_prior_plan" in plans["c1"]["reason"]
+    assert (plans["c1"]["start_s"], plans["c1"]["end_s"]) == (0.0, 4.0)
+    assert plans["c2"]["verdict"] == "unrefined"
+    assert plans["c2"]["reason"] == "client_setup_failed"
+    assert result["editorial_refinement"]["counts_reconcile"]
+
+
+def test_r3_mutation_empty_reason_prior_is_invalid():
+    prior = _r3_valid_prior()
+    prior["reason"] = "   "
+    result = _r3_run(prior, client_factory=_r3_Client)
+    plan = result["editorial_plans"][0]
+    assert plan["verdict"] == "unrefined"
+    assert "invalid_prior_plan" in plan["reason"]
+
+
+def test_r3_mutation_refined_unrefined_verdict_mismatch_is_invalid():
+    prior = _r3_valid_prior()
+    prior.update(status="refined", verdict="unrefined")
+    result = _r3_run(prior, client_factory=_r3_Client)
+    plan = result["editorial_plans"][0]
+    assert plan["verdict"] == "unrefined"
+    assert "invalid_prior_plan" in plan["reason"]
+    assert (plan["start_s"], plan["end_s"]) == (0.0, 4.0)
+
+
+def test_r3_mutation_valid_reject_prior_is_reused():
+    """A refined reject on the exact candidate interval stays reusable."""
+    prior = _r3_valid_prior()
+    prior.update(
+        verdict="reject",
+        status="refined",
+        quotes={},
+        quality={},
+        recommendation_score=None,
+        reason="rejected earlier",
+    )
+    result = _r3_run(prior, client_factory=None)
+    plan = result["editorial_plans"][0]
+    assert plan["verdict"] == "reject"
+    assert plan["status"] == "refined"
+    assert plan["reason"] == "rejected earlier"
+    assert result["editorial_refinement"]["packets_attempted"] == 0

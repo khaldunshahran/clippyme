@@ -351,7 +351,11 @@ def _validate_prior_plan(raw: Any, candidate: Mapping[str, Any],
     short reason. Stale identity is never trusted: the embedded
     candidate ID and moment fingerprint must match the current
     candidate, the schema version must be current, and boundaries,
-    verdict/status, and duration/source bounds must still hold.
+    verdict/status, and duration/source bounds must still hold. The
+    uniform stored-state contract also applies: refined pairs only
+    with accept/adjust/reject, unrefined pairs only with unrefined,
+    every reusable record has a non-empty reason, and unrefined/reject
+    records retain the exact current discovery interval.
     """
     if not isinstance(raw, Mapping):
         return "not an object"
@@ -379,6 +383,24 @@ def _validate_prior_plan(raw: Any, candidate: Mapping[str, Any],
     dur = se - ss
     if dur < policy_min - 1e-6 or dur > policy_max + 1e-6:
         return "duration policy violation"
+    # Uniform stored-state contract (review 03): refined pairs only with
+    # accept/adjust/reject; unrefined pairs only with unrefined; every
+    # reusable record carries a non-empty reason; unrefined and reject
+    # records must retain the exact current discovery interval.
+    status = raw.get("status")
+    verdict = raw.get("verdict")
+    if status == "refined":
+        if verdict not in ("accept", "adjust", "reject"):
+            return "status/verdict inconsistent"
+    elif verdict != "unrefined":
+        return "status/verdict inconsistent"
+    if not (raw.get("reason") or "").strip():
+        return "empty reason"
+    if verdict in ("unrefined", "reject"):
+        cs = float(candidate["start_s"])
+        ce = float(candidate["end_s"])
+        if abs(ss - cs) > 1e-6 or abs(se - ce) > 1e-6:
+            return "stale boundaries"
     return None
 
 
@@ -404,7 +426,12 @@ def _revalidate_prior_material(
     if not (plan.reason or "").strip():
         return "empty reason"
     if plan.verdict == "reject":
-        # Rejections carry no interval semantics beyond identity.
+        # Rejections keep the discovery interval; anything else is stale.
+        orig_start = float(candidate["start_s"])
+        orig_end = float(candidate["end_s"])
+        if (abs(float(plan.start_s) - orig_start) > 1e-6
+                or abs(float(plan.end_s) - orig_end) > 1e-6):
+            return "reject interval does not equal candidate interval"
         return None
     valid = [w for w in words if _valid_word(w)]
     ps, pe = float(plan.start_s), float(plan.end_s)
@@ -1273,35 +1300,6 @@ def run_editorial_refinement(
             _count_verdict(p)
         return _finish(plans)
 
-    # Client lifecycle: create exactly one owned client via the factory,
-    # close it exactly once on all exits. A factory result identical to
-    # the caller's already-owned instance is borrowed, never closed.
-    client = None
-    owned = False
-    if client_factory is not None:
-        try:
-            client = client_factory()
-            owned = True
-        except Exception as e:
-            plans = [_unrefined(c, "client_setup_failed")
-                     for c in (candidates_by_id[cid]
-                               for cid in kept_ids)]
-            funnel["packets_skipped"] = len(kept_ids)
-            funnel["rejections"].append(
-                {"reason": "client_setup_failed",
-                 "detail": str(e)[:200]})
-            for p in plans:
-                _count_verdict(p)
-            return _finish(plans)
-    if client is None:
-        # Enabled but no client available: zero provider calls.
-        plans = [_unrefined(c, "no_client_factory")
-                 for c in (candidates_by_id[cid] for cid in kept_ids)]
-        funnel["packets_skipped"] = len(kept_ids)
-        for p in plans:
-            _count_verdict(p)
-        return _finish(plans)
-
     _real_build = gr.build_editorial_prompt
     if build_prompt_fn is not None:
         def build_prompt(packet, instructions, **prefs):
@@ -1321,58 +1319,108 @@ def run_editorial_refinement(
 
     plans: List[EditorialPlan] = []
     group_plans: List[EditorialPlan] = []
-    try:
-        all_cands = [candidates_by_id[cid] for cid in kept_ids]
-        for cid in kept_ids:
-            cand = candidates_by_id[cid]
-            # Resume: never repeat a completed plan — but never
-            # trust stale identity either. An invalid prior plan is
-            # reprocessed from scratch (recorded honestly) instead of
-            # being preserved as completed work.
-            if prior_plans and cid in prior_plans:
-                raw = prior_plans[cid]
-                bad = _validate_prior_plan(raw, cand, video_duration,
-                                           policy_min, policy_max)
-                plan = None
+    all_cands = [candidates_by_id[cid] for cid in kept_ids]
+    _order = {cid: i for i, cid in enumerate(kept_ids)}
+
+    def _sort_plans() -> None:
+        plans.sort(key=lambda p: _order[p.candidate_id])
+
+    # Phase 1 -- resume: validate and reuse prior plans FIRST, with no
+    # provider client required. Completed plans stay reusable even when
+    # no client can be created; invalid priors become unrefined on the
+    # current discovery interval (never trusted as completed work).
+    resolved: set = set()
+    for cid in kept_ids:
+        cand = candidates_by_id[cid]
+        if not (prior_plans and cid in prior_plans):
+            continue
+        raw = prior_plans[cid]
+        bad = _validate_prior_plan(raw, cand, video_duration,
+                                   policy_min, policy_max)
+        plan = None
+        if bad is None:
+            plan = EditorialPlan.from_dict(raw)
+            if plan.status == "refined":
+                # A completed plan may skip provider work only after it
+                # is revalidated against the current transcript packet
+                # and candidate with the same material invariants as a
+                # fresh result.
+                try:
+                    packet = build_context_packet(
+                        cand, all_cands, words, video_duration,
+                        policy_min, policy_max, cfg)
+                except Exception as e:
+                    bad = (f"packet:{type(e).__name__}:"
+                           f"{str(e)[:60]}")
                 if bad is None:
-                    plan = EditorialPlan.from_dict(raw)
-                    if plan.status == "refined":
-                        # A completed plan may skip provider work only
-                        # after it is revalidated against the current
-                        # transcript packet and candidate with the same
-                        # material invariants as a fresh result.
-                        try:
-                            packet = build_context_packet(
-                                cand, all_cands, words, video_duration,
-                                policy_min, policy_max, cfg)
-                        except Exception as e:
-                            bad = (f"packet:{type(e).__name__}:"
-                                   f"{str(e)[:60]}")
-                        if bad is None:
-                            neighbor_guards = [
-                                (float(candidates_by_id[o]["start_s"]),
-                                 float(candidates_by_id[o]["end_s"]))
-                                for o in kept_ids if o != cid
-                            ]
-                            bad = _revalidate_prior_material(
-                                plan, cand, packet, words,
-                                video_duration, policy_min, policy_max,
-                                neighbor_guards)
-                    # A verdict-"unrefined" prior is already explicitly
-                    # unrefined; identity checks suffice to reuse it.
-                if bad is None:
-                    plans.append(plan)
-                    funnel["packets_skipped"] += 1
-                    _count_verdict(plan)
-                    continue
-                funnel["rejections"].append(
-                    {"candidate_id": cid,
-                     "reason": f"invalid_prior_plan:{bad}"})
-                plans.append(_unrefined(
-                    cand, f"invalid_prior_plan:{bad}"))
+                    neighbor_guards = [
+                        (float(candidates_by_id[o]["start_s"]),
+                         float(candidates_by_id[o]["end_s"]))
+                        for o in kept_ids if o != cid
+                    ]
+                    bad = _revalidate_prior_material(
+                        plan, cand, packet, words,
+                        video_duration, policy_min, policy_max,
+                        neighbor_guards)
+        if bad is None:
+            plans.append(plan)
+            funnel["packets_skipped"] += 1
+            _count_verdict(plan)
+            resolved.add(cid)
+            continue
+        funnel["rejections"].append(
+            {"candidate_id": cid,
+             "reason": f"invalid_prior_plan:{bad}"})
+        plans.append(_unrefined(
+            cand, f"invalid_prior_plan:{bad}"))
+        funnel["packets_skipped"] += 1
+        _count_verdict(plans[-1])
+        resolved.add(cid)
+    _sort_plans()
+
+    unresolved = [cid for cid in kept_ids if cid not in resolved]
+    if not unresolved:
+        # Every candidate resolved from priors: no provider client is
+        # ever created.
+        return _finish(plans)
+
+    # Phase 2 -- lazy client: create exactly one owned client via the
+    # factory only when an unresolved candidate needs generation.
+    # Close it exactly once on all exits. A factory result identical to
+    # the caller's already-owned instance is borrowed, never closed.
+    client = None
+    owned = False
+    if client_factory is not None:
+        try:
+            client = client_factory()
+            owned = True
+        except Exception as e:
+            for cid in unresolved:
+                plans.append(_unrefined(candidates_by_id[cid],
+                                        "client_setup_failed"))
                 funnel["packets_skipped"] += 1
                 _count_verdict(plans[-1])
-                continue
+            funnel["rejections"].append(
+                {"reason": "client_setup_failed",
+                 "detail": str(e)[:200]})
+            _sort_plans()
+            return _finish(plans)
+    if client is None:
+        # Enabled but no client available: zero provider calls. Valid
+        # priors resolved above are retained; only unresolved
+        # candidates are marked.
+        for cid in unresolved:
+            plans.append(_unrefined(candidates_by_id[cid],
+                                    "no_client_factory"))
+            funnel["packets_skipped"] += 1
+            _count_verdict(plans[-1])
+        _sort_plans()
+        return _finish(plans)
+
+    try:
+        _sort_plans()
+        for cid in unresolved:
+            cand = candidates_by_id[cid]
             try:
                 packet = build_context_packet(
                     cand, all_cands, words, video_duration,
