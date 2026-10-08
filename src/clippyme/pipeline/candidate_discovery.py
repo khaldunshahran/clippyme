@@ -958,11 +958,23 @@ def run_windowed_discovery(
               + funnel["final_selected"])
         funnel["counts_reconcile"] = bool(c1 and c2 and c3 and c4)
         _efunnel, _eplans = _attach_editorial(funnel, candidate_store)
-        return {"shorts": shorts,
+        # Task 10: apply validated editorial plans to the final shorts
+        # exactly once, after Task 09 returns plans and before the
+        # result leaves run_windowed_discovery. Deferred import mirrors
+        # _attach_editorial (editorial_application imports this module).
+        from clippyme.pipeline import editorial_application as _ea
+        _editorial_ran = bool(
+            isinstance(_efunnel, dict) and _efunnel.get("enabled"))
+        _applied_shorts, _app_record = _ea.apply_editorial_plans(
+            shorts, candidate_store, _eplans,
+            video_duration, _policy.min_duration, _policy.max_duration,
+            editorial_ran=_editorial_ran)
+        return {"shorts": _applied_shorts,
                 "candidate_discovery": funnel,
                 "candidate_store": candidate_store,
                 "editorial_refinement": _efunnel,
-                "editorial_plans": _eplans}
+                "editorial_plans": _eplans,
+                "editorial_application": _app_record}
 
     if not windows:
         funnel["candidate_discovery_note"] = "no valid words"

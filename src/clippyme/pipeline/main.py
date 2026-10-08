@@ -1050,7 +1050,13 @@ if __name__ == '__main__':
                     if isinstance(clips_data, dict) else None)
         _eplans = (clips_data.get("editorial_plans")
                    if isinstance(clips_data, dict) else None)
-        def _keep_funnel(data):
+        # Task 10: preserve the application record through fallbacks.
+        _app_record = (clips_data.get("editorial_application")
+                       if isinstance(clips_data, dict) else None)
+        def _keep_funnel(data, strategy=None):
+            # strategy names the fallback ("texttiling"/"whole_video");
+            # None preserves the application record verbatim (no
+            # fallback shortlist was produced).
             if isinstance(data, dict):
                 if _dfunnel is not None:
                     data["candidate_discovery"] = _dfunnel
@@ -1061,11 +1067,20 @@ if __name__ == '__main__':
                     data["editorial_refinement"] = _efunnel
                 if _eplans is not None:
                     data["editorial_plans"] = _eplans
+                if _app_record is not None:
+                    if strategy is None:
+                        data["editorial_application"] = _app_record
+                    else:
+                        from clippyme.pipeline import (
+                            editorial_application as _ea)
+                        _ea.preserve_application_through_fallback(
+                            data, _app_record, strategy)
             return data
         if not clips_data or 'shorts' not in clips_data:
             if should_use_fallback(args.monitor):
                 clips_data = _keep_funnel(
-                    build_texttiling_fallback(transcript, video_title))
+                    build_texttiling_fallback(transcript, video_title),
+                    "texttiling")
                 if _dfunnel is not None and isinstance(clips_data, dict) \
                         and "candidate_discovery" in clips_data:
                     clips_data["candidate_discovery"][
@@ -1076,7 +1091,7 @@ if __name__ == '__main__':
                 # Monitor: no hallucinated/fallback clips — write empty metadata
                 # (+ exhaustion marker if Gemini ran out of models) and exit clean.
                 empty = {'shorts': [], 'transcript': transcript, 'aspect': args.aspect}
-                empty = _keep_funnel(empty)
+                empty = _keep_funnel(empty)  # no fallback clips: keep record verbatim
                 if getattr(get_viral_clips, '_last_gemini_exhausted', False):
                     empty['gemini_exhausted'] = True
                 _meta = os.path.join(output_dir, f"{video_title}_metadata.json")
@@ -1092,7 +1107,8 @@ if __name__ == '__main__':
                                           aspect_ratio=aspect_ratio, letterbox_zoom=letterbox_zoom)
                 # Persist funnel/store atomically for whole-video fallback.
                 _wv_data = _keep_funnel({'shorts': [], 'transcript': transcript,
-                                        'aspect': args.aspect})
+                                        'aspect': args.aspect},
+                                        "whole_video")
                 if _dfunnel is not None:
                     _wv_data['candidate_discovery']['fallback_strategy'] = 'whole_video'
                     _wv_data['candidate_discovery']['fallback_result'] = 'rendered_whole_video'

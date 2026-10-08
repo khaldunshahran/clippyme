@@ -570,7 +570,13 @@ def _load_or_analyze(
                              if isinstance(clips_data, dict) else None)
         _editorial_plans = (clips_data.get("editorial_plans")
                             if isinstance(clips_data, dict) else None)
-        def _preserve_funnel(data):
+        # Task 10: preserve the application record through fallbacks.
+        _application_record = (clips_data.get("editorial_application")
+                               if isinstance(clips_data, dict) else None)
+        def _preserve_funnel(data, strategy=None):
+            # strategy names the fallback ("texttiling"/"whole_video");
+            # None preserves the application record verbatim (no
+            # fallback shortlist was produced).
             if isinstance(data, dict):
                 if _discovery_funnel is not None:
                     data["candidate_discovery"] = _discovery_funnel
@@ -581,11 +587,20 @@ def _load_or_analyze(
                     data["editorial_refinement"] = _editorial_funnel
                 if _editorial_plans is not None:
                     data["editorial_plans"] = _editorial_plans
+                if _application_record is not None:
+                    if strategy is None:
+                        data["editorial_application"] = _application_record
+                    else:
+                        from clippyme.pipeline import (
+                            editorial_application as _ea)
+                        _ea.preserve_application_through_fallback(
+                            data, _application_record, strategy)
             return data
         if not clips_data or "shorts" not in clips_data:
             if should_use_fallback(args.monitor):
                 clips_data = _preserve_funnel(
-                    legacy.build_texttiling_fallback(transcript, video_title))
+                    legacy.build_texttiling_fallback(transcript, video_title),
+                    "texttiling")
                 if _discovery_funnel is not None and isinstance(clips_data, dict) and "candidate_discovery" in clips_data:
                     clips_data["candidate_discovery"]["fallback_strategy"] = "texttiling"
         if not clips_data or not clips_data.get("shorts"):
@@ -599,7 +614,8 @@ def _load_or_analyze(
             else:
                 print("⚠️ No valid AI/topic clips; using whole-video fallback", flush=True)
                 clips_data = _preserve_funnel(
-                    _whole_video_fallback(video_title, duration))
+                    _whole_video_fallback(video_title, duration),
+                    "whole_video")
                 if _discovery_funnel is not None and isinstance(clips_data, dict) and "candidate_discovery" in clips_data:
                     clips_data["candidate_discovery"]["fallback_strategy"] = "whole_video"
         # Phase B: steering that arrived while moment selection was
@@ -641,6 +657,23 @@ def _load_or_analyze(
                     f"?? editorial_refinement version mismatch "
                     f"(got {_er.get('version')}, want {EDITORIAL_VERSION}); "
                     f"keeping metadata as-is (fail-soft).",
+                    flush=True)
+        except Exception:
+            pass
+    # Task 10: fail-soft validation of the editorial application record.
+    # It flows through the existing atomic checkpoint unchanged; we only
+    # verify its version.
+    _ea_rec = clips_data.get("editorial_application")
+    if isinstance(_ea_rec, dict):
+        try:
+            from clippyme.pipeline.editorial_application import (
+                APPLICATION_VERSION)
+            if _ea_rec.get("version") != APPLICATION_VERSION:
+                print(
+                    f"?? editorial_application version mismatch "
+                    f"(got {_ea_rec.get('version')}, want "
+                    f"{APPLICATION_VERSION}); keeping metadata as-is "
+                    f"(fail-soft).",
                     flush=True)
         except Exception:
             pass
