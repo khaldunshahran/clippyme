@@ -20,12 +20,19 @@ Design rules (see docs/turn-aware-framing.md for the full contract):
   ``cooldown_s`` have elapsed. Weak evidence yields group/wide or held-safe
   framing, never a bounce.
 * The crop is fixed within each stable segment. Only a short bounded ease
-  (``ease_frames``) interpolates between accepted turns; travel is capped, zoom
-  is held unless widening, crops are clamped in-bounds with headroom/padding.
+  (``ease_frames``) interpolates between accepted turns; travel is limited to
+  ``max_travel_frac`` of the frame dimension PER SECOND (the transition
+  extends over as many frames as the speed cap needs, or the previous lock is
+  held), zoom is held unless widening, crops are clamped in-bounds with
+  headroom/padding.
 * Plans are versioned (``SCHEMA_VERSION``) and reused only when source
-  fingerprint, dimensions/FPS/frame count, scene plan, schema version and
-  config digest all match. No pixels, embeddings, names, provider responses or
-  raw mouth landmarks are ever persisted.
+  fingerprint, dimensions/FPS/frame count, scene plan, schema version, config
+  digest, output aspect, ordered scene strategies and the tracker decision
+  digest all match. No pixels, embeddings, names, provider responses or raw
+  mouth landmarks are ever persisted.
+* Pass-1 analysis runs under one monotonic wall-time + frame budget
+  (``AnalysisBudget``); when it exhausts, expensive analysis stops and the
+  affected scenes keep the accepted static/wide fallback.
 """
 from __future__ import annotations
 
@@ -39,7 +46,7 @@ import time
 from dataclasses import dataclass, field
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PLAN_PRODUCER = "clippyme-turn-framing-plan"
 
 # Bound for per-observation mouth-motion evidence. Mirrors the tracker's
@@ -105,7 +112,10 @@ class TurnFramingConfig:
     merge_window_s: float = 0.5        # sub-window oscillation blips are merged away
     occlusion_hold_s: float = 1.0      # short occlusion holds the framing safely
     ease_frames: int = 6               # short bounded ease between accepted turns
-    max_travel_frac: float = 0.5       # cap crop-centre travel per switch (fraction of frame)
+    max_travel_frac: float = 0.5       # per-second cap on crop-centre travel
+                                       # (fraction of the frame dimension / s)
+    analysis_deadline_s: float = 120.0  # monotonic wall-time budget for pass-1
+                                       # analysis (decode/detect/MAR/planner)
     headroom_frac: float = 0.15        # headroom above the subject, fraction of crop height
     padding_frac: float = 0.35         # padding around the subject union box
     hold_zoom: bool = True             # never zoom in mid-scene; only widen
@@ -157,7 +167,56 @@ def config_from_env() -> TurnFramingConfig:
         occlusion_hold_s=_env_float("CLIPPYME_TURN_OCCLUSION_S", 1.0, 0.0, 10.0),
         ease_frames=_env_int("CLIPPYME_TURN_EASE_FRAMES", 6, 0),
         max_analysis_frames=_env_int("CLIPPYME_TURN_MAX_ANALYSIS_FRAMES", 20000, 1),
+        analysis_deadline_s=_env_float("CLIPPYME_TURN_ANALYSIS_DEADLINE_S",
+                                       120.0, 0.05, 3600.0),
     )
+
+
+class AnalysisBudget:
+    """Monotonic wall-time + frame budget for pass-1 turn analysis.
+
+    One monotonic clock per framing invocation: the deadline is fixed at
+    construction from ``time.monotonic()`` and never re-read from a wall
+    clock that can jump. ``ok()`` latches -- once the deadline passes or the
+    frame budget is spent it stays ``False`` and ``exhaust_reason`` names the
+    cause:
+
+    * ``"analysis_budget_exhausted"`` -- the wall-time deadline passed;
+    * ``"analysis-frame-budget-exhausted"`` -- the frame/observation cap hit
+      (the same token the ``ObservationLog`` records on its first drop).
+
+    The caller checks ``ok()`` before every expensive step (frame
+    decode/retrieve, face detection, mouth analysis, planner build) and stops
+    new expensive analysis once it latches -- detector/MAR call counts must
+    freeze, not merely have their results discarded.
+
+    The clock is injectable for tests (``clock=time.monotonic`` by default).
+    """
+
+    def __init__(self, *, deadline_s: float, max_frames: int, clock=None):
+        self._clock = clock if clock is not None else time.monotonic
+        self._deadline = self._clock() + max(0.0, float(deadline_s))
+        self.frames_left = max(0, int(max_frames))
+        self.exhausted = False
+        self.exhaust_reason: str | None = None
+
+    def ok(self) -> bool:
+        if self.exhausted:
+            return False
+        if self.frames_left <= 0:
+            self.exhausted = True
+            self.exhaust_reason = "analysis-frame-budget-exhausted"
+            return False
+        if self._clock() >= self._deadline:
+            self.exhausted = True
+            self.exhaust_reason = "analysis_budget_exhausted"
+            return False
+        return True
+
+    def consume(self) -> None:
+        """Spend one analyzed frame of the frame budget."""
+        if self.frames_left > 0:
+            self.frames_left -= 1
 
 
 # --- observation record -----------------------------------------------------
@@ -783,15 +842,21 @@ def _lerp_box(a: list, b: list, t: float, frame_w: float,
 def build_scene_keyframes(segments: list[FramingSegment], log: ObservationLog,
                           scene_id: int, config: TurnFramingConfig,
                           frame_w: float, frame_h: float,
-                          aspect: float) -> tuple[list[FramingSegment], list[CropKeyframe], list[str]]:
+                          aspect: float, *,
+                          fps: float) -> tuple[list[FramingSegment], list[CropKeyframe], list[str]]:
     """Attach fixed lock crops to segments and build bounded ease keyframes.
 
     One stable subject (or pair) keeps ONE crop for the whole segment. Between
-    accepted turns, ``ease_frames`` keyframes interpolate linearly from the
-    previous lock crop — the only camera motion the plan ever emits — with
-    per-switch travel capped at ``max_travel_frac`` of the frame dimension.
-    Segments whose subjects cannot fit a crop become ``wide`` with a reason.
-    Returns ``(segments, keyframes, diagnostics)``.
+    accepted turns, ease keyframes interpolate linearly from the previous lock
+    crop — the only camera motion the plan ever emits — with travel limited to
+    ``max_travel_frac`` of the frame dimension PER SECOND: the transition is
+    extended over as many frames as the per-frame speed cap
+    (``max_travel_frac * dim / fps``) needs, so EVERY consecutive rendered
+    crop-centre step — including the final ease-to-lock step — respects the
+    cap. When the segment cannot fit the transition, the previous lock is held
+    (zero travel — the safe fallback); excess travel is never hidden in the
+    final step. Segments whose subjects cannot fit a crop become ``wide``
+    with a reason. Returns ``(segments, keyframes, diagnostics)``.
     """
     diagnostics: list[str] = []
     keyframes: list[CropKeyframe] = []
@@ -805,6 +870,7 @@ def build_scene_keyframes(segments: list[FramingSegment], log: ObservationLog,
                    if seg.start_frame <= o.frame <= seg.end_frame]
         lock: list | None = None
         kind = seg.kind
+        subject_ids = seg.subject_ids
         reason = seg.reason
         if kind in ("single", "two-subject"):
             boxes = []
@@ -826,6 +892,7 @@ def build_scene_keyframes(segments: list[FramingSegment], log: ObservationLog,
                                          config, hold_h)
             if lock is None:
                 kind = "wide"
+                subject_ids = ()
                 reason = "subjects-too-wide-for-crop"
                 diagnostics.append(
                     f"scene {scene_id} segment @{seg.start_frame}: {reason}")
@@ -836,44 +903,49 @@ def build_scene_keyframes(segments: list[FramingSegment], log: ObservationLog,
             mean_cx = sum(cxs) / len(cxs) if cxs else None
             lock = _wide_crop(mean_cx, frame_w, frame_h, aspect)
 
-        # Travel cap vs the previous lock crop.
-        if prev_lock is not None and lock is not None:
-            pcx = (prev_lock[0] + prev_lock[2]) / 2.0
-            pcy = (prev_lock[1] + prev_lock[3]) / 2.0
-            ncx = (lock[0] + lock[2]) / 2.0
-            ncy = (lock[1] + lock[3]) / 2.0
-            capx = config.max_travel_frac * frame_w
-            capy = config.max_travel_frac * frame_h
-            dx, dy = ncx - pcx, ncy - pcy
-            if abs(dx) > capx or abs(dy) > capy:
-                if abs(dx) > capx:
-                    ncx = pcx + math.copysign(capx, dx)
-                if abs(dy) > capy:
-                    ncy = pcy + math.copysign(capy, dy)
-                shx = int(round(ncx - (lock[0] + lock[2]) / 2.0))
-                shy = int(round(ncy - (lock[1] + lock[3]) / 2.0))
-                lock = [lock[0] + shx, lock[1] + shy,
-                        lock[2] + shx, lock[3] + shy]
-                lock[0] = max(0, min(int(frame_w) - 1, lock[0]))
-                lock[1] = max(0, min(int(frame_h) - 1, lock[1]))
-                lock[2] = max(lock[0] + 1, min(int(frame_w), lock[2]))
-                lock[3] = max(lock[1] + 1, min(int(frame_h), lock[3]))
+        # Per-second travel limiting: extend the transition over enough frames
+        # that no consecutive rendered step exceeds the speed cap, or hold the
+        # previous lock when the segment cannot fit it.
+        ease_n = 0
+        if idx > 0 and prev_lock is not None and lock is not None \
+                and config.ease_frames > 0 and fps > 0:
+            capx = config.max_travel_frac * frame_w / fps
+            capy = config.max_travel_frac * frame_h / fps
+            travel = [abs(lock[i] - prev_lock[i]) for i in range(4)]
+            need = 0
+            if capx > 0:
+                need = max(need, math.ceil(travel[0] / capx),
+                           math.ceil(travel[2] / capx))
+            if capy > 0:
+                need = max(need, math.ceil(travel[1] / capy),
+                           math.ceil(travel[3] / capy))
+            # +1 frame of margin so int rounding of the keyframes can never
+            # push a step over the cap.
+            ease_n = max(int(config.ease_frames), need + 1)
+            avail = seg.end_frame - seg.start_frame + 1
+            if ease_n > avail:
+                # Safe fallback: hold the previous lock (zero travel) rather
+                # than rushing the pan or hiding excess in the final step.
+                lock = list(prev_lock)
+                ease_n = 0
                 diagnostics.append(
-                    f"scene {scene_id} segment @{seg.start_frame}: travel-capped")
+                    f"scene {scene_id} segment @{seg.start_frame}: "
+                    f"transition-held")
 
-        # Bounded ease: the only motion the plan emits.
-        if idx > 0 and prev_lock is not None and config.ease_frames > 0:
-            for i in range(config.ease_frames):
+        # Bounded ease: the only motion the plan emits. Uniform t spacing over
+        # ease_n+1 steps keeps the final ease-to-lock step under the cap too.
+        if ease_n > 0:
+            for i in range(ease_n):
                 fr = seg.start_frame + i
                 if fr > seg.end_frame:
                     break
-                tt = (i + 1) / (config.ease_frames + 1)
+                tt = (i + 1) / (ease_n + 1)
                 eb = _lerp_box(prev_lock, lock, tt, frame_w, frame_h)
                 keyframes.append(CropKeyframe(frame=fr, x1=eb[0], y1=eb[1],
                                               x2=eb[2], y2=eb[3], kind="ease"))
         out_segments.append(FramingSegment(
             scene_id=seg.scene_id, start_frame=seg.start_frame,
-            end_frame=seg.end_frame, subject_ids=seg.subject_ids, kind=kind,
+            end_frame=seg.end_frame, subject_ids=subject_ids, kind=kind,
             confidence=seg.confidence, evidence=seg.evidence, reason=reason,
             crop=lock))
         prev_lock = lock
@@ -931,6 +1003,9 @@ class FramingPlan:
     frame_count: int
     scene_intervals: list
     config_digest: str
+    output_aspect: float = 9 / 16  # actual render aspect the crops were built for
+    tracker_digest: str = ""       # digest of the tracker decision config that
+                                   # produced the plan's observations
     scenes: list = field(default_factory=list)  # ScenePlan
     created_at: str = ""
 
@@ -965,6 +1040,8 @@ def plan_to_dict(plan: FramingPlan) -> dict:
         "frame_count": plan.frame_count,
         "scene_intervals": [list(iv) for iv in plan.scene_intervals],
         "config_digest": plan.config_digest,
+        "output_aspect": plan.output_aspect,
+        "tracker_digest": plan.tracker_digest,
         "created_at": plan.created_at,
         "scenes": [
             {
@@ -985,130 +1062,381 @@ def plan_to_dict(plan: FramingPlan) -> dict:
     }
 
 
-def _req(d: dict, key: str, types, ctx: str):
-    if key not in d or not isinstance(d[key], types):
-        raise ValueError(f"malformed-plan: {ctx} missing/invalid '{key}'")
+def _strict_int(v) -> bool:
+    """int that is not a bool — JSON true/false must never validate as a number."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _strict_num(v) -> bool:
+    """Finite non-boolean number."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) \
+        and math.isfinite(v)
+
+
+def _req(d: dict, key: str, ctx: str):
+    if not isinstance(d, dict) or key not in d:
+        raise ValueError(f"malformed-plan: {ctx} missing '{key}'")
     return d[key]
 
 
+def _no_unknown(d: dict, allowed: frozenset, ctx: str) -> None:
+    unknown = set(d) - allowed
+    if unknown:
+        raise ValueError(
+            f"malformed-plan: {ctx} has unknown keys {sorted(unknown)!r}")
+
+
+# Exact key allow-lists: the parser rejects anything it did not write —
+# pixels, landmarks, embeddings, names and any other nested smuggling.
+_PLAN_TOP_KEYS = frozenset({
+    "schema_version", "producer", "source_fingerprint", "frame_w", "frame_h",
+    "fps", "frame_count", "scene_intervals", "config_digest", "output_aspect",
+    "tracker_digest", "created_at", "scenes",
+})
+_SCENE_KEYS = frozenset({
+    "scene_id", "strategy", "start_frame", "end_frame", "applies",
+    "tracks", "segments", "keyframes", "fallback", "fallback_crop",
+})
+_SEGMENT_KEYS = frozenset({
+    "scene_id", "start_frame", "end_frame", "subject_ids", "kind",
+    "confidence", "evidence", "reason", "crop",
+})
+_KEYFRAME_KEYS = frozenset({"frame", "x1", "y1", "x2", "y2", "kind"})
+_TRACK_KEYS = frozenset({"id", "first_frame", "last_frame", "n_obs"})
+_FALLBACK_KEYS = frozenset({"reason", "detail"})
+# Allowed segment evidence keys with bounded scalar values only.
+_EVIDENCE_SPEC = {
+    "mouth_mean": (0.0, MOUTH_MOTION_MAX),
+    "margin_mean": (0.0, 100.0),
+    "n_evidence_frames": "count",
+    "occluded_frames": "count",
+}
+
+
+def _parse_track(t: dict, ctx: str, frame_count: int) -> dict:
+    tctx = ctx + ".track"
+    if not isinstance(t, dict):
+        raise ValueError(f"malformed-plan: {tctx} must be a dict")
+    _no_unknown(t, _TRACK_KEYS, tctx)
+    tid = _req(t, "id", tctx)
+    if not isinstance(tid, str) or not TRACK_ID_RE.match(tid):
+        raise ValueError(f"malformed-plan: {tctx} non-anonymous track id")
+    first = _req(t, "first_frame", tctx)
+    last = _req(t, "last_frame", tctx)
+    n_obs = _req(t, "n_obs", tctx)
+    if (not _strict_int(first) or not _strict_int(last)
+            or not _strict_int(n_obs)
+            or not 0 <= first <= last < frame_count
+            or not 0 <= n_obs <= frame_count):
+        raise ValueError(f"malformed-plan: {tctx} bad frame/count fields")
+    return {"id": tid, "first_frame": first, "last_frame": last,
+            "n_obs": n_obs}
+
+
+def _parse_evidence(ev: dict, ctx: str) -> dict:
+    ectx = ctx + ".evidence"
+    if not isinstance(ev, dict):
+        raise ValueError(f"malformed-plan: {ectx} must be a dict")
+    unknown = set(ev) - set(_EVIDENCE_SPEC)
+    if unknown:
+        raise ValueError(
+            f"malformed-plan: {ectx} unknown keys {sorted(unknown)!r}")
+    out: dict = {}
+    for key, spec in _EVIDENCE_SPEC.items():
+        if key not in ev:
+            continue
+        v = ev[key]
+        if spec == "count":
+            if not _strict_int(v) or v < 0:
+                raise ValueError(f"malformed-plan: {ectx} bad '{key}'")
+            out[key] = int(v)
+        else:
+            lo, hi = spec
+            if not _strict_num(v) or not lo <= v <= hi:
+                raise ValueError(f"malformed-plan: {ectx} bad '{key}'")
+            out[key] = float(v)
+    return out
+
+
+def _parse_segment(g: dict, ctx: str, scene_id: int, start_frame: int,
+                   end_frame: int, frame_w: int, frame_h: int) -> FramingSegment:
+    gctx = ctx + ".segment"
+    if not isinstance(g, dict):
+        raise ValueError(f"malformed-plan: {gctx} must be a dict")
+    _no_unknown(g, _SEGMENT_KEYS, gctx)
+    seg_scene = _req(g, "scene_id", gctx)
+    if not _strict_int(seg_scene) or seg_scene != scene_id:
+        raise ValueError(f"malformed-plan: {gctx} scene_id mismatch")
+    gs = _req(g, "start_frame", gctx)
+    ge = _req(g, "end_frame", gctx)
+    if (not _strict_int(gs) or not _strict_int(ge)
+            or not start_frame <= gs <= ge <= end_frame):
+        raise ValueError(f"malformed-plan: {gctx} frames out of range")
+    kind = _req(g, "kind", gctx)
+    if kind not in ("single", "two-subject", "wide"):
+        raise ValueError(f"malformed-plan: {gctx} bad kind {kind!r}")
+    sids = _req(g, "subject_ids", gctx)
+    if (not isinstance(sids, list)
+            or any(not isinstance(i, str) or not TRACK_ID_RE.match(i)
+                   for i in sids)):
+        raise ValueError(f"malformed-plan: {gctx} non-anonymous subject id")
+    want_n = {"single": 1, "two-subject": 2, "wide": 0}[kind]
+    if len(sids) != want_n:
+        raise ValueError(f"malformed-plan: {gctx} kind/subject-count mismatch")
+    conf = _req(g, "confidence", gctx)
+    if not _strict_num(conf) or not 0.0 <= conf <= 1.0:
+        raise ValueError(f"malformed-plan: {gctx} bad confidence")
+    evidence = _parse_evidence(_req(g, "evidence", gctx), gctx)
+    reason = _req(g, "reason", gctx)
+    if (not isinstance(reason, str) or not reason
+            or len(reason) > REASON_MAX_LEN):
+        raise ValueError(f"malformed-plan: {gctx} bad reason token")
+    crop = _req(g, "crop", gctx)
+    if (not isinstance(crop, list) or len(crop) != 4
+            or not all(_strict_int(v) for v in crop)):
+        raise ValueError(f"malformed-plan: {gctx} bad crop")
+    x1, y1, x2, y2 = crop
+    if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
+        raise ValueError(f"malformed-plan: {gctx} crop out of bounds")
+    return FramingSegment(
+        scene_id=scene_id, start_frame=gs, end_frame=ge,
+        subject_ids=tuple(sids), kind=kind, confidence=float(conf),
+        evidence=evidence, reason=reason, crop=list(crop))
+
+
+def _parse_keyframe(k: dict, ctx: str, start_frame: int, end_frame: int,
+                    frame_w: int, frame_h: int) -> CropKeyframe:
+    kctx = ctx + ".keyframe"
+    if not isinstance(k, dict):
+        raise ValueError(f"malformed-plan: {kctx} must be a dict")
+    _no_unknown(k, _KEYFRAME_KEYS, kctx)
+    fr = _req(k, "frame", kctx)
+    if not _strict_int(fr) or not start_frame <= fr <= end_frame:
+        raise ValueError(f"malformed-plan: {kctx} frame outside scene")
+    kk = _req(k, "kind", kctx)
+    if kk not in ("lock", "ease"):
+        raise ValueError(f"malformed-plan: {kctx} bad kind {kk!r}")
+    coords = []
+    for c in ("x1", "y1", "x2", "y2"):
+        v = _req(k, c, kctx)
+        if not _strict_int(v):
+            raise ValueError(f"malformed-plan: {kctx} bad coord '{c}'")
+        coords.append(v)
+    if not (0 <= coords[0] < coords[2] <= frame_w
+            and 0 <= coords[1] < coords[3] <= frame_h):
+        raise ValueError(f"malformed-plan: {kctx} out of bounds")
+    return CropKeyframe(frame=fr, x1=coords[0], y1=coords[1], x2=coords[2],
+                        y2=coords[3], kind=kk)
+
+
+def _parse_fallback(fb, ctx: str) -> dict | None:
+    if fb is None:
+        return None
+    fctx = ctx + ".fallback"
+    if not isinstance(fb, dict):
+        raise ValueError(f"malformed-plan: {fctx} must be a dict or null")
+    _no_unknown(fb, _FALLBACK_KEYS, fctx)
+    reason = _req(fb, "reason", fctx)
+    if (not isinstance(reason, str) or not reason
+            or len(reason) > REASON_MAX_LEN):
+        raise ValueError(f"malformed-plan: {fctx} reason must be a bounded "
+                         f"token")
+    detail = fb.get("detail")
+    if detail is not None and (not isinstance(detail, str)
+                               or len(detail) > 256):
+        raise ValueError(f"malformed-plan: {fctx} detail must be a bounded "
+                         f"string")
+    out = {"reason": reason}
+    if detail is not None:
+        out["detail"] = detail
+    return out
+
+
+def _parse_fallback_crop(fc, ctx: str, frame_w: int,
+                         frame_h: int) -> list | None:
+    if fc is None:
+        return None
+    cctx = ctx + ".fallback_crop"
+    if (not isinstance(fc, (list, tuple)) or len(fc) != 3
+            or not all(_strict_num(v) for v in fc)):
+        raise ValueError(f"malformed-plan: {cctx} must be [cx, cy, zoom] "
+                         f"numbers")
+    cx, cy, zoom = (float(v) for v in fc)
+    if not (0.0 <= cx <= frame_w and 0.0 <= cy <= frame_h
+            and 0.0 < zoom <= 16.0):
+        raise ValueError(f"malformed-plan: {cctx} out of bounds")
+    return [cx, cy, zoom]
+
+
 def plan_from_dict(d: dict) -> FramingPlan:
-    """Strict parse. Anything unexpected → ``ValueError`` (caller rebuilds)."""
+    """Strict parse. Anything unexpected → ``ValueError`` (caller rebuilds).
+
+    Every persisted field is validated recursively: strict non-boolean
+    numerics, finite positive dimensions/FPS/frame count, ordered unique scene
+    ids with intervals matching the plan header, anonymous track ids with
+    bounded frame/count fields, ordered non-overlapping full-coverage
+    segments, unique in-scene keyframes, allowed evidence keys with bounded
+    scalar values only, bounded reason/detail tokens, and finite in-bounds
+    fallback crops. Unknown keys — pixels, landmarks, embeddings, names —
+    are rejected at every level.
+    """
     if not isinstance(d, dict):
         raise ValueError("malformed-plan: top-level object must be a dict")
-    if _req(d, "schema_version", int, "plan") != SCHEMA_VERSION:
+    _no_unknown(d, _PLAN_TOP_KEYS, "plan")
+    schema_version = _req(d, "schema_version", "plan")
+    if not _strict_int(schema_version) or schema_version != SCHEMA_VERSION:
         raise ValueError(
             f"malformed-plan: unsupported schema_version "
             f"{d.get('schema_version')!r} (expected {SCHEMA_VERSION})")
-    frame_w = _req(d, "frame_w", int, "plan")
-    frame_h = _req(d, "frame_h", int, "plan")
-    frame_count = _req(d, "frame_count", int, "plan")
-    fps = d.get("fps")
-    if not _is_num(fps) or not math.isfinite(fps) or fps <= 0:
+    producer = _req(d, "producer", "plan")
+    if not isinstance(producer, str) or not producer or len(producer) > 128:
+        raise ValueError("malformed-plan: invalid 'producer'")
+    source_fingerprint = _req(d, "source_fingerprint", "plan")
+    if (not isinstance(source_fingerprint, str) or not source_fingerprint
+            or len(source_fingerprint) > 256):
+        raise ValueError("malformed-plan: invalid 'source_fingerprint'")
+    frame_w = _req(d, "frame_w", "plan")
+    frame_h = _req(d, "frame_h", "plan")
+    frame_count = _req(d, "frame_count", "plan")
+    for _name, _v in (("frame_w", frame_w), ("frame_h", frame_h),
+                      ("frame_count", frame_count)):
+        if not _strict_int(_v) or not 0 < _v <= 100000:
+            raise ValueError(f"malformed-plan: invalid '{_name}'")
+    fps = _req(d, "fps", "plan")
+    if not _strict_num(fps) or not 0.0 < fps <= 1000.0:
         raise ValueError("malformed-plan: invalid 'fps'")
-    if frame_w <= 0 or frame_h <= 0 or frame_count <= 0:
-        raise ValueError("malformed-plan: non-positive dimensions/frame_count")
-    intervals = _req(d, "scene_intervals", list, "plan")
+    output_aspect = _req(d, "output_aspect", "plan")
+    if not _strict_num(output_aspect) or not 0.0 < output_aspect <= 16.0:
+        raise ValueError("malformed-plan: invalid 'output_aspect'")
+    tracker_digest = _req(d, "tracker_digest", "plan")
+    if not isinstance(tracker_digest, str) or len(tracker_digest) > 256:
+        raise ValueError("malformed-plan: invalid 'tracker_digest'")
+    config_digest = _req(d, "config_digest", "plan")
+    if (not isinstance(config_digest, str) or not config_digest
+            or len(config_digest) > 256):
+        raise ValueError("malformed-plan: invalid 'config_digest'")
+    created_at = _req(d, "created_at", "plan")
+    if not isinstance(created_at, str) or len(created_at) > 64:
+        raise ValueError("malformed-plan: invalid 'created_at'")
+    intervals = _req(d, "scene_intervals", "plan")
+    if not isinstance(intervals, list):
+        raise ValueError("malformed-plan: invalid 'scene_intervals'")
     for iv in intervals:
         if (not isinstance(iv, (list, tuple)) or len(iv) != 2
-                or not all(isinstance(v, int) for v in iv)
+                or not all(_strict_int(v) for v in iv)
                 or not 0 <= iv[0] < iv[1] <= frame_count):
             raise ValueError(f"malformed-plan: bad scene interval {iv!r}")
+    raw_scenes = _req(d, "scenes", "plan")
+    if not isinstance(raw_scenes, list):
+        raise ValueError("malformed-plan: invalid 'scenes'")
+    if len(raw_scenes) != len(intervals):
+        raise ValueError("malformed-plan: scenes/scene_intervals length "
+                         "mismatch")
     scenes = []
-    for s in _req(d, "scenes", list, "plan"):
+    for idx, s in enumerate(raw_scenes):
+        ctx = f"scene[{idx}]"
         if not isinstance(s, dict):
-            raise ValueError("malformed-plan: scene must be a dict")
-        scene_id = _req(s, "scene_id", int, "scene")
-        applies = _req(s, "applies", bool, "scene")
-        start_frame = _req(s, "start_frame", int, "scene")
-        end_frame = _req(s, "end_frame", int, "scene")
-        if not 0 <= start_frame <= end_frame < frame_count:
-            raise ValueError("malformed-plan: scene frames out of range")
+            raise ValueError(f"malformed-plan: {ctx} must be a dict")
+        _no_unknown(s, _SCENE_KEYS, ctx)
+        scene_id = _req(s, "scene_id", ctx)
+        if not _strict_int(scene_id) or scene_id != idx:
+            raise ValueError(f"malformed-plan: {ctx} scene_id must be the "
+                             f"ordered unique index {idx}")
+        start_frame = _req(s, "start_frame", ctx)
+        end_frame = _req(s, "end_frame", ctx)
+        if (not _strict_int(start_frame) or not _strict_int(end_frame)
+                or (start_frame, end_frame) != (intervals[idx][0],
+                                                intervals[idx][1])):
+            raise ValueError(f"malformed-plan: {ctx} frames must match "
+                             f"scene_intervals[{idx}]")
+        applies = _req(s, "applies", ctx)
+        if not isinstance(applies, bool):
+            raise ValueError(f"malformed-plan: {ctx} 'applies' must be a bool")
+        strategy = _req(s, "strategy", ctx)
+        if (not isinstance(strategy, str) or not strategy
+                or len(strategy) > 32):
+            raise ValueError(f"malformed-plan: {ctx} invalid 'strategy'")
+        raw_tracks = _req(s, "tracks", ctx)
+        if not isinstance(raw_tracks, list):
+            raise ValueError(f"malformed-plan: {ctx} invalid 'tracks'")
+        tracks = [_parse_track(t, ctx, frame_count) for t in raw_tracks]
+        raw_segments = _req(s, "segments", ctx)
+        if not isinstance(raw_segments, list):
+            raise ValueError(f"malformed-plan: {ctx} invalid 'segments'")
         segments = []
-        prev_end = -1
-        for g in s.get("segments", []):
-            if not isinstance(g, dict):
-                raise ValueError("malformed-plan: segment must be a dict")
-            gs, ge = _req(g, "start_frame", int, "segment"), _req(
-                g, "end_frame", int, "segment")
-            if not (start_frame <= gs <= ge <= end_frame) or gs <= prev_end:
-                raise ValueError("malformed-plan: segments overlap/out of order")
-            prev_end = ge
-            kind = _req(g, "kind", str, "segment")
-            if kind not in ("single", "two-subject", "wide"):
-                raise ValueError(f"malformed-plan: bad kind {kind!r}")
-            sids = _req(g, "subject_ids", list, "segment")
-            if any(not isinstance(i, str) or not TRACK_ID_RE.match(i)
-                   for i in sids):
-                raise ValueError("malformed-plan: non-anonymous subject id")
-            if kind == "wide" and sids:
-                raise ValueError("malformed-plan: wide segment with subjects")
-            conf = _req(g, "confidence", (int, float), "segment")
-            if isinstance(conf, bool) or not 0.0 <= conf <= 1.0:
-                raise ValueError("malformed-plan: bad confidence")
-            crop = _req(g, "crop", list, "segment")
-            if len(crop) != 4 or not all(isinstance(v, int) for v in crop):
-                raise ValueError("malformed-plan: bad crop")
-            x1, y1, x2, y2 = crop
-            if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
-                raise ValueError("malformed-plan: crop out of bounds")
-            segments.append(FramingSegment(
-                scene_id=scene_id, start_frame=gs, end_frame=ge,
-                subject_ids=tuple(sids), kind=kind,
-                confidence=float(conf), evidence=_req(g, "evidence", dict, "segment"),
-                reason=_req(g, "reason", str, "segment"), crop=list(crop)))
+        prev_end = start_frame - 1
+        for g in raw_segments:
+            seg = _parse_segment(g, ctx, scene_id, start_frame, end_frame,
+                                 frame_w, frame_h)
+            if seg.start_frame <= prev_end:
+                raise ValueError(f"malformed-plan: {ctx} segments "
+                                 f"overlap/out of order")
+            prev_end = seg.end_frame
+            segments.append(seg)
+        if segments and (segments[0].start_frame != start_frame
+                         or segments[-1].end_frame != end_frame):
+            raise ValueError(f"malformed-plan: {ctx} segments must cover "
+                             f"the scene")
+        raw_keyframes = _req(s, "keyframes", ctx)
+        if not isinstance(raw_keyframes, list):
+            raise ValueError(f"malformed-plan: {ctx} invalid 'keyframes'")
         keyframes = []
-        for k in s.get("keyframes", []):
-            if not isinstance(k, dict):
-                raise ValueError("malformed-plan: keyframe must be a dict")
-            kf_frame = _req(k, "frame", int, "keyframe")
-            if not start_frame <= kf_frame <= end_frame:
-                raise ValueError("malformed-plan: keyframe outside scene")
-            kk = _req(k, "kind", str, "keyframe")
-            if kk not in ("lock", "ease"):
-                raise ValueError(f"malformed-plan: bad keyframe kind {kk!r}")
-            coords = [_req(k, c, int, "keyframe") for c in ("x1", "y1", "x2", "y2")]
-            if not (0 <= coords[0] < coords[2] <= frame_w
-                    and 0 <= coords[1] < coords[3] <= frame_h):
-                raise ValueError("malformed-plan: keyframe out of bounds")
-            keyframes.append(CropKeyframe(frame=kf_frame, x1=coords[0],
-                                          y1=coords[1], x2=coords[2],
-                                          y2=coords[3], kind=kk))
-        keyframes.sort(key=lambda k: k.frame)
-        fallback = s.get("fallback")
-        if fallback is not None:
-            if not isinstance(fallback, dict) or "reason" not in fallback:
-                raise ValueError("malformed-plan: bad fallback")
+        prev_kf = start_frame - 1
+        for k in raw_keyframes:
+            kf = _parse_keyframe(k, ctx, start_frame, end_frame, frame_w,
+                                 frame_h)
+            if kf.frame <= prev_kf:
+                raise ValueError(f"malformed-plan: {ctx} keyframes must be "
+                                 f"unique and ordered")
+            prev_kf = kf.frame
+            keyframes.append(kf)
+        fallback = _parse_fallback(s.get("fallback"), ctx)
+        fallback_crop = _parse_fallback_crop(s.get("fallback_crop"), ctx,
+                                             frame_w, frame_h)
         scenes.append(ScenePlan(
-            scene_id=scene_id, strategy=_req(s, "strategy", str, "scene"),
-            start_frame=start_frame, end_frame=end_frame, applies=applies,
-            tracks=s.get("tracks", []), segments=segments, keyframes=keyframes,
-            fallback=dict(fallback) if fallback else None,
-            fallback_crop=list(s["fallback_crop"])
-            if s.get("fallback_crop") else None))
+            scene_id=scene_id, strategy=strategy, start_frame=start_frame,
+            end_frame=end_frame, applies=applies, tracks=tracks,
+            segments=segments, keyframes=keyframes, fallback=fallback,
+            fallback_crop=fallback_crop))
     return FramingPlan(
         schema_version=SCHEMA_VERSION,
-        producer=_req(d, "producer", str, "plan"),
-        source_fingerprint=_req(d, "source_fingerprint", str, "plan"),
+        producer=producer,
+        source_fingerprint=source_fingerprint,
         frame_w=frame_w, frame_h=frame_h, fps=float(fps),
         frame_count=frame_count,
-        scene_intervals=[list(iv) for iv in intervals],
-        config_digest=_req(d, "config_digest", str, "plan"),
+        scene_intervals=[[int(iv[0]), int(iv[1])] for iv in intervals],
+        config_digest=config_digest,
+        output_aspect=float(output_aspect),
+        tracker_digest=tracker_digest,
         scenes=scenes,
-        created_at=d.get("created_at", ""),
+        created_at=created_at,
     )
+
 
 
 def save_plan_atomic(plan: FramingPlan, path: str) -> str:
     """Persist the plan atomically (temp file + ``os.replace``).
 
-    Readers never see a half-written plan. Returns ``path``.
+    Readers never see a half-written plan. If the write, flush or replace
+    fails, the temp file is removed in ``finally`` while an existing
+    destination is left untouched. Returns ``path``.
     """
     payload = json.dumps(plan_to_dict(plan), sort_keys=True,
                          separators=(",", ":"))
     tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(payload)
-    os.replace(tmp, path)
+    failed = True
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+        os.replace(tmp, path)
+        failed = False
+    finally:
+        if failed:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     return path
 
 
@@ -1126,8 +1454,17 @@ def load_plan(path: str) -> FramingPlan:
 
 def plan_matches(plan: FramingPlan, *, source_fingerprint: str, frame_w: int,
                  frame_h: int, fps: float, frame_count: int,
-                 scene_intervals: list, config_digest: str) -> tuple[bool, str]:
+                 scene_intervals: list, config_digest: str,
+                 aspect: float | None = None,
+                 strategies: list | None = None,
+                 tracker_digest: str | None = None) -> tuple[bool, str]:
     """Reuse gate: every identity input must match, else rebuild.
+
+    ``aspect`` is the requested output aspect (width/height), ``strategies``
+    the current ordered per-scene strategies, ``tracker_digest`` the digest of
+    the tracker decision config that produced the observations. Each is
+    compared when given; ``None`` skips that check (callers that omit an
+    input get a weaker gate — the production path always passes all three).
 
     Returns ``(True, "match")`` or ``(False, "<stale-field>")``.
     """
@@ -1137,6 +1474,9 @@ def plan_matches(plan: FramingPlan, *, source_fingerprint: str, frame_w: int,
         return False, "stale-source"
     if plan.frame_w != int(frame_w) or plan.frame_h != int(frame_h):
         return False, "stale-dimensions"
+    if aspect is not None and abs(plan.output_aspect - float(aspect)) > 1e-9:
+        return False, (f"stale-aspect:{plan.output_aspect:.6f}-vs-"
+                       f"{float(aspect):.6f}")
     if abs(plan.fps - float(fps)) > 1e-6:
         return False, "stale-fps"
     if plan.frame_count != int(frame_count):
@@ -1144,8 +1484,15 @@ def plan_matches(plan: FramingPlan, *, source_fingerprint: str, frame_w: int,
     want = [[int(s), int(e)] for s, e in scene_intervals]
     if plan.scene_intervals != want:
         return False, "stale-scenes"
+    if strategies is not None:
+        want_strategies = [str(x) for x in strategies]
+        plan_strategies = [sp.strategy for sp in plan.scenes]
+        if plan_strategies != want_strategies:
+            return False, "stale-strategies"
     if plan.config_digest != config_digest:
         return False, "stale-config"
+    if tracker_digest is not None and plan.tracker_digest != tracker_digest:
+        return False, "stale-tracker-config"
     return True, "match"
 
 
@@ -1185,7 +1532,7 @@ def build_scene_plan(log: ObservationLog, *, scene_id: int, strategy: str,
         config=config, fps=fps, frame_w=frame_w, frame_h=frame_h,
         aspect=aspect)
     segments, keyframes, kf_diag = build_scene_keyframes(
-        segments, log, scene_id, config, frame_w, frame_h, aspect)
+        segments, log, scene_id, config, frame_w, frame_h, aspect, fps=fps)
     diagnostics = seg_diag + kf_diag
     return ScenePlan(
         scene_id=scene_id, strategy=strategy, start_frame=scene_start,
@@ -1198,13 +1545,20 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
                        strategies: list, config: TurnFramingConfig, fps: float,
                        frame_w: float, frame_h: float, frame_count: int,
                        source_fingerprint: str,
-                       aspect: float = 9 / 16) -> FramingPlan:
+                       aspect: float = 9 / 16,
+                       tracker_digest: str = "") -> FramingPlan:
     """Build one versioned plan for the whole clip.
 
     Only ``TRACK``/``WIDE`` scenes are planned; every other strategy keeps its
     existing renderer (``applies=False``). Per-scene failures are isolated: an
     invalid face scene gets a fallback entry with the reason and the renderer
     keeps the accepted static/wide behavior for it.
+
+    The plan's identity binds the actual render ``aspect``, the ordered scene
+    ``strategies`` (persisted per scene) and the ``tracker_digest`` of the
+    tracker decision config that produced the observations, so a sidecar is
+    never reused across a different output shape, strategy assignment or
+    tracker configuration.
     """
     scene_plans: list[ScenePlan] = []
     for idx, (start, end) in enumerate(scenes):
@@ -1241,6 +1595,8 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
         frame_count=int(frame_count),
         scene_intervals=[[int(s), int(e)] for s, e in scenes],
         config_digest=config.config_digest(),
+        output_aspect=float(aspect),
+        tracker_digest=str(tracker_digest),
         scenes=scene_plans,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
     )

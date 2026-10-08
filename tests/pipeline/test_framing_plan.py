@@ -132,11 +132,14 @@ class TestFlagAndConfig:
     def test_config_defaults(self, monkeypatch):
         for v in ("CLIPPYME_TURN_EVIDENCE_S", "CLIPPYME_TURN_MIN_DWELL_S",
                   "CLIPPYME_TURN_COOLDOWN_S", "CLIPPYME_TURN_SWITCH_MARGIN",
-                  "CLIPPYME_TURN_EASE_FRAMES", "CLIPPYME_TURN_MAX_ANALYSIS_FRAMES"):
+                  "CLIPPYME_TURN_EASE_FRAMES", "CLIPPYME_TURN_MAX_ANALYSIS_FRAMES",
+                  "CLIPPYME_TURN_ANALYSIS_DEADLINE_S"):
             monkeypatch.delenv(v, raising=False)
         cfg = fp.config_from_env()
         assert (cfg.evidence_duration_s, cfg.min_dwell_s, cfg.cooldown_s,
                 cfg.switch_margin, cfg.ease_frames) == (0.8, 1.0, 1.5, 1.25, 6)
+        # The wall-time budget defaults to a positive, sane value.
+        assert cfg.analysis_deadline_s == 120.0
 
     def test_config_parses_env(self, monkeypatch):
         monkeypatch.setenv("CLIPPYME_TURN_EVIDENCE_S", "1.2")
@@ -144,19 +147,23 @@ class TestFlagAndConfig:
         monkeypatch.setenv("CLIPPYME_TURN_COOLDOWN_S", "2")
         monkeypatch.setenv("CLIPPYME_TURN_SWITCH_MARGIN", "2.0")
         monkeypatch.setenv("CLIPPYME_TURN_EASE_FRAMES", "3")
+        monkeypatch.setenv("CLIPPYME_TURN_ANALYSIS_DEADLINE_S", "45")
         cfg = fp.config_from_env()
         assert (cfg.evidence_duration_s, cfg.min_dwell_s, cfg.cooldown_s,
                 cfg.switch_margin, cfg.ease_frames) == (1.2, 0.5, 2.0, 2.0, 3)
+        assert cfg.analysis_deadline_s == 45.0
 
     def test_config_garbage_falls_back(self, monkeypatch):
         monkeypatch.setenv("CLIPPYME_TURN_EVIDENCE_S", "junk")
         monkeypatch.setenv("CLIPPYME_TURN_SWITCH_MARGIN", "nan")
         monkeypatch.setenv("CLIPPYME_TURN_EASE_FRAMES", "-4")
+        monkeypatch.setenv("CLIPPYME_TURN_ANALYSIS_DEADLINE_S", "junk")
         cfg = fp.config_from_env()
         assert cfg.evidence_duration_s == 0.8
         assert cfg.switch_margin == 1.25
         # ease_frames clamps at 0, so -4 becomes 0 (a valid int, not the default).
         assert cfg.ease_frames == 0
+        assert cfg.analysis_deadline_s == 120.0
 
     def test_config_digest_stable(self, monkeypatch):
         monkeypatch.delenv("CLIPPYME_TURN_EVIDENCE_S", raising=False)
@@ -423,17 +430,30 @@ class TestCropMath:
         sp = self._planned_scene(log)
         ease = [k for k in sp.keyframes if k.kind == "ease"]
         assert ease, "expected ease keyframes around the accepted turn"
-        # Ease frames cluster at segment starts only.
-        starts = {s.start_frame for s in sp.segments}
-        for k in ease:
-            assert any(s <= k.frame < s + 6 for s in starts)
+        # Ease frames form a frame-contiguous run starting at a segment start
+        # only (the per-second cap may extend the run past ease_frames).
+        starts = {s.start_frame: s for s in sp.segments}
+        by_start = {}
+        for k in sorted(ease, key=lambda k: k.frame):
+            owner = max(st for st in starts if st <= k.frame)
+            by_start.setdefault(owner, []).append(k.frame)
+        for st, frames in by_start.items():
+            assert frames == list(range(st, st + len(frames))), \
+                "ease keyframes must be a contiguous run from the segment start"
+            seg = starts[st]
+            assert frames[-1] <= seg.end_frame, "ease must not overrun its segment"
         # Monotonic travel from the left crop to the right crop.
         xs = [k.x1 for k in sorted(ease, key=lambda k: k.frame)
               if 60 <= k.frame <= 90]
         assert xs == sorted(xs), "ease must not oscillate"
 
     def test_travel_cap(self):
-        cfg = fp.TurnFramingConfig(max_travel_frac=0.1)  # 64px on 640w
+        # max_travel_frac is a PER-SECOND fraction of the frame dimension:
+        # every consecutive rendered crop-centre step (including the final
+        # ease-to-lock step) must respect max_travel_frac * dim / fps.
+        # The lock-to-lock distance itself is NOT capped — the transition
+        # extends over as many frames as the speed cap needs.
+        cfg = fp.TurnFramingConfig(max_travel_frac=0.1)  # 2.13px/frame on 640w@30fps
         log = _scripted_log()
         plan = fp.build_framing_plan(
             log=log, scenes=[(0, 119)], strategies=["WIDE"], config=cfg,
@@ -442,9 +462,18 @@ class TestCropMath:
         sp = plan.scenes[0]
         singles = [s for s in sp.segments if s.kind == "single"]
         assert len(singles) >= 2
-        c0 = (singles[0].crop[0] + singles[0].crop[2]) / 2
-        c1 = (singles[1].crop[0] + singles[1].crop[2]) / 2
-        assert abs(c1 - c0) <= 0.1 * 640 + 2
+        capx = cfg.max_travel_frac * 640 / 30.0 + 1.0
+        capy = cfg.max_travel_frac * 360 / 30.0 + 1.0
+        centers = []
+        for f in range(0, 120):
+            crop = fp.crop_at_frame(sp, f)
+            assert crop is not None
+            centers.append(((crop[0] + crop[2]) / 2.0,
+                            (crop[1] + crop[3]) / 2.0))
+        max_x = max(abs(b[0] - a[0]) for a, b in zip(centers, centers[1:]))
+        max_y = max(abs(b[1] - a[1]) for a, b in zip(centers, centers[1:]))
+        assert max_x <= capx, f"per-second x cap violated: {max_x} > {capx}"
+        assert max_y <= capy, f"per-second y cap violated: {max_y} > {capy}"
 
     def test_hold_zoom_never_tightens(self):
         # Second speaker has a much bigger face (would zoom in) — hold_zoom
@@ -495,7 +524,8 @@ class TestPlanIdentity:
         log = _scripted_log()
         args = dict(log=log, scenes=[(0, 119)], strategies=["WIDE"],
                     config=fp.TurnFramingConfig(), fps=30.0, frame_w=640,
-                    frame_h=360, frame_count=120, source_fingerprint="fp123")
+                    frame_h=360, frame_count=120, source_fingerprint="fp123",
+                    aspect=9 / 16, tracker_digest="tracker-digest-1")
         args.update(kw)
         return fp.build_framing_plan(**args)
 
@@ -504,6 +534,9 @@ class TestPlanIdentity:
         plan2 = fp.plan_from_dict(fp.plan_to_dict(plan))
         assert plan2.source_fingerprint == "fp123"
         assert plan2.config_digest == plan.config_digest
+        assert plan2.output_aspect == pytest.approx(9 / 16)
+        assert plan2.tracker_digest == "tracker-digest-1"
+        assert [sp.strategy for sp in plan2.scenes] == ["WIDE"]
         assert [(s.start_frame, s.end_frame, s.subject_ids, s.kind, s.crop)
                 for s in plan2.scenes[0].segments] == \
                [(s.start_frame, s.end_frame, s.subject_ids, s.kind, s.crop)
@@ -521,26 +554,33 @@ class TestPlanIdentity:
         ok, why = fp.plan_matches(
             plan, source_fingerprint="fp123", frame_w=640, frame_h=360,
             fps=30.0, frame_count=120, scene_intervals=[(0, 119)],
-            config_digest=fp.TurnFramingConfig().config_digest())
+            config_digest=fp.TurnFramingConfig().config_digest(),
+            aspect=9 / 16, strategies=["WIDE"],
+            tracker_digest="tracker-digest-1")
         assert (ok, why) == (True, "match")
 
     @pytest.mark.parametrize("field,value,reason", [
         ("source_fingerprint", "other", "stale-source"),
         ("frame_w", 641, "stale-dimensions"),
         ("frame_h", 361, "stale-dimensions"),
+        ("aspect", 1.0, "stale-aspect"),
         ("fps", 29.97, "stale-fps"),
         ("frame_count", 121, "stale-frame-count"),
         ("scene_intervals", [(0, 100)], "stale-scenes"),
+        ("strategies", ["TRACK"], "stale-strategies"),
         ("config_digest", "deadbeef", "stale-config"),
+        ("tracker_digest", "tracker-digest-2", "stale-tracker-config"),
     ])
     def test_stale_fields_rejected(self, field, value, reason):
         plan = self._plan()
         kw = dict(source_fingerprint="fp123", frame_w=640, frame_h=360,
                   fps=30.0, frame_count=120, scene_intervals=[(0, 119)],
-                  config_digest=fp.TurnFramingConfig().config_digest())
+                  config_digest=fp.TurnFramingConfig().config_digest(),
+                  aspect=9 / 16, strategies=["WIDE"],
+                  tracker_digest="tracker-digest-1")
         kw[field] = value
         ok, why = fp.plan_matches(plan, **kw)
-        assert ok is False and why == reason
+        assert ok is False and reason in why
 
     def test_malformed_plans_rejected(self):
         plan = self._plan()

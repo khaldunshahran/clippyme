@@ -5,6 +5,8 @@ speaker tracker uses 2D geometry + IoU identity association, mouth-motion
 confidence and relative switch hysteresis so the crop follows the actual speaker
 without oscillating between nearby faces or inheriting IDs across crossings.
 """
+import hashlib
+import json
 import math
 import os
 from collections import deque
@@ -373,6 +375,33 @@ class SpeakerTracker:
         self.group_enabled = os.getenv("REFRAME_DIALOGUE_GROUP", "1").lower() not in {"0", "false", "no"}
         self.group_score_ratio = max(0.5, min(1.0, float(os.getenv("REFRAME_DIALOGUE_SCORE_RATIO", "0.88"))))
         self.group_separation = max(0.05, min(0.9, float(os.getenv("REFRAME_DIALOGUE_SEPARATION", "0.28"))))
+
+    def decision_config(self) -> dict:
+        """The decision-affecting configuration that produced observations.
+
+        Every value here can change which subject the tracker crowns, so the
+        turn-aware plan binds its digest (``decision_digest``) into the plan
+        identity: a sidecar built under different tracker settings is stale
+        and must be rebuilt, never silently reused.
+        """
+        return {
+            "cooldown_frames": self.switch_cooldown,
+            "switch_margin": self.switch_margin,
+            "min_face_ratio": self.min_face_ratio,
+            "group_enabled": self.group_enabled,
+            "group_score_ratio": self.group_score_ratio,
+            "group_separation": self.group_separation,
+            "mar_window_size": self.MAR_WINDOW_SIZE,
+            "size_weight": self.SIZE_WEIGHT,
+            "mouth_weight": self.MOUTH_WEIGHT,
+            "weak_mouth_floor": self.WEAK_MOUTH_FLOOR,
+        }
+
+    def decision_digest(self) -> str:
+        """Stable digest of ``decision_config`` for plan reuse matching."""
+        payload = json.dumps(self.decision_config(), sort_keys=True,
+                             separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def reset(self, frame_number=None):
         self.active_speaker_id = None

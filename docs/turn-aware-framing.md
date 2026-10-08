@@ -66,25 +66,54 @@ Ordered, non-overlapping, full-coverage scene-local segments:
 Fixed crop within each stable segment (`crop_for_subjects`): headroom
 (0.15), padding (0.35), clamped to the frame, zoom in [1.0, 1.6].
 Between accepted turns only: a short bounded linear ease (`ease_frames`
-6, travel capped at `max_travel_frac` 0.5 of frame width). Zoom holds
-unless the framing widens; wide→single resets the zoom (deliberate
-reframe). No continuous chase, breathing or jitter.
+6) with travel limited to `max_travel_frac` (0.5) of the frame dimension
+PER SECOND — the transition extends over as many frames as the per-frame
+speed cap (`max_travel_frac * dim / fps`) needs, so every consecutive
+rendered crop-centre step, including the final ease-to-lock step, respects
+the cap. When the segment cannot fit the transition, the previous lock is
+held (zero travel — the safe fallback); excess travel is never hidden in
+the final step. Zoom holds unless the framing widens; wide→single resets
+the zoom (deliberate reframe). No continuous chase, breathing or jitter.
 
 ## Plan identity, persistence, reuse
 
-`FramingPlan` carries: schema version, producer, source fingerprint
-(SHA-256 of the file bytes), frame dims, FPS, frame count, scene intervals
-(inclusive ends), config digest, per-scene strategies/tracks/segments/
-keyframes, fallback crops and diagnostics. No pixels, embeddings, names,
-provider responses or mouth landmarks.
+`FramingPlan` carries (schema version 2): schema version, producer, source
+fingerprint (SHA-256 of the file bytes), frame dims, FPS, frame count,
+scene intervals (inclusive ends), config digest, the ACTUAL render aspect
+(`output_aspect` — the crops are built for it, never a silent 9:16 default),
+the ordered per-scene strategies, the tracker decision digest
+(`tracker_digest` — the `SpeakerTracker` decision config that produced the
+observations), per-scene tracks/segments/keyframes, fallback crops and
+diagnostics. No pixels, embeddings, names, provider responses or mouth
+landmarks.
 
-- `save_plan_atomic` writes temp + `os.replace` (no `*.tmp-*` leftovers).
+- `save_plan_atomic` writes temp + `os.replace`; the temp file is removed
+  in `finally` after ANY write/flush/replace failure while an existing
+  destination is preserved (no `*.tmp-*` leftovers).
 - Pass 2 re-loads the plan from disk and renders it verbatim.
-- Reuse requires fingerprint + dims + FPS + frame count + scene plan +
-  schema version + config digest to match, else rebuild with a logged
-  reason (`stale-*`); missing/malformed plans rebuild (`malformed`).
-- Analysis is bounded (`max_analysis_frames` 20000, observation cap);
-  per-scene failures are isolated — invalid TRACK/WIDE scenes keep the
+- Reuse requires fingerprint + dims + output aspect + FPS + frame count +
+  scene plan + ordered strategies + schema version + config digest +
+  tracker digest to match, else rebuild with a logged reason (`stale-*`);
+  missing/malformed plans rebuild (`malformed`). A 9:16 sidecar is never
+  reused for 1:1/16:9 output (`stale-aspect`), nor after a strategy or
+  tracker-config change (`stale-strategies`, `stale-tracker-config`).
+- `plan_from_dict` validates every persisted field recursively with strict
+  non-boolean numerics: finite positive dims/FPS/frame count, ordered unique
+  scene ids matching the header intervals, anonymous track ids with bounded
+  frame/count fields, ordered non-overlapping full-coverage segments, unique
+  ordered keyframes, allowed evidence keys with bounded scalar values only,
+  bounded reason/detail tokens, finite in-bounds fallback crops. Unknown
+  keys (pixels, landmarks, embeddings, names) are rejected at every level.
+- Analysis is bounded by ONE monotonic budget (`AnalysisBudget`):
+  `max_analysis_frames` (20000, observation cap) AND `analysis_deadline_s`
+  (default 120 s, `CLIPPYME_TURN_ANALYSIS_DEADLINE_S`). The budget is checked
+  before every expensive step (frame decode/retrieve, face detection,
+  mouth analysis, planner build); once exhausted, detector/MAR call counts
+  STOP increasing, the exhaustion is recorded (`analysis_budget_exhausted` /
+  `analysis-frame-budget-exhausted`), and unobserved scenes keep the accepted
+  static/wide fallback. The render continues safely and every resource is
+  released exactly once.
+- Per-scene failures are isolated — invalid TRACK/WIDE scenes keep the
   accepted static/wide fallback crop with a reason.
 
 ## Limits (stated honestly)

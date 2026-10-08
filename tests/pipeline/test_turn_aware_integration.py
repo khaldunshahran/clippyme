@@ -180,7 +180,7 @@ def _build_fixture(path):
     return path
 
 
-def _install_fakes(monkeypatch, turn_at=60):
+def _install_fakes(monkeypatch, turn_at=20):
     """Inject deterministic detections + MAR evidence keyed off the marker."""
     def fake_detect(frame):
         idx = _marker_index(frame)
@@ -268,7 +268,7 @@ def _probe(path):
 def test_turn_aware_two_pass_end_to_end(tmp_path, monkeypatch, capsys):
     src = _build_fixture(str(tmp_path / "src.mp4"))
     out = str(tmp_path / "out.mp4")
-    _install_fakes(monkeypatch, turn_at=60)
+    _install_fakes(monkeypatch, turn_at=20)
 
     assert reframe.process_video_to_vertical(src, out, reframe_mode="auto") is True
     logged = capsys.readouterr().out
@@ -302,7 +302,7 @@ def test_turn_aware_two_pass_end_to_end(tmp_path, monkeypatch, capsys):
                 if s.subject_ids != singles[0].subject_ids)
     # Sustained-evidence lag: the tracker needs ~25 MAR samples + the
     # segmenter's 0.8s window after the turn before the switch is accepted.
-    assert 60 <= turn.start_frame <= 112
+    assert 50 <= turn.start_frame <= 90
     assert turn.reason == "turn-switch-sustained-evidence"
     first_crop, last_crop = singles[0].crop, singles[-1].crop
     assert first_crop[2] < W / 2 < last_crop[0], \
@@ -323,7 +323,7 @@ def test_turn_aware_two_pass_end_to_end(tmp_path, monkeypatch, capsys):
     assert abs(on - N_FRAMES) <= 2, f"frame count drifted: {on}"
     assert _audio_peak_hz(out, tmp_path) == pytest.approx(880, abs=8)
 
-    frames = _read_frames(out, [20, 21, 22, 30, 115, 125, 140, 170, 200])
+    frames = _read_frames(out, [20, 21, 22, 30, 115, 125, 150, 170, 200])
 
     def _mean_diff(a, b):
         return np.abs(a.astype(np.int16) - b.astype(np.int16)).mean()
@@ -340,9 +340,9 @@ def test_turn_aware_two_pass_end_to_end(tmp_path, monkeypatch, capsys):
     # ...and the hard cut renders (no garbage at the boundary).
     assert _mean_diff(frames[115], frames[125]) > 20.0
     # Scene 2 (stable single subject) holds one static crop. The single
-    # segment starts at 128 with ease keyframes through 133; compare two
-    # frames well inside the lock.
-    assert _mean_diff(frames[140], frames[170]) < 3.0
+    # segment starts at 128; the per-second cap extends its eased transition,
+    # so compare two frames well inside the lock.
+    assert _mean_diff(frames[150], frames[170]) < 3.0
     # Scene 3 (GENERAL) keeps the existing renderer: blurred-background
     # general shot (not a face crop, not black letterbox). The top-center
     # pixel is the blurred scene bg, close to the (180,50,50) BGR backdrop.
@@ -361,7 +361,7 @@ def test_turn_aware_two_pass_end_to_end(tmp_path, monkeypatch, capsys):
 def test_plan_reuse_skips_rebuild(tmp_path, monkeypatch, capsys):
     src = _build_fixture(str(tmp_path / "src.mp4"))
     out = str(tmp_path / "out.mp4")
-    _install_fakes(monkeypatch, turn_at=60)
+    _install_fakes(monkeypatch, turn_at=20)
     assert reframe.process_video_to_vertical(src, out, reframe_mode="auto")
     plan_path = os.path.splitext(out)[0] + ".turn_framing_plan.json"
     mtime1 = os.path.getmtime(plan_path)
@@ -385,7 +385,7 @@ def test_plan_reuse_skips_rebuild(tmp_path, monkeypatch, capsys):
 def test_stale_and_malformed_plans_rebuild(tmp_path, monkeypatch, capsys):
     src = _build_fixture(str(tmp_path / "src.mp4"))
     out = str(tmp_path / "out.mp4")
-    _install_fakes(monkeypatch, turn_at=60)
+    _install_fakes(monkeypatch, turn_at=20)
     assert reframe.process_video_to_vertical(src, out, reframe_mode="auto")
     plan_path = os.path.splitext(out)[0] + ".turn_framing_plan.json"
 
@@ -448,7 +448,7 @@ def test_disabled_flag_restores_static_comfort(tmp_path, monkeypatch, capsys):
     # whole-scene median-collapse behavior (no mid-scene reframing, no plan).
     src = _build_fixture(str(tmp_path / "src.mp4"))
     out = str(tmp_path / "out.mp4")
-    _install_fakes(monkeypatch, turn_at=60)
+    _install_fakes(monkeypatch, turn_at=20)
     monkeypatch.setenv("CLIPPYME_TURN_AWARE_FRAMING", "0")
 
     assert reframe.process_video_to_vertical(src, out, reframe_mode="auto") is True
@@ -473,7 +473,7 @@ def test_disabled_flag_restores_static_comfort(tmp_path, monkeypatch, capsys):
 def test_explicit_modes_incur_no_plan_cost(tmp_path, monkeypatch, capsys):
     # Explicit disabled/subject modes: no framing-plan analysis, no sidecar.
     src = _build_fixture(str(tmp_path / "src.mp4"))
-    _install_fakes(monkeypatch, turn_at=60)
+    _install_fakes(monkeypatch, turn_at=20)
     for mode in ("disabled", "subject"):
         out = str(tmp_path / f"out_{mode}.mp4")
         assert reframe.process_video_to_vertical(
@@ -575,3 +575,341 @@ def test_import_evicts_stub_bound_modules():
         env=_env,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# --- Task 12 review-01 corrections -------------------------------------------
+# Production-route aspect coverage (1:1, 16:9), the monotonic analysis
+# deadline with injected clock/detector, and behavioral mutation gates.
+# The pure halves of these corrections live in test_turn_aware_review1.py.
+
+
+@pytest.mark.parametrize("aspect_ratio,exp_w,exp_h", [
+    (1.0, 360, 360),
+    (16 / 9, 640, 360),
+])
+def test_production_route_non_916_aspects(tmp_path, monkeypatch,
+                                          aspect_ratio, exp_w, exp_h):
+    """The real two-pass route for 1:1 and 16:9: the plan binds the actual
+    render aspect, every persisted crop honors the requested geometry, and
+    the output has correct dimensions, duration/FPS/frame count and 880 Hz
+    audio. Landmark frames prove the turn is visible in the render."""
+    src = _build_fixture(str(tmp_path / "src.mp4"))
+    out = str(tmp_path / "out.mp4")
+    _install_fakes(monkeypatch, turn_at=20)
+
+    assert reframe.process_video_to_vertical(
+        src, out, reframe_mode="auto", aspect_ratio=aspect_ratio) is True
+    plan_path = os.path.splitext(out)[0] + ".turn_framing_plan.json"
+    plan = fp.load_plan(plan_path)
+    assert plan.output_aspect == pytest.approx(aspect_ratio)
+
+    # Correct crop geometry: every persisted crop/keyframe matches the
+    # requested aspect (int rounding only).
+    for sp in plan.scenes:
+        for seg in sp.segments:
+            if seg.crop:
+                x1, y1, x2, y2 = seg.crop
+                assert (x2 - x1) / (y2 - y1) == pytest.approx(
+                    aspect_ratio, abs=0.05), seg.crop
+        for kf in sp.keyframes:
+            assert (kf.x2 - kf.x1) / (kf.y2 - kf.y1) == pytest.approx(
+                aspect_ratio, abs=0.05)
+
+    # Output media properties.
+    ow, oh, ofps, on = _probe(out)
+    assert (ow, oh) == (exp_w, exp_h), (ow, oh)
+    assert ofps == pytest.approx(30.0)
+    assert abs(on - N_FRAMES) <= 2, f"frame count drifted: {on}"
+    assert _audio_peak_hz(out, tmp_path) == pytest.approx(880, abs=8)
+
+    # The turn is visible: landmark frames on the A-lock and B-lock differ
+    # substantially. Segment ends sit past the eased transition (any ease
+    # occupies the segment start). 16:9 cannot fit both speakers in one crop
+    # at min zoom, so the turn resolves single(A) -> wide -> single(B).
+    by_id = {sp.scene_id: sp for sp in plan.scenes}
+    kinds = [(sg.kind, sg.start_frame, sg.subject_ids)
+             for sg in by_id[0].segments]
+    singles = [sg for sg in by_id[0].segments if sg.kind == "single"]
+    assert len(singles) >= 2, kinds
+    assert singles[0].subject_ids != singles[-1].subject_ids, kinds
+    turn = next(sg for sg in singles[1:]
+                if sg.subject_ids != singles[0].subject_ids)
+    a_frame = singles[0].end_frame - 1
+    b_frame = turn.end_frame - 1
+    assert singles[0].start_frame < a_frame <= 119, kinds
+    assert turn.start_frame < b_frame <= 119, kinds
+    frames = _read_frames(out, [a_frame, b_frame])
+
+    def _mean_diff(a, b):
+        return np.abs(a.astype(np.int16) - b.astype(np.int16)).mean()
+
+    assert _mean_diff(frames[a_frame], frames[b_frame]) > 20.0
+
+
+def test_production_route_square_crop_geometry_pixels(tmp_path, monkeypatch):
+    """1:1 render: decoded landmark frames prove the square crop actually
+    frames the active speaker (orange left box vs teal right box)."""
+    src = _build_fixture(str(tmp_path / "src.mp4"))
+    out = str(tmp_path / "out.mp4")
+    _install_fakes(monkeypatch, turn_at=20)
+    assert reframe.process_video_to_vertical(
+        src, out, reframe_mode="auto", aspect_ratio=1.0) is True
+    plan = fp.load_plan(os.path.splitext(out)[0] + ".turn_framing_plan.json")
+    by_id = {sp.scene_id: sp for sp in plan.scenes}
+    singles = [s for s in by_id[0].segments if s.kind == "single"]
+    turn = next(s for s in singles[1:]
+                if s.subject_ids != singles[0].subject_ids)
+    # Lock frames: segment ends sit past the eased transition.
+    # A-side crop [0,56,225,281]: output (110,180) -> src ~(69,169) orange.
+    # B-side crop [415,56,640,281]: output (250,180) -> src ~(571,169) teal.
+    a_frame = singles[0].end_frame - 1
+    b_frame = turn.end_frame - 1
+    assert singles[0].start_frame < a_frame <= 119
+    assert turn.start_frame < b_frame <= 119
+    frames = _read_frames(out, [a_frame, b_frame])
+    px = frames[a_frame][180, 110].astype(int)
+    assert px[2] > 150 and px[1] > 80 and px[0] < 100, f"not orange: {px}"
+    px = frames[b_frame][180, 250].astype(int)
+    assert px[0] > 150 and px[1] > 80 and px[2] < 100, f"not teal: {px}"
+
+
+def test_plan_reuse_rejected_on_aspect_change(tmp_path, monkeypatch, capsys):
+    """A 9:16 sidecar is never reused for a 1:1 render: stale-aspect rebuild."""
+    src = _build_fixture(str(tmp_path / "src.mp4"))
+    out = str(tmp_path / "out.mp4")
+    _install_fakes(monkeypatch, turn_at=20)
+    assert reframe.process_video_to_vertical(src, out, reframe_mode="auto")
+    plan_path = os.path.splitext(out)[0] + ".turn_framing_plan.json"
+    mtime1 = os.path.getmtime(plan_path)
+    # Production binds the ACTUAL render aspect (202/360 from the
+    # even-rounded output width), not the requested 9/16.
+    assert fp.load_plan(plan_path).output_aspect == pytest.approx(202 / 360)
+
+    capsys.readouterr()
+    assert reframe.process_video_to_vertical(
+        src, out, reframe_mode="auto", aspect_ratio=1.0) is True
+    logged = capsys.readouterr().out
+    assert "stale-aspect" in logged
+    assert os.path.getmtime(plan_path) != mtime1, "aspect change must rebuild"
+    assert fp.load_plan(plan_path).output_aspect == pytest.approx(1.0)
+    ow, oh, _, _ = _probe(out)
+    assert (ow, oh) == (360, 360)
+
+
+def test_mutation_gate_omitted_aspect_wiring(tmp_path, monkeypatch):
+    """The production plan build must receive the actual render aspect.
+
+    If the wiring is omitted, the build silently falls back to the 9:16
+    default — this gate fails."""
+    src = _build_fixture(str(tmp_path / "src.mp4"))
+    out = str(tmp_path / "out.mp4")
+    _install_fakes(monkeypatch, turn_at=20)
+    real_build = reframe.build_framing_plan
+    seen = {}
+
+    def spy(**kw):
+        seen.update(kw)
+        return real_build(**kw)
+
+    monkeypatch.setattr(reframe, "build_framing_plan", spy)
+    assert reframe.process_video_to_vertical(
+        src, out, reframe_mode="auto", aspect_ratio=1.0) is True
+    assert seen.get("aspect") == pytest.approx(1.0), \
+        "production must thread the render aspect into the plan build"
+    plan = fp.load_plan(os.path.splitext(out)[0] + ".turn_framing_plan.json")
+    assert plan.output_aspect == pytest.approx(1.0)
+
+
+def test_mutation_gate_omitted_aspect_wiring_simulated(tmp_path, monkeypatch):
+    """Simulate the omission: drop the aspect kwarg in flight and prove the
+    persisted plan exposes the 9:16 default — the defect the review found."""
+    src = _build_fixture(str(tmp_path / "src.mp4"))
+    out = str(tmp_path / "out.mp4")
+    _install_fakes(monkeypatch, turn_at=20)
+    real_build = reframe.build_framing_plan
+
+    def drop_aspect(**kw):
+        kw.pop("aspect", None)
+        return real_build(**kw)
+
+    monkeypatch.setattr(reframe, "build_framing_plan", drop_aspect)
+    assert reframe.process_video_to_vertical(
+        src, out, reframe_mode="auto", aspect_ratio=1.0) is True
+    plan = fp.load_plan(os.path.splitext(out)[0] + ".turn_framing_plan.json")
+    # The bug: a 9:16 plan persisted for a 1:1 render.
+    assert plan.output_aspect == pytest.approx(9 / 16)
+    assert plan.output_aspect != pytest.approx(1.0)
+
+
+# --- analysis deadline: injected clock/detector -------------------------------
+
+class _FakeClock:
+    """Monotonic clock stand-in; every call advances ``now`` by ``step``."""
+
+    def __init__(self, step=0.005):
+        self.now = 1000.0
+        self.step = step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+class _FakeCapture:
+    """cv2.VideoCapture stand-in: ``n_frames`` synthetic frames, then EOF."""
+
+    def __init__(self, n_frames):
+        self.remaining = n_frames
+        self.released = 0
+        self._closed = False
+
+    def isOpened(self):
+        return not self._closed
+
+    def _next(self):
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+    def read(self):
+        ok = self._next()
+        return (ok, object() if ok else None)
+
+    def grab(self):
+        return self._next()
+
+    def release(self):
+        self.released += 1
+        self._closed = True
+
+
+def _pass1_with_fakes(n_frames=2000, deadline_s=0.05, clock_step=0.005,
+                      max_analysis_frames=10 ** 9, strategies=("TRACK",)):
+    """Drive ``reframe._pass1_track`` with a fake capture, fake clock and
+    counting detector/MAR stand-ins. Returns (result, calls, cap)."""
+    clock = _FakeClock(step=clock_step)
+    calls = {"detect": 0, "mar": 0, "person": 0}
+
+    def fake_detect(frame):
+        calls["detect"] += 1
+        return [{"box": [60, 90, 90, 90], "score": 1.0}]
+
+    def fake_mar(frame, box):
+        calls["mar"] += 1
+        return 0.5
+
+    def fake_person(frame):
+        calls["person"] += 1
+        return None
+
+    cfg = fp.TurnFramingConfig(analysis_deadline_s=deadline_s,
+                               max_analysis_frames=max_analysis_frames)
+    tracker = reframe.SpeakerTracker(cooldown_frames=45)
+    smoother = reframe.DetectionSmoother(window_size=5)
+    cameraman = reframe.SmoothedCameraman(202, 360, 640, 360,
+                                          aspect_ratio=9 / 16)
+    holder = {}
+
+    def factory(path):
+        cap = _FakeCapture(n_frames)
+        holder["cap"] = cap
+        return cap
+
+    result = reframe._pass1_track(
+        "fake.mp4",
+        scene_boundaries=[(0, n_frames)], scene_strategies=list(strategies),
+        speaker_tracker=tracker, detection_smoother=smoother,
+        cameraman=cameraman, turn_cfg=cfg, turn_aware=True, plan_reused=False,
+        original_width=640, original_height=360, total_frames=n_frames,
+        fps=30.0, clock=clock, detect_fn=fake_detect, mar_fn=fake_mar,
+        person_fn=fake_person, capture_factory=factory, show_progress=False,
+    )
+    return result, calls, holder["cap"]
+
+
+def test_analysis_deadline_stops_expensive_calls():
+    """Subsecond deadline on a long source: detector and MAR call counts
+    freeze at exhaustion — they do not merely get discarded afterwards."""
+    (targets, scene_ids, strategies, recorder, budget), calls, cap = \
+        _pass1_with_fakes(n_frames=2000, deadline_s=0.05, clock_step=0.005)
+    # Deterministic: the 5ms clock exhausts the 50ms deadline after exactly
+    # two analyzed frames (see the trace in the test docstring below).
+    assert calls["detect"] == 2, calls
+    assert calls["mar"] == 2, calls
+    assert budget.exhausted
+    assert budget.exhaust_reason == "analysis_budget_exhausted"
+    assert "analysis_budget_exhausted" in recorder.diagnostics
+    # Bookkeeping continued for the whole source; capture released once.
+    assert len(targets) == 2000
+    assert len(scene_ids) == 2000 and len(strategies) == 2000
+    assert cap.released == 1
+
+
+def test_zero_deadline_makes_no_detector_calls():
+    """Deadline 0 with the injected clock: not a single detector/MAR call,
+    while frame bookkeeping still completes."""
+    (targets, _, _, recorder, budget), calls, cap = _pass1_with_fakes(
+        n_frames=500, deadline_s=0.0, clock_step=0.0)
+    assert calls == {"detect": 0, "mar": 0, "person": 0}, calls
+    assert budget.exhaust_reason == "analysis_budget_exhausted"
+    assert "analysis_budget_exhausted" in recorder.diagnostics
+    assert len(targets) == 500
+    assert cap.released == 1
+
+
+def test_analysis_frame_budget_stops_calls():
+    """Tiny max_analysis_frames: the observation cap stops expensive calls
+    and records the frame-budget diagnostic."""
+    (targets, _, _, recorder, budget), calls, cap = _pass1_with_fakes(
+        n_frames=2000, deadline_s=3600.0, clock_step=0.0,
+        max_analysis_frames=4)
+    # 4 observations max; the log drops on the 5th analyzed frame and the
+    # loop stops analyzing right after.
+    assert 0 < calls["detect"] <= 8, calls
+    assert calls["mar"] <= calls["detect"], calls
+    assert "analysis-frame-budget-exhausted" in recorder.diagnostics
+    assert len(targets) == 2000
+    assert cap.released == 1
+
+
+def test_mutation_gate_disabled_deadline_checks(monkeypatch):
+    """If the budget checks are disabled (ok() forced True), the tiny
+    deadline must NOT stop the detector — proving the stop-tests above are
+    sensitive to removed checks."""
+    monkeypatch.setattr(fp.AnalysisBudget, "ok", lambda self: True)
+    (_, _, _, _, budget), calls, _ = _pass1_with_fakes(
+        n_frames=200, deadline_s=0.05, clock_step=0.005)
+    assert calls["detect"] == 100, calls  # every even frame analyzed
+    assert not budget.exhausted
+
+
+def test_tiny_deadline_completes_render_safely(tmp_path, monkeypatch):
+    """A subsecond wall-time budget on the real route: the render completes,
+    the detector call count is bounded, the plan persists, and the output is
+    a valid clip (affected scenes keep the accepted static/wide fallback)."""
+    src = _build_fixture(str(tmp_path / "src.mp4"))
+    out = str(tmp_path / "out.mp4")
+    _install_fakes(monkeypatch, turn_at=20)
+    calls = {"detect": 0}
+    real_detect = reframe.detect_face_candidates
+
+    def counting_detect(frame):
+        calls["detect"] += 1
+        import time as _t
+        _t.sleep(0.002)  # keep the tiny deadline deterministic on any host
+        return real_detect(frame)
+
+    monkeypatch.setattr(reframe, "detect_face_candidates", counting_detect)
+    monkeypatch.setenv("CLIPPYME_TURN_ANALYSIS_DEADLINE_S", "0.05")
+    assert reframe.process_video_to_vertical(src, out, reframe_mode="auto") is True
+    # 120 even frames could be analyzed; the deadline must stop well short.
+    assert 0 < calls["detect"] < 120, calls
+    plan_path = os.path.splitext(out)[0] + ".turn_framing_plan.json"
+    assert os.path.exists(plan_path)
+    assert not list(tmp_path.glob("*.tmp-*")), "no temp leftovers"
+    ow, oh, ofps, on = _probe(out)
+    assert (ow, oh) == (int(H * 9 / 16), H) and ow % 2 == 0
+    assert ofps == pytest.approx(30.0)
+    assert abs(on - N_FRAMES) <= 2
+    assert _audio_peak_hz(out, tmp_path) == pytest.approx(880, abs=8)
