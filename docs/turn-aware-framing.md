@@ -134,6 +134,21 @@ landmarks.
 - `analysis_deadline_s` is part of `TurnFramingConfig.to_dict()`, so the
   deadline participates in `config_digest` and plan identity.
 
+## Exhaustion boundary refinements (review 03)
+
+- Observation-cap exhaustion is recorded at the actual first dropped
+  observation: `ObservationLog.add()` calls `mark_exhaustion(
+  `nalysis-frame-budget-exhausted`, frame=obs.frame,
+  scene_id=obs.scene_id)` on the first drop. First-call-wins semantics
+  are preserved, so pass 1 can never replace this original context after
+  scene bookkeeping advances; a partially observed prior scene is never
+  treated as fully analyzed and reused.
+- Exhaustion fallbacks apply only to TRACK/WIDE face scenes:
+  `build_framing_plan()` checks the strategy before the incomplete-scene
+  fallback. SPLIT, SCREENCAST, GENERAL, and DISABLED scenes remain
+  `applies=False` with no fallback, tracks, segments, or keyframes, even
+  when analysis exhausted earlier.
+
 ## Relational sidecar validation (review 02)
 
 - Beyond scalar shapes, `plan_from_dict` enforces relationships: scene

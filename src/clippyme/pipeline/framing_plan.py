@@ -291,7 +291,12 @@ class ObservationLog:
         if len(self._obs) >= self.max_observations:
             self.dropped += 1
             if self.dropped == 1:
-                self.diagnostics.append("analysis-frame-budget-exhausted")
+                # Task 12 review 03: record exhaustion at the actual first
+                # dropped observation. mark_exhaustion is first-call-wins,
+                # so pass 1 can never replace this original context after
+                # scene bookkeeping advances.
+                self.mark_exhaustion("analysis-frame-budget-exhausted",
+                                     frame=obs.frame, scene_id=obs.scene_id)
             return
         self._obs.append(obs)
         self._seen.add((obs.frame, obs.track_id))
@@ -1685,14 +1690,18 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
     scene_plans: list[ScenePlan] = []
     for idx, (start, end) in enumerate(scenes):
         strategy = strategies[idx] if idx < len(strategies) else "TRACK"
-        if not _scene_fully_analyzed(int(start), int(end)):
-            scene_plans.append(_exhaustion_fallback(
-                idx, strategy, start, end, exhaustion_reason))
-            continue
+        # Task 12 review 03: exhaustion fallbacks apply only to TRACK/WIDE
+        # face scenes. Non-face strategies keep applies=False with no
+        # fallback, tracks, segments, or keyframes, even when analysis
+        # exhausted earlier.
         if strategy not in FACE_STRATEGIES:
             scene_plans.append(ScenePlan(
                 scene_id=idx, strategy=strategy, start_frame=int(start),
                 end_frame=int(end), applies=False))
+            continue
+        if not _scene_fully_analyzed(int(start), int(end)):
+            scene_plans.append(_exhaustion_fallback(
+                idx, strategy, start, end, exhaustion_reason))
             continue
         try:
             sp = build_scene_plan(
