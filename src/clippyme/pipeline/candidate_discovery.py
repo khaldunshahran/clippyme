@@ -984,9 +984,12 @@ def av_checkpoint_identity(*, source_fingerprint: str,
     contract covers the discovery model name, the fallback chain, and
     the explicit AV prompt/schema contract version: a model or contract
     change re-runs instead of silently reusing results produced under a
-    different contract. Everything here is pure and deterministic (no
-    sampling, no provider calls): frame timestamps come from the
-    planner and audio events from the transcript.
+    different contract. The schema version is persisted explicitly as
+    ``av_prompt_schema_version`` (not only inside the contract digest)
+    and compared field-for-field on resume. Everything here is pure
+    and deterministic (no sampling, no provider calls): frame
+    timestamps come from the planner and audio events from the
+    transcript.
     """
     from clippyme.pipeline.gemini_request import AV_PROMPT_SCHEMA_VERSION
     words, _ = normalize_transcript_words(transcript_result)
@@ -1064,6 +1067,10 @@ def av_checkpoint_identity(*, source_fingerprint: str,
         "window_plan_digest": h_plan.hexdigest()[:32],
         "evidence_manifest_digest": h_man.hexdigest()[:32],
         "provider_contract_digest": h_contract.hexdigest()[:32],
+        # Explicit AV prompt/schema contract version: a mismatch
+        # forces re-analysis on resume, even when every digest still
+        # matches.
+        "av_prompt_schema_version": int(AV_PROMPT_SCHEMA_VERSION),
     }
 
 
@@ -1160,7 +1167,8 @@ def av_resume_reusable(saved_funnel: Any, *,
     saved_identity = saved_av.get("identity") or {}
     for key in ("source_fingerprint", "av_discovery_version",
                 "av_config_digest", "window_plan_digest",
-                "evidence_manifest_digest", "provider_contract_digest"):
+                "evidence_manifest_digest", "provider_contract_digest",
+                "av_prompt_schema_version"):
         if str(saved_identity.get(key)) != str(cur_identity.get(key)):
             return False, f"av_identity_mismatch:{key}"
     return True, "av_identity_match"

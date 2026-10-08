@@ -516,10 +516,14 @@ def ffmpeg_frame_sampler(
     requested timestamp slightly; that is reported honestly).
 
     The source is opened read-only; it is never modified. No temp files:
-    frame bytes are captured from stdout in memory. Raises
-    ``SamplingError`` on unreadable source, invalid timestamps, decode
-    failure, missing decoded timestamps, or cap violations. Raises
-    ``FileNotFoundError`` when the ffmpeg binary is missing.
+    frame bytes are captured from stdout in memory. One monotonic
+    deadline covers the whole sampling operation: the remaining time
+    is recomputed before every frame decode and every JPEG-quality
+    subprocess, and no attempt starts once the deadline is exhausted.
+    Raises ``SamplingError`` on unreadable source, invalid timestamps,
+    decode failure, missing decoded timestamps, deadline exhaustion,
+    or cap violations. Raises ``FileNotFoundError`` when the ffmpeg
+    binary is missing.
     """
     lim = limits or FrameLimits()
     if not source_media_usable(source_path):
@@ -536,11 +540,17 @@ def ffmpeg_frame_sampler(
         "showinfo"
     )
     out: List[FrameSample] = []
+    # One monotonic deadline for the whole sampling operation.
+    deadline = time.monotonic() + lim.sampling_timeout_s
     for t in ts_list:
         frame_bytes: Optional[bytes] = None
         decoded_ts: Optional[float] = None
         last_err = ""
         for q in lim.jpeg_quality_steps:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_err = "sampling_deadline_exhausted"
+                break
             cmd = [
                 ffmpeg_bin, "-hide_banner", "-loglevel", "info",
                 "-ss", f"{t:.3f}", "-copyts", "-i", source_path,
@@ -551,7 +561,7 @@ def ffmpeg_frame_sampler(
             try:
                 proc = subprocess.run(
                     cmd, capture_output=True,
-                    timeout=lim.sampling_timeout_s)
+                    timeout=remaining)
             except FileNotFoundError:
                 raise
             except subprocess.TimeoutExpired:
@@ -1107,7 +1117,10 @@ def validate_av_evidence(
     candidate uses visual frame evidence (basis ``visual``, or
     ``multimodal`` with frame refs), a bounded nonempty model-produced
     ``visual_description`` is required — reason
-    ``missing_visual_description`` when absent.
+    ``missing_visual_description`` when absent. The description must
+    be an actual JSON string — reason
+    ``invalid_visual_description_type`` for booleans, numbers,
+    objects, arrays, or any other non-string type.
     """
     if not isinstance(item, dict):
         raise EvidenceValidationError("candidate_not_object")
@@ -1216,7 +1229,12 @@ def validate_av_evidence(
     visual_desc = item.get("visual_description")
     visual_desc_rec: Optional[Dict[str, Any]] = None
     if visual_desc is not None:
-        vd = str(visual_desc).strip()
+        if not isinstance(visual_desc, str):
+            raise EvidenceValidationError(
+                "invalid_visual_description_type",
+                "visual_description must be a JSON string, got "
+                f"{type(visual_desc).__name__}")
+        vd = visual_desc.strip()
         if not vd:
             raise EvidenceValidationError("empty_visual_description")
         if len(vd) > max_visual_description_chars:

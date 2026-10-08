@@ -174,9 +174,19 @@ Exact rejection reasons (`EvidenceValidationError.reason`):
 - `missing_visual_reference`, `missing_audio_reference`
 - `multimodal_missing_transcript_evidence`,
   `multimodal_missing_media_reference`
-- `empty_visual_description`, `visual_description_too_long`
+- `empty_visual_description`, `visual_description_too_long`,
+  `invalid_visual_description_type` (non-string description)
 - `non_finite_confidence`, `non_finite_score`,
   `confidence_out_of_range` ([0,1]), `score_out_of_range` ([1,100])
+
+## Checkpoint identity and resume
+
+`av_checkpoint_identity` persists `av_prompt_schema_version`
+explicitly (the current `AV_PROMPT_SCHEMA_VERSION` from
+`gemini_request.py`, alongside the provider-contract digest).
+Resume validation compares it field-for-field: a checkpoint whose
+explicit version differs from the running code forces re-analysis
+instead of reuse, even when every digest still matches.
 
 ## Config / env vars (`CLIPPYME_AV_DISCOVERY`)
 
@@ -193,7 +203,9 @@ Exact rejection reasons (`EvidenceValidationError.reason`):
 | `CLIPPYME_AV_MAX_FRAME_BYTES` | `65536` | per-frame byte cap |
 | `CLIPPYME_AV_MAX_WINDOW_BYTES` | `262144` | per-window byte cap |
 | `CLIPPYME_AV_MAX_INVOCATION_BYTES` | `4194304` | invocation byte cap |
-| `CLIPPYME_AV_SAMPLING_TIMEOUT_S` | `30.0` | per-frame ffmpeg timeout |
+| `CLIPPYME_AV_SAMPLING_TIMEOUT_S` | `30.0` | per-operation monotonic
+| | | sampling deadline shared by every frame decode and JPEG-quality |
+| | | subprocess; remaining time is recomputed before each attempt |
 | `CLIPPYME_AV_FINGERPRINT_PROBE_BYTES` | `65536` | head bytes fingerprinted |
 | `CLIPPYME_AV_MAX_EVENT_LABEL_CHARS` | `64` | audio-event label cap |
 | `CLIPPYME_AV_MAX_VISUAL_DESC_CHARS` | `500` | model description cap |
