@@ -589,6 +589,10 @@ def _get_viral_clips_windowed(
         transcript_result, video_duration,
         config=config, client_factory=_client_factory,
         instructions=instructions,
+        min_duration=min_duration, max_duration=max_duration,
+        min_clips=min_clips, max_clips=max_clips,
+        clip_type=clip_type, duration_mode=duration_mode,
+        audience_intel=audience_intel,
     )
     # Preserve exhaustion semantics for the orchestrator.
     funnel = result.get("candidate_discovery", {})

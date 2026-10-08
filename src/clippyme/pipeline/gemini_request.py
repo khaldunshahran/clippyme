@@ -838,10 +838,16 @@ def build_discovery_prompt(window, window_words, instructions=None):
     """
     lines = []
     for w in window_words:
-        text = w.get("text") or w.get("word") or ""
-        start = w.get("start", w.get("start_time", "?"))
-        speaker = w.get("speaker", w.get("speaker_id", "?"))
-        lines.append(f"[{start}][spk:{speaker}] {text}")
+        # Handle normalized w/s/e/sp and legacy text/word/start/speaker.
+        text = w.get("w") or w.get("text") or w.get("word") or ""
+        start = w.get("s", w.get("start", w.get("start_time", "?")))
+        # Preserve speaker 0; normalized uses 'sp'.
+        speaker = w.get("sp", w.get("speaker", w.get("speaker_id", "?")))
+        if isinstance(start, (int, float)):
+            start_s = f"{float(start):.1f}"
+        else:
+            start_s = str(start)
+        lines.append(f"[{start_s}][spk:{speaker}] {text}")
     transcript_block = "\n".join(lines)
     fenced_instructions = ""
     if instructions:

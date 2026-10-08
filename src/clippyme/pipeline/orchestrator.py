@@ -560,20 +560,39 @@ def _load_or_analyze(
             duration_mode=getattr(args, "duration_mode", None),
             audience_intel=audience_intel,
         )
+        # Preserve discovery funnel through fallbacks (Task 08 Fix 6).
+        _discovery_funnel = (clips_data.get("candidate_discovery")
+                             if isinstance(clips_data, dict) else None)
+        _candidate_store = (clips_data.get("candidate_store")
+                            if isinstance(clips_data, dict) else None)
+        def _preserve_funnel(data):
+            if isinstance(data, dict):
+                if _discovery_funnel is not None:
+                    data["candidate_discovery"] = _discovery_funnel
+                    data["candidate_discovery"]["fallback_used"] = True
+                if _candidate_store is not None:
+                    data["candidate_store"] = _candidate_store
+            return data
         if not clips_data or "shorts" not in clips_data:
             if should_use_fallback(args.monitor):
-                clips_data = legacy.build_texttiling_fallback(transcript, video_title)
+                clips_data = _preserve_funnel(
+                    legacy.build_texttiling_fallback(transcript, video_title))
+                if _discovery_funnel is not None and isinstance(clips_data, dict) and "candidate_discovery" in clips_data:
+                    clips_data["candidate_discovery"]["fallback_strategy"] = "texttiling"
         if not clips_data or not clips_data.get("shorts"):
             if not should_use_fallback(args.monitor):
-                clips_data = {
+                clips_data = _preserve_funnel({
                     "shorts": [],
                     "gemini_exhausted": bool(
                         getattr(legacy.get_viral_clips, "_last_gemini_exhausted", False)
                     ),
-                }
+                })
             else:
                 print("⚠️ No valid AI/topic clips; using whole-video fallback", flush=True)
-                clips_data = _whole_video_fallback(video_title, duration)
+                clips_data = _preserve_funnel(
+                    _whole_video_fallback(video_title, duration))
+                if _discovery_funnel is not None and isinstance(clips_data, dict) and "candidate_discovery" in clips_data:
+                    clips_data["candidate_discovery"]["fallback_strategy"] = "whole_video"
         # Phase B: steering that arrived while moment selection was
         # running missed the checkpoint -- record it, never drop it.
         _late = state.consume_steering()

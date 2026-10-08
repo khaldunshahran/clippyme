@@ -122,12 +122,21 @@ class PlannedWindow:
 
 
 def _word_text(w: Dict[str, Any]) -> str:
-    t = w.get("text") or w.get("word") or ""
-    return str(t)
+    # Handle: w (Task 04), text, word (production segments).
+    for k in ("w", "text", "word"):
+        t = w.get(k)
+        if isinstance(t, str) and t.strip():
+            return t
+        if t is not None and not isinstance(t, bool):
+            s = str(t).strip()
+            if s:
+                return s
+    return ""
 
 
 def _word_start(w: Dict[str, Any]) -> Optional[float]:
-    for k in ("start", "start_time", "start_s"):
+    # Handle: s (Task 04), start (production/words).
+    for k in ("s", "start", "start_time", "start_s"):
         v = w.get(k)
         if isinstance(v, bool):
             continue
@@ -137,7 +146,8 @@ def _word_start(w: Dict[str, Any]) -> Optional[float]:
 
 
 def _word_end(w: Dict[str, Any]) -> Optional[float]:
-    for k in ("end", "end_time", "end_s"):
+    # Handle: e (Task 04), end (production/words).
+    for k in ("e", "end", "end_time", "end_s"):
         v = w.get(k)
         if isinstance(v, bool):
             continue
@@ -146,62 +156,138 @@ def _word_end(w: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _word_speaker(w: Dict[str, Any]) -> Optional[int]:
+    # Handle: sp (Task 04), speaker (production). Preserve 0.
+    for k in ("sp", "speaker"):
+        v = w.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+    return None
+
+
+def normalize_transcript_words(transcript_result: Any) -> List[Dict[str, Any]]:
+    """One authoritative normalizer for all transcript contracts.
+
+    Handles:
+    - Real production: {"segments": [{"words": [{"word","start","end","speaker"}]}]}
+    - Task 04 flattened: [{"w","s","e","sp"}] (list) or {"words": [...]}
+    - Words shape: {"words": [{"text","start","end","speaker"}]}
+
+    Returns list of {"w","s","e"} plus "sp" if speaker present.
+    Preserves absolute timestamps (never rebases) and speaker ID 0.
+    Invalid words are omitted here; plan_windows reports them.
+    """
+    raw_words: List[Dict[str, Any]] = []
+
+    if isinstance(transcript_result, dict):
+        # Try segments first (real production).
+        segments = transcript_result.get("segments")
+        if isinstance(segments, list):
+            for seg in segments:
+                if not isinstance(seg, dict):
+                    continue
+                for w in seg.get("words", []):
+                    if isinstance(w, dict):
+                        raw_words.append(w)
+        # Fallback to top-level words list.
+        if not raw_words:
+            v = transcript_result.get("words")
+            if isinstance(v, list):
+                raw_words = [w for w in v if isinstance(w, dict)]
+            v = transcript_result.get("word_list")
+            if not raw_words and isinstance(v, list):
+                raw_words = [w for w in v if isinstance(w, dict)]
+    elif isinstance(transcript_result, list):
+        raw_words = [w for w in transcript_result if isinstance(w, dict)]
+    else:
+        # Object with .words attribute.
+        words = getattr(transcript_result, "words", None)
+        if isinstance(words, list):
+            raw_words = [w for w in words if isinstance(w, dict)]
+
+    normalized: List[Dict[str, Any]] = []
+    for w in raw_words:
+        text = _word_text(w)
+        s = _word_start(w)
+        e = _word_end(w)
+        if not text or s is None or e is None:
+            continue
+        entry: Dict[str, Any] = {"w": text, "s": s, "e": e}
+        sp = _word_speaker(w)
+        if sp is not None:
+            entry["sp"] = sp
+        normalized.append(entry)
+    return normalized
+
+
 def plan_windows(words: Sequence[Dict[str, Any]],
                  config: DiscoveryConfig) -> Dict[str, Any]:
     """Deterministic overlapping window plan over word timestamps.
 
     Returns {"windows": [PlannedWindow...], "coverage": {...},
-    "invalid_words": [...]}. Every valid word appears in >= 1 window;
-    first and last valid words are never dropped. Invalid words are
-    isolated and reported, never crashing the plan.
+    "invalid_words": [...]}. Every valid word appears in >= 1 window
+    under normal capacity; first and last valid words are never dropped
+    unless the window cap prevents it (then reported honestly).
+    No window ever exceeds target + boundary_tolerance.
+    Invalid words are isolated and reported, never crashing the plan.
     """
-    valid: List[tuple] = []  # (orig_idx, start, end)
+    valid: List[tuple] = []  # (orig_idx, start, end, text)
     invalid: List[int] = []
     for i, w in enumerate(words):
         if not isinstance(w, dict):
             invalid.append(i)
             continue
         s, e = _word_start(w), _word_end(w)
-        if s is None or e is None or not _word_text(w).strip():
+        t = _word_text(w)
+        if s is None or e is None or not t.strip():
             invalid.append(i)
             continue
         if e <= s:
             invalid.append(i)
             continue
-        valid.append((i, s, e))
+        valid.append((i, s, e, t))
 
     if not valid:
         return {"windows": [], "coverage": {
             "valid_words": 0, "covered_words": 0,
             "first_covered": False, "last_covered": False,
             "transcript_span_s": 0.0,
+            "truncated_by_window_limit": False,
+            "uncovered_word_ranges": [],
+            "uncovered_time_ranges": [],
         }, "invalid_words": invalid}
 
     span_start = valid[0][1]
     span_end = valid[-1][2]
+    max_window_s = config.window_target_s + config.boundary_tolerance_s
     step = config.window_target_s - config.window_overlap_s
     windows: List[PlannedWindow] = []
-    idx = 0
-    # Word pointer for boundary snapping.
     n = len(valid)
+    truncated = False
 
     cur_start = span_start
     while True:
-        cur_end_target = cur_start + config.window_target_s
-        # Find last word starting before cur_end_target (+ tolerance snap).
-        lo, hi = 0, n - 1
+        if len(windows) >= config.max_windows:
+            truncated = True
+            break
+        # Target end, snapped to punctuation/gap within tolerance.
+        target_end = cur_start + config.window_target_s
+        # Find candidate end word index: last word starting before target.
         end_vi = 0
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if valid[mid][1] < cur_end_target:
-                end_vi = mid
-                lo = mid + 1
+        for vi in range(n):
+            if valid[vi][1] < target_end:
+                end_vi = vi
             else:
-                hi = mid - 1
-        # Snap end to sentence boundary within tolerance.
-        end_vi = _snap_end(valid, end_vi, cur_end_target,
-                           config.boundary_tolerance_s)
-        # Find first word ending after cur_start.
+                break
+        # Snap to sentence boundary using actual word text.
+        end_vi = _snap_end_to_punctuation(valid, end_vi, target_end,
+                                          config.boundary_tolerance_s,
+                                          max_window_s, cur_start)
+        # Find start word index: first word ending after cur_start.
         start_vi = 0
         for vi in range(n):
             if valid[vi][2] > cur_start:
@@ -209,79 +295,115 @@ def plan_windows(words: Sequence[Dict[str, Any]],
                 break
         else:
             start_vi = n - 1
-        start_vi = _snap_start(valid, start_vi, cur_start,
-                               config.boundary_tolerance_s)
 
         w_start_s = valid[start_vi][1]
         w_end_s = valid[end_vi][2]
+        # Enforce hard bound: never exceed target + tolerance.
+        if w_end_s - w_start_s > max_window_s + 1e-6:
+            # Clamp end to max bound.
+            w_end_s = w_start_s + max_window_s
+            # Adjust end_vi to last word ending within bound.
+            for vi in range(start_vi, n):
+                if valid[vi][2] <= w_end_s + 1e-6:
+                    end_vi = vi
+                else:
+                    break
+            w_end_s = valid[end_vi][2]
+
         windows.append(PlannedWindow(
-            index=idx, start_s=w_start_s, end_s=w_end_s,
+            index=len(windows), start_s=w_start_s, end_s=w_end_s,
             word_start=valid[start_vi][0], word_end=valid[end_vi][0] + 1))
-        idx += 1
-        if len(windows) >= config.max_windows:
-            break
+
         if w_end_s >= span_end - 1e-6:
             break
-        # Advance, but guarantee forward progress and last-word coverage.
+        # Advance.
         nxt = cur_start + step
-        if nxt >= span_end - config.window_overlap_s:
-            # Final window must reach the last word.
-            cur_start = max(nxt, span_end - config.window_target_s)
-            # Ensure the final window actually extends coverage.
-            if cur_start <= windows[-1].start_s and len(windows) > 1:
-                break
-        else:
+        if nxt >= cur_start:  # Ensure forward progress.
             cur_start = nxt
-        # Safety: never let start pass the last word start.
+        else:
+            break
         if cur_start >= span_end:
             break
 
-    # Guarantee the last valid word is covered.
-    last_orig = valid[-1][0]
-    if windows and windows[-1].word_end <= last_orig:
-        # Extend the final window to include it.
-        w = windows[-1]
-        windows[-1] = PlannedWindow(
-            index=w.index, start_s=w.start_s,
-            end_s=valid[-1][2], word_start=w.word_start,
-            word_end=last_orig + 1)
-
+    # Coverage analysis.
     covered = set()
     for w in windows:
-        for vi, (oi, _s, _e) in enumerate(valid):
-            if w.word_start <= oi < w.word_end:
-                covered.add(oi)
-    return {
-        "windows": windows,
-        "coverage": {
-            "valid_words": len(valid),
-            "covered_words": len(covered),
-            "first_covered": valid[0][0] in covered,
-            "last_covered": valid[-1][0] in covered,
-            "transcript_span_s": round(span_end - span_start, 3),
-        },
-        "invalid_words": invalid,
-    }
+        for oi in range(w.word_start, w.word_end):
+            covered.add(oi)
+    # Uncovered ranges.
+    uncovered_words = []
+    uncovered_times = []
+    if covered:
+        all_orig = [v[0] for v in valid]
+        # Find gaps in coverage.
+        sorted_covered = sorted(covered)
+        # Check from first valid to last valid.
+        prev = None
+        for oi in sorted(all_orig):
+            if oi not in covered:
+                if prev is None or oi != prev + 1:
+                    # Start new gap.
+                    uncovered_words.append([oi, oi])
+                else:
+                    uncovered_words[-1][1] = oi
+                prev = oi
+            else:
+                prev = None
+        # Convert to time ranges.
+        orig_to_time = {v[0]: (v[1], v[2]) for v in valid}
+        for s_oi, e_oi in uncovered_words:
+            s_t = orig_to_time[s_oi][0]
+            e_t = orig_to_time[e_oi][1]
+            uncovered_times.append([s_t, e_t])
+
+    # If cap hit and words uncovered, mark truncated.
+    if uncovered_words:
+        # Check if we hit the cap.
+        if len(windows) >= config.max_windows:
+            truncated = True
+
+    return {"windows": windows, "coverage": {
+        "valid_words": len(valid),
+        "covered_words": len(covered),
+        "first_covered": valid[0][0] in covered,
+        "last_covered": valid[-1][0] in covered,
+        "transcript_span_s": span_end - span_start,
+        "truncated_by_window_limit": truncated,
+        "uncovered_word_ranges": uncovered_words,
+        "uncovered_time_ranges": uncovered_times,
+    }, "invalid_words": invalid}
 
 
-def _snap_end(valid, end_vi, target, tol):
-    """Snap window end to a sentence boundary within tolerance."""
-    best = end_vi
-    # Look ahead for sentence end within tolerance.
-    for vi in range(end_vi, min(len(valid), end_vi + 40)):
-        _oi, s, _e = valid[vi]
-        if s - target > tol:
-            break
-        # Reconstruct approximate text check from stored words is not
-        # possible here; use the word dict via index is unavailable, so
-        # keep the deterministic time-based end. Sentence snapping is
-        # applied by the caller when word dicts are available.
-        best = vi
-    return best
+def _snap_end_to_punctuation(valid: List[tuple], end_vi: int,
+                             target_end: float, tolerance: float,
+                             max_window_s: float,
+                             window_start_s: float) -> int:
+    """Snap window end to sentence punctuation using word text.
+
+    Looks for words ending with . ! ? within tolerance of target.
+    Never exceeds window_start + max_window_s.
+    """
+    n = len(valid)
+    # Search forward and backward within tolerance for punctuation.
+    best_vi = end_vi
+    # Check words near target_end.
+    for vi in range(max(0, end_vi - 10), min(n, end_vi + 10)):
+        ws, we, text = valid[vi][1], valid[vi][2], valid[vi][3]
+        # Must be within tolerance of target.
+        if abs(we - target_end) > tolerance:
+            continue
+        # Must not exceed max window size.
+        if we - window_start_s > max_window_s + 1e-6:
+            continue
+        # Check for sentence-ending punctuation.
+        t = text.strip()
+        if t and t[-1] in ".!?":
+            # Prefer the closest to target.
+            if abs(we - target_end) < abs(valid[best_vi][2] - target_end):
+                best_vi = vi
+    return best_vi
 
 
-def _snap_start(valid, start_vi, target, tol):
-    return start_vi
 
 
 def _normalize_evidence(text: str) -> str:
@@ -294,7 +416,7 @@ def _normalize_evidence(text: str) -> str:
 class CandidateRecord:
     """Validated discovery candidate with stable local identity."""
 
-    candidate_id: str
+    candidate_id: str  # Distinct per window occurrence (trace ID)
     window_index: int
     start_s: float
     end_s: float
@@ -307,6 +429,7 @@ class CandidateRecord:
     confidence: float
     recommendation_score: float
     speaker_ids: List[Any]
+    moment_fingerprint: str = ""  # Stable across windows (dedupe key)
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -319,11 +442,26 @@ def _is_finite_number(v: Any) -> bool:
             and math.isfinite(v))
 
 
-def make_candidate_id(source_tag: str, start_s: float, end_s: float,
-                      evidence_text: str) -> str:
-    """Stable local ID from evidence + interval; never model-provided."""
+def make_moment_fingerprint(source_tag: str, start_s: float,
+                            end_s: float, evidence_text: str) -> str:
+    """Stable moment fingerprint across windows; for semantic dedupe."""
     h = hashlib.sha256()
     h.update(source_tag.encode("utf-8"))
+    h.update(f"{start_s:.3f}-{end_s:.3f}".encode("utf-8"))
+    h.update(_normalize_evidence(evidence_text).encode("utf-8"))
+    return "moment-" + h.hexdigest()[:16]
+
+
+def make_candidate_id(source_tag: str, start_s: float, end_s: float,
+                      evidence_text: str, window_index: int = 0) -> str:
+    """Distinct trace ID per window occurrence; never model-provided.
+
+    Includes window_index so the same moment in overlapping windows
+    gets distinct IDs. Use moment_fingerprint for stable dedupe.
+    """
+    h = hashlib.sha256()
+    h.update(source_tag.encode("utf-8"))
+    h.update(f"w{window_index}:".encode("utf-8"))
     h.update(f"{start_s:.3f}-{end_s:.3f}".encode("utf-8"))
     h.update(_normalize_evidence(evidence_text).encode("utf-8"))
     return "cand-" + h.hexdigest()[:16]
@@ -331,9 +469,16 @@ def make_candidate_id(source_tag: str, start_s: float, end_s: float,
 
 def validate_discovery_candidate(item: Any, window: PlannedWindow,
                                  window_words: Sequence[Dict[str, Any]],
-                                 source_tag: str = "src"
+                                 source_tag: str = "src",
+                                 video_duration: Optional[float] = None,
                                  ) -> CandidateRecord:
-    """Validate one candidate independently; raise DiscoveryError if bad."""
+    """Validate one candidate independently; raise DiscoveryError if bad.
+
+    Rejects: booleans, non-finite numbers, reversed/out-of-window
+    intervals, intervals outside source duration, missing
+    evidence/context/payoff, wordless ranges, confidence outside
+    [0,1], recommendation_score outside [1,100].
+    """
     if not isinstance(item, dict):
         raise DiscoveryError("candidate must be an object")
     start, end = item.get("start_s", item.get("start")), item.get(
@@ -344,6 +489,11 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
     if not (window.start_s - 1e-6 <= start < end <= window.end_s + 1e-6):
         raise DiscoveryError(
             "candidate interval outside window or reversed")
+    # Source duration is authoritative bound.
+    if video_duration is not None and video_duration > 0:
+        if not (0 <= start < end <= video_duration + 1e-6):
+            raise DiscoveryError(
+                "candidate interval outside source duration")
     evidence = item.get("evidence_text") or item.get("evidence") or ""
     context = item.get("context") or ""
     payoff = item.get("expected_payoff") or item.get("payoff") or ""
@@ -376,6 +526,12 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
         raise DiscoveryError("confidence must be a finite number")
     if isinstance(score, bool) or not _is_finite_number(score):
         raise DiscoveryError("recommendation_score must be finite")
+    confidence = float(confidence)
+    score = float(score)
+    if not (0.0 <= confidence <= 1.0):
+        raise DiscoveryError("confidence must be in [0,1]")
+    if not (1.0 <= score <= 100.0):
+        raise DiscoveryError("recommendation_score must be in [1,100]")
     event_key = item.get("event_key") or item.get("continuity_key")
     if event_key is not None and not str(event_key).strip():
         event_key = None
@@ -385,12 +541,17 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
         if ws is None or we is None:
             continue
         if ws < end and we > start:
-            sid = w.get("speaker") if "speaker" in w else w.get("speaker_id")
+            # Normalized words use 'sp'; preserve 0.
+            sid = _word_speaker(w)
             if sid is not None and sid not in speakers:
                 speakers.append(sid)
-    cid = make_candidate_id(source_tag, start, end, str(evidence))
+    cid = make_candidate_id(
+        source_tag, start, end, str(evidence), window.index)
+    mfp = make_moment_fingerprint(
+        source_tag, start, end, str(evidence))
     return CandidateRecord(
         candidate_id=cid,
+        moment_fingerprint=mfp,
         window_index=window.index,
         start_s=start, end_s=end,
         event_type=str(item.get("event_type") or "moment"),
@@ -399,8 +560,8 @@ def validate_discovery_candidate(item: Any, window: PlannedWindow,
         context=str(context).strip(),
         expected_payoff=str(payoff).strip(),
         event_key=str(event_key).strip() if event_key else None,
-        confidence=float(confidence),
-        recommendation_score=float(score),
+        confidence=confidence,
+        recommendation_score=score,
         speaker_ids=speakers,
         raw=dict(item),
     )
@@ -466,10 +627,15 @@ def dedupe_candidates(candidates: Sequence[CandidateRecord]
                 dup_of, basis = k.candidate_id, "evidence_similarity"
                 break
         if dup_of:
-            removed[cand.candidate_id] = {"kept_id": dup_of, "basis": basis}
+            # Ensure distinct trace IDs in funnel even if inputs alias.
+            rid = cand.candidate_id
+            if rid == dup_of:
+                rid = f"{rid}#w{cand.window_index}"
+            removed[rid] = {"kept_id": dup_of, "basis": basis,
+                            "candidate_id": cand.candidate_id}
             for g in groups:
                 if g["kept_id"] == dup_of:
-                    g["removed_ids"].append(cand.candidate_id)
+                    g["removed_ids"].append(rid)
                     break
         else:
             kept.append(cand)
@@ -502,9 +668,15 @@ class DiscoveryBudget:
                 or self.remaining_s() <= 0)
 
     def sdk_timeout_ms(self) -> int:
-        """Finite SDK timeout never exceeding remaining budget."""
+        """Finite SDK timeout never exceeding remaining budget.
+
+        No artificial floor: subsecond remainders yield subsecond
+        timeouts. Returns 0 if no time remains (caller must skip).
+        """
         remaining_ms = int(self.remaining_s() * 1000)
-        return max(1000, min(self.config.sdk_timeout_ms, remaining_ms))
+        if remaining_ms <= 0:
+            return 0
+        return min(self.config.sdk_timeout_ms, remaining_ms)
 
     def consume(self) -> bool:
         """Consume one attempt; return False if budget exhausted."""
@@ -522,7 +694,8 @@ def _window_words_text(window: PlannedWindow,
         txt = _word_text(w)
         if s is None:
             continue
-        spk = w.get("speaker", w.get("speaker_id", "?"))
+        # Normalized words use 'sp'; preserve 0.
+        spk = w.get("sp", w.get("speaker", "?"))
         parts.append(f"[{s:.1f}][spk:{spk}] {txt}")
     return "\n".join(parts)
 
@@ -539,6 +712,13 @@ def run_windowed_discovery(
     instructions: Optional[str] = None,
     source_tag: str = "src",
     time_fn: Callable[[], float] = time.monotonic,
+    min_duration: Optional[float] = None,
+    max_duration: Optional[float] = None,
+    min_clips: Optional[int] = None,
+    max_clips: Optional[int] = None,
+    clip_type: Optional[str] = None,
+    duration_mode: Optional[str] = None,
+    audience_intel: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run bounded windowed discovery; return funnel + candidate store.
 
@@ -657,7 +837,8 @@ def run_windowed_discovery(
                     continue
                 try:
                     rec = validate_discovery_candidate(
-                        item, w, w_words, source_tag=source_tag)
+                        item, w, w_words, source_tag=source_tag,
+                        video_duration=video_duration)
                 except DiscoveryError as e:
                     funnel["invalid_candidates"] += 1
                     key = str(e)[:80]
@@ -740,18 +921,26 @@ def run_windowed_discovery(
             "speaker_ids": c.speaker_ids,
         }
     for c in selected:
+        reason = f"{c.evidence_text.strip()} {c.context.strip()}".strip()
+        if len(reason) < 20:
+            reason = (reason + " " + c.expected_payoff.strip()).strip()
+        if len(reason) < 20:
+            reason = reason.ljust(20, ".")
         shorts.append({
             "start": c.start_s,
             "end": c.end_s,
             "viral_score": max(1, min(100, int(round(
                 c.recommendation_score)))),
+            "viral_reason": reason[:500],
             "candidate_id": c.candidate_id,
             "event_type": c.event_type,
+            "viral_hook_text": "",
+            "video_description": "",
         })
     funnel["candidate_store_ids"] = sorted(candidate_store.keys())
-    # Counts reconcile: raw == valid + invalid (+ capped raw extras).
+    # Counts reconcile exactly: raw == valid + invalid.
     funnel["counts_reconcile"] = (
-        funnel["raw_candidates"] >= funnel["valid_candidates"]
+        funnel["raw_candidates"] == funnel["valid_candidates"]
         + funnel["invalid_candidates"])
     return {"shorts": shorts,
             "candidate_discovery": funnel,
@@ -759,17 +948,8 @@ def run_windowed_discovery(
 
 
 def _extract_words(transcript_result: Any) -> List[Dict[str, Any]]:
-    if isinstance(transcript_result, dict):
-        for k in ("words", "word_list"):
-            v = transcript_result.get(k)
-            if isinstance(v, list):
-                return v
-    if isinstance(transcript_result, list):
-        return transcript_result
-    words = getattr(transcript_result, "words", None)
-    if isinstance(words, list):
-        return words
-    return []
+    """Extract normalized words via the authoritative normalizer."""
+    return normalize_transcript_words(transcript_result)
 
 
 def _default_parse(text: str) -> List[Dict[str, Any]]:
@@ -779,10 +959,47 @@ def _default_parse(text: str) -> List[Dict[str, Any]]:
 
 def _default_generate(client: Any, prompt: str, cfg: DiscoveryConfig,
                       budget: DiscoveryBudget) -> str:
+    """Budget-aware generation: check/consume before every SDK call.
+
+    Implements model fallback loop locally so the shared budget is
+    checked immediately before each generate_content call, including
+    fallbacks. Timeout recomputed per attempt; never exceeds remaining
+    deadline. Preserves default fallback chain.
+    """
     from clippyme.pipeline import gemini_request as gr
-    models = [cfg.model_name] + list(cfg.fallback_models) or [
-        "gemini-3.5-flash"]
-    response, _model = gr.generate_with_model_fallback(
-        client, prompt, [m for m in models if m],
-        max_attempts=1, timeout_ms=budget.sdk_timeout_ms())
-    return response.text or ""
+    models = [cfg.model_name] + list(cfg.fallback_models)
+    models = [m for m in models if m] or ["gemini-3.5-flash"]
+    last_error = None
+    first = True
+    for model_name in models:
+        # Primary already consumed by window loop; fallbacks consume.
+        if not first:
+            if budget.exhausted():
+                break
+            if not budget.consume():
+                break
+        first = False
+        timeout_ms = budget.sdk_timeout_ms()
+        if timeout_ms <= 0:
+            break
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config={"http_options": {"timeout": int(timeout_ms)}},
+            )
+            return response.text or ""
+        except Exception as exc:
+            last_error = exc
+            # Check if retryable; if not, raise.
+            if not gr._is_retryable_model_error(exc):
+                raise
+            # If unavailable, try next model (budget already consumed).
+            if gr._is_unavailable_model_error(exc):
+                continue
+            # For rate/capacity errors, try next model if available.
+            # Otherwise, break (no more retries in discovery path).
+            break
+    if last_error:
+        raise last_error
+    raise DiscoveryError("budget exhausted before generation")
