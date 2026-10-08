@@ -120,3 +120,12 @@ shorts list, and independently verified zero-output arithmetic
 adjusted, or grouped) may suppress TextTiling/whole-video
 fallback. Stale versions, type-coerced counts (booleans,
 strings, floats), or inconsistent metadata never do.
+
+## Skipped items contradict an empty result (review 03)
+
+Every skipped short is retained, so no skip may coexist with an
+intentionally empty result. `application_skips` must be an actual
+empty mapping and `skipped` an actual empty list: missing fields,
+wrong types (for example a list for `application_skips` or a dict
+for `skipped`), or non-empty values all return false and preserve
+the genuine-failure fallback path.

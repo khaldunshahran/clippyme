@@ -140,11 +140,13 @@ def is_intentional_editorial_empty(clips_data: Any) -> bool:
 
     Strict contract: only a current APPLICATION_VERSION record with
     exact boolean flags, non-boolean nonnegative integer counts, an
-    actual empty shorts list, and independently verified zero-output
-    arithmetic may suppress fallback. Every original selection must
-    have been actually rejected; nothing may be retained, adjusted, or
-    grouped. Stale versions, type-coerced counts, or inconsistent
-    metadata never suppress fallback.
+    actual empty shorts list, empty application_skips and skipped
+    fields, and independently verified zero-output arithmetic may
+    suppress fallback. Every original selection must have been actually
+    rejected; nothing may be retained, adjusted, grouped, or skipped --
+    every skipped short is retained, so any skip contradicts zero
+    output. Stale versions, type-coerced counts, wrong-typed or missing
+    skip fields, or inconsistent metadata never suppress fallback.
     """
     if not isinstance(clips_data, dict):
         return False
@@ -175,6 +177,17 @@ def is_intentional_editorial_empty(clips_data: Any) -> bool:
     if not orig > 0:
         return False
     if final != 0:
+        return False
+    # No skipped item may coexist with an intentionally empty result:
+    # every skipped short is retained, so any skip contradicts zero
+    # output. application_skips must be an actual empty mapping and
+    # skipped an actual empty list; missing fields, wrong types, or
+    # non-empty values preserve the genuine-failure fallback path.
+    skips = rec.get("application_skips")
+    if not isinstance(skips, Mapping) or len(skips) != 0:
+        return False
+    skipped = rec.get("skipped")
+    if not isinstance(skipped, list) or len(skipped) != 0:
         return False
     # Independently verified zero-output arithmetic: every original
     # selection was actually rejected and nothing was retained,

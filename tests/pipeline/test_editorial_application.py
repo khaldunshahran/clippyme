@@ -1463,6 +1463,7 @@ def test_r1_all_editorial_rejections_do_not_render_whole_video_fallback(
                     "groups_applied": 0,
                     "groups_rejected": 0,
                     "application_skips": {},
+                    "skipped": [],
                     "final_selected_count": 0,
                     "counts_reconcile": True,
                     "source_bounds_checked": True,
@@ -1503,6 +1504,8 @@ def _r1_editorial_empty_record(**kw):
         "rejects_removed": 2,
         "unrefined_retained": 0,
         "legacy_no_id_retained": 0,
+        "application_skips": {},
+        "skipped": [],
         "groups_applied": 0,
     }
     rec.update(kw)
@@ -1711,6 +1714,7 @@ def _r2_empty_record(**overrides):
         "unrefined_retained": 0,
         "legacy_no_id_retained": 0,
         "application_skips": {},
+        "skipped": [],
         "groups_applied": 0,
     }
     record.update(overrides)
@@ -1842,3 +1846,88 @@ def test_r2_real_all_rejected_record_still_suppresses_fallback():
     assert output == []
     clips_data = {"shorts": output, "editorial_application": record}
     assert ea.is_intentional_editorial_empty(clips_data) is True
+
+
+# --- review-03: skipped items contradict an intentionally empty result ---
+
+
+def _r3_empty_record(**overrides):
+    record = {
+        "version": ea.APPLICATION_VERSION,
+        "enabled": True,
+        "counts_reconcile": True,
+        "original_selected_count": 1,
+        "final_selected_count": 0,
+        "accepts_retained": 0,
+        "adjustments_applied": 0,
+        "rejects_removed": 1,
+        "unrefined_retained": 0,
+        "legacy_no_id_retained": 0,
+        "application_skips": {},
+        "skipped": [],
+        "groups_applied": 0,
+    }
+    record.update(overrides)
+    return {"shorts": [], "editorial_application": record}
+
+
+def test_r3_skipped_items_cannot_coexist_with_an_intentionally_empty_result():
+    assert ea.is_intentional_editorial_empty(_r3_empty_record()) is True
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(application_skips={"invalid_source_duration": 1})) is False
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(skipped=[{"candidate_id": "c1", "reason": "bad"}])) is False
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(application_skips=[])) is False
+
+
+# --- review-03 mutation coverage: each skip gate alone decides ---
+# If either gate were removed, the adversarial record below would pass
+# every remaining check and suppress fallback, flipping these to True.
+
+
+def test_r3_mutation_application_skips_gate_is_load_bearing():
+    assert ea.is_intentional_editorial_empty(_r3_empty_record()) is True
+    # Non-empty mapping: a retained skipped item contradicts zero output.
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(application_skips={"plan_interval_mismatch": 2})) is False
+    # Wrong types must not be treated as "empty": a list is not a mapping.
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(application_skips=[])) is False
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(application_skips="none")) is False
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(application_skips=None)) is False
+    # Missing field must not be treated as empty.
+    missing = _r3_empty_record()
+    del missing["editorial_application"]["application_skips"]
+    assert ea.is_intentional_editorial_empty(missing) is False
+
+
+def test_r3_mutation_skipped_gate_is_load_bearing():
+    assert ea.is_intentional_editorial_empty(_r3_empty_record()) is True
+    # Non-empty list: each skipped short is retained, contradicting zero.
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(skipped=[{"candidate_id": "c9",
+                                   "reason": "invalid_source_duration"}])) is False
+    # Wrong types must not be treated as "empty": a dict is not a list.
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(skipped={})) is False
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(skipped="")) is False
+    assert ea.is_intentional_editorial_empty(
+        _r3_empty_record(skipped=None)) is False
+    # Missing field must not be treated as empty.
+    missing = _r3_empty_record()
+    del missing["editorial_application"]["skipped"]
+    assert ea.is_intentional_editorial_empty(missing) is False
+
+
+def test_r3_both_gates_reject_together():
+    # A record contradicting both gates must still fail, with the
+    # genuine-failure fallback path preserved.
+    both = _r3_empty_record(
+        application_skips={"candidate_boundaries_out_of_source": 1},
+        skipped=[{"candidate_id": "c1", "reason": "candidate_boundaries_out_of_source"}])
+    assert ea.is_intentional_editorial_empty(both) is False
+    assert ea.is_intentional_editorial_empty(_r3_empty_record()) is True
