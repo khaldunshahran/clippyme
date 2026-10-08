@@ -298,9 +298,11 @@ class EditorialPlan:
     moment_fingerprint: str = ""
     continuity_group: Optional[str] = None
     components: List[str] = field(default_factory=list)
+    plan_version: str = EDITORIAL_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "plan_version": EDITORIAL_VERSION,
             "candidate_id": self.candidate_id,
             "verdict": self.verdict,
             "status": self.status,
@@ -337,6 +339,47 @@ class EditorialPlan:
             continuity_group=d.get("continuity_group"),
             components=list(d.get("components") or []),
         )
+
+
+def _validate_prior_plan(raw: Any, candidate: Mapping[str, Any],
+                         video_duration: float,
+                         policy_min: float, policy_max: float
+                         ) -> Optional[str]:
+    """Validate a persisted prior plan against the current candidate.
+
+    Returns None when the plan may be reused as completed work, else a
+    short reason. Stale identity is never trusted: the embedded
+    candidate ID and moment fingerprint must match the current
+    candidate, the schema version must be current, and boundaries,
+    verdict/status, and duration/source bounds must still hold.
+    """
+    if not isinstance(raw, Mapping):
+        return "not an object"
+    if raw.get("plan_version") != EDITORIAL_VERSION:
+        return "schema version mismatch"
+    if raw.get("candidate_id") != candidate.get("candidate_id"):
+        return "candidate_id mismatch"
+    if (raw.get("moment_fingerprint") or "") != (
+            candidate.get("moment_fingerprint") or ""):
+        return "moment_fingerprint mismatch"
+    if raw.get("verdict") not in ("accept", "adjust", "reject",
+                                  "unrefined"):
+        return "unknown verdict"
+    if raw.get("status") not in ("refined", "unrefined"):
+        return "unknown status"
+    ss, se = raw.get("start_s"), raw.get("end_s")
+    if not _is_finite_number(ss) or not _is_finite_number(se):
+        return "non-finite boundaries"
+    ss, se = float(ss), float(se)
+    if not ss < se:
+        return "reversed boundaries"
+    if video_duration and video_duration > 0:
+        if not (0 <= ss and se <= video_duration + 1e-6):
+            return "outside source bounds"
+    dur = se - ss
+    if dur < policy_min - 1e-6 or dur > policy_max + 1e-6:
+        return "duration policy violation"
+    return None
 
 
 def _blank_quality() -> Dict[str, Optional[float]]:
@@ -434,31 +477,33 @@ def _check_no_invented_names(quote: str, words: Sequence[Dict[str, Any]],
                 raise EditorialError(f"invented name in {field}: {tok}")
 
 
-def _check_boundary(p: float, words: Sequence[Dict[str, Any]],
-                    is_start: bool) -> Optional[str]:
-    """Word-boundary alignment within WORD_ALIGN_TOL_S.
+def _snap_boundary(p: float, words: Sequence[Dict[str, Any]],
+                   is_start: bool) -> float:
+    """Snap a proposed boundary to the nearest exact word edge.
 
-    |p - nearest word edge| must be <= tolerance; a boundary strictly
-    inside a word beyond tolerance from both edges "cuts through a
-    word" and is rejected.
+    The contract tolerates recognizing the intended edge within
+    WORD_ALIGN_TOL_S, but the persisted plan must never store a
+    mid-word fractional value: the boundary is stored as the exact
+    edge. Anything farther than tolerance from every edge (or
+    strictly inside a word beyond tolerance from both edges) raises
+    EditorialError.
     """
     kind = "start" if is_start else "end"
     edges: List[float] = []
-    cuts_through = False
     for w in words:
         if not _valid_word(w):
             continue
         s, e = _word_start(w), _word_end(w)
-        edges.append(s if is_start else e)
+        edges.append(s)
+        edges.append(e)
         if s < p < e and min(p - s, e - p) > WORD_ALIGN_TOL_S:
-            cuts_through = True
+            raise EditorialError("proposed boundary cuts through a word")
     if not edges:
-        return "proposed interval covers no words"
-    if min(abs(v - p) for v in edges) > WORD_ALIGN_TOL_S:
-        return f"proposed {kind} not word-aligned"
-    if cuts_through:
-        return "proposed boundary cuts through a word"
-    return None
+        raise EditorialError("proposed interval covers no words")
+    best = min(edges, key=lambda v: abs(v - p))
+    if abs(best - p) > WORD_ALIGN_TOL_S + 1e-9:
+        raise EditorialError(f"proposed {kind} not word-aligned")
+    return best
 
 
 def _unrefined_plan(candidate: Mapping[str, Any],
@@ -482,6 +527,19 @@ def _unrefined_plan(candidate: Mapping[str, Any],
         conflict=conflict,
         moment_fingerprint=candidate.get("moment_fingerprint", ""),
     )
+
+
+def _passes_selection_gates(
+        quality: Mapping[str, Optional[float]]) -> bool:
+    """Context/payoff gates for every refined selected edit.
+
+    Applies to accept AND adjust: a strong opening cannot hide an
+    incomplete clip, and continuity may only use plans that passed.
+    """
+    cs = quality.get("context_sufficiency")
+    pd = quality.get("payoff_delivery")
+    return (cs is not None and cs >= 0.5
+            and pd is not None and pd >= 0.5)
 
 
 def validate_editorial_decision(
@@ -524,8 +582,15 @@ def validate_editorial_decision(
             "packet timestamps do not match candidate interval")
     quality = _validate_quality(decision.get("quality"))
     score = compute_editorial_score(quality)
-    reason = decision.get("decision_reason") or ""
-    reason = reason if isinstance(reason, str) else str(reason)
+    # Strict decision contract: a transcript-only evidence basis and an
+    # explicit bounded reason are required for every verdict, including
+    # reject. Nothing is manufactured on the provider's behalf.
+    basis = decision.get("evidence_basis")
+    if not isinstance(basis, str) or basis.strip().lower() != "transcript":
+        raise EditorialError('evidence_basis must be "transcript"')
+    reason = decision.get("decision_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise EditorialError("decision_reason must be a non-empty string")
     reason = reason.strip()[:500]
     links = decision.get("continuity_links") or []
     if not isinstance(links, list):
@@ -546,7 +611,7 @@ def validate_editorial_decision(
             candidate_id=cid, verdict="reject",
             start_s=orig_start, end_s=orig_end,
             quotes={}, quality=quality, recommendation_score=score,
-            reason=reason or "rejected",
+            reason=reason,
             continuity_links=[], bridge_evidence=None,
             status="refined",
             moment_fingerprint=candidate.get("moment_fingerprint", ""))
@@ -571,12 +636,25 @@ def validate_editorial_decision(
     if not any(_valid_word(w) and _word_start(w) < pe
                and _word_end(w) > ps for w in words):
         raise EditorialError("proposed interval covers no words")
-    err = _check_boundary(ps, words, is_start=True)
-    if err:
-        raise EditorialError(err)
-    err = _check_boundary(pe, words, is_start=False)
-    if err:
-        raise EditorialError(err)
+    # Snap tolerated boundaries to exact word edges: the persisted plan
+    # must never store a mid-word fractional value.
+    ps = _snap_boundary(ps, words, is_start=True)
+    pe = _snap_boundary(pe, words, is_start=False)
+    if not ps < pe:
+        raise EditorialError("proposed interval reversed or empty")
+    # Re-run the spatial checks against the snapped interval (snapping
+    # moves each boundary by at most the tolerance).
+    if not (ctx_start - 1e-6 <= ps and pe <= ctx_end + 1e-6):
+        raise EditorialError("proposed interval outside packet context")
+    if video_duration and video_duration > 0:
+        if not (0 <= ps and pe <= video_duration + 1e-6):
+            raise EditorialError("proposed interval outside source duration")
+    if not (ps < orig_end and orig_start < pe):
+        raise EditorialError(
+            "proposed interval does not overlap original candidate")
+    if not any(_valid_word(w) and _word_start(w) < pe
+               and _word_end(w) > ps for w in words):
+        raise EditorialError("proposed interval covers no words")
 
     # Quote grounding before duration-conflict analysis (the story's
     # required span decides conflict vs. hard violation).
@@ -592,10 +670,6 @@ def validate_editorial_decision(
         _check_no_invented_names(q, words, ps, pe, f)
         quotes[f] = q.strip()
         spans[f] = span
-
-    basis = decision.get("evidence_basis")
-    if basis is not None and str(basis).strip().lower() != "transcript":
-        raise EditorialError('evidence_basis must be "transcript"')
 
     dur = pe - ps
     req_start = min(s[0] for s in spans.values())
@@ -632,10 +706,7 @@ def validate_editorial_decision(
                 "accept verdict requires proposed interval to equal "
                 "candidate interval")
         # Gates: a strong opening cannot hide an incomplete clip.
-        cs = quality.get("context_sufficiency")
-        pd = quality.get("payoff_delivery")
-        if not (cs is not None and cs >= 0.5
-                and pd is not None and pd >= 0.5):
+        if not _passes_selection_gates(quality):
             return _unrefined_plan(
                 candidate, quality, score,
                 reason="gate_failed: context/payoff incomplete")
@@ -643,14 +714,19 @@ def validate_editorial_decision(
             candidate_id=cid, verdict="accept",
             start_s=ps, end_s=pe,
             quotes=quotes, quality=quality, recommendation_score=score,
-            reason=reason or "accepted",
+            reason=reason,
             continuity_links=links,
             bridge_evidence=bridge.strip() if bridge and bridge.strip()
             else None,
             status="refined",
             moment_fingerprint=candidate.get("moment_fingerprint", ""))
 
-    # verdict == "adjust": content-preserving rules.
+    # verdict == "adjust": content-preserving rules. The selection
+    # gates protect every refined edit, not just accept.
+    if not _passes_selection_gates(quality):
+        return _unrefined_plan(
+            candidate, quality, score,
+            reason="gate_failed: context/payoff incomplete")
     tol = WORD_ALIGN_TOL_S
     # Payoff first: ending before the grounded payoff gets the specific
     # reason (it implies the span check below, which stays for the other
@@ -674,7 +750,7 @@ def validate_editorial_decision(
         candidate_id=cid, verdict="adjust",
         start_s=ps, end_s=pe,
         quotes=quotes, quality=quality, recommendation_score=score,
-        reason=reason or "adjusted",
+        reason=reason,
         continuity_links=links,
         bridge_evidence=bridge.strip() if bridge and bridge.strip()
         else None,
@@ -816,18 +892,23 @@ def _plan_id(p: Any) -> str:
 def group_variants(plans: Sequence[Any]) -> Dict[str, Any]:
     """Group plans by moment fingerprint.
 
-    Candidates sharing a fingerprint are variants of ONE distinct
-    moment; they must not inflate the distinct-moment count.
+    Candidates sharing a non-empty fingerprint are variants of ONE
+    distinct moment; they must not inflate the distinct-moment count.
+    A missing fingerprint is unknown identity: each such plan stays
+    its own distinct moment and is never collapsed under a shared
+    empty key.
     Returns {"distinct_moments": int, "variants": {fp: [ids]}} where
     variants lists only fingerprints with >1 plan.
     """
-    by_fp: Dict[str, List[str]] = {}
+    by_key: Dict[Any, List[str]] = {}
     for p in plans:
-        by_fp.setdefault(_plan_fingerprint(p), []).append(_plan_id(p))
+        fp = _plan_fingerprint(p)
+        key = fp if fp else ("__unknown__", _plan_id(p))
+        by_key.setdefault(key, []).append(_plan_id(p))
     return {
-        "distinct_moments": len(by_fp),
-        "variants": {fp: ids for fp, ids in by_fp.items()
-                     if len(ids) > 1},
+        "distinct_moments": len(by_key),
+        "variants": {fp: ids for fp, ids in by_key.items()
+                     if isinstance(fp, str) and len(ids) > 1},
     }
 
 
@@ -1133,13 +1214,23 @@ def run_editorial_refinement(
         all_cands = [candidates_by_id[cid] for cid in kept_ids]
         for cid in kept_ids:
             cand = candidates_by_id[cid]
-            # Resume: never repeat a completed plan.
+            # Resume: never repeat a completed plan — but never
+            # trust stale identity either. An invalid prior plan is
+            # reprocessed from scratch (recorded honestly) instead of
+            # being preserved as completed work.
             if prior_plans and cid in prior_plans:
-                plan = EditorialPlan.from_dict(prior_plans[cid])
-                plans.append(plan)
-                funnel["packets_skipped"] += 1
-                _count_verdict(plan)
-                continue
+                raw = prior_plans[cid]
+                bad = _validate_prior_plan(raw, cand, video_duration,
+                                           policy_min, policy_max)
+                if bad is None:
+                    plan = EditorialPlan.from_dict(raw)
+                    plans.append(plan)
+                    funnel["packets_skipped"] += 1
+                    _count_verdict(plan)
+                    continue
+                funnel["rejections"].append(
+                    {"candidate_id": cid,
+                     "reason": f"invalid_prior_plan:{bad}"})
             try:
                 packet = build_context_packet(
                     cand, all_cands, words, video_duration,
@@ -1156,10 +1247,18 @@ def run_editorial_refinement(
                 _count_verdict(plans[-1])
                 continue
             funnel["packets_attempted"] += 1
-            prompt = build_prompt(
-                packet, instructions,
-                clip_type=clip_type, duration_mode=duration_mode,
-                audience_intel=audience_intel)
+            try:
+                prompt = build_prompt(
+                    packet, instructions,
+                    clip_type=clip_type, duration_mode=duration_mode,
+                    audience_intel=audience_intel)
+            except Exception as e:
+                plans.append(_unrefined(
+                    cand, f"prompt_failed:{type(e).__name__}:"
+                          f"{str(e)[:100]}"))
+                funnel["packets_failed"] += 1
+                _count_verdict(plans[-1])
+                continue
             try:
                 raw_text = gen(client, prompt, cfg, budget)
             except Exception as e:
@@ -1267,16 +1366,19 @@ def run_editorial_refinement(
                 by_id[cid].continuity_group = gplan.candidate_id
             group_plans.append(gplan)
 
-        # Distinct moments: variants share one fingerprint. Accepted
-        # merges of distinct fingerprints collapse to one story.
-        gv = group_variants(
-            [p for p in plans if not p.candidate_id.startswith("group:")])
-        distinct = gv["distinct_moments"]
-        for gplan in group_plans:
-            fps = {candidates_by_id[c].get("moment_fingerprint")
-                   for c in gplan.components}
-            distinct -= max(0, len(fps) - 1)
-        funnel["distinct_moments"] = max(0, distinct)
+        # Final selected editorial metrics describe selected
+        # outcomes only: refined accept/adjust plans plus explicit
+        # unrefined discovery candidates (failure semantics keep them
+        # selected). Rejects are excluded. Accepted continuity groups
+        # collapse their selected components exactly once.
+        selected = [p for p in plans
+                    if p.verdict in ("accept", "adjust", "unrefined")]
+        grouped_cids = {c for g in group_plans for c in g.components}
+        ungrouped = [p for p in selected
+                     if p.candidate_id not in grouped_cids]
+        gv = group_variants(ungrouped)
+        funnel["distinct_moments"] = (
+            gv["distinct_moments"] + len(group_plans))
         funnel["selected_variants"] = sum(
             len(v) - 1 for v in gv["variants"].values())
     finally:

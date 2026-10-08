@@ -5,6 +5,7 @@ no live SDK calls.
 """
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -317,6 +318,7 @@ def test_validate_reject_needs_no_interval():
     cand = make_candidate("c1", s, e, "tension builds slowly")
     packet = make_packet(cand, words)
     d = {"candidate_id": "c1", "verdict": "reject",
+         "evidence_basis": "transcript",
          "decision_reason": "no payoff present"}
     plan = validate(d, packet, cand, words)
     assert plan.verdict == "reject" and plan.status == "refined"
@@ -971,7 +973,9 @@ def test_run_accept_adjust_reject_reconciles():
     assert f["packets_skipped"] == 0
     assert (f["accept_count"], f["adjust_count"], f["reject_count"],
             f["unrefined_count"]) == (1, 1, 1, 0)
-    assert f["distinct_moments"] == 3
+    # Review-01: final metrics describe selected outcomes only; the
+    # rejected candidate is excluded, the accept + adjust remain.
+    assert f["distinct_moments"] == 2
     assert f["selected_variants"] == 0
     assert f["counts_reconcile"]
     assert calls["n"] == 3
@@ -1477,19 +1481,590 @@ def test_mutation_variants_as_distinct_fails():
     assert gv["distinct_moments"] != 2  # counting variants as distinct
 
 
-def test_wiring_preserves_editorial_through_fallbacks():
-    # main.py / orchestrator.py cannot be imported here (cv2 at top), so
-    # assert the preservation wiring exists in source, mirroring the
-    # Task 08 source-text regression style.
-    base = Path(__file__).parent.parent.parent / "src" / "clippyme" / "pipeline"
-    main_text = (base / "main.py").read_text(encoding="utf-8")
-    assert '"editorial_refinement"' in main_text
-    assert '"editorial_plans"' in main_text
-    assert "_efunnel" in main_text and "_eplans" in main_text
-    orch_text = (base / "orchestrator.py").read_text(encoding="utf-8")
-    assert "EDITORIAL_VERSION" in orch_text
-    assert '"editorial_refinement"' in orch_text
-    assert '"editorial_plans"' in orch_text
-    assert "_editorial_funnel" in orch_text
-    # The nested helpers preserve both keys (not just discovery's).
-    assert main_text.count('"editorial_plans"') >= 2
+# --- Real route tests: direct + queued persistence -----------
+# Review-01 finding 7: these EXECUTE the fallback/atomic-write
+# blocks instead of inspecting source text. The old
+# test_wiring_preserves_editorial_through_fallbacks source-string
+# assertions are replaced by the tests below.
+
+
+
+# --- Real route tests: direct + queued persistence (review-01 finding 7) ---
+# These execute the actual fallback/atomic-write blocks instead of
+# inspecting source text.
+
+def test_direct_whole_video_fallback_persists_editorial_atomically(tmp_path):
+    """Real execution: the direct main.py whole-video fallback block must
+    atomically persist discovery funnel + store + editorial funnel + plans."""
+    import textwrap
+    from types import SimpleNamespace
+    source = Path("src/clippyme/pipeline/main.py").read_text(encoding="utf-8")
+    tail = source.split("        clips_data = get_viral_clips(", 1)[1]
+    block = "        clips_data = get_viral_clips(" + tail
+    block = block.split('        else:\n            print(f"🔥 Found', 1)[0]
+    block = textwrap.dedent(block)
+
+    funnel = {"version": cd.DISCOVERY_VERSION, "final_selected": 1,
+              "counts_reconcile": True}
+    store = {"c1": {"candidate_id": "c1"}}
+    efunnel = {"version": er.EDITORIAL_VERSION, "enabled": True,
+               "distinct_moments": 1, "counts_reconcile": True}
+    eplans = [{"candidate_id": "c1", "verdict": "accept",
+               "status": "refined"}]
+    rendered = []
+    env = {
+        "args": SimpleNamespace(
+            instructions=None, min_duration=None, max_duration=None,
+            min_clips=None, max_clips=None, clip_type=None,
+            duration_mode=None, monitor=False, reframe_mode="auto",
+            aspect="9:16",
+        ),
+        "audience_intel": None,
+        "transcript": {"words": []},
+        "duration": 60.0,
+        "get_viral_clips": lambda *_a, **_k: {
+            "shorts": [], "candidate_discovery": funnel,
+            "candidate_store": store,
+            "editorial_refinement": efunnel,
+            "editorial_plans": eplans,
+        },
+        "should_use_fallback": lambda _monitor: True,
+        "build_texttiling_fallback": lambda *_a: {"shorts": []},
+        "video_title": "sample",
+        "output_dir": str(tmp_path),
+        "input_video": "source.mp4",
+        "process_video_to_vertical": lambda *_a, **_k: rendered.append(True),
+        "aspect_ratio": "9:16",
+        "letterbox_zoom": 1.0,
+        "os": os,
+        "json": json,
+    }
+    exec(compile(block, "main-analysis-block", "exec"), env, env)
+    assert rendered == [True]
+    metadata = tmp_path / "sample_metadata.json"
+    assert metadata.exists()
+    assert not list(tmp_path.glob("*.tmp"))  # atomic: no leftovers
+    saved = json.loads(metadata.read_text(encoding="utf-8"))
+    assert saved["candidate_discovery"]["fallback_strategy"] == "whole_video"
+    assert saved["candidate_store"] == store
+    assert saved["editorial_refinement"] == efunnel
+    assert saved["editorial_plans"] == eplans
+
+
+def _queued_state_and_args(tmp_path, completed=False, metadata_path=None):
+    from types import SimpleNamespace
+
+    class State:
+        data = {"job_id": "job"}
+
+        def artifact(self, name):
+            if completed and name == "metadata":
+                return metadata_path
+            return None
+
+        def completed(self, name):
+            return completed and name == "analyzing"
+
+        def consume_steering(self):
+            return []
+
+        def start(self, *_args, **_kwargs):
+            pass
+
+        def set_clip_total(self, *_args, **_kwargs):
+            pass
+
+        def complete_stage(self, *_args, **_kwargs):
+            pass
+
+        def note_missed_steering(self, *_args, **_kwargs):
+            pass
+
+    args = SimpleNamespace(
+        skip_analysis=False, instructions=None, min_duration=None,
+        max_duration=None, min_clips=None, max_clips=None, clip_type=None,
+        duration_mode=None, monitor=False, aspect="9:16",
+        caption_style_default=None, reframe_mode="auto",
+    )
+    return State(), args
+
+
+def test_queued_fallback_preserves_editorial_funnel_and_plans(
+        tmp_path, monkeypatch):
+    """Real execution: queued _load_or_analyze fallback path preserves
+    discovery funnel + store + editorial funnel + plans, atomically."""
+    from clippyme.pipeline import orchestrator as orch
+
+    dfunnel = {"version": cd.DISCOVERY_VERSION, "final_selected": 1}
+    dstore = {"c1": {"candidate_id": "c1"}}
+    efunnel = {"version": er.EDITORIAL_VERSION, "enabled": True,
+               "distinct_moments": 1}
+    eplans = [{"candidate_id": "c1", "verdict": "accept",
+               "status": "refined"}]
+
+    class Legacy:
+        @staticmethod
+        def get_viral_clips(*_args, **_kwargs):
+            return {"shorts": [], "candidate_discovery": dfunnel,
+                    "candidate_store": dstore,
+                    "editorial_refinement": efunnel,
+                    "editorial_plans": eplans}
+
+        @staticmethod
+        def build_texttiling_fallback(*_args, **_kwargs):
+            return {"shorts": []}
+
+    state, args = _queued_state_and_args(tmp_path)
+    monkeypatch.setattr(orch, "should_use_fallback", lambda _monitor: True)
+    monkeypatch.setattr(orch, "_whole_video_fallback",
+                        lambda *_args, **_kwargs: {"shorts": []})
+    result, metadata_file = orch._load_or_analyze(
+        args,
+        str(tmp_path / "source.mp4"),
+        "title",
+        str(tmp_path),
+        60.0,
+        {"segments": []},
+        state,
+        Legacy(),
+    )
+    assert result["candidate_discovery"]["version"] == cd.DISCOVERY_VERSION
+    assert result["candidate_store"] == dstore
+    assert result["editorial_refinement"] == efunnel
+    assert result["editorial_plans"] == eplans
+    # Atomic checkpoint on disk carries all four together.
+    assert not list(tmp_path.glob("*.tmp"))
+    saved = json.loads(Path(metadata_file).read_text(encoding="utf-8"))
+    assert saved["candidate_discovery"]["version"] == cd.DISCOVERY_VERSION
+    assert saved["candidate_store"] == dstore
+    assert saved["editorial_refinement"] == efunnel
+    assert saved["editorial_plans"] == eplans
+
+
+def test_queued_resume_reuses_editorial_without_provider_calls(
+        tmp_path, monkeypatch):
+    """Real execution: a completed analysis checkpoint resumes as-is;
+    zero editorial provider calls happen on resume."""
+    from clippyme.pipeline import orchestrator as orch
+
+    efunnel = {"version": er.EDITORIAL_VERSION, "enabled": True,
+               "distinct_moments": 1, "counts_reconcile": True}
+    eplans = [{"candidate_id": "c1", "verdict": "accept",
+               "status": "refined", "start_s": 0.0, "end_s": 4.0}]
+    saved = {"shorts": [{"start": 0.0, "end": 4.0}],
+             "candidate_discovery": {"version": cd.DISCOVERY_VERSION},
+             "candidate_store": {"c1": {"candidate_id": "c1"}},
+             "editorial_refinement": efunnel,
+             "editorial_plans": eplans}
+    meta = tmp_path / "title_metadata.json"
+    meta.write_text(json.dumps(saved), encoding="utf-8")
+
+    state, args = _queued_state_and_args(
+        tmp_path, completed=True, metadata_path=str(meta))
+    calls = {"n": 0}
+
+    def _boom(*_a, **_k):
+        calls["n"] += 1
+        raise AssertionError("editorial must not run on resume")
+
+    monkeypatch.setattr(er, "run_editorial_refinement", _boom)
+
+    class Legacy:
+        @staticmethod
+        def get_viral_clips(*_a, **_k):
+            raise AssertionError("analysis must not rerun on resume")
+
+    result, _metadata_file = orch._load_or_analyze(
+        args, str(tmp_path / "source.mp4"), "title", str(tmp_path),
+        60.0, {"segments": []}, state, Legacy(),
+    )
+    assert calls["n"] == 0
+    assert result["editorial_refinement"] == efunnel
+    assert result["editorial_plans"] == eplans
+    assert result["candidate_discovery"]["version"] == cd.DISCOVERY_VERSION
+    assert result["candidate_store"] == {"c1": {"candidate_id": "c1"}}
+
+
+# --- Mutation tests for review-01 findings --------------------------------
+
+def test_mutation_unsnappable_boundary_rejected():
+    """A boundary far from every word edge must be rejected, not stored."""
+    words = [
+        {"w": "a", "s": 0.0, "e": 1.0, "sp": 0},
+        {"w": "b", "s": 10.0, "e": 11.0, "sp": 0},
+    ]
+    cand = _candidate("c1", 0.0, 6.0, "fp-1")
+    packet = _packet(cand, words)
+    decision = _decision("c1", "adjust", 5.0, 11.0)
+    with pytest.raises(er.EditorialError, match="not word-aligned"):
+        er.validate_editorial_decision(
+            decision, packet, {"c1": cand}, words, 12.0, 1.0, 20.0, [])
+
+
+def test_mutation_continuity_excludes_gate_failed_plans():
+    """A gate-failed adjust is unrefined and must not feed continuity."""
+    words = _words(20)
+    store = {
+        "c1": _candidate("c1", 0.0, 4.0, "fp-1"),
+        "c2": _candidate("c2", 5.0, 9.0, "fp-2"),
+    }
+
+    def prompt(packet, *_a, **_k):
+        return f"Candidate: {packet['candidate_id']}"
+
+    def gen(_client, text, *_a, **_k):
+        cid = re.search(r"Candidate: (\S+)", text).group(1)
+        if cid == "c1":
+            d = _decision("c1", "accept", 0.0, 4.0)
+        else:
+            d = _decision(
+                "c2", "adjust", 5.0, 9.0,
+                quality=_quality(context=0.1, payoff=0.1))
+            # Quotes valid inside [5, 9] so the decision reaches the
+            # selection gates (and fails them) instead of quote grounding.
+            d.update({
+                "opening_evidence": "w5",
+                "premise_evidence": "w6",
+                "payoff_evidence": "w7",
+                "ending_evidence": "w8",
+            })
+            d["continuity_links"] = ["c1"]
+        return json.dumps({"decision": d})
+
+    result = er.run_editorial_refinement(
+        {"candidate_store": store, "candidate_discovery": {}},
+        words, 20.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        build_prompt_fn=prompt,
+        generate_fn=gen,
+        policy_min=1.0, policy_max=20.0,
+    )
+    plans = {p["candidate_id"]: p for p in result["editorial_plans"]}
+    assert plans["c2"]["status"] == "unrefined"
+    f = result["editorial_refinement"]
+    assert f["continuity_proposed"] == 0
+    assert f["counts_reconcile"]
+
+
+def test_mutation_unrefined_discovery_candidates_stay_selected():
+    """Failure semantics: explicit unrefined candidates remain selected."""
+    words = _words(20)
+    store = {
+        "c1": _candidate("c1", 0.0, 4.0, "fp-1"),
+        "c2": _candidate("c2", 5.0, 9.0, "fp-2"),
+    }
+
+    def prompt(packet, *_a, **_k):
+        return f"Candidate: {packet['candidate_id']}"
+
+    def gen(_client, text, *_a, **_k):
+        cid = re.search(r"Candidate: (\S+)", text).group(1)
+        if cid == "c2":
+            raise RuntimeError("provider exploded")
+        return json.dumps(
+            {"decision": _decision("c1", "accept", 0.0, 4.0)})
+
+    result = er.run_editorial_refinement(
+        {"candidate_store": store, "candidate_discovery": {}},
+        words, 20.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        build_prompt_fn=prompt,
+        generate_fn=gen,
+        policy_min=1.0, policy_max=20.0,
+    )
+    plans = {p["candidate_id"]: p for p in result["editorial_plans"]}
+    assert plans["c1"]["verdict"] == "accept"
+    assert plans["c2"]["status"] == "unrefined"
+    f = result["editorial_refinement"]
+    assert f["distinct_moments"] == 2  # accept + unrefined both selected
+    assert f["counts_reconcile"]
+
+
+def test_mutation_unknown_identities_stay_distinct():
+    """Mixed known/unknown identity: unknowns never merge with anyone."""
+    plans = [
+        er.EditorialPlan("c1", "accept", 0.0, 2.0, status="refined",
+                         moment_fingerprint="fp-x"),
+        er.EditorialPlan("c2", "accept", 5.0, 7.0, status="refined"),
+        er.EditorialPlan("c3", "accept", 8.0, 9.0, status="refined"),
+    ]
+    gv = er.group_variants(plans)
+    assert gv["distinct_moments"] == 3
+    assert gv["variants"] == {}
+
+
+def test_mutation_empty_reject_reason_rejected():
+    """A whitespace-only reject reason must not validate."""
+    words = _words(6)
+    cand = _candidate(end=4.0)
+    packet = _packet(cand, words)
+    decision = {
+        "candidate_id": "c1",
+        "verdict": "reject",
+        "evidence_basis": "transcript",
+        "decision_reason": "   ",
+        "quality": _quality(),
+    }
+    with pytest.raises(er.EditorialError, match="decision_reason"):
+        er.validate_editorial_decision(
+            decision, packet, {"c1": cand}, words, 6.0, 1.0, 20.0, [])
+
+
+def test_mutation_prior_plan_fingerprint_mismatch_reprocessed():
+    """Same candidate ID but a stale fingerprint must not be trusted."""
+    words = _words(6)
+    cand = _candidate(end=4.0)
+    stale = er.EditorialPlan(
+        "c1", "accept", 0.0, 4.0,
+        status="refined", moment_fingerprint="stale-fp",
+    ).to_dict()
+    result = er.run_editorial_refinement(
+        {"candidate_store": {"c1": cand}, "candidate_discovery": {}},
+        words, 6.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        prior_plans={"c1": stale},
+        policy_min=1.0, policy_max=20.0,
+    )
+    plan = result["editorial_plans"][0]
+    # Reprocessed (no generate_fn -> generate fails -> unrefined), but
+    # with the CURRENT candidate identity, never the stale one.
+    assert plan["candidate_id"] == "c1"
+    assert plan["moment_fingerprint"] == "fp-1"
+    assert plan["status"] == "unrefined"
+
+
+# --- Promoted from coordinator-review1-remaining.py (7 tests) ---
+# Durable regression tests for Task 09 review-01 corrections.
+
+
+def _words(count=24):
+    return [
+        {"w": f"w{i}", "s": float(i), "e": float(i + 1), "sp": i % 2}
+        for i in range(count)
+    ]
+
+
+def _quality(context=0.9, payoff=0.9):
+    return {
+        "opening_strength": 0.9,
+        "context_sufficiency": context,
+        "payoff_delivery": payoff,
+        "useful_value": 0.8,
+        "entertaining_value": 0.7,
+        "transcript_support": 1.0,
+        "editability": 0.9,
+        "confidence": 0.9,
+    }
+
+
+def _candidate(cid="c1", start=0.0, end=4.0, fp="fp-1"):
+    return {
+        "candidate_id": cid,
+        "moment_fingerprint": fp,
+        "start_s": start,
+        "end_s": end,
+        "evidence_text": "w0 w1",
+        "context": "grounded context",
+        "expected_payoff": "grounded payoff",
+        "event_key": None,
+        "speaker_ids": [0],
+    }
+
+
+def _packet(candidate, words):
+    return er.build_context_packet(
+        candidate, [candidate], words, words[-1]["e"], 1.0, 20.0,
+        er.EditorialConfig(model_name="editor"),
+    )
+
+
+def _decision(cid, verdict, start, end, quality=None):
+    return {
+        "candidate_id": cid,
+        "verdict": verdict,
+        "proposed_start_s": start,
+        "proposed_end_s": end,
+        "opening_evidence": "w0",
+        "premise_evidence": "w1",
+        "payoff_evidence": "w2",
+        "ending_evidence": "w3",
+        "evidence_basis": "transcript",
+        "quality": quality or _quality(),
+        "decision_reason": "grounded decision",
+        "continuity_links": [],
+    }
+
+
+def test_midword_boundary_inside_tolerance_is_not_left_in_plan():
+    words = _words(6)
+    cand = _candidate(end=4.0)
+    packet = _packet(cand, words)
+    decision = _decision("c1", "adjust", 0.4, 4.0)
+    plan = er.validate_editorial_decision(
+        decision, packet, {"c1": cand}, words, 6.0, 1.0, 20.0, [])
+    assert plan.start_s == 0.0, (
+        "a boundary inside w0 must be snapped to the word edge or rejected; "
+        f"production kept the mid-word boundary {plan.start_s}"
+    )
+
+
+def test_adjust_obeys_context_and_payoff_quality_gates():
+    words = _words(6)
+    cand = _candidate(end=4.0)
+    packet = _packet(cand, words)
+    decision = _decision(
+        "c1", "adjust", 0.0, 4.0, quality=_quality(context=0.1, payoff=0.1))
+    plan = er.validate_editorial_decision(
+        decision, packet, {"c1": cand}, words, 6.0, 1.0, 20.0, [])
+    assert plan.status == "unrefined", (
+        "context/payoff gates must cover every selected edit, including adjust"
+    )
+
+
+def _discovery_item():
+    return {
+        "start_s": 0.0,
+        "end_s": 16.0,
+        "event_type": "story",
+        "evidence_text": "w0 w1 w2",
+        "evidence_basis": "transcript",
+        "context": "specific grounded context",
+        "expected_payoff": "specific grounded payoff",
+        "confidence": 0.8,
+        "recommendation_score": 80,
+    }
+
+
+def test_final_distinct_moments_excludes_rejected_candidates():
+    words = _words(20)
+    store = {
+        "c1": _candidate("c1", 0.0, 4.0, "fp-1"),
+        "c2": _candidate("c2", 5.0, 9.0, "fp-2"),
+    }
+
+    def prompt(packet, *_args, **_kwargs):
+        return f"Candidate: {packet['candidate_id']}"
+
+    def generate(_client, text, *_args, **_kwargs):
+        cid = re.search(r"Candidate: (\S+)", text).group(1)
+        return json.dumps({"decision": {
+            "candidate_id": cid,
+            "verdict": "reject",
+            "evidence_basis": "transcript",
+            "decision_reason": "no complete payoff",
+            "quality": _quality(context=0.1, payoff=0.1),
+        }})
+
+    result = er.run_editorial_refinement(
+        {"candidate_store": store, "candidate_discovery": {}},
+        words, 20.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        build_prompt_fn=prompt,
+        generate_fn=generate,
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+    assert result["editorial_refinement"]["reject_count"] == 2
+    assert result["editorial_refinement"]["distinct_moments"] == 0, (
+        "final distinct moments must describe selected refined output, not rejected plans"
+    )
+
+
+def test_missing_fingerprints_do_not_collapse_unrelated_plans():
+    plans = [
+        er.EditorialPlan("c1", "accept", 0.0, 2.0, status="refined"),
+        er.EditorialPlan("c2", "accept", 5.0, 7.0, status="refined"),
+    ]
+    grouped = er.group_variants(plans)
+    assert grouped["distinct_moments"] == 2, (
+        "missing identity is unknown; unrelated plans must not become variants "
+        "under the shared empty-string key"
+    )
+
+
+def test_reject_requires_explicit_reason_and_transcript_basis():
+    words = _words(6)
+    cand = _candidate(end=4.0)
+    packet = _packet(cand, words)
+    decision = {
+        "candidate_id": "c1",
+        "verdict": "reject",
+        "quality": _quality(context=0.1, payoff=0.1),
+    }
+    try:
+        er.validate_editorial_decision(
+            decision, packet, {"c1": cand}, words, 6.0, 1.0, 20.0, [])
+    except er.EditorialError:
+        return
+    raise AssertionError(
+        "the strict transcript-only decision contract must not manufacture "
+        "a generic reason or accept a missing evidence_basis"
+    )
+
+
+def test_prompt_failure_isolated_per_candidate():
+    words = _words(12)
+    store = {
+        "c1": _candidate("c1", 0.0, 4.0, "fp-1"),
+        "c2": _candidate("c2", 5.0, 9.0, "fp-2"),
+    }
+
+    def prompt(packet, *_args, **_kwargs):
+        if packet["candidate_id"] == "c1":
+            raise ValueError("bad packet-specific preference")
+        return f"Candidate: {packet['candidate_id']}"
+
+    def generate(_client, text, *_args, **_kwargs):
+        cid = re.search(r"Candidate: (\S+)", text).group(1)
+        offset = 5.0 if cid == "c2" else 0.0
+        decision = _decision(cid, "accept", offset, offset + 4.0)
+        decision.update({
+            "opening_evidence": "w5",
+            "premise_evidence": "w6",
+            "payoff_evidence": "w7",
+            "ending_evidence": "w8",
+        })
+        return json.dumps({"decision": decision})
+
+    result = er.run_editorial_refinement(
+        {"candidate_store": store, "candidate_discovery": {}},
+        words, 12.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        build_prompt_fn=prompt,
+        generate_fn=generate,
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+    plans = {p["candidate_id"]: p for p in result["editorial_plans"]}
+    assert plans["c1"]["status"] == "unrefined"
+    assert plans["c2"]["verdict"] == "accept"
+    assert result["editorial_refinement"]["counts_reconcile"] is True
+
+
+def test_stale_prior_plan_identity_is_not_trusted():
+    words = _words(6)
+    cand = _candidate(end=4.0)
+    stale = er.EditorialPlan(
+        "different-candidate", "accept", 0.0, 4.0,
+        status="refined", moment_fingerprint="stale-fp",
+    ).to_dict()
+    result = er.run_editorial_refinement(
+        {"candidate_store": {"c1": cand}, "candidate_discovery": {}},
+        words, 6.0,
+        config=er.EditorialConfig(model_name="editor"),
+        client_factory=FakeClient,
+        prior_plans={"c1": stale},
+        policy_min=1.0,
+        policy_max=20.0,
+    )
+    plan = result["editorial_plans"][0]
+    assert plan["candidate_id"] == "c1"
+    assert plan["moment_fingerprint"] == "fp-1", (
+        "resume data must be reprocessed or rejected against the current "
+        "candidate, not trust another candidate's stale identity"
+    )
