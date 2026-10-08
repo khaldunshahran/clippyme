@@ -46,7 +46,7 @@ import time
 from dataclasses import dataclass, field
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PLAN_PRODUCER = "clippyme-turn-framing-plan"
 
 # Bound for per-observation mouth-motion evidence. Mirrors the tracker's
@@ -148,6 +148,7 @@ class TurnFramingConfig:
             "min_zoom": self.min_zoom,
             "max_zoom": self.max_zoom,
             "max_analysis_frames": self.max_analysis_frames,
+            "analysis_deadline_s": self.analysis_deadline_s,
         }
 
     def config_digest(self) -> str:
@@ -275,6 +276,15 @@ class ObservationLog:
         self._track_scene: dict[str, int] = {}
         self.diagnostics: list[str] = []
         self.dropped = 0
+        # Structured budget-exhaustion state (Task 12 review 02): set
+        # once via mark_exhaustion() when pass-1 analysis stops.
+        # exhaustion_frame is the first frame that was NOT analyzed;
+        # scenes ending strictly before it were fully analyzed, the
+        # containing scene is partial, later scenes are unobserved.
+        # None when exhaustion was recorded without frame context.
+        self.exhaustion_reason: str | None = None
+        self.exhaustion_frame: int | None = None
+        self.exhaustion_scene: int | None = None
 
     def add(self, obs: FaceObservation) -> None:
         self._validate(obs)
@@ -290,6 +300,23 @@ class ObservationLog:
 
     def note(self, message: str) -> None:
         self.diagnostics.append(message)
+
+    def mark_exhaustion(self, reason: str, frame: int | None = None,
+                        scene_id: int | None = None) -> None:
+        """Record budget exhaustion with structured frame/scene context.
+
+        First call wins: pass 1 latches analysis off exactly once, and
+        the planner must see the ORIGINAL exhaustion point, not a later
+        one. The reason is also appended to ``diagnostics`` (once) so
+        older consumers that only read diagnostics keep working.
+        """
+        if self.exhaustion_reason is not None:
+            return
+        self.exhaustion_reason = str(reason)
+        self.exhaustion_frame = frame
+        self.exhaustion_scene = scene_id
+        if reason not in self.diagnostics:
+            self.diagnostics.append(reason)
 
     def observations_for_scene(self, scene_id: int) -> list[FaceObservation]:
         out = [o for o in self._obs if o.scene_id == scene_id]
@@ -1008,6 +1035,11 @@ class FramingPlan:
                                    # produced the plan's observations
     scenes: list = field(default_factory=list)  # ScenePlan
     created_at: str = ""
+    # Whether pass-1 analysis ran to completion. An exhausted/incomplete
+    # plan may be persisted for audit and safe rendering, but
+    # plan_matches() refuses to reuse it -- the next invocation must
+    # re-analyze.
+    analysis_complete: bool = True
 
 
 def _segment_to_dict(seg: FramingSegment) -> dict:
@@ -1042,6 +1074,7 @@ def plan_to_dict(plan: FramingPlan) -> dict:
         "config_digest": plan.config_digest,
         "output_aspect": plan.output_aspect,
         "tracker_digest": plan.tracker_digest,
+        "analysis_complete": plan.analysis_complete,
         "created_at": plan.created_at,
         "scenes": [
             {
@@ -1091,7 +1124,7 @@ def _no_unknown(d: dict, allowed: frozenset, ctx: str) -> None:
 _PLAN_TOP_KEYS = frozenset({
     "schema_version", "producer", "source_fingerprint", "frame_w", "frame_h",
     "fps", "frame_count", "scene_intervals", "config_digest", "output_aspect",
-    "tracker_digest", "created_at", "scenes",
+    "tracker_digest", "analysis_complete", "created_at", "scenes",
 })
 _SCENE_KEYS = frozenset({
     "scene_id", "strategy", "start_frame", "end_frame", "applies",
@@ -1183,6 +1216,9 @@ def _parse_segment(g: dict, ctx: str, scene_id: int, start_frame: int,
     want_n = {"single": 1, "two-subject": 2, "wide": 0}[kind]
     if len(sids) != want_n:
         raise ValueError(f"malformed-plan: {gctx} kind/subject-count mismatch")
+    if kind == "two-subject" and len(set(sids)) != 2:
+        raise ValueError(f"malformed-plan: {gctx} two-subject ids must "
+                         "be distinct")
     conf = _req(g, "confidence", gctx)
     if not _strict_num(conf) or not 0.0 <= conf <= 1.0:
         raise ValueError(f"malformed-plan: {gctx} bad confidence")
@@ -1315,6 +1351,10 @@ def plan_from_dict(d: dict) -> FramingPlan:
     if (not isinstance(config_digest, str) or not config_digest
             or len(config_digest) > 256):
         raise ValueError("malformed-plan: invalid 'config_digest'")
+    analysis_complete = _req(d, "analysis_complete", "plan")
+    if not isinstance(analysis_complete, bool):
+        raise ValueError("malformed-plan: 'analysis_complete' must be "
+                         "a bool")
     created_at = _req(d, "created_at", "plan")
     if not isinstance(created_at, str) or len(created_at) > 64:
         raise ValueError("malformed-plan: invalid 'created_at'")
@@ -1326,6 +1366,10 @@ def plan_from_dict(d: dict) -> FramingPlan:
                 or not all(_strict_int(v) for v in iv)
                 or not 0 <= iv[0] < iv[1] <= frame_count):
             raise ValueError(f"malformed-plan: bad scene interval {iv!r}")
+    for idx in range(1, len(intervals)):
+        if not intervals[idx - 1][1] < intervals[idx][0]:
+            raise ValueError("malformed-plan: scene intervals must be "
+                             "strictly ordered and non-overlapping")
     raw_scenes = _req(d, "scenes", "plan")
     if not isinstance(raw_scenes, list):
         raise ValueError("malformed-plan: invalid 'scenes'")
@@ -1368,13 +1412,13 @@ def plan_from_dict(d: dict) -> FramingPlan:
         for g in raw_segments:
             seg = _parse_segment(g, ctx, scene_id, start_frame, end_frame,
                                  frame_w, frame_h)
-            if seg.start_frame <= prev_end:
-                raise ValueError(f"malformed-plan: {ctx} segments "
-                                 f"overlap/out of order")
+            if seg.start_frame != prev_end + 1:
+                raise ValueError(f"malformed-plan: {ctx} segments must "
+                                 "be contiguous without gaps or "
+                                 "overlaps")
             prev_end = seg.end_frame
             segments.append(seg)
-        if segments and (segments[0].start_frame != start_frame
-                         or segments[-1].end_frame != end_frame):
+        if segments and segments[-1].end_frame != end_frame:
             raise ValueError(f"malformed-plan: {ctx} segments must cover "
                              f"the scene")
         raw_keyframes = _req(s, "keyframes", ctx)
@@ -1393,6 +1437,41 @@ def plan_from_dict(d: dict) -> FramingPlan:
         fallback = _parse_fallback(s.get("fallback"), ctx)
         fallback_crop = _parse_fallback_crop(s.get("fallback_crop"), ctx,
                                              frame_w, frame_h)
+        # Relational invariants (Task 12 review 02): relationships
+        # between tracks, segments and the scene — not just scalar
+        # shapes.
+        tids = [t["id"] for t in tracks]
+        if len(set(tids)) != len(tids):
+            raise ValueError(f"malformed-plan: {ctx} duplicate track "
+                             "ids")
+        for t in tracks:
+            if not (start_frame <= t["first_frame"]
+                    <= t["last_frame"] <= end_frame):
+                raise ValueError(f"malformed-plan: {ctx} track "
+                                 f"'{t["id"]}' frames outside its "
+                                 "scene")
+        track_by_id = {t["id"]: t for t in tracks}
+        for seg in segments:
+            for sid in seg.subject_ids:
+                tr = track_by_id.get(sid)
+                if tr is None:
+                    raise ValueError(f"malformed-plan: {ctx} segment "
+                                     f"subject '{sid}' missing from "
+                                     "scene tracks")
+                if not (tr["first_frame"] <= seg.end_frame
+                        and tr["last_frame"] >= seg.start_frame):
+                    raise ValueError(f"malformed-plan: {ctx} segment "
+                                     f"subject '{sid}' track range "
+                                     "inconsistent with segment")
+        if fallback is not None and (segments or keyframes):
+            raise ValueError(f"malformed-plan: {ctx} fallback scene "
+                             "must not carry active segments/keyframes")
+        if not applies and (segments or keyframes or tracks
+                           or fallback is not None
+                           or fallback_crop is not None):
+            raise ValueError(f"malformed-plan: {ctx} non-applicable "
+                             "scene must not carry planned face "
+                             "content")
         scenes.append(ScenePlan(
             scene_id=scene_id, strategy=strategy, start_frame=start_frame,
             end_frame=end_frame, applies=applies, tracks=tracks,
@@ -1408,6 +1487,7 @@ def plan_from_dict(d: dict) -> FramingPlan:
         config_digest=config_digest,
         output_aspect=float(output_aspect),
         tracker_digest=tracker_digest,
+        analysis_complete=analysis_complete,
         scenes=scenes,
         created_at=created_at,
     )
@@ -1470,6 +1550,11 @@ def plan_matches(plan: FramingPlan, *, source_fingerprint: str, frame_w: int,
     """
     if plan.schema_version != SCHEMA_VERSION:
         return False, f"stale-schema:{plan.schema_version}"
+    if not plan.analysis_complete:
+        # An exhausted/incomplete sidecar may render safely, but it is
+        # never a completed plan: force re-analysis on the next
+        # invocation so a later run can retry the unobserved scenes.
+        return False, "incomplete-analysis"
     if plan.source_fingerprint != source_fingerprint:
         return False, "stale-source"
     if plan.frame_w != int(frame_w) or plan.frame_h != int(frame_h):
@@ -1560,9 +1645,50 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
     never reused across a different output shape, strategy assignment or
     tracker configuration.
     """
+    # Task 12 review 02: structured budget-exhaustion state. The pass-1
+    # detector/MAR calls stop on AnalysisBudget expiry, but the planner
+    # must not turn partial observations into a normal reusable plan.
+    # Scenes the record proves fully analyzed may still be planned; the
+    # affected partial scene and every later unobserved face scene get
+    # an explicit static/wide fallback, and the plan is marked
+    # incomplete so plan_matches() forces re-analysis next run.
+    exhaustion_reason = log.exhaustion_reason
+    if exhaustion_reason is None:
+        for _d in log.diagnostics:
+            if _d in ("analysis_budget_exhausted",
+                      "analysis-frame-budget-exhausted"):
+                exhaustion_reason = _d
+                break
+    exhaustion_frame = log.exhaustion_frame
+    analysis_complete = exhaustion_reason is None
+
+    def _scene_fully_analyzed(s: int, e: int) -> bool:
+        if exhaustion_reason is None:
+            return True
+        # exhaustion_frame is the first frame NOT analyzed: only scenes
+        # ending strictly before it were fully analyzed. Without frame
+        # context (a bare diagnostic note) nothing can be proven, so
+        # every face scene falls back conservatively.
+        return (exhaustion_frame is not None
+                and int(e) < int(exhaustion_frame))
+
+    def _exhaustion_fallback(idx: int, strategy: str, s: int, e: int,
+                             reason: str) -> ScenePlan:
+        return ScenePlan(
+            scene_id=idx, strategy=strategy, start_frame=int(s),
+            end_frame=int(e), applies=True,
+            tracks=log.track_summary(idx), fallback={
+                "reason": reason,
+                "detail": ("pass-1 analysis stopped before this scene "
+                           "was fully observed; re-analysis required")})
+
     scene_plans: list[ScenePlan] = []
     for idx, (start, end) in enumerate(scenes):
         strategy = strategies[idx] if idx < len(strategies) else "TRACK"
+        if not _scene_fully_analyzed(int(start), int(end)):
+            scene_plans.append(_exhaustion_fallback(
+                idx, strategy, start, end, exhaustion_reason))
+            continue
         if strategy not in FACE_STRATEGIES:
             scene_plans.append(ScenePlan(
                 scene_id=idx, strategy=strategy, start_frame=int(start),
@@ -1597,6 +1723,7 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
         config_digest=config.config_digest(),
         output_aspect=float(aspect),
         tracker_digest=str(tracker_digest),
+        analysis_complete=analysis_complete,
         scenes=scene_plans,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
     )

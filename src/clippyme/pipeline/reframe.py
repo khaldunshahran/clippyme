@@ -752,22 +752,20 @@ def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
             max_observations=turn_cfg.max_analysis_frames)
 
     analysis_live = recorder is not None
-    noted_exhaustion = False
-
-    def _note_exhausted(reason):
-        nonlocal noted_exhaustion
-        if not noted_exhaustion and recorder is not None:
-            recorder.note(reason)
-            noted_exhaustion = True
 
     def _stop_analysis(reason):
         # Latch off: no new expensive analysis from here on. The observation
         # log already recorded "analysis-frame-budget-exhausted" itself on its
-        # first drop; the wall-time deadline is recorded here, once.
+        # first drop; the wall-time deadline is recorded here, once — with
+        # structured frame/scene context so the planner can prove which
+        # scenes were fully analyzed (Task 12 review 02).
         nonlocal analysis_live
         if analysis_live:
             analysis_live = False
-            _note_exhausted(reason)
+            if recorder is not None:
+                recorder.mark_exhaustion(
+                    reason, frame=frame_number,
+                    scene_id=current_scene_index)
 
     def _budget_ok_or_stop():
         """Check the budget; on exhaustion latch the analysis off.
@@ -1015,10 +1013,16 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                 # fallback); the diagnostic was recorded when the budget first
                 # exhausted in pass 1.
                 if not _analysis_budget.ok() and recorder is not None:
-                    _reason = (_analysis_budget.exhaust_reason
-                               or "analysis_budget_exhausted")
-                    if _reason not in recorder.diagnostics:
-                        recorder.note(_reason)
+                    # Structured exhaustion (no frame context this late:
+                    # the planner conservatively falls back every face
+                    # scene). build_framing_plan reads the log's
+                    # exhaustion state and skips turn segmentation and
+                    # keyframe construction for affected scenes; the
+                    # persisted plan is marked incomplete and ineligible
+                    # for reuse (Task 12 review 02).
+                    recorder.mark_exhaustion(
+                        _analysis_budget.exhaust_reason
+                        or "analysis_budget_exhausted")
                 plan = build_framing_plan(
                     log=recorder if recorder is not None else ObservationLog(
                         original_width, original_height),

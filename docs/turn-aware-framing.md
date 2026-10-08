@@ -116,6 +116,34 @@ landmarks.
 - Per-scene failures are isolated — invalid TRACK/WIDE scenes keep the
   accepted static/wide fallback crop with a reason.
 
+## Budget exhaustion and incomplete plans (review 02)
+
+- Pass 1 records structured exhaustion on the observation log via
+  `mark_exhaustion(reason, frame, scene_id)`: the exhaustion frame is the
+  first frame NOT analyzed. `build_framing_plan` carries this state into
+  planning: scenes ending strictly before the exhaustion frame were fully
+  analyzed and may keep their plan; the affected partial scene and every
+  later unobserved face scene skip turn segmentation/keyframe construction
+  and get an explicit static/wide fallback with `analysis_budget_exhausted`
+  or `analysis-frame-budget-exhausted`. Without frame context (a bare
+  diagnostic note) every face scene falls back conservatively.
+- The persisted plan records `analysis_complete` (schema v3). An
+  exhausted/incomplete plan may be saved for audit and safe rendering,
+  but `plan_matches()` returns `incomplete-analysis` for it, so the next
+  invocation re-analyzes instead of reusing the partial result.
+- `analysis_deadline_s` is part of `TurnFramingConfig.to_dict()`, so the
+  deadline participates in `config_digest` and plan identity.
+
+## Relational sidecar validation (review 02)
+
+- Beyond scalar shapes, `plan_from_dict` enforces relationships: scene
+  intervals strictly ordered and non-overlapping; unique track IDs whose
+  frame ranges lie inside their scene; every segment subject ID exists in
+  the scene's track table and its track range intersects the segment;
+  two-subject IDs distinct; consecutive segments tile the scene
+  contiguously with no gaps or overlaps; fallback scenes carry no active
+  segments/keyframes; non-applicable scenes carry no planned face content.
+
 ## Limits (stated honestly)
 
 Injected face/mouth observations and synthetic fixtures validate the
