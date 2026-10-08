@@ -23,10 +23,23 @@ no provider calls):
   `application_skipped` with the exact reason (duplicate IDs,
   missing plan/store entry, fingerprint mismatch, bool/NaN/Infinity,
   reversed/out-of-source/out-of-policy bounds, malformed state, unknown
-  plan version). Never silently approves or rejects; never erases
+  plan version, store-record identity mismatch
+  (`candidate_store_id_mismatch`), malformed store/short intervals
+  (`invalid_store_boundaries` / `invalid_short_boundaries`), short/store
+  interval disagreement (`short_store_interval_mismatch`), unknown source
+  duration (`invalid_source_duration` -- never authorizes a negative cut),
+  plan interval not describing the current candidate
+  (`plan_interval_mismatch` for accept/reject/unrefined,
+  `plan_interval_disjoint_from_candidate` for adjust), and non-adjust
+  group verdicts (`group_invalid_verdict`). The store record must carry
+  the exact `candidate_id`; store and short intervals must each be
+  finite, non-boolean, and ordered, and must agree; accept/reject/
+  unrefined plans retain the exact candidate interval while adjust plans
+  must overlap it. Never silently approves or rejects; never erases
   unrelated clips.
 - **continuity groups** — a `group:c1+c2` plan replaces its components
-  only when every check passes (refined, unique non-empty components,
+  only when every check passes (refined **adjust** verdict, unique
+  non-empty components,
   all present, all survived as refined accept/adjust, finite/in-bounds/
   policy-compliant interval covering all applied component intervals,
   no identity conflict with a base ID). The group is inserted at the
@@ -72,6 +85,18 @@ unchanged; empty stays empty.
   fallback record explicitly states plans were NOT applied to fallback
   shorts, while the earlier record survives for audit under
   `superseded_record`. Fallback shorts never inherit stale plans.
+
+## Intentional empty results
+
+When enabled editorial application reconciles a non-empty selection
+down to zero shorts (every candidate rejected), that empty set is the
+validated outcome -- not a failure. Both the direct CLI (`main.py`,
+via `_resolve_empty_shorts_action`) and the queued orchestrator
+(`orchestrator._load_or_analyze`, via
+`is_intentional_editorial_empty`) persist zero shorts and render
+nothing: no TextTiling and no whole-video fallback. Genuine
+discovery/provider failures (empty discovery, errors, no reconciled
+all-rejected record) keep the existing fallback behavior.
 
 ## Scope limits
 

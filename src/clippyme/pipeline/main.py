@@ -819,6 +819,23 @@ def build_texttiling_fallback(transcript_result, video_title):
         return None
 
 
+def _resolve_empty_shorts_action(clips_data, monitor):
+    """Decide the no-shorts path for the direct CLI.
+
+    Returns "intentional_empty" when enabled editorial application
+    honestly reduced a non-empty selection to zero (persist zero
+    shorts, render nothing); "monitor_empty" when no-AI fallbacks are
+    disabled; "whole_video" otherwise.
+    """
+    from clippyme.pipeline import editorial_application as _ea
+    from clippyme.pipeline.run_ops import should_use_fallback
+    if _ea.is_intentional_editorial_empty(clips_data):
+        return "intentional_empty"
+    if not should_use_fallback(monitor):
+        return "monitor_empty"
+    return "whole_video"
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
@@ -1087,7 +1104,23 @@ if __name__ == '__main__':
                         "fallback_strategy"] = "texttiling"
 
         if not clips_data or not clips_data.get('shorts'):
-            if not should_use_fallback(args.monitor):
+            _empty_action = _resolve_empty_shorts_action(
+                clips_data, args.monitor)
+            if _empty_action == "intentional_empty":
+                # Enabled editorial application honestly reduced a
+                # non-empty selection to zero: persist zero shorts and
+                # render nothing. This is the validated outcome, not a
+                # failure -- no TextTiling/whole-video fallback.
+                empty = {'shorts': [], 'transcript': transcript,
+                         'aspect': args.aspect}
+                empty = _keep_funnel(empty)  # keep record verbatim
+                _meta = os.path.join(output_dir, f"{video_title}_metadata.json")
+                _tmp = _meta + '.tmp'
+                with open(_tmp, 'w', encoding="utf-8") as f:
+                    json.dump(empty, f, indent=2)
+                os.replace(_tmp, _meta)
+                print("Editorial: all selected clips were rejected -- rendering nothing.")
+            elif _empty_action == "monitor_empty":
                 # Monitor: no hallucinated/fallback clips — write empty metadata
                 # (+ exhaustion marker if Gemini ran out of models) and exit clean.
                 empty = {'shorts': [], 'transcript': transcript, 'aspect': args.aspect}

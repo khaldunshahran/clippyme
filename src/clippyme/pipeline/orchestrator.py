@@ -604,7 +604,14 @@ def _load_or_analyze(
                 if _discovery_funnel is not None and isinstance(clips_data, dict) and "candidate_discovery" in clips_data:
                     clips_data["candidate_discovery"]["fallback_strategy"] = "texttiling"
         if not clips_data or not clips_data.get("shorts"):
-            if not should_use_fallback(args.monitor):
+            from clippyme.pipeline.editorial_application import (
+                is_intentional_editorial_empty)
+            if is_intentional_editorial_empty(clips_data):
+                # Enabled editorial application honestly reduced a
+                # non-empty selection to zero: persist zero shorts and
+                # render nothing. Not a failure -- no fallback.
+                clips_data = _preserve_funnel({"shorts": []})
+            elif not should_use_fallback(args.monitor):
                 clips_data = _preserve_funnel({
                     "shorts": [],
                     "gemini_exhausted": bool(

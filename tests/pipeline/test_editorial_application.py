@@ -1283,3 +1283,299 @@ def test_wired_shorts_remain_viralclip_compatible():
     result = run_wired()
     for s in result["shorts"]:
         ViralClip.model_validate(s)
+
+# --- Review-01 promoted probes + mutation coverage ----------------------
+
+from types import SimpleNamespace as _R1SimpleNamespace
+
+
+def _r1_short(cid="c1", start=10.0, end=30.0):
+    return {
+        "candidate_id": cid,
+        "start": start,
+        "end": end,
+        "viral_score": 80,
+        "viral_reason": "grounded candidate reason",
+        "unknown_field": {"kept": True},
+    }
+
+
+def _r1_store(cid="c1", start_s=10.0, end_s=30.0, fp="fp-1"):
+    return {
+        cid: {
+            "candidate_id": cid,
+            "start_s": start_s,
+            "end_s": end_s,
+            "moment_fingerprint": fp,
+            "recommendation_score": 90.0,
+            "quality": {},
+        }
+    }
+
+
+def _r1_plan(cid="c1", verdict="accept", start=10.0, end=30.0, fp="fp-1",
+             **kw):
+    plan = {
+        "candidate_id": cid,
+        "verdict": verdict,
+        "start_s": start,
+        "end_s": end,
+        "plan_version": er.EDITORIAL_VERSION,
+        "status": "refined",
+        "moment_fingerprint": fp,
+    }
+    plan.update(kw)
+    return plan
+
+
+def _r1_apply(shorts, records, plans, source_duration=200.0):
+    return ea.apply_editorial_plans(
+        shorts, records, plans, source_duration, 15.0, 120.0,
+        enabled=True, editorial_ran=True,
+    )
+
+
+def _r1_assert_skipped(out, rec, original, reason):
+    assert len(out) == 1
+    for key, value in original.items():
+        assert out[0][key] == value
+    assert out[0]["application_skipped"] == reason
+    assert rec["application_skips"] == {reason: 1}
+    assert rec["counts_reconcile"] is True
+
+
+def test_r1_store_record_identity_must_match_lookup_key():
+    records = _r1_store()
+    records["c1"]["candidate_id"] = "different-id"
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply([_r1_short()], records, [_r1_plan()])
+    _r1_assert_skipped(out, rec, original, "candidate_store_id_mismatch")
+
+
+def test_r1_adjusted_plan_must_overlap_current_candidate_interval():
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply(
+        [_r1_short()], _r1_store(),
+        [_r1_plan(verdict="adjust", start=80.0, end=100.0)],
+    )
+    _r1_assert_skipped(
+        out, rec, original, "plan_interval_disjoint_from_candidate")
+
+
+def test_r1_unknown_source_duration_cannot_authorize_negative_cut():
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply(
+        [_r1_short()], _r1_store(),
+        [_r1_plan(verdict="adjust", start=-5.0, end=15.0)],
+        source_duration=0.0,
+    )
+    _r1_assert_skipped(out, rec, original, "invalid_source_duration")
+    assert rec["source_bounds_checked"] is False
+
+
+def test_r1_accept_does_not_approve_malformed_original_short_interval():
+    short = _r1_short()
+    short["start"] = True
+    original = copy.deepcopy(short)
+    out, rec = _r1_apply([short], _r1_store(), [_r1_plan()])
+    _r1_assert_skipped(out, rec, original, "invalid_short_boundaries")
+    assert out[0]["start"] is True
+    assert rec["accepts_retained"] == 0
+    # The caller's short is untouched: annotation landed on the copy.
+    assert short == original
+
+
+def test_r1_non_adjust_group_verdict_cannot_replace_components():
+    shorts = [_r1_short("c1", 10.0, 30.0), _r1_short("c2", 40.0, 60.0)]
+    records = _r1_store("c1", 10.0, 30.0, "fp-1")
+    records.update(_r1_store("c2", 40.0, 60.0, "fp-2"))
+    plans = [
+        _r1_plan("c1", "accept", 10.0, 30.0, fp="fp-1"),
+        _r1_plan("c2", "accept", 40.0, 60.0, fp="fp-2"),
+        {
+            "candidate_id": "group:c1+c2",
+            "verdict": "reject",
+            "start_s": 10.0,
+            "end_s": 60.0,
+            "plan_version": er.EDITORIAL_VERSION,
+            "status": "refined",
+            "moment_fingerprint": "",
+            "components": ["c1", "c2"],
+        },
+    ]
+    out, rec = _r1_apply(shorts, records, plans)
+    assert [s["candidate_id"] for s in out] == ["c1", "c2"]
+    assert rec["groups_applied"] == 0
+    assert rec["groups_rejected"] == 1
+    assert rec["group_rejections"][0]["reason"] == "group_invalid_verdict"
+    assert rec["counts_reconcile"] is True
+
+
+def test_r1_all_editorial_rejections_do_not_render_whole_video_fallback(
+    orch_mod, tmp_path, monkeypatch,
+):
+    orch = orch_mod
+
+    class _R1State:
+        def __init__(self):
+            self.total = None
+
+        def artifact(self, name):
+            return None
+
+        def completed(self, stage):
+            return False
+
+        def consume_steering(self):
+            return []
+
+        def start(self, *a, **k):
+            pass
+
+        def complete_stage(self, *a, **k):
+            pass
+
+        def set_clip_total(self, n):
+            self.total = n
+
+    class _R1Legacy:
+        def get_viral_clips(self, *a, **k):
+            return {
+                "shorts": [],
+                "editorial_application": {
+                    "version": ea.APPLICATION_VERSION,
+                    "enabled": True,
+                    "status": "applied",
+                    "ran": True,
+                    "fail_soft": False,
+                    "original_selected_count": 1,
+                    "accepts_retained": 0,
+                    "adjusts_applied": 0,
+                    "rejects_removed": 1,
+                    "groups_applied": 0,
+                    "groups_rejected": 0,
+                    "application_skips": {},
+                    "final_selected_count": 0,
+                    "counts_reconcile": True,
+                    "source_bounds_checked": True,
+                },
+            }
+
+        def build_texttiling_fallback(self, transcript, video_title):
+            raise AssertionError(
+                "fallback must not run on intentional empty")
+
+    monkeypatch.setenv("CLIPPYME_SILENCE_SNAP", "0")
+
+    args = _R1SimpleNamespace(
+        monitor=False, aspect="9:16", skip_analysis=False,
+        instructions=None, min_duration=None, max_duration=None,
+        min_clips=None, max_clips=None, clip_type=None,
+    )
+    state = _R1State()
+    result, _metadata_file = orch._load_or_analyze(
+        args, str(tmp_path / "source.mp4"), "source", str(tmp_path),
+        120.0, {"segments": []}, state, _R1Legacy(),
+    )
+    assert result["shorts"] == []
+    assert result["editorial_application"]["enabled"] is True
+    assert result["editorial_application"]["rejects_removed"] == 1
+    assert state.total == 0
+
+
+def _r1_editorial_empty_record(**kw):
+    rec = {
+        "version": ea.APPLICATION_VERSION,
+        "enabled": True,
+        "counts_reconcile": True,
+        "original_selected_count": 2,
+        "final_selected_count": 0,
+        "rejects_removed": 2,
+    }
+    rec.update(kw)
+    return {"shorts": [], "editorial_application": rec}
+
+
+def test_r1_is_intentional_editorial_empty_shapes():
+    assert ea.is_intentional_editorial_empty(
+        _r1_editorial_empty_record()) is True
+    assert ea.is_intentional_editorial_empty({"shorts": []}) is False
+    assert ea.is_intentional_editorial_empty(None) is False
+    assert ea.is_intentional_editorial_empty(
+        _r1_editorial_empty_record(enabled=False)) is False
+    assert ea.is_intentional_editorial_empty(
+        _r1_editorial_empty_record(counts_reconcile=False)) is False
+    assert ea.is_intentional_editorial_empty(
+        _r1_editorial_empty_record(original_selected_count=0)) is False
+    assert ea.is_intentional_editorial_empty(
+        _r1_editorial_empty_record(final_selected_count=1)) is False
+    assert ea.is_intentional_editorial_empty(
+        {"editorial_application": "nope"}) is False
+
+
+def test_r1_direct_empty_action_intentional_empty(main_mod):
+    assert main_mod._resolve_empty_shorts_action(
+        _r1_editorial_empty_record(), False) == "intentional_empty"
+
+
+def test_r1_direct_empty_action_whole_video_on_genuine_failure(main_mod):
+    resolve = main_mod._resolve_empty_shorts_action
+    assert resolve({"shorts": []}, False) == "whole_video"
+    assert resolve(None, False) == "whole_video"
+    assert resolve(
+        _r1_editorial_empty_record(enabled=False), False) == "whole_video"
+    assert resolve(
+        _r1_editorial_empty_record(counts_reconcile=False),
+        False) == "whole_video"
+    assert resolve(
+        _r1_editorial_empty_record(original_selected_count=0),
+        False) == "whole_video"
+
+
+def test_r1_direct_empty_action_monitor_empty(main_mod):
+    assert main_mod._resolve_empty_shorts_action(
+        {"shorts": []}, True) == "monitor_empty"
+
+
+def test_r1_reversed_store_interval_is_invalid_store_boundaries():
+    records = _r1_store()
+    records["c1"]["start_s"], records["c1"]["end_s"] = 30.0, 10.0
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply([_r1_short()], records, [_r1_plan()])
+    _r1_assert_skipped(out, rec, original, "invalid_store_boundaries")
+
+
+def test_r1_boolean_store_interval_is_invalid_store_boundaries():
+    records = _r1_store()
+    records["c1"]["start_s"] = True
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply([_r1_short()], records, [_r1_plan()])
+    _r1_assert_skipped(out, rec, original, "invalid_store_boundaries")
+
+
+def test_r1_short_store_interval_disagreement_isolated():
+    records = _r1_store()
+    records["c1"]["start_s"] = 11.0  # short says [10, 30]
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply([_r1_short()], records, [_r1_plan()])
+    _r1_assert_skipped(out, rec, original, "short_store_interval_mismatch")
+
+
+def test_r1_accept_plan_must_retain_exact_candidate_interval():
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply(
+        [_r1_short()], _r1_store(),
+        [_r1_plan("c1", "accept", 10.0, 30.000001)],
+    )
+    _r1_assert_skipped(out, rec, original, "plan_interval_mismatch")
+    assert rec["accepts_retained"] == 0
+
+
+def test_r1_reject_plan_must_retain_exact_candidate_interval():
+    original = copy.deepcopy(_r1_short())
+    out, rec = _r1_apply(
+        [_r1_short()], _r1_store(),
+        [_r1_plan("c1", "reject", 12.0, 28.0)],
+    )
+    _r1_assert_skipped(out, rec, original, "plan_interval_mismatch")
+    assert rec["rejects_removed"] == 0

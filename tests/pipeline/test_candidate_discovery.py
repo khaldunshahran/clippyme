@@ -1304,6 +1304,8 @@ def test_direct_whole_video_fallback_atomically_persists_funnel(tmp_path):
         },
         "should_use_fallback": lambda _monitor: True,
         "build_texttiling_fallback": lambda *_a: {"shorts": []},
+        "_resolve_empty_shorts_action": (
+            _import_main_stubbed()._resolve_empty_shorts_action),
         "video_title": "sample",
         "output_dir": str(tmp_path),
         "input_video": "source.mp4",

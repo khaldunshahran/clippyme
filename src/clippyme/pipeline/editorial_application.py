@@ -11,14 +11,21 @@ Contract:
   deep copies; the caller's ``shorts``, ``candidate_store`` and
   ``editorial_plans`` are left byte-for-byte untouched.
 - Strict identity join per short: a short is applicable only with a
-  unique non-empty ``candidate_id``, a matching candidate-store record,
-  and exactly one matching non-group plan carrying the current plan
-  version and a matching moment fingerprint. Every numeric value must
-  be a finite non-boolean; source and resolved duration bounds are
-  revalidated. Duplicates, missing/malformed plans, fingerprint
-  mismatches, invalid intervals, and contradictory state are isolated
-  per item with an exact reason -- they never crash the run and never
-  erase unrelated clips.
+  unique non-empty ``candidate_id``, a candidate-store record carrying
+  the exact same ``candidate_id``, and exactly one matching non-group
+  plan carrying the current plan version and a matching moment
+  fingerprint. The store interval and the selected short interval must
+  each be finite, non-boolean, and ordered, and must agree with each
+  other. The plan interval must describe the current candidate:
+  accept/reject/unrefined retain it exactly, adjust must overlap it.
+  The source duration must be finite and positive for the upper bound
+  check; an unknown duration never authorizes a negative cut. Every
+  numeric value must be a finite non-boolean; source and resolved
+  duration bounds are revalidated. Duplicates, missing/malformed
+  plans, fingerprint mismatches, invalid intervals, identity and
+  interval mismatches, and contradictory state are isolated per item
+  with an exact reason -- they never crash the run and never erase
+  unrelated clips.
 - Fail-safe base semantics: refined ``accept`` retains the original
   short and interval; refined ``adjust`` copies the short and replaces
   only ``start``/``end`` (every other field -- titles, descriptions,
@@ -31,7 +38,8 @@ Contract:
   Candidate-store items absent from the final shorts are never promoted,
   and no quota padding happens here.
 - Continuity groups: a group plan replaces its component shorts only
-  when the group is refined, has a non-empty unique component list,
+  when the group is a refined adjust plan, has a non-empty unique
+  component list,
   every component is present in the current final shorts, every
   component survived as refined accept/adjust, the group interval is
   finite, in source bounds, policy-compliant, and covers all applied
@@ -95,6 +103,41 @@ def _as_float(value: Any) -> Optional[float]:
     if _is_finite_number(value):
         return float(value)
     return None
+
+
+def _ordered_interval(start_v: Any, end_v: Any) -> Optional[Tuple[float, float]]:
+    """Finite non-boolean ordered interval, or None when malformed."""
+    ss = _as_float(start_v)
+    se = _as_float(end_v)
+    if ss is None or se is None:
+        return None
+    if not ss < se:
+        return None
+    return (ss, se)
+
+
+def is_intentional_editorial_empty(clips_data: Any) -> bool:
+    """Whether enabled editorial application honestly reduced a non-empty
+    selection to zero shorts.
+
+    Such results must be persisted as zero shorts with no fallback
+    rendering: the empty set is the validated editorial outcome, not a
+    discovery/provider failure.
+    """
+    rec = (clips_data.get("editorial_application")
+           if isinstance(clips_data, dict) else None)
+    if not isinstance(rec, Mapping):
+        return False
+    if rec.get("enabled") is not True:
+        return False
+    if rec.get("counts_reconcile") is not True:
+        return False
+    try:
+        orig = int(rec.get("original_selected_count") or 0)
+        final = int(rec.get("final_selected_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return orig > 0 and final == 0
 
 
 def disabled_application_record(reason: str,
@@ -189,7 +232,13 @@ def _validate_plan_boundaries(plan: Mapping[str, Any],
         return None, "non_finite_plan_boundaries"
     if not ss < se:
         return None, "reversed_plan_boundaries"
-    if source_checked and not (ss >= 0.0 and se <= source_duration):
+    if ss < 0.0:
+        # A negative cut is never authorized. When the source duration
+        # is invalid the upper bound cannot be verified either; report
+        # the missing duration instead of silently skipping the check.
+        return None, ("plan_boundaries_out_of_source" if source_checked
+                      else "invalid_source_duration")
+    if source_checked and se > source_duration:
         return None, "plan_boundaries_out_of_source"
     duration = se - ss
     if not (duration_min <= duration <= duration_max):
@@ -236,6 +285,10 @@ def _validate_group_plan(group: Mapping[str, Any],
     gid = group.get("candidate_id")
     if group.get("status") != "refined":
         return None, "group_not_refined"
+    if group.get("verdict") != "adjust":
+        # Only a genuine refined adjustment plan may replace components;
+        # a reject/accept/unrefined group plan never does.
+        return None, "group_invalid_verdict"
     if group.get("plan_version") != EDITORIAL_VERSION:
         return None, "group_unknown_plan_version"
     comps = group.get("components")
@@ -402,6 +455,25 @@ def apply_editorial_plans(
         if not isinstance(rec, Mapping):
             _skip(s, cid, "missing_candidate_store_entry")
             continue
+        # Strict base join: the store record must carry the exact same
+        # candidate_id, and the store and short intervals must each be
+        # finite, non-boolean, and ordered, and must agree with each
+        # other. Anything else keeps the original short with an exact
+        # application_skipped reason and never touches the counts.
+        if rec.get("candidate_id") != cid:
+            _skip(s, cid, "candidate_store_id_mismatch")
+            continue
+        store_iv = _ordered_interval(rec.get("start_s"), rec.get("end_s"))
+        if store_iv is None:
+            _skip(s, cid, "invalid_store_boundaries")
+            continue
+        short_iv = _ordered_interval(s.get("start"), s.get("end"))
+        if short_iv is None:
+            _skip(s, cid, "invalid_short_boundaries")
+            continue
+        if short_iv != store_iv:
+            _skip(s, cid, "short_store_interval_mismatch")
+            continue
         matches = base_by_id.get(cid, [])
         if not matches:
             _skip(s, cid, "no_matching_plan")
@@ -417,8 +489,17 @@ def apply_editorial_plans(
             continue
         pss, pse = interval
         verdict = plan.get("verdict")
-        orig_start = _as_float(s.get("start"))
-        orig_end = _as_float(s.get("end"))
+        # The plan must describe the current candidate: accept/reject/
+        # unrefined retain its exact interval; adjust must overlap it.
+        if verdict == "adjust":
+            if not (pss < store_iv[1] and pse > store_iv[0]):
+                _skip(s, cid, "plan_interval_disjoint_from_candidate")
+                continue
+        elif not (abs(pss - store_iv[0]) <= 1e-9
+                  and abs(pse - store_iv[1]) <= 1e-9):
+            _skip(s, cid, "plan_interval_mismatch")
+            continue
+        orig_start, orig_end = short_iv
         if verdict == "accept":
             s["editorial_application"] = {
                 "verdict": "accept",

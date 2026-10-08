@@ -1500,6 +1500,28 @@ def test_mutation_variants_as_distinct_fails():
 # These execute the actual fallback/atomic-write blocks instead of
 # inspecting source text.
 
+def _import_main_stubbed():
+    """Import main.py with heavy deps stubbed (no cv2/torch on host)."""
+    import sys as _sys
+    from unittest.mock import MagicMock as _MM
+    _torch = _MM()
+    _torch.cuda.is_available.return_value = False
+    _psutil = _MM()
+    _psutil.virtual_memory.return_value.total = 16 * (1024 ** 3)
+    _sys.modules["psutil"] = _psutil
+    for _m in ["cv2", "scenedetect", "scenedetect.detectors", "ultralytics",
+               "mediapipe", "yt_dlp", "tqdm", "dotenv", "google",
+               "google.genai", "numpy", "psutil", "faster_whisper",
+               "stable_ts"]:
+        _sys.modules.setdefault(_m, _MM())
+    _sys.modules["torch"] = _torch
+    _sys.modules["scenedetect"].open_video = _MM()
+    _sys.modules["scenedetect"].SceneManager = _MM()
+    _sys.modules["google"].genai = _sys.modules["google.genai"]
+    import clippyme.pipeline.main as main_mod
+    return main_mod
+
+
 def test_direct_whole_video_fallback_persists_editorial_atomically(tmp_path):
     """Real execution: the direct main.py whole-video fallback block must
     atomically persist discovery funnel + store + editorial funnel + plans."""
@@ -1537,6 +1559,8 @@ def test_direct_whole_video_fallback_persists_editorial_atomically(tmp_path):
         },
         "should_use_fallback": lambda _monitor: True,
         "build_texttiling_fallback": lambda *_a: {"shorts": []},
+        "_resolve_empty_shorts_action": (
+            _import_main_stubbed()._resolve_empty_shorts_action),
         "video_title": "sample",
         "output_dir": str(tmp_path),
         "input_video": "source.mp4",
