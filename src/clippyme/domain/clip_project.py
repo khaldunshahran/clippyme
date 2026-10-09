@@ -271,6 +271,33 @@ class FramingKeyframe(BaseModel):
         return self
 
 
+class FramingFitRange(BaseModel):
+    """One conservative full-frame fit range (Task 14 rev4).
+
+    Clip-relative INCLUSIVE ``[start_frame, end_frame]``. Additive: old
+    projects without fit ranges validate unchanged (the ``fit`` bool on
+    the scene timeline is still honored for legacy timelines).
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    start_frame: int = Field(ge=0)
+    end_frame: int = Field(ge=0)
+
+    @field_validator("start_frame", "end_frame", mode="before")
+    @classmethod
+    def _no_bools(cls, v):
+        return _reject_bool_numeric(v)
+
+    @model_validator(mode="after")
+    def _order(self):
+        if self.start_frame > self.end_frame:
+            raise ValueError(
+                f"start_frame ({self.start_frame}) must be <= end_frame "
+                f"({self.end_frame})")
+        return self
+
+
 class FramingSceneTimeline(BaseModel):
     """Normalized Task 12 scene on the clip-relative clock (inclusive frames)."""
 
@@ -294,6 +321,9 @@ class FramingSceneTimeline(BaseModel):
     # (not as crops); keyframes still give crop targets where the plan
     # tightens. Additive optional -- old projects validate unchanged.
     fit: bool = False
+    #: Lossless ordered clip-relative fit intervals (Task 14 rev4).
+    #: Additive: old projects without this field validate unchanged.
+    fit_ranges: list[FramingFitRange] = Field(default_factory=list)
 
     @field_validator("scene_id", "start_frame", "end_frame", mode="before")
     @classmethod
@@ -334,6 +364,26 @@ class FramingSceneTimeline(BaseModel):
         frames = [k.frame for k in self.keyframes]
         if any(b <= a for a, b in zip(frames, frames[1:])):
             raise ValueError("keyframes must be ordered with unique frames")
+        # Task 14 rev4: fit ranges are ordered, non-overlapping, inside
+        # the scene, and never cover a keyframe (a keyframe is a crop
+        # target; fit renders full-frame letterbox, the renderer gives
+        # fit precedence).
+        prev_end = self.start_frame - 1
+        for r in self.fit_ranges:
+            if not (self.start_frame <= r.start_frame <= r.end_frame <= self.end_frame):
+                raise ValueError(
+                    f"fit range [{r.start_frame}, {r.end_frame}] outside "
+                    f"scene [{self.start_frame}, {self.end_frame}]")
+            if r.start_frame <= prev_end:
+                raise ValueError("fit_ranges must be ordered and non-overlapping")
+            prev_end = r.end_frame
+            for k in self.keyframes:
+                if r.start_frame <= k.frame <= r.end_frame:
+                    raise ValueError(
+                        f"keyframe at frame {k.frame} inside fit range "
+                        f"[{r.start_frame}, {r.end_frame}]")
+        if self.fit_ranges and not self.fit:
+            raise ValueError("fit_ranges requires fit=true")
         return self
 
 

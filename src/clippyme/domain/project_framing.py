@@ -422,6 +422,7 @@ def normalize_timeline(
                 "keyframes": [],
                 "fallback_reason": None,
                 "fallback_detail": None,
+                "fit_ranges": [],
             })
             continue
         if kind == "face":
@@ -463,6 +464,7 @@ def normalize_timeline(
                 "fallback_reason": None,
                 "fallback_detail": None,
                 "fit": False,
+                "fit_ranges": [],
             })
             continue
 
@@ -473,19 +475,37 @@ def normalize_timeline(
         raw_segments = s.get("segments")
         if not isinstance(raw_segments, list):
             raise FramingError(f"{REASON_MALFORMED}: {ctx} segments bad")
+        # Task 14 rev4: explicit conservative full-frame fit persisted on
+        # action wide segments. Carried as lossless ordered clip-relative
+        # fit intervals (rebased once, below) so plans whose fit boundaries
+        # differ stay distinct through the bridge. Booleans,
+        # coverage/order/bounds and consistency with crop ranges are all
+        # validated; the single integer rebase is never applied twice.
         seg_fit = False
-        for g in raw_segments:
+        fit_ranges: list[dict] = []
+        prev_seg_end = start - 1
+        for gi, g in enumerate(raw_segments):
+            gctx = f"{ctx}.segment[{gi}]"
             if not isinstance(g, dict):
-                raise FramingError(f"{REASON_MALFORMED}: {ctx} segment bad")
-            # Task 14 rev3: explicit conservative full-frame fit persisted
-            # on action wide segments. Folded to one scene-level flag:
-            # True when ANY segment fits (those ranges render as
-            # full-frame letterbox, not crops).
+                raise FramingError(f"{REASON_MALFORMED}: {gctx} must be a dict")
+            gs = _strict_int(f"{gctx}.start_frame", g.get("start_frame")) - offset
+            ge = _strict_int(f"{gctx}.end_frame", g.get("end_frame")) - offset
+            if not start <= gs <= ge <= end:
+                raise FramingError(
+                    f"{REASON_MALFORMED}: {gctx} frames [{gs}, {ge}] outside "
+                    f"scene [{start}, {end}]")
+            if gs <= prev_seg_end:
+                raise FramingError(
+                    f"{REASON_MALFORMED}: {gctx} segments must be ordered "
+                    "and non-overlapping")
+            prev_seg_end = ge
             _gf = g.get("fit", False)
             if not isinstance(_gf, bool):
                 raise FramingError(
-                    f"{REASON_MALFORMED}: {ctx} segment fit bad")
-            seg_fit = seg_fit or _gf
+                    f"{REASON_MALFORMED}: {gctx} segment fit bad")
+            if _gf:
+                seg_fit = True
+                fit_ranges.append({"start_frame": gs, "end_frame": ge})
             for sid in g.get("subject_ids") or []:
                 if not isinstance(sid, str) or not track_id_re.match(sid):
                     raise FramingError(
@@ -531,6 +551,17 @@ def normalize_timeline(
                 raise FramingError(
                     f"{REASON_MALFORMED}: {ctx} fallback detail bad")
 
+        # A keyframe is a crop target; a fit range renders full-frame
+        # letterbox (the renderer gives fit precedence). A keyframe inside
+        # a fit range is contradictory data, never a valid plan.
+        for kf in keyframes:
+            for fr in fit_ranges:
+                rs, re_ = fr["start_frame"], fr["end_frame"]
+                if rs <= kf["frame"] <= re_:
+                    raise FramingError(
+                        f"{REASON_MALFORMED}: {ctx} keyframe at frame "
+                        f"{kf['frame']} inside fit range [{rs}, {re_}]")
+
         out.append({
             "scene_id": scene_id,
             "strategy": strategy,
@@ -543,6 +574,7 @@ def normalize_timeline(
             "fallback_reason": fallback_reason,
             "fallback_detail": fallback_detail,
             "fit": seg_fit if kind == "action" else False,
+            "fit_ranges": fit_ranges if kind == "action" else [],
         })
     return out
 

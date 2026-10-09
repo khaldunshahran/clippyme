@@ -142,6 +142,27 @@
       "title": "CropBox",
       "type": "object"
     },
+    "FramingFitRange": {
+      "description": "One conservative full-frame fit range (Task 14 rev4).\n\nClip-relative INCLUSIVE ``[start_frame, end_frame]``. Additive: old\nprojects without fit ranges validate unchanged (the ``fit`` bool on\nthe scene timeline is still honored for legacy timelines).",
+      "properties": {
+        "start_frame": {
+          "minimum": 0,
+          "title": "Start Frame",
+          "type": "integer"
+        },
+        "end_frame": {
+          "minimum": 0,
+          "title": "End Frame",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_frame",
+        "end_frame"
+      ],
+      "title": "FramingFitRange",
+      "type": "object"
+    },
     "FramingKeyframe": {
       "description": "One crop target in clip-relative inclusive frame coordinates.",
       "properties": {
@@ -378,6 +399,13 @@
           "default": false,
           "title": "Fit",
           "type": "boolean"
+        },
+        "fit_ranges": {
+          "items": {
+            "$ref": "#/$defs/FramingFitRange"
+          },
+          "title": "Fit Ranges",
+          "type": "array"
         }
       },
       "required": [

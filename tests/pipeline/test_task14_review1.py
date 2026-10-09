@@ -136,7 +136,12 @@ def test_mutation_face_kind_with_applies_false_is_rejected():
 
 def _run_steal_scenario():
     """Production path for the large-static-object vs small-moving-person
-    scenario. Returns (tight_ids, log)."""
+    scenario. Returns (tight_ids, log).
+
+    90-frame variant (review-03): the historical 30-frame fixture needed
+    shortened acquisition gates to acquire in time; with 90 frames the
+    production defaults acquire on their own. Assertions unchanged.
+    """
     width, height, fps = 1920, 1080, 30.0
     log = af.ActionObservationLog(width, height)
     tracker = af.ActionTracker()
@@ -157,7 +162,7 @@ def _run_steal_scenario():
         # Strong support belongs to the moving person, not the static object.
         return [0.0, 1.0], 0.0, prev
 
-    for frame_number in range(30):
+    for frame_number in range(90):
         frame = np.zeros((2, 2, 3), dtype=np.uint8)
         frame[0, 0, 0] = frame_number
         previous = reframe._analyze_action_frame(
@@ -169,15 +174,11 @@ def _run_steal_scenario():
         log,
         scene_id=0,
         scene_start=0,
-        scene_end=29,
+        scene_end=89,
         config=af.ActionFramingConfig(
             fast_travel_frac=1.0,
             fast_motion_widen=1.0,
             uncertain_motion_range=1.0,
-            # Temporal gate compatible with the 30-frame scenario
-            # (test is about visibility weighting, not acquisition).
-            acquisition_min_span_s=0.2,
-            acquisition_max_gap_s=0.2,
         ),
         fps=fps,
         frame_w=width,

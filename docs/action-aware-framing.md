@@ -181,11 +181,43 @@ reason is recorded honestly instead of being merged away.
 **Conservative fit:** uncertain wide segments (no action, ambiguous
 action, unsafe union, failed locks) are persisted with `fit=True` and an
 empty crop -- NO keyframes, NO saliency-biased wide crop. Pass 2 renders
-those ranges with the accepted GENERAL letterbox renderer
-(`create_general_frame`), retaining the full frame without redetection.
-A centered zoom-1 crop would still discard edge participants, so it is
-never used. The v4 parser enforces the contract strictly (action wide
-<=> fit, fit => empty crop); plans predating the flag default to the
-conservative contract. The project bridge folds the flag to a
-scene-level `fit` (true when any segment fits) which satisfies the
-trajectory requirement alongside keyframes and fallback reasons.
+those ranges with the deterministic full-frame fit renderer
+(`create_general_fit_frame`), retaining the full frame without
+redetection. A centered zoom-1 crop would still discard edge
+participants, so it is never used. The v4 parser enforces the contract
+strictly (action wide <=> fit, fit => empty crop); plans predating the
+flag default to the conservative contract. The project bridge carries
+the flag as a scene-level `fit` bool plus lossless ordered
+clip-relative `fit_ranges`, which satisfy the trajectory requirement
+alongside keyframes and fallback reasons.
+
+## Review-03 corrections (authoritative fit rendering + timed fit ranges)
+
+**Explicit fit is authoritative during rendering.** The pass-2 action fit
+branch used to call `create_general_frame()`, which honors the user's
+optional object-weighted (`REFRAME_OBJECT_WEIGHTS`) and saliency
+(`REFRAME_SALIENT_GENERAL`) crop opt-ins: with those enabled, a
+persisted all-fit plan invoked the optional crop on every frame and
+removed edge participants, contradicting the exact-plan/no-redetection
+contract. The letterbox tail is now extracted as
+`create_general_fit_frame()` -- a deterministic full-frame fit renderer
+that bypasses optional object/saliency analysis entirely -- and the fit
+branch calls it. The legacy `create_general_frame()` keeps its opt-in
+behavior for callers WITHOUT such a plan (user options are not disabled
+globally); with the opt-ins off it is byte-identical to the fit
+renderer. Verified with both optional modes enabled on first render AND
+sidecar reuse: zero optional analysis calls, edge containment, 270x480
+geometry, 880 Hz audio.
+
+**Timed fit ranges survive ClipProject.** `normalize_timeline()` used to
+fold every segment `fit` value to one scene-wide `any()` flag, so two
+parser-valid plans with fit ranges [0,14] vs [0,19] normalized and
+digested identically. The bridge now carries a lossless ordered
+clip-relative `fit_ranges` composition (validated: booleans,
+coverage/order/bounds, keyframe-vs-fit consistency; rebased once with
+integer arithmetic) through the additive project model
+(`FramingSceneTimeline.fit_ranges`, `FramingFitRange`), the schema twin,
+normalization, the timeline digest, and the lineage geometry identity.
+Old projects validate unchanged. Differing fit boundaries stay distinct
+through real emission, save/load, version/undo, and unchanged-base
+reuse; edited or malformed timing cannot silently reuse stale pixels.

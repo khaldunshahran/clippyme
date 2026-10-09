@@ -245,37 +245,17 @@ def _salient_general_crop(frame, output_width, output_height):
         return None
 
 
-def create_general_frame(frame, output_width, output_height, force_object_weights=False):
+def create_general_fit_frame(frame, output_width, output_height):
+    """Deterministic full-frame fit renderer (Task 14 rev4).
+
+    Blurred-background letterbox of the whole frame: nothing is
+    cropped, no optional object/saliency analysis runs, no detector
+    is consulted. Used ONLY for explicit persisted fit decisions
+    (action wide segments): the render consumes the exact plan, so
+    this must be a pure function of the frame and output geometry.
+    Byte-identical to the letterbox tail of create_general_frame
+    when its opt-ins are disabled.
     """
-    Creates a 'General Shot' frame:
-    - Background: Blurred zoom of original
-    - Foreground: Original video scaled to fit width, centered vertically.
-
-    Opt-in crops for faceless scenes (tried most-specific first, each falling
-    through to the next on None):
-      1. REFRAME_OBJECT_WEIGHTS — centre on the weighted-object centroid so a
-         B-roll subject (product/dog/car) stays framed (_weighted_object_general_crop)
-      2. REFRAME_SALIENT_GENERAL=1 — centre on the Sobel-salient column band
-         (_salient_general_crop)
-    Both default-off, keeping the letterbox path below byte-identical.
-
-    ``force_object_weights=True`` (used by the ``object`` reframe mode) turns the
-    object-centroid crop on with the curated default weights regardless of the
-    env flag, so element-aware framing is the primary path and the blurred
-    letterbox below is only the no-element fallback.
-    """
-    obj = _weighted_object_general_crop(
-        frame, output_width, output_height,
-        weights=dict(_DEFAULT_OBJECT_WEIGHTS) if force_object_weights else None,
-    )
-    if obj is not None:
-        return obj
-
-    if os.getenv("REFRAME_SALIENT_GENERAL", "").strip().lower() in ("1", "true", "yes", "on"):
-        salient = _salient_general_crop(frame, output_width, output_height)
-        if salient is not None:
-            return salient
-
     orig_h, orig_w = frame.shape[:2]
 
     # 1. Background (Fill Height)
@@ -308,6 +288,40 @@ def create_general_frame(frame, output_width, output_height, force_object_weight
 
     return final_frame
 
+
+
+def create_general_frame(frame, output_width, output_height, force_object_weights=False):
+    """
+    Creates a 'General Shot' frame:
+    - Background: Blurred zoom of original
+    - Foreground: Original video scaled to fit width, centered vertically.
+
+    Opt-in crops for faceless scenes (tried most-specific first, each falling
+    through to the next on None):
+      1. REFRAME_OBJECT_WEIGHTS — centre on the weighted-object centroid so a
+         B-roll subject (product/dog/car) stays framed (_weighted_object_general_crop)
+      2. REFRAME_SALIENT_GENERAL=1 — centre on the Sobel-salient column band
+         (_salient_general_crop)
+    Both default-off, keeping the letterbox path below byte-identical.
+
+    ``force_object_weights=True`` (used by the ``object`` reframe mode) turns the
+    object-centroid crop on with the curated default weights regardless of the
+    env flag, so element-aware framing is the primary path and the blurred
+    letterbox below is only the no-element fallback.
+    """
+    obj = _weighted_object_general_crop(
+        frame, output_width, output_height,
+        weights=dict(_DEFAULT_OBJECT_WEIGHTS) if force_object_weights else None,
+    )
+    if obj is not None:
+        return obj
+
+    if os.getenv("REFRAME_SALIENT_GENERAL", "").strip().lower() in ("1", "true", "yes", "on"):
+        salient = _salient_general_crop(frame, output_width, output_height)
+        if salient is not None:
+            return salient
+
+    return create_general_fit_frame(frame, output_width, output_height)
 
 # FrameShift face-first reframe weights. Mirror the FrameShift GUI defaults
 # (face 1.0, person 0.8, every other COCO class = default 0.5), see
@@ -1402,10 +1416,13 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                                 == "action" and _a_scene.usable):
                             if segment_fit_at_frame(_a_scene, frame_number):
                                 # Explicit conservative fit persisted in
-                                # the plan: full-frame letterbox via the
-                                # accepted GENERAL renderer, no
-                                # redetection.
-                                output_frame = create_general_frame(
+                                # the plan: deterministic full-frame
+                                # fit. This bypasses the optional
+                                # object/saliency analysis in
+                                # create_general_frame so an explicit-fit
+                                # plan can never invoke cropping or
+                                # redetection here.
+                                output_frame = create_general_fit_frame(
                                     frame, output_width, output_height)
                                 _a_rendered = True
                             else:

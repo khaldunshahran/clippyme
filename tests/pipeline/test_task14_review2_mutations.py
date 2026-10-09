@@ -8,7 +8,50 @@ Gate 2 (conservative fit): replacing the fit decision with the pre-fix
 center-wide crop must lose the edge landmarks -- proving the fit (not
 just any wide crop) is what retains them.
 """
+import sys
+import types
+
 import pytest
+
+
+def _stub_heavy_modules():
+    """Import-time stubs for the missing ML wheels (host has no GPU/CV)."""
+    if "mediapipe" not in sys.modules:
+        mp = types.ModuleType("mediapipe")
+        solutions = types.ModuleType("mediapipe.solutions")
+        face = types.ModuleType("mediapipe.solutions.face_detection")
+        face.FaceDetection = object
+        solutions.face_detection = face
+        mp.solutions = solutions
+        sys.modules["mediapipe"] = mp
+        sys.modules["mediapipe.solutions"] = solutions
+        sys.modules["mediapipe.solutions.face_detection"] = face
+    if "ultralytics" not in sys.modules:
+        ultra = types.ModuleType("ultralytics")
+        ultra.YOLO = object
+        sys.modules["ultralytics"] = ultra
+    if "torch" not in sys.modules:
+        torch = types.ModuleType("torch")
+        cuda = types.ModuleType("torch.cuda")
+        cuda.is_available = lambda: False
+        torch.cuda = cuda
+        torch.device = lambda value: value
+        sys.modules["torch"] = torch
+        sys.modules["torch.cuda"] = cuda
+    if "psutil" not in sys.modules:
+        psutil = types.ModuleType("psutil")
+
+        class _VM:
+            total = 16 * 1024 ** 3
+            available = 8 * 1024 ** 3
+            percent = 50.0
+
+        psutil.virtual_memory = lambda: _VM()
+        psutil.cpu_count = lambda logical=True: 8
+        sys.modules["psutil"] = psutil
+
+
+_stub_heavy_modules()
 
 from clippyme.pipeline import action_framing as af
 
@@ -98,28 +141,52 @@ def test_temporal_gate_sustained_acquires():
 # GATE 2: conservative fit is load-bearing (vs the pre-fix center-wide crop).
 # ===========================================================================
 
-def test_mutation_center_wide_crop_loses_edge_landmarks():
-    """Replacing the conservative fit with the pre-fix center-wide crop
-    loses the edge landmarks. Uses the production
-    saliency_biased_wide_crop (the exact pre-fix wide composition) on a
-    640x480 source: the landmarks at x=20-80 and x=560-620 fall outside
-    the aspect-shaped window. This BAD outcome proves the fit decision
-    (full-frame letterbox, no crop) is what retains them."""
+def test_mutation_fit_renderer_removed_loses_edge_landmarks(monkeypatch):
+    """Fail-then-restore on the PRODUCTION fit renderer (review-03).
+
+    The old center-wide test evaluated the pre-fix crop math in isolation.
+    This one mutates the production render seam: routing explicit fit
+    through the pre-fix center-wide crop composition loses the edge
+    landmarks on a real frame; restoring create_general_fit_frame keeps
+    them. This proves the production-render regression catches removal
+    of fit rendering.
+    """
     pytest.importorskip("cv2", reason="CV runtime unavailable")
     import numpy as np
+    from clippyme.pipeline import reframe
     from clippyme.pipeline.reframe_ops import saliency_biased_wide_crop
+    import cv2
 
-    W, H = 640, 480
-    # Pre-fix behavior: saliency-biased wide crop of the 9:16 window.
-    x1, y1, x2, y2 = saliency_biased_wide_crop(
-        W / 2.0, float(W), float(H), 9 / 16, 0.05)
-    # The window is aspect-shaped and interior: it cannot span x=20..620.
-    assert (x2 - x1) < W, "wide crop must be narrower than the source"
-    keeps_left = x1 <= 20
-    keeps_right = x2 >= 620
-    assert not (keeps_left and keeps_right), \
-        f"center-wide crop [{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}] must lose " \
-        "at least one edge landmark (x=20-80 or x=560-620)"
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    image[180:300, 20:80] = (0, 255, 0)
+    image[180:300, 560:620] = (255, 0, 0)
+
+    def landmarks_present(frame, thresh=100):
+        g = int((frame[:, :, 1].astype(int) > 200).sum())
+        b = int((frame[:, :, 0].astype(int) > 200).sum())
+        return g > thresh and b > thresh
+
+    # Production: deterministic full-frame fit keeps both landmarks.
+    assert landmarks_present(reframe.create_general_fit_frame(
+        image, 270, 480))
+
+    # MUTATION: the fit renderer is removed; explicit fit falls back to
+    # the pre-fix center-wide crop composition. An edge landmark is lost.
+    def removed_fit(frame, w, h):
+        x1, y1, x2, y2 = saliency_biased_wide_crop(
+            frame.shape[1] / 2.0, float(frame.shape[1]),
+            float(frame.shape[0]), 9 / 16, 0.05)
+        return cv2.resize(frame[int(y1):int(y2), int(x1):int(x2)], (w, h))
+
+    monkeypatch.setattr(reframe, "create_general_fit_frame", removed_fit)
+    assert not landmarks_present(reframe.create_general_fit_frame(
+        image, 270, 480)), \
+        "removing the fit renderer must lose an edge landmark"
+
+    # RESTORE: the production renderer keeps the landmarks again.
+    monkeypatch.undo()
+    assert landmarks_present(reframe.create_general_fit_frame(
+        image, 270, 480))
 
 
 def test_fit_segment_carries_no_crop_no_keyframes():
