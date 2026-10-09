@@ -255,6 +255,12 @@ def create_general_fit_frame(frame, output_width, output_height):
     this must be a pure function of the frame and output geometry.
     Byte-identical to the letterbox tail of create_general_frame
     when its opt-ins are disabled.
+
+    The foreground contain-fits in BOTH dimensions: it is scaled by
+    min(output_w/src_w, output_h/src_h) so the whole source is
+    always visible at any requested output aspect, then centered on
+    the canvas. Where the legacy width-fit already fits (e.g. 9:16
+    outputs), the result is pixel-identical to it.
     """
     orig_h, orig_w = frame.shape[:2]
 
@@ -274,17 +280,20 @@ def create_general_fit_frame(frame, output_width, output_height):
     # Blur background
     background = cv2.GaussianBlur(background, (51, 51), 0)
     
-    # 2. Foreground (Fit Width)
-    scale = output_width / orig_w
-    fg_h = int(orig_h * scale)
-    foreground = cv2.resize(frame, (output_width, fg_h))
-    
-    # 3. Overlay
+    # 2. Foreground (contain-fit in BOTH dimensions: preserve source
+    # aspect, never exceed the canvas on either axis)
+    scale = min(output_width / orig_w, output_height / orig_h)
+    fg_w = max(1, int(orig_w * scale))
+    fg_h = max(1, int(orig_h * scale))
+    foreground = cv2.resize(frame, (fg_w, fg_h))
+
+    # 3. Overlay, centered on both axes
+    x_offset = (output_width - fg_w) // 2
     y_offset = (output_height - fg_h) // 2
-    
+
     # Clone background to avoid modifying it
     final_frame = background.copy()
-    final_frame[y_offset:y_offset+fg_h, :] = foreground
+    final_frame[y_offset:y_offset+fg_h, x_offset:x_offset+fg_w] = foreground
 
     return final_frame
 

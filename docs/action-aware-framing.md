@@ -221,3 +221,20 @@ normalization, the timeline digest, and the lineage geometry identity.
 Old projects validate unchanged. Differing fit boundaries stay distinct
 through real emission, save/load, version/undo, and unchanged-base
 reuse; edited or malformed timing cannot silently reuse stale pixels.
+
+## Review-04 corrections (both-dimension contain fit)
+
+**Fit contains the source at every output aspect.** `create_general_fit_frame()`
+previously copied the legacy width-only foreground scale
+(`scale = output_width / source_width`), which overflows the canvas
+vertically whenever the output is wider than the source (e.g. 640x480 ->
+854x480, 360x640 -> 480x480): the assignment raised `ValueError` and the
+real render fell back to black frames while reporting success. The
+foreground now contain-fits in BOTH dimensions --
+`scale = min(output_w / src_w, output_h / src_h)` -- preserving source
+aspect, never exceeding the canvas on either axis, and centered on the
+requested canvas over the blurred background. No cropping, no
+stretching, no black frames; output geometry is exact. Where the legacy
+width-fit already fits (e.g. 9:16 outputs), the result is pixel-identical
+to it. Zero optional analysis calls (the review-03 authority contract
+stands); all Task 01-13 integrity contracts preserved.
