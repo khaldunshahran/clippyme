@@ -562,7 +562,7 @@ def test_mutation_selected_option_emission_is_load_bearing(
     # MUTATION: emission falls back to the legacy hook text.
     monkeypatch.setattr(
         pem, "_grounded_hook_overlay",
-        lambda clip, duration: (
+        lambda clip, duration, current_packet=None: (
             [{"type": "hook", "text": (clip.get("viral_hook_text") or ""),
               "style": "viral", "start": 0.0, "end": 3.0,
               "position": "top"}],
@@ -589,8 +589,9 @@ def test_mutation_explicit_timing_emission_is_load_bearing(
     _plan(clip, clips_data, src, [_good_option()])  # display [2.0, 4.0)
     real = pem._grounded_hook_overlay
 
-    def _legacy_timing(clip, duration):
-        overlays, opening = real(clip, duration)
+    def _legacy_timing(clip, duration, current_packet=None):
+        overlays, opening = real(clip, duration,
+                                 current_packet=current_packet)
         for o in overlays:
             o["start"] = 0.0
             o["end"] = round(min(3.0, duration), 3)

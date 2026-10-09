@@ -14,38 +14,73 @@ Design rules (see docs/grounded-openings.md for the full contract):
   the final interval, and the packet builder rejects anything else.
 * Providers are INJECTED, never live: this module performs no network,
   no downloads, no decoding. One request per eligible clip, at most
-  three distinct opening text options per request.
+  three distinct opening text options per request. The lazy production
+  adapter (GeminiOpeningProvider) reuses the supported Gemini client
+  configuration (GEMINI_API_KEY + auxiliary model) via a replaceable
+  factory, builds its SDK client lazily on first request, makes exactly
+  one SDK call per request (no internal retries — retries are disabled
+  structurally in the adapter, not by a dict flag), and caps the call
+  by the budgeted per-attempt timeout.
 * Evidence quotes must match complete normalized token slices inside the
-  retained words. Paraphrases need not be verbatim, but no invented
-  names/quotes/events/numbers/guaranteed outcomes/rankings/measured-
-  performance claims are accepted.
+  retained words. Material claim support: an option may only add
+  low-information glue words to its evidence (English); invented people,
+  events, objects, numbers, endorsements, guaranteed outcomes, rankings,
+  or measured-performance claims are rejected. If semantic support is
+  not established the option is rejected (unknown/unverified), never
+  selected or promoted as grounded. Genuinely supported paraphrases
+  (reordering + glue) and non-English options are allowed; English is
+  never forced.
 * A speech-free option may use bounded visual/audio-event evidence inside
   the final interval, labeled explicitly, never described as speech or
-  verified OCR.
+  verified OCR. Sensory citations bind to a specific accepted event's
+  identity AND interval.
 * Strict validation per option and per clip: strict types (no boolean
   numerics/coercion), finite ordered timing, bounded text/evidence
   sizes, grounded citations, complete token matching, source bounds,
-  actual text language, non-empty reasons. Malformed options are
-  rejected with exact reasons; valid neighbors survive.
+  recognized language codes, language/preference consistency, non-empty
+  reasons. Malformed options are rejected with exact reasons; valid
+  neighbors survive.
 * Selection is deterministic from the validated options plus user
   preference, with a documented heuristic and a qualitative confidence
   label — never a virality probability.
 * Explicit user-authored hook overrides win and are marked user-authored;
-  no provider rewrites them.
+  no provider rewrites them. Override handling runs BEFORE packet
+  construction so a packet failure can never block the authorized
+  override.
 * Display timing is explicit, clip-relative, half-open, inside
   [0, clip duration). A malformed interval rejects the option; it is
   never silently defaulted to legacy timing.
 * A separate configurable opening invocation budget: one monotonic
   deadline and a bounded request count across all clips and fallback
   attempts. SDK-internal retries are disabled by contract, every attempt
-  is charged, per-attempt timeout is capped by remaining time, and the
-  runner stops before exhaustion. Initialized clients close exactly
-  once on all exits.
+  is charged, per-attempt timeout is capped by remaining time (sub-
+  millisecond remainders still produce positive timeouts), and the
+  runner stops before exhaustion. Ownership: a provider passed directly
+  by the caller is caller-owned and is NEVER closed by the stage (one
+  job's shared provider survives all its clips); a provider the stage
+  builds itself via a factory is closed exactly once. Jobs never
+  consume each other's budget: the job entry resets the run budget.
 * The versioned opening funnel (requested/validated/rejected/selected/
   no-selection counts plus per-clip reasons) must reconcile exactly.
-  Resume reuses a plan only when the full current identity and material
-  validation match; a changed final interval/words/source/config forces
-  re-analysis. Fully valid resumed plans need no client.
+* Packet identity binds the EXACT final bounds (no ms rounding — exact
+  float repr in the hash), canonical AV identity/timing, words,
+  language/preferences, and the relevant model/fallback/prompt/schema/
+  config. Resume reuses a plan only when the full current identity and
+  material validation match; a changed final interval/words/source/
+  evidence/config forces re-analysis. Transient no-provider/setup/
+  budget failures with empty options are never resumable as successful
+  plans. Fully valid resumed plans need no client.
+* Word speaker evidence follows the accepted Task 04 contract: the
+  word-level label wins, integer 0 is valid and preserved, a missing
+  word label stays unknown (no key), and segment summaries are never
+  copied into word labels.
+* AV evidence comes from the accepted Task 11 candidate evidence
+  (clips_data["candidate_store"][candidate_id]); clip.opening_av_evidence
+  is kept only as a legacy/test alias.
+* Emission fails closed: the selected option must be a member of the
+  validated options, the plan's packet id must match the packet id
+  recomputed from the current clip, and the selection's evidence must
+  re-validate. Stale automatic plans are cleared on failed re-analysis.
 """
 
 from __future__ import annotations
@@ -120,6 +155,30 @@ def normalize_tokens(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Word speaker evidence — the accepted Task 04 contract
+# ---------------------------------------------------------------------------
+
+def _canonical_word_speaker(value: Any) -> Optional[int]:
+    """Task 04 word-attribution contract for speaker evidence.
+
+    Implements the same contract as the authoritative Task 04
+    normalizer (``gemini_request._canonical_speaker``): the word-level
+    label wins, integer 0 is valid and preserved (falsy but valid),
+    a missing label stays unknown (None — never mapped to 0), and
+    bool/negative/non-integer/non-numeric labels are rejected.
+    Segment summaries are never consulted here.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    # Floats that are exact integers (e.g. 1.0 from JSON) are accepted.
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Preferences (sanitized, capped, delimiter-safe)
 # ---------------------------------------------------------------------------
 
@@ -179,6 +238,84 @@ def user_preference_from_env() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Language codes (recognized languages; English never forced)
+# ---------------------------------------------------------------------------
+
+# ISO 639-1 codes. An option's language must be a recognized code (or a
+# known language name below) — a non-empty arbitrary string is not a
+# language.
+_LANGUAGE_CODES = frozenset((
+    "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az",
+    "ba", "be", "bg", "bh", "bi", "bm", "bn", "bo", "br", "bs",
+    "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy",
+    "da", "de", "dv", "dz",
+    "ee", "el", "en", "eo", "es", "et", "eu",
+    "fa", "ff", "fi", "fj", "fo", "fr", "fy",
+    "ga", "gd", "gl", "gn", "gu", "gv",
+    "ha", "he", "hi", "ho", "hr", "ht", "hu", "hy", "hz",
+    "ia", "id", "ie", "ig", "ii", "ik", "io", "is", "it", "iu",
+    "ja", "jv",
+    "ka", "kg", "ki", "kj", "kk", "kl", "km", "kn", "ko", "kr", "ks",
+    "ku", "kv", "kw", "ky",
+    "la", "lb", "lg", "li", "ln", "lo", "lt", "lu", "lv",
+    "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my",
+    "na", "nb", "nd", "ne", "ng", "nl", "nn", "no", "nr", "nv", "ny",
+    "oc", "oj", "om", "or", "os",
+    "pa", "pi", "pl", "ps", "pt",
+    "qu",
+    "rm", "rn", "ro", "ru", "rw",
+    "sa", "sc", "sd", "se", "sg", "si", "sk", "sl", "sm", "sn", "so",
+    "sq", "sr", "ss", "st", "su", "sv", "sw",
+    "ta", "te", "tg", "th", "ti", "tk", "tl", "tn", "to", "tr", "ts",
+    "tt", "tw", "ty",
+    "ug", "uk", "ur", "uz",
+    "ve", "vi", "vo",
+    "wa", "wo",
+    "xh",
+    "yi", "yo",
+    "za", "zh", "zu",
+))
+
+# Common English language names mapped to their code.
+_LANGUAGE_NAMES = {
+    "english": "en", "spanish": "es", "finnish": "fi", "french": "fr",
+    "german": "de", "swedish": "sv", "italian": "it", "portuguese": "pt",
+    "dutch": "nl", "norwegian": "nb", "danish": "da", "polish": "pl",
+    "russian": "ru", "ukrainian": "uk", "japanese": "ja", "chinese": "zh",
+    "korean": "ko", "arabic": "ar", "hindi": "hi", "turkish": "tr",
+    "greek": "el", "czech": "cs", "hungarian": "hu", "romanian": "ro",
+    "thai": "th", "vietnamese": "vi", "indonesian": "id", "malay": "ms",
+    "swahili": "sw", "hebrew": "he", "bengali": "bn", "tamil": "ta",
+    "telugu": "te", "urdu": "ur", "persian": "fa", "farsi": "fa",
+}
+
+
+def _canonical_language(value: Any) -> Optional[str]:
+    """Recognized language -> ISO 639-1 code; None when not recognized."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if text in _LANGUAGE_CODES:
+        return text
+    return _LANGUAGE_NAMES.get(text)
+
+
+def _expected_option_language(packet: dict[str, Any]) -> Optional[str]:
+    """The language the option text must be written in, when known.
+
+    An explicit translation preference wins; otherwise the packet
+    (clip) language. None when neither is a recognized language.
+    """
+    prefs = packet.get("preferences") or {}
+    if isinstance(prefs, dict):
+        for key in ("translate_to", "target_language", "language"):
+            canon = _canonical_language(prefs.get(key))
+            if canon is not None:
+                return canon
+    return _canonical_language(packet.get("language"))
+
+
+# ---------------------------------------------------------------------------
 # Packet construction
 # ---------------------------------------------------------------------------
 
@@ -200,7 +337,9 @@ def _window_words(
     """Words overlapping [start, end): the retained evidence window.
 
     Same window rule as project_emit._clip_relative_words: absolute
-    source timestamps preserved, clip-relative timing derived once.
+    source timestamps preserved (EXACT — no ms rounding, so tiny
+    boundary changes stay distinguishable in the packet identity),
+    clip-relative timing derived once.
     Words outside the final interval are dropped here; the builder
     additionally rejects a packet whose caller-supplied words are not
     already windowed (defense in depth against lead-in/payoff leakage).
@@ -222,18 +361,22 @@ def _window_words(
         rs, re_ = round(rs, 3), round(re_, 3)
         if re_ <= rs:
             continue
-        speaker = w.get("speaker")
         entry: dict[str, Any] = {
             "w": text,
-            "abs_start": round(float(ws), 3),
-            "abs_end": round(float(we), 3),
+            "abs_start": float(ws),
+            "abs_end": float(we),
             "start": rs,
             "end": re_,
         }
-        # Preserve anonymous speaker0 / unknown speaker distinctions
-        # verbatim; never normalize or invent speaker names.
-        if isinstance(speaker, str) and speaker.strip():
-            entry["speaker"] = speaker.strip()[:64]
+        # Task 04 contract: word-level speaker wins; integer 0 is valid
+        # and preserved; a missing word label stays unknown (no key).
+        # Legacy verbatim string labels are preserved as-is for
+        # backward compatibility with already-windowed evidence.
+        speaker = _canonical_word_speaker(w.get("speaker"))
+        if speaker is not None:
+            entry["speaker"] = speaker
+        elif isinstance(w.get("speaker"), str) and w.get("speaker").strip():
+            entry["speaker"] = w.get("speaker").strip()[:64]
         out.append(entry)
     out.sort(key=lambda e: (e["abs_start"], e["abs_end"]))
     return out
@@ -242,7 +385,13 @@ def _window_words(
 def _validate_av_evidence(
     av_evidence: Any, start: float, end: float
 ) -> list[dict[str, Any]]:
-    """Bounded visual/audio-event evidence inside the final interval."""
+    """Bounded visual/audio-event evidence inside the final interval.
+
+    Absolute source timestamps are preserved EXACTLY (no ms rounding)
+    so shifted evidence changes the packet identity. Each item keeps
+    its event identity (event_id when supplied) so same-label
+    different-event evidence stays distinguishable.
+    """
     if av_evidence is None:
         return []
     if not isinstance(av_evidence, list):
@@ -251,7 +400,7 @@ def _validate_av_evidence(
         raise PacketBuildError(
             f"av_evidence exceeds {MAX_AV_EVIDENCE_ITEMS} items")
     out: list[dict[str, Any]] = []
-    for item in av_evidence:
+    for idx, item in enumerate(av_evidence):
         if not isinstance(item, dict):
             raise PacketBuildError("av_evidence item must be an object")
         kind = item.get("kind")
@@ -269,12 +418,18 @@ def _validate_av_evidence(
         if not (start - 1e-6 <= es <= ee <= end + 1e-6):
             raise PacketBuildError(
                 "av_evidence interval outside the final clip interval")
-        out.append({
+        entry: dict[str, Any] = {
             "kind": kind,
             "label": " ".join(label.split()),
-            "start": round(float(es), 3),
-            "end": round(float(ee), 3),
-        })
+            "start": float(es),
+            "end": float(ee),
+        }
+        event_id = item.get("event_id")
+        if isinstance(event_id, str) and event_id.strip():
+            entry["event_id"] = event_id.strip()[:128]
+        else:
+            entry["event_id"] = f"av-{idx}"
+        out.append(entry)
     return out
 
 
@@ -283,11 +438,32 @@ def _words_hash(windowed: list[dict[str, Any]]) -> str:
     for e in windowed:
         h.update(e["w"].encode("utf-8", errors="replace"))
         h.update(b"\x00")
-        h.update(f"{e['abs_start']:.3f}-{e['abs_end']:.3f}".encode("ascii"))
+        # Exact float repr: no ms rounding, so tiny boundary changes
+        # change the identity.
+        h.update(repr(e["abs_start"]).encode("ascii"))
+        h.update(b"\x00")
+        h.update(repr(e["abs_end"]).encode("ascii"))
         h.update(b"\x00")
         if "speaker" in e:
-            h.update(e["speaker"].encode("utf-8", errors="replace"))
+            h.update(str(e["speaker"]).encode("utf-8", errors="replace"))
             h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _av_identity_hash(evidence: list[dict[str, Any]]) -> str:
+    """Canonical AV identity: event identity + kind + label + exact timing."""
+    h = hashlib.sha256()
+    for ev in evidence:
+        h.update(str(ev.get("event_id", "")).encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+        h.update(str(ev.get("kind", "")).encode("ascii"))
+        h.update(b"\x00")
+        h.update(str(ev.get("label", "")).encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+        h.update(repr(ev.get("start")).encode("ascii"))
+        h.update(b"\x00")
+        h.update(repr(ev.get("end")).encode("ascii"))
+        h.update(b"\x00")
     return h.hexdigest()
 
 
@@ -302,12 +478,18 @@ def build_opening_packet(
     av_evidence: Optional[list[dict[str, Any]]] = None,
     language: Optional[str] = None,
     preferences: Optional[dict[str, Any]] = None,
+    provider_config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build the bounded opening packet from the FINAL cutter interval.
 
     ``words`` must already be windowed to [final_start, final_end) —
     the builder rejects any word outside the final interval so removed
     lead-in/payoff or neighboring-clip words can never leak in.
+
+    The packet identity binds the EXACT final bounds (no ms rounding),
+    the canonical AV identity/timing, the words, the language/
+    preferences, and the relevant provider model/fallback/prompt/
+    schema/config — so any material change forces re-analysis.
     """
     if not _is_finite_number(final_start) or not _is_finite_number(final_end):
         raise PacketBuildError("final interval must be finite numeric")
@@ -336,17 +518,22 @@ def build_opening_packet(
     prefs_hash = hashlib.sha256(
         json.dumps(prefs, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+    if provider_config is not None and not isinstance(provider_config, dict):
+        raise PacketBuildError("provider_config must be a dict or None")
 
     duration = round(float(final_end) - float(final_start), 3)
     identity = {
         "source_fingerprint": source_fingerprint,
         "candidate_id": candidate_id,
         "moment_id": moment_id,
-        "final_start": round(float(final_start), 3),
-        "final_end": round(float(final_end), 3),
+        # EXACT bounds: no ms rounding (20.0001 and 20.0002 differ).
+        "final_start": float(final_start),
+        "final_end": float(final_end),
         "words_sha256": _words_hash(windowed),
+        "av_sha256": _av_identity_hash(evidence),
         "language": language,
         "preferences_sha256": prefs_hash,
+        "provider_config": provider_config,
         "prompt_version": OPENING_PROMPT_VERSION,
         "schema_version": OPENING_PLAN_SCHEMA_VERSION,
         "config_version": OPENING_CONFIG_VERSION,
@@ -360,8 +547,17 @@ def build_opening_packet(
         "clip_duration": duration,
         "words": windowed,
         "av_evidence": evidence,
+        "language": language,
         "preferences": prefs,
     }
+
+
+def _translation_target(prefs: dict[str, Any]) -> Optional[str]:
+    for key in ("translate_to", "target_language", "language"):
+        canon = _canonical_language(prefs.get(key))
+        if canon is not None:
+            return canon
+    return None
 
 
 def build_opening_prompt(packet: dict[str, Any]) -> str:
@@ -371,35 +567,75 @@ def build_opening_prompt(packet: dict[str, Any]) -> str:
     sanitized at packet build time so they cannot break the fence.
     The prompt is never sent anywhere by this module — only handed to
     the injected provider.
+
+    Packet AV intervals are ABSOLUTE source seconds; the prompt labels
+    them as such and derives the clip-relative display clocks once.
+    The actual option language (packet language or an explicit
+    translation preference) is passed to the provider here.
     """
     words = packet.get("words") or []
     word_lines = []
     for e in words:
-        speaker = f"[{e['speaker']}] " if e.get("speaker") else ""
+        speaker = f"[{e['speaker']}] " if e.get("speaker") is not None else ""
         word_lines.append(
             f"{e['start']:.2f}-{e['end']:.2f} {speaker}{e['w']}")
+    identity = packet.get("identity") or {}
+    final_start = identity.get("final_start", 0.0)
+    try:
+        final_start_f = float(final_start)
+    except (TypeError, ValueError):
+        final_start_f = 0.0
     evidence_lines = []
     for ev in packet.get("av_evidence") or []:
+        rel_start = ev["start"] - final_start_f
+        rel_end = ev["end"] - final_start_f
         evidence_lines.append(
-            f"[{ev['kind']}] {ev['start']:.2f}-{ev['end']:.2f}: {ev['label']}")
+            f"[{ev['kind']}] abs {ev['start']:.2f}-{ev['end']:.2f} "
+            f"(clip {rel_start:.2f}-{rel_end:.2f}): {ev['label']}")
     prefs = packet.get("preferences") or {}
     pref_lines = [f"{k}: {v}" for k, v in sorted(prefs.items())]
+
+    target = _translation_target(prefs)
+    packet_lang = packet.get("language")
+    if target is not None:
+        lang_line = (
+            f"- Write each option in '{target}' (explicit user translation "
+            f"request). The language field must carry the ACTUAL language "
+            f"of the hook text.")
+    elif isinstance(packet_lang, str) and packet_lang.strip():
+        lang_line = (
+            f"- Write each option in '{packet_lang.strip()}' (the clip's "
+            f"language). The language field must carry the ACTUAL language "
+            f"of the hook text.")
+    else:
+        lang_line = (
+            "- Write each option in the clip's spoken language. The "
+            "language field must carry the ACTUAL language of the hook "
+            "text.")
 
     parts = [
         "Choose up to 3 distinct opening text options for the start of "
         "this final clip. Rules:",
         "- Ground every option in the retained evidence below. Speech "
         "quotes must match the transcript words exactly (complete token "
-        "slices). Paraphrases are allowed but must be supported by cited "
-        "evidence.",
+        "slices). A paraphrase may only add low-information glue words — "
+        "never invent people, events, objects, numbers, endorsements, "
+        "guaranteed outcomes, rankings, or measured-performance claims.",
         "- Never invent names, quotes, events, numbers, guaranteed "
         "outcomes, rankings, or measured-performance claims.",
         "- A speech-free option may use the visual/audio events, labeled "
         "as visual or audio evidence; never describe it as speech or "
         "verified OCR.",
-        "- Each option: stable id, text (<=140 chars), actual language, "
-        "short rationale, cited evidence, explicit clip-relative display "
-        "interval [start, end) inside the clip duration.",
+        "- Each option: stable id, text (<=140 chars), the ACTUAL language "
+        "of the hook text as a language code, short rationale, cited "
+        "evidence, explicit clip-relative display interval [start, end) "
+        "inside the clip duration.",
+        lang_line,
+        "- Respond with ONLY a JSON array of option objects: "
+        '[{"id": ..., "text": ..., "language": ..., "rationale": ..., '
+        '"evidence_basis": "speech|visual|audio", "evidence": '
+        '[{"basis": ..., "quote"|"label": ..., "start": ..., "end": ...}], '
+        '"display": {"start": ..., "end": ...}}]. No other text.',
         f"Clip duration: {packet.get('clip_duration'):.2f}s.",
     ]
     if word_lines:
@@ -408,7 +644,8 @@ def build_opening_prompt(packet: dict[str, Any]) -> str:
         parts.extend(word_lines)
     if evidence_lines:
         parts.append(_EVIDENCE_DELIMITER.strip())
-        parts.append("Accepted visual/audio events (clip-relative seconds):")
+        parts.append("Accepted visual/audio events (ABSOLUTE source "
+                     "seconds; clip-relative display in parentheses):")
         parts.extend(evidence_lines)
     if pref_lines:
         parts.append(_EVIDENCE_DELIMITER.strip())
@@ -418,9 +655,9 @@ def build_opening_prompt(packet: dict[str, Any]) -> str:
     if len(prompt) > MAX_PROMPT_CHARS:
         # Truncate the word list first (keep head: openings favor early
         # material), never the rules.
-        head = "\n".join(parts[:7])
+        head = "\n".join(parts[:8])
         budget = MAX_PROMPT_CHARS - len(head) - 64
-        tail = "\n".join(parts[7:])[: max(0, budget)]
+        tail = "\n".join(parts[8:])[: max(0, budget)]
         prompt = head + "\n[truncated]\n" + tail
     return prompt
 
@@ -430,12 +667,16 @@ def build_opening_prompt(packet: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 # A provider exposes request_options(request) -> list[dict] and,
-# optionally, close(). The request carries the prompt, the packet, the
-# per-attempt timeout, and the retries-disabled contract.
+# optionally, close() and describe(). The request carries the prompt,
+# the packet, the per-attempt timeout, and the retries-disabled
+# contract. Ownership: a provider passed directly to run_opening_stage
+# is caller-owned and is NEVER closed by the stage; a provider the
+# stage builds via a factory is closed exactly once by the stage.
 Provider = Any
 
 _OPENING_PROVIDER: Provider = None
 _OPENING_FALLBACK_PROVIDER: Provider = None
+_OPENING_PROVIDER_FACTORY: Optional[Callable[[], Provider]] = None
 
 
 def set_opening_provider(provider: Provider) -> None:
@@ -457,16 +698,231 @@ def get_opening_fallback_provider() -> Provider:
     return _OPENING_FALLBACK_PROVIDER
 
 
+def set_opening_provider_factory(factory: Optional[Callable[[], Provider]]) -> None:
+    """Inject the opening provider factory (tests / wiring). None clears it.
+
+    When no factory is injected, the wiring falls back to the lazy
+    production factory (Gemini). The factory is only invoked when the
+    flag is on and a clip actually needs a provider.
+    """
+    global _OPENING_PROVIDER_FACTORY
+    _OPENING_PROVIDER_FACTORY = factory
+
+
+def get_opening_provider_factory() -> Optional[Callable[[], Provider]]:
+    return _OPENING_PROVIDER_FACTORY
+
+
+# ---------------------------------------------------------------------------
+# Lazy production provider adapter (Gemini)
+# ---------------------------------------------------------------------------
+
+def _import_google_genai():
+    """Import the google-genai SDK lazily (never at module import)."""
+    try:
+        from google import genai as _genai
+        return _genai
+    except Exception as exc:
+        raise RuntimeError(
+            "google-genai SDK is not available; inject a provider/factory "
+            "for tests") from exc
+
+
+def _opening_model_name() -> str:
+    """Supported model configuration for opening choices.
+
+    Reuses the existing supported config path (auxiliary/lightweight
+    model selection); falls back to env/default when the config
+    stack is unavailable. Lazy — never at module import.
+    """
+    try:
+        from clippyme.pipeline.gemini_service import (
+            get_auxiliary_gemini_model,
+        )
+        return get_auxiliary_gemini_model()
+    except Exception:
+        return (
+            os.environ.get("GEMINI_LITE_MODEL")
+            or os.environ.get("GEMINI_MODEL")
+            or "gemini-3.5-flash-lite"
+        )
+
+
+def _opening_fallback_models() -> list[str]:
+    return [
+        m.strip()
+        for m in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",")
+        if m.strip()
+    ]
+
+
+def _parse_opening_response(response: Any) -> list[dict[str, Any]]:
+    """Parse the production JSON-array response into option dicts.
+
+    Raises on empty/non-JSON/non-array payloads (the stage isolates
+    these as provider failures). Option-level validation happens
+    downstream in validate_opening_option — never here.
+    """
+    text = getattr(response, "text", None)
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("opening provider returned an empty response")
+    cleaned = text.strip()
+    # Strip a single markdown fence if the model wrapped the JSON.
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"opening provider response is not JSON: {exc}") from exc
+    if not isinstance(data, list):
+        raise ValueError("opening provider response is not a JSON array")
+    options = [item for item in data if isinstance(item, dict)]
+    if len(options) != len(data):
+        raise ValueError(
+            "opening provider response array must contain only objects")
+    return options
+
+
+class GeminiOpeningProvider:
+    """Lazy production opening provider using the supported Gemini config.
+
+    The SDK client is built lazily on first request (never at
+    construction); the SDK module itself is injected for tests or
+    imported lazily in production. Each request_options call makes
+    EXACTLY ONE SDK call — no retry loop in the adapter (retries are
+    disabled structurally here, plus the established
+    ``retry_options: {attempts: 1}`` call config). The per-attempt
+    timeout comes from the request's budgeted ``timeout_s``. The
+    client is closed exactly once per attempt.
+    """
+
+    def __init__(
+        self,
+        *,
+        client_factory: Callable[[], Any],
+        model: Optional[str] = None,
+        fallback_models: Optional[list[str]] = None,
+    ):
+        if not callable(client_factory):
+            raise ValueError("client_factory must be callable")
+        self._client_factory = client_factory
+        self._model = model or _opening_model_name()
+        self._fallback_models = list(fallback_models or [])
+        self.attempts = 0
+
+    def describe(self) -> dict[str, Any]:
+        """Provider config for the packet identity."""
+        return {
+            "kind": "gemini-opening",
+            "model": self._model,
+            "fallback_models": list(self._fallback_models),
+            "prompt_version": OPENING_PROMPT_VERSION,
+        }
+
+    def request_options(self, request: dict[str, Any]) -> list[dict[str, Any]]:
+        timeout_s = request.get("timeout_s")
+        if not _is_finite_number(timeout_s) or timeout_s <= 0:
+            raise ValueError("request timeout_s must be positive finite")
+        prompt = request.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("request prompt must be non-empty text")
+        timeout_ms = max(1, int(round(float(timeout_s) * 1000)))
+        client = self._client_factory()
+        try:
+            # Single SDK attempt: no loop on transient failures. The
+            # budgeted provider->fallback switch is the stage's job.
+            response = client.models.generate_content(
+                model=self._model,
+                contents=prompt,
+                config={
+                    "http_options": {
+                        "timeout": timeout_ms,
+                        "retry_options": {"attempts": 1},
+                    },
+                },
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        self.attempts += 1
+        return _parse_opening_response(response)
+
+    def close(self) -> None:
+        """No cached client: per-attempt clients close in request_options."""
+        return None
+
+
+class GeminiOpeningProviderFactory:
+    """Default lazy production provider factory (replaceable).
+
+    Called per clip by the stage; builds one GeminiOpeningProvider.
+    describe() exposes the model/fallback config for the packet
+    identity without building any client. The SDK client is built
+    lazily inside the provider on first request — never here, and
+    only when the flag is on (the wiring checks the flag first).
+    """
+
+    def __init__(self, *, sdk: Any = None):
+        self._sdk = sdk
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "kind": "gemini-opening",
+            "model": _opening_model_name(),
+            "fallback_models": _opening_fallback_models(),
+            "prompt_version": OPENING_PROMPT_VERSION,
+        }
+
+    def __call__(self) -> GeminiOpeningProvider:
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        config = self.describe()
+        sdk = self._sdk
+
+        def _build_client():
+            if sdk is not None:
+                # Injected SDK (tests): no live credentials needed.
+                return sdk.Client(api_key=api_key or "injected-test-key")
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY is not configured")
+            return _import_google_genai().Client(api_key=api_key)
+
+        return GeminiOpeningProvider(
+            client_factory=_build_client,
+            model=config["model"],
+            fallback_models=config["fallback_models"],
+        )
+
+
+_DEFAULT_GEMINI_FACTORY = GeminiOpeningProviderFactory()
+
+
+def default_opening_provider_factory() -> GeminiOpeningProviderFactory:
+    """The default lazy production factory (Gemini). Replaceable via
+    set_opening_provider_factory in tests/wiring."""
+    return _DEFAULT_GEMINI_FACTORY
+
+
+# Backwards-compatible alias used by the wiring.
+def default_gemini_opening_provider_factory() -> GeminiOpeningProviderFactory:
+    return default_opening_provider_factory()
+
+
 # ---------------------------------------------------------------------------
 # Option validation
 # ---------------------------------------------------------------------------
 
 _EVIDENCE_BASES = ("speech", "visual", "audio")
 
-# Mechanical hard-claim guards. Semantic invention (names/events) is a
-# provider-side obligation; the evidence-citation requirement plus the
-# quote-mark and number grounding checks below make the mechanical part
-# load-bearing.
+# Mechanical hard-claim guards. The material claim-support contract
+# below additionally rejects invented people/events/objects for
+# English options; semantic invention in other languages falls back to
+# the evidence-overlap rule (unknown/unverified, never promoted).
 _HARD_CLAIM_PATTERNS = [
     (re.compile(r"\bguarantee[sd]?\b", re.I), "guaranteed outcome claim"),
     (re.compile(r"#\s*1\b"), "ranking claim"),
@@ -487,6 +943,33 @@ _SPEECH_VERBS = frozenset({
     "speaks", "speaking", "spoke", "spoken", "announced", "announces",
     "claim", "claims", "claimed", "stated", "states", "according",
 })
+
+# Low-information glue words an English paraphrase may add to its
+# evidence. Anything else novel in the option text is a material claim
+# the evidence does not support (invented person/event/object) and is
+# rejected. Deterministic and reviewable; not a semantic model.
+_GLUE_TOKENS = frozenset((
+    "a", "an", "the", "this", "that", "these", "those",
+    "i", "me", "my", "mine", "you", "your", "yours",
+    "he", "him", "his", "she", "her", "hers", "it", "its",
+    "we", "us", "our", "ours", "they", "them", "their", "theirs",
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "has", "have", "had", "do", "does", "did",
+    "will", "would", "shall", "should", "can", "could",
+    "may", "might", "must",
+    "and", "or", "but", "nor", "yet", "so", "for",
+    "of", "in", "on", "at", "to", "from", "with", "by",
+    "about", "as", "into", "over", "under", "after", "before",
+    "between", "through", "during", "without", "within",
+    "against", "among",
+    "not", "no", "yes",
+    "very", "really", "just", "quite", "rather", "too", "also",
+    "even", "still", "already",
+    "here", "there", "now", "then", "today", "tonight",
+    "always", "never", "sometimes", "often",
+    "oh", "wow", "hey", "hmm", "well", "okay", "ok",
+    "watch", "see", "look", "listen", "hear",
+))
 
 
 def _reject(option_id: Any, code: str, reason: str) -> dict[str, Any]:
@@ -574,6 +1057,9 @@ def _validate_sensory_evidence(
     items: list[dict[str, Any]], basis: str,
     av_evidence: list[dict[str, Any]],
 ) -> Optional[str]:
+    """Bind each sensory citation to a specific accepted event's identity
+    AND interval. A citation without an interval, or with an interval
+    that does not match its event, is rejected (fail closed)."""
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
             return f"evidence[{idx}] must be an object"
@@ -586,17 +1072,30 @@ def _validate_sensory_evidence(
         if err:
             return err
         es, ee = item.get("start"), item.get("end")
-        if es is not None or ee is not None:
-            if not _is_finite_number(es) or not _is_finite_number(ee):
-                return f"evidence[{idx}] interval must be finite numeric"
-            if ee <= es:
-                return f"evidence[{idx}] interval end must be after start"
-        # The label must correspond to an accepted packet event.
-        if not any(_normalize_label(ev.get("label", "")) ==
-                   _normalize_label(label)
-                   for ev in av_evidence or [] if ev.get("kind") == basis):
+        # The citation interval is required and must be finite/ordered.
+        if not _is_finite_number(es) or not _is_finite_number(ee):
+            return (f"evidence[{idx}] must cite an explicit finite "
+                    f"interval inside the final clip")
+        if ee <= es:
+            return f"evidence[{idx}] interval end must be after start"
+        # The label must correspond to a specific accepted packet event.
+        match = None
+        for ev in av_evidence or []:
+            if ev.get("kind") != basis:
+                continue
+            if _normalize_label(ev.get("label", "")) == _normalize_label(label):
+                match = ev
+                break
+        if match is None:
             return (f"evidence[{idx}].label does not match accepted "
                     f"{basis} evidence inside the final interval")
+        # The cited interval must be the event's interval — a fabricated
+        # interval for a real label is rejected.
+        if abs(float(es) - float(match["start"])) > 1e-6 or abs(
+                float(ee) - float(match["end"])) > 1e-6:
+            return (f"evidence[{idx}] interval [{es}, {ee}] does not match "
+                    f"the accepted {basis} event's interval "
+                    f"[{match['start']}, {match['end']}]")
     return None
 
 
@@ -623,19 +1122,58 @@ def _check_hard_claims(text: str, quote_tokens_union: set[str]) -> Optional[str]
     return None
 
 
-def _check_text_support(text: str, quote_tokens_union: set[str],
-                        basis: str) -> Optional[str]:
-    """Paraphrase support: content tokens must substantially overlap evidence."""
-    if basis != "speech":
-        tokens = set(normalize_tokens(text))
-        if tokens & _SPEECH_VERBS:
-            return ("speech-free option describes speech "
-                    "without speech evidence")
-        return None
-    content = [t for t in normalize_tokens(text) if len(t) >= 4]
+def _content_tokens(text: str) -> list[str]:
+    """Content-bearing tokens (length >= 4 after normalization)."""
+    return [t for t in normalize_tokens(text) if len(t) >= 4]
+
+
+def _check_speech_text_support(
+    text: str, quote_tokens_union: set[str], language: Optional[str]
+) -> Optional[str]:
+    """Material claim-support contract for speech options.
+
+    English: every content token must come from the cited evidence or
+    be a low-information glue word, and at least one content token
+    must be evidence-grounded. Novel people/events/objects (e.g.
+    'Alice', 'championship') are rejected as invented. Genuinely
+    supported paraphrases (reordering + glue) pass; English is not
+    forced on other languages.
+    Other languages: token-overlap rule only (novel-vocabulary
+    invention cannot be judged deterministically); unsupported text
+    is rejected as unknown/unverified, never promoted.
+    """
+    content = _content_tokens(text)
     if not content:
         return None
+    if _canonical_language(language) == "en":
+        novel = [t for t in content
+                 if t not in quote_tokens_union and t not in _GLUE_TOKENS]
+        if novel:
+            return ("option introduces material claims not supported by "
+                    f"cited evidence: {', '.join(novel[:4])}")
+        if not any(t in quote_tokens_union for t in content):
+            return ("option text has no evidence-grounded content token "
+                    "(unknown/unverified)")
+        return None
     overlap = sum(1 for t in content if t in quote_tokens_union)
+    if overlap * 2 < len(content):
+        return ("option text is not supported by cited evidence "
+                f"({overlap}/{len(content)} content tokens overlap)")
+    return None
+
+
+def _check_sensory_text_support(
+    text: str, label_tokens_union: set[str]
+) -> Optional[str]:
+    """Text support for speech-free options against cited event labels."""
+    tokens = set(normalize_tokens(text))
+    if tokens & _SPEECH_VERBS:
+        return ("speech-free option describes speech "
+                "without speech evidence")
+    content = _content_tokens(text)
+    if not content:
+        return None
+    overlap = sum(1 for t in content if t in label_tokens_union)
     if overlap * 2 < len(content):
         return ("option text is not supported by cited evidence "
                 f"({overlap}/{len(content)} content tokens overlap)")
@@ -669,6 +1207,20 @@ def validate_opening_option(
                                  max_chars=MAX_LANGUAGE_CHARS)
     if err:
         return None, _reject(option_id, "bad_language", err)
+    # A non-empty arbitrary string is not a language: the option must
+    # name a recognized language (code or known name).
+    canon_lang = _canonical_language(language)
+    if canon_lang is None:
+        return None, _reject(option_id, "bad_language",
+                             f"language {language!r} is not a recognized language")
+    # The option text must be written in the packet language (or an
+    # explicit translation preference) — actual language, verified.
+    expected = _expected_option_language(packet)
+    if expected is not None and canon_lang != expected:
+        return None, _reject(
+            option_id, "language_mismatch",
+            f"option language {canon_lang!r} does not match the required "
+            f"{expected!r} (packet language / explicit translation preference)")
     rationale, err = _strict_text(option.get("rationale"), field="rationale",
                                   max_chars=MAX_RATIONALE_CHARS)
     if err:
@@ -692,6 +1244,7 @@ def validate_opening_option(
     words = packet.get("words") or []
     stream = _word_token_stream(words)
     quote_union: set[str] = set()
+    label_union: set[str] = set()
     if basis == "speech":
         if not stream:
             return None, _reject(option_id, "quote_not_grounded",
@@ -706,11 +1259,16 @@ def validate_opening_option(
             evidence, basis, packet.get("av_evidence") or [])
         if err:
             return None, _reject(option_id, "evidence_not_accepted", err)
+        for item in evidence:
+            label_union.update(normalize_tokens(item["label"]))
 
     err = _check_hard_claims(text, quote_union)
     if err:
         return None, _reject(option_id, "hard_claim", err)
-    err = _check_text_support(text, quote_union, basis)
+    if basis == "speech":
+        err = _check_speech_text_support(text, quote_union, language)
+    else:
+        err = _check_sensory_text_support(text, label_union)
     if err:
         return None, _reject(option_id, "text_unsupported", err)
 
@@ -734,9 +1292,8 @@ def validate_opening_option(
             entry["quote"] = item["quote"].strip()
         else:
             entry["label"] = " ".join(item["label"].split())
-            if item.get("start") is not None:
-                entry["start"] = round(float(item["start"]), 3)
-                entry["end"] = round(float(item["end"]), 3)
+            entry["start"] = float(item["start"])
+            entry["end"] = float(item["end"])
         normalized_evidence.append(entry)
 
     return ({
@@ -826,7 +1383,8 @@ class OpeningBudget:
     One monotonic deadline and one bounded request count across all
     clips and fallback attempts. Every attempt is charged before it
     starts; per-attempt timeout is capped by the remaining time; the
-    runner stops before exhaustion.
+    runner stops before exhaustion. Sub-millisecond remainders still
+    produce positive timeouts (never rounded to zero).
     """
 
     def __init__(self, *, deadline_s: float, max_requests: int,
@@ -855,7 +1413,8 @@ class OpeningBudget:
 
         Fails when the request count is exhausted or the deadline has
         passed (stops before exhaustion). The per-attempt timeout is
-        capped by the remaining time.
+        capped by the remaining time; a positive remainder always
+        yields a positive timeout (never rounded down to zero).
         """
         if self.requests_used >= self.max_requests:
             return False, 0.0
@@ -863,7 +1422,10 @@ class OpeningBudget:
         if remaining <= 0:
             return False, 0.0
         self.requests_used += 1
-        return True, round(min(self.request_timeout_s, remaining), 3)
+        timeout = min(self.request_timeout_s, remaining)
+        rounded = round(timeout, 3)
+        # A positive remainder must never become a zero timeout.
+        return True, rounded if rounded > 0 else timeout
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -905,7 +1467,12 @@ _RUN_BUDGET: Optional[OpeningBudget] = None
 
 
 def get_run_budget() -> OpeningBudget:
-    """Process-wide run budget: one monotonic deadline across all clips."""
+    """Process-wide run budget: one monotonic deadline across all clips.
+
+    The budget is (re)created lazily; every job entry MUST call
+    reset_run_budget() first so a new job never inherits an exhausted
+    budget from a previous job in this process.
+    """
     global _RUN_BUDGET
     if _RUN_BUDGET is None:
         _RUN_BUDGET = opening_budget_from_env()
@@ -913,7 +1480,11 @@ def get_run_budget() -> OpeningBudget:
 
 
 def reset_run_budget() -> None:
-    """Clear the process-wide budget (tests)."""
+    """Clear the process-wide budget so the next job starts fresh.
+
+    Called at every real job entry (direct CLI and queued
+    orchestrator); tests use it to simulate job boundaries.
+    """
     global _RUN_BUDGET
     _RUN_BUDGET = None
 
@@ -938,27 +1509,37 @@ def run_opening_stage(
     *,
     packet: dict[str, Any],
     provider: Provider = None,
+    provider_factory: Optional[Callable[[], Provider]] = None,
     fallback_provider: Provider = None,
+    fallback_factory: Optional[Callable[[], Provider]] = None,
     budget: Optional[OpeningBudget] = None,
     user_preference: Optional[dict] = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Run one opening-choice stage for a single clip.
 
-    Returns a run record: packet_id, requested count, validated
-    options, rejections with exact reasons, selected option (or None),
-    no-selection reason, per-attempt failures, and provider call counts.
-    Provider/setup/prompt failures are isolated to this clip (recorded,
-    never raised). Initialized providers are closed exactly once on all
-    exits.
+    Ownership contract: a provider passed directly is caller-owned —
+    the stage NEVER closes it, so one job's shared provider survives
+    all its clips. A provider the stage builds itself via a factory is
+    closed exactly once on all exits; a failed factory build is
+    isolated as a setup failure. Provider/setup/prompt failures are
+    isolated to this clip (recorded, never raised).
+
+    Returns a run record: packet_id, requested count, provider/
+    fallback call counts, per-attempt records (every attempt charged),
+    validated options, rejections with exact reasons, selected option
+    (or None), no-selection reason, and per-attempt failures.
     """
     budget = budget or get_run_budget()
     closed: set[int] = set()
+    own_primary: Provider = None
+    own_fallback: Provider = None
     result: dict[str, Any] = {
         "packet_id": packet.get("packet_id"),
         "requested": 0,
         "provider_calls": 0,
         "fallback_calls": 0,
+        "attempts": [],
         "validated": [],
         "rejected": [],
         "failures": [],
@@ -967,12 +1548,42 @@ def run_opening_stage(
         "no_selection_reason": None,
         "notes": [],
     }
+
+    def _resolve(name: str, direct: Provider,
+                 factory: Optional[Callable[[], Provider]]) -> Optional[Provider]:
+        """Resolve the effective provider for one slot.
+
+        A directly-passed provider is caller-owned (never closed here).
+        A factory-built provider is recorded in own_primary/own_fallback
+        and closed exactly once by the stage. A failed factory build is
+        isolated as a setup failure.
+        """
+        nonlocal own_primary, own_fallback
+        if direct is not None:
+            return direct
+        if factory is None:
+            return None
+        try:
+            built = factory()
+        except Exception as exc:
+            result["failures"].append(
+                {"stage": f"{name}_setup",
+                 "error": f"provider factory failed: {str(exc)[:160]}"})
+            return None
+        if name == "primary":
+            own_primary = built
+        else:
+            own_fallback = built
+        return built
+
     try:
+        primary = _resolve("primary", provider, provider_factory)
+        fallback = _resolve("fallback", fallback_provider, fallback_factory)
         candidates: list[tuple[str, Provider]] = []
-        if provider is not None:
-            candidates.append(("primary", provider))
-        if fallback_provider is not None:
-            candidates.append(("fallback", fallback_provider))
+        if primary is not None:
+            candidates.append(("primary", primary))
+        if fallback is not None:
+            candidates.append(("fallback", fallback))
         if not candidates:
             result["no_selection_reason"] = "no_provider_configured"
             return result
@@ -993,6 +1604,9 @@ def run_opening_stage(
                 budget_exhausted = True
                 result["failures"].append(
                     {"stage": name, "error": "budget_exhausted"})
+                result["attempts"].append(
+                    {"stage": name, "timeout_s": 0.0, "ok": False,
+                     "error": "budget_exhausted"})
                 break
             request = {
                 "prompt": prompt,
@@ -1003,17 +1617,26 @@ def run_opening_stage(
             }
             try:
                 # No SDK-internal retries by contract: a single call per
-                # attempt, every attempt charged above.
+                # attempt, every attempt charged above. The adapter
+                # itself performs no retry loop.
                 options = prov.request_options(request)
+                call_ok = True
+                call_error = None
             except Exception as exc:
+                call_ok = False
+                call_error = str(exc)[:200]
+                options = None
+            if name == "primary":
+                result["provider_calls"] += 1
+            else:
+                result["fallback_calls"] += 1
+            result["attempts"].append(
+                {"stage": name, "timeout_s": timeout_s, "ok": call_ok,
+                 **({"error": call_error} if call_error else {})})
+            if not call_ok:
                 result["failures"].append(
-                    {"stage": name, "error": str(exc)[:200]})
+                    {"stage": name, "error": call_error})
                 continue
-            finally:
-                if name == "primary":
-                    result["provider_calls"] += 1
-                else:
-                    result["fallback_calls"] += 1
             result["requested"] += 1
             if not isinstance(options, list):
                 result["failures"].append(
@@ -1056,10 +1679,12 @@ def run_opening_stage(
                 result["no_selection_reason"] = "no_options_returned"
         return result
     finally:
-        if provider is not None:
-            _close_provider(provider, closed)
-        if fallback_provider is not None:
-            _close_provider(fallback_provider, closed)
+        # Close ONLY stage-built providers, exactly once. Caller-owned
+        # providers are never closed here.
+        if own_primary is not None:
+            _close_provider(own_primary, closed)
+        if own_fallback is not None:
+            _close_provider(own_fallback, closed)
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1799,18 @@ def funnel_reconciles(funnel: dict[str, Any]) -> tuple[bool, str]:
 # Resume (full identity + material validation)
 # ---------------------------------------------------------------------------
 
+# No-selection reasons that are transient: a saved plan with empty
+# validated options and one of these reasons must be re-analyzed, never
+# resumed as a successful plan.
+_TRANSIENT_NO_SELECTION_REASONS = frozenset({
+    "no_provider_configured",
+    "provider_failed",
+    "budget_exhausted",
+    "prompt_build_failed",
+    "packet_build_failed",
+})
+
+
 def _validate_saved_options(
     saved: list[dict[str, Any]], packet: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1194,8 +1831,11 @@ def opening_plan_resumable(
 ) -> tuple[bool, str]:
     """True only when the full current identity matches AND the saved
     validated options still pass material validation against the
-    current packet. A changed final interval/words/source/config
-    forces re-analysis. Fully valid resumed plans need no client.
+    current packet. A changed final interval/words/source/evidence/
+    config forces re-analysis. A transient no-provider/setup/budget
+    failure with empty options is never resumable as a successful
+    plan. The saved selection must be a member of the saved validated
+    options. Fully valid resumed plans need no client.
     """
     if not isinstance(saved_plan, dict):
         return False, "no saved plan"
@@ -1209,6 +1849,23 @@ def opening_plan_resumable(
     if saved_plan.get("schema_version") != OPENING_PLAN_SCHEMA_VERSION:
         return False, "schema version changed"
     saved_validated = saved_plan.get("validated_options") or []
+    # Transient failures with empty options are never resumable as a
+    # successful plan: the next attempt must re-analyze.
+    saved_selected = saved_plan.get("selected")
+    if (not saved_validated and not saved_plan.get("user_authored")
+            and not (isinstance(saved_selected, dict)
+                    and saved_selected.get("id"))):
+        reason = saved_plan.get("no_selection_reason")
+        if reason in _TRANSIENT_NO_SELECTION_REASONS:
+            return False, (
+                f"transient no-selection not resumable: {reason}")
+    # The saved selection must be a member of the saved validated
+    # options — a forged/obsolete selection never resumes.
+    if isinstance(saved_selected, dict) and saved_selected.get("id"):
+        valid_ids = {v.get("id") for v in saved_validated
+                     if isinstance(v, dict)}
+        if saved_selected["id"] not in valid_ids:
+            return False, "saved selection not a member of validated options"
     valid, rejected = _validate_saved_options(saved_validated, packet)
     if rejected:
         return False, (
@@ -1225,12 +1882,19 @@ def opening_plan_resumable(
 def _window_transcript_words(
     transcript: dict[str, Any], start: float, end: float
 ) -> list[dict[str, Any]]:
-    """Window transcript words to [start, end), absolute times preserved."""
+    """Window transcript words to [start, end), absolute times preserved.
+
+    Task 04 contract: the word-level speaker label wins (integer 0 is
+    valid and preserved); a word without a label stays unknown (no
+    'speaker' key); segment summaries are NEVER copied into word
+    labels — they stay separate.
+    """
     out: list[dict[str, Any]] = []
     segments = transcript.get("segments", []) if isinstance(transcript, dict) else []
     for seg in segments:
-        seg_speaker = seg.get("speaker") if isinstance(seg, dict) else None
-        for w in (seg.get("words") or [] if isinstance(seg, dict) else []):
+        if not isinstance(seg, dict):
+            continue
+        for w in seg.get("words") or []:
             if not isinstance(w, dict):
                 continue
             ws, we = w.get("start"), w.get("end")
@@ -1241,14 +1905,126 @@ def _window_transcript_words(
             text = (w.get("word") or "").strip()
             if not text:
                 continue
-            speaker = w.get("speaker", seg_speaker)
             entry: dict[str, Any] = {
                 "word": text, "start": float(ws), "end": float(we)}
-            if isinstance(speaker, str) and speaker.strip():
-                entry["speaker"] = speaker.strip()[:64]
+            speaker = _canonical_word_speaker(w.get("speaker"))
+            if speaker is not None:
+                entry["speaker"] = speaker
+            # Unknown words stay unknown: no 'speaker' key, and the
+            # segment summary is never inherited.
             out.append(entry)
     out.sort(key=lambda e: (e["start"], e["end"]))
     return out
+
+
+def _opening_av_evidence_for_clip(
+    clip: dict[str, Any], clips_data: dict[str, Any],
+    start: float, end: float,
+) -> list[dict[str, Any]]:
+    """Production AV evidence for one clip: the accepted Task 11
+    candidate evidence.
+
+    Reads ``clips_data["candidate_store"][clip["candidate_id"]]`` (the
+    accepted Task 11 candidate record) and converts its visual/audio
+    evidence to packet items {kind, label, start, end} in absolute
+    source time, intersected with the final clip interval. Falls back
+    to the legacy ``clip["opening_av_evidence"]`` test alias only when
+    the Task 11 path yields nothing. Returns [] when neither has
+    usable evidence.
+    """
+    items: list[dict[str, Any]] = []
+    store = (clips_data or {}).get("candidate_store")
+    cid = clip.get("candidate_id")
+    rec = (store.get(cid) if isinstance(store, dict)
+           and isinstance(cid, str) else None)
+    if isinstance(rec, dict):
+        basis = str(rec.get("evidence_basis") or "").strip().lower()
+        rs, re_ = rec.get("start_s"), rec.get("end_s")
+        if _is_finite_number(rs) and _is_finite_number(re_) and re_ > rs:
+            cs, ce = max(float(rs), start), min(float(re_), end)
+            if ce > cs:
+                if basis in ("visual", "multimodal"):
+                    label = rec.get("visual_description")
+                    if isinstance(label, str) and label.strip():
+                        items.append({
+                            "kind": "visual", "label": label.strip(),
+                            "start": cs, "end": ce, "event_id": cid,
+                        })
+                if basis in ("audio_event", "multimodal"):
+                    label = rec.get("evidence_text")
+                    if isinstance(label, str) and label.strip():
+                        items.append({
+                            "kind": "audio", "label": label.strip(),
+                            "start": cs, "end": ce, "event_id": cid,
+                        })
+    if not items:
+        legacy = clip.get("opening_av_evidence")
+        if isinstance(legacy, list):
+            items = legacy
+    return items
+
+
+def _provider_describe(provider: Provider) -> Optional[dict[str, Any]]:
+    describe = getattr(provider, "describe", None)
+    if not callable(describe):
+        return None
+    try:
+        config = describe()
+    except Exception:
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def _packet_provider_config(
+    provider: Provider,
+    provider_factory: Optional[Callable[[], Provider]],
+) -> Optional[dict[str, Any]]:
+    """Provider model/fallback config for the packet identity."""
+    config = _provider_describe(provider)
+    if config is None and provider_factory is not None:
+        config = _provider_describe(provider_factory)
+    return config
+
+
+def current_opening_packet_or_none(
+    clip: dict[str, Any], clips_data: dict[str, Any],
+    start: float, end: float,
+) -> Optional[dict[str, Any]]:
+    """Recompute the current opening packet for emission checks.
+
+    Uses the CURRENT clip bounds/words/AV evidence/language/
+    preferences/config plus the source fingerprint stored at plan
+    time. Returns None (never raises) when the packet cannot be
+    rebuilt — the emission boundary then fails closed on the checks
+    it can still perform (selection membership).
+    """
+    try:
+        plan = clip.get("opening_plan") or {}
+        fingerprint = clip.get("opening_source_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return None
+        if not _is_finite_number(start) or not _is_finite_number(end):
+            return None
+        if not (end > start >= 0):
+            return None
+        transcript = clips_data.get("transcript") or {}
+        words = _window_transcript_words(transcript, float(start), float(end))
+        avidence = _opening_av_evidence_for_clip(
+            clip, clips_data, float(start), float(end))
+        return build_opening_packet(
+            source_fingerprint=fingerprint,
+            final_start=float(start),
+            final_end=float(end),
+            words=words,
+            candidate_id=clip.get("candidate_id"),
+            moment_id=clip.get("moment_id"),
+            av_evidence=avidence or None,
+            language=clip.get("language") or clips_data.get("language"),
+            preferences=user_preference_from_env(),
+            provider_config=plan.get("provider_config"),
+        )
+    except Exception:
+        return None
 
 
 def user_authored_override(clip: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1278,7 +2054,9 @@ def plan_clip_opening(
     index: int,
     budget: Optional[OpeningBudget] = None,
     provider: Provider = None,
+    provider_factory: Optional[Callable[[], Provider]] = None,
     fallback_provider: Provider = None,
+    fallback_factory: Optional[Callable[[], Provider]] = None,
     user_preference: Optional[dict] = None,
     route: str = "direct",
 ) -> dict[str, Any]:
@@ -1289,50 +2067,28 @@ def plan_clip_opening(
     plan on ``clip['opening_plan']`` and the funnel in
     ``clips_data['opening_funnel']``. Never raises for provider-side
     problems; packet-build problems raise (caller treats them as
-    clip-local warnings).
+    clip-local warnings) AFTER clearing a stale automatic plan so no
+    obsolete hook can reach emission.
+
+    The explicit user-authored override is handled FIRST — before
+    fingerprinting and packet construction — so a packet failure can
+    never block the authorized override.
     """
-    start = clip.get("start")
-    end = clip.get("end")
-    if not _is_finite_number(start) or not _is_finite_number(end):
-        raise PacketBuildError("clip start/end must be finite numeric")
-    if not (end > start >= 0):
-        raise PacketBuildError(f"invalid clip interval [{start}, {end})")
-
-    from clippyme.pipeline.framing_plan import (
-        source_fingerprint as _source_fingerprint,
-    )
-    try:
-        fingerprint = _source_fingerprint(input_video)
-    except Exception as exc:
-        raise PacketBuildError(f"cannot fingerprint source: {exc}")
-
-    transcript = clips_data.get("transcript") or {}
-    words = _window_transcript_words(transcript, float(start), float(end))
-    packet = build_opening_packet(
-        source_fingerprint=fingerprint,
-        final_start=float(start),
-        final_end=float(end),
-        words=words,
-        candidate_id=clip.get("candidate_id"),
-        moment_id=clip.get("moment_id"),
-        av_evidence=clip.get("opening_av_evidence"),
-        language=clip.get("language") or clips_data.get("language"),
-        preferences=user_preference or {},
-    )
-
     clip_key = f"clip-{index}"
     funnel = clips_data.get("opening_funnel")
     if not isinstance(funnel, dict):
         funnel = new_opening_funnel()
         clips_data["opening_funnel"] = funnel
 
-    # Explicit user-authored override: wins, marked, no provider call.
+    # Explicit user-authored override: wins, marked, no provider call,
+    # no packet needed — handled FIRST, before bounds validation,
+    # fingerprinting, and packet construction, so no packet failure can
+    # ever block the authorized override, and without depending on
+    # provider readiness.
     override = user_authored_override(clip)
     if override is not None:
         plan = {
             "schema_version": OPENING_PLAN_SCHEMA_VERSION,
-            "packet_id": packet.get("packet_id"),
-            "packet_identity": packet.get("identity"),
             "user_authored": True,
             "text": override["text"],
             "route": route,
@@ -1340,7 +2096,7 @@ def plan_clip_opening(
         clip["opening_plan"] = plan
         record_opening_result(
             funnel, clip_key,
-            {"packet_id": packet.get("packet_id"), "requested": 0,
+            {"packet_id": None, "requested": 0,
              "validated": [], "rejected": [], "selected": None,
              "selection": None,
              "no_selection_reason": "user_authored_override",
@@ -1348,6 +2104,65 @@ def plan_clip_opening(
             user_authored=True,
         )
         return plan
+
+    try:
+        start = clip.get("start")
+        end = clip.get("end")
+        if not _is_finite_number(start) or not _is_finite_number(end):
+            raise PacketBuildError("clip start/end must be finite numeric")
+        if not (end > start >= 0):
+            raise PacketBuildError(
+                f"invalid clip interval [{start}, {end})")
+
+        from clippyme.pipeline.framing_plan import (
+            source_fingerprint as _source_fingerprint,
+        )
+        try:
+            fingerprint = _source_fingerprint(input_video)
+        except Exception as exc:
+            raise PacketBuildError(f"cannot fingerprint source: {exc}")
+
+        # Additive: the emission boundary recomputes the current packet
+        # from this stored fingerprint plus the clip's current content.
+        clip["opening_source_fingerprint"] = fingerprint
+
+        provider_config = _packet_provider_config(provider, provider_factory)
+
+        transcript = clips_data.get("transcript") or {}
+        words = _window_transcript_words(transcript, float(start), float(end))
+        packet = build_opening_packet(
+            source_fingerprint=fingerprint,
+            final_start=float(start),
+            final_end=float(end),
+            words=words,
+            candidate_id=clip.get("candidate_id"),
+            moment_id=clip.get("moment_id"),
+            av_evidence=_opening_av_evidence_for_clip(
+                clip, clips_data, float(start), float(end)) or None,
+            language=clip.get("language") or clips_data.get("language"),
+            preferences=user_preference or {},
+            provider_config=provider_config,
+        )
+    except PacketBuildError as exc:
+        # Failed re-analysis invalidates a stale automatic plan: clear
+        # it so no obsolete hook can reach emission. User-authored
+        # overrides were handled above and are never cleared here.
+        prior = clip.get("opening_plan")
+        cleared = (isinstance(prior, dict) and not prior.get("user_authored")
+                   and "opening_plan" in clip)
+        if cleared:
+            del clip["opening_plan"]
+        record_opening_result(
+            funnel, clip_key,
+            {"packet_id": None, "requested": 0,
+             "validated": [], "rejected": [], "selected": None,
+             "selection": None,
+             "no_selection_reason": "packet_build_failed",
+             "failures": [{"stage": "packet", "error": str(exc)[:200]}],
+             "notes": (["stale automatic plan cleared"]
+                       if cleared else [])},
+        )
+        raise
 
     # Resume: reuse only on full identity + material validation match.
     # Fully valid resumed plans need no client.
@@ -1363,6 +2178,7 @@ def plan_clip_opening(
             "schema_version": OPENING_PLAN_SCHEMA_VERSION,
             "packet_id": packet.get("packet_id"),
             "packet_identity": packet.get("identity"),
+            "provider_config": provider_config,
             "resumed": True,
             "resume_reason": resume_reason,
             "validated_options": valid,
@@ -1386,7 +2202,9 @@ def plan_clip_opening(
     run = run_opening_stage(
         packet=packet,
         provider=provider,
+        provider_factory=provider_factory,
         fallback_provider=fallback_provider,
+        fallback_factory=fallback_factory,
         budget=budget or get_run_budget(),
         user_preference=user_preference,
     )
@@ -1394,6 +2212,7 @@ def plan_clip_opening(
         "schema_version": OPENING_PLAN_SCHEMA_VERSION,
         "packet_id": packet.get("packet_id"),
         "packet_identity": packet.get("identity"),
+        "provider_config": provider_config,
         "resumed": False,
         "resume_reason": resume_reason,
         "validated_options": run["validated"],

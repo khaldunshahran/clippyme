@@ -282,7 +282,8 @@ def test_visual_option_describing_speech_rejected():
         "id": "op-v2", "text": "he said it best", "language": "en",
         "rationale": "claims speech from a visual",
         "evidence_basis": "visual",
-        "evidence": [{"label": "crowd cheers", "basis": "visual"}],
+        "evidence": [{"label": "crowd cheers", "basis": "visual",
+                      "start": 11.0, "end": 13.0}],
         "display": {"start": 0.5, "end": 2.0},
     }, packet=pkt)
     assert rej["code"] == "text_unsupported"
@@ -600,7 +601,11 @@ def test_runner_fallback_charged_and_counted():
     assert budget.requests_used == 2  # every attempt charged
     assert len(run["failures"]) == 1
     assert run["selected"]["id"] == "f"
-    assert primary.closed == 1 and fallback.closed == 1
+    # Review-01 ownership: directly-passed providers are caller-owned —
+    # the stage never closes them (one job's shared provider survives
+    # all its clips). Factory-built providers are closed exactly once
+    # by the stage (see test_task15_review1.py).
+    assert primary.closed == 0 and fallback.closed == 0
 
 
 def test_runner_budget_exhaustion_stops():
@@ -622,7 +627,7 @@ def test_runner_provider_failure_isolated():
     run = op.run_opening_stage(packet=pkt, provider=prov, budget=budget)
     assert run["selected"] is None
     assert run["no_selection_reason"] == "provider_failed"
-    assert prov.closed == 1  # closed exactly once even on failure
+    assert prov.closed == 0  # caller-owned: never closed by the stage
 
 
 def test_runner_request_carries_contract():
@@ -651,7 +656,7 @@ def test_runner_non_list_response_isolated():
                               request_timeout_s=5)
     run = op.run_opening_stage(packet=pkt, provider=prov, budget=budget)
     assert run["no_selection_reason"] == "provider_failed"
-    assert prov.closed == 1
+    assert prov.closed == 0  # caller-owned: never closed by the stage
 
 
 # ---------------------------------------------------------------------------

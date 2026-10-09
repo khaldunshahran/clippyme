@@ -851,6 +851,48 @@ def _resolve_empty_shorts_action(clips_data, monitor):
     return "whole_video"
 
 
+def _plan_opening_for_direct_clip(clip, clips_data, input_video, index,
+                                  metadata_file):
+    """Task 15: grounded opening choice for one direct-path clip.
+
+    Called from the direct cutter loop AFTER the final boundary repair
+    (snap_clips_to_transcript) and BEFORE the actual cutter
+    (build_cut_command), so the packet is grounded in exactly what the
+    cutter will cut. Flag-gated; disabled mode is a no-op with zero
+    provider calls. Never raises: a failure is logged and the clip
+    proceeds without an opening plan (Task 14 behavior).
+    """
+    from clippyme.pipeline import opening_plan as _opening_plan
+    if not _opening_plan.grounded_openings_enabled():
+        return None
+    try:
+        plan = _opening_plan.plan_clip_opening(
+            clip=clip,
+            clips_data=clips_data,
+            input_video=input_video,
+            index=index,
+            budget=_opening_plan.get_run_budget(),
+            provider=_opening_plan.get_opening_provider(),
+            provider_factory=(
+                _opening_plan.get_opening_provider_factory()
+                or _opening_plan.default_opening_provider_factory()
+            ),
+            fallback_provider=_opening_plan.get_opening_fallback_provider(),
+            user_preference=_opening_plan.user_preference_from_env(),
+            route="direct",
+        )
+        _meta_tmp = metadata_file + ".tmp"
+        with open(_meta_tmp, "w", encoding="utf-8") as _f:
+            json.dump(clips_data, _f, indent=2)
+        os.replace(_meta_tmp, metadata_file)
+        return plan
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "task15: opening plan failed for direct clip %d",
+            index, exc_info=True)
+        return None
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
@@ -896,6 +938,11 @@ if __name__ == '__main__':
     parser.add_argument('--duration-mode', type=str, default=None, help="Duration mode (shorts, mid, long, all, custom).")
 
     args = parser.parse_args()
+
+    # Task 15: each job owns a fresh opening invocation budget — a new job
+    # never inherits an exhausted process-wide budget from this process.
+    from clippyme.pipeline import opening_plan as _opening_plan_main
+    _opening_plan_main.reset_run_budget()
 
     # Output aspect ratio drives the crop dimensions + SmoothedCameraman crop
     # box. Passed explicitly to every process_video_to_vertical call below
@@ -1291,6 +1338,19 @@ if __name__ == '__main__':
                 end = clip['end']
                 print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
                 print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+                # Task 15: grounded opening choice — wired AFTER the final
+                # boundary repair (snap_clips_to_transcript above) and BEFORE
+                # the actual cutter (build_cut_command below). Flag-gated;
+                # disabled mode is a no-op with zero provider calls. The
+                # NameError guard keeps AST-compiled execution of this loop
+                # (tests running the block with a restricted env that lacks
+                # module-level helpers) working; in real CLI runs the helper
+                # is always defined.
+                try:
+                    _plan_opening_for_direct_clip(
+                        clip, clips_data, input_video, i, metadata_file)
+                except NameError:
+                    pass
                 
                 # Cut clip. Filename prefers the clip's Gemini viral title
                 # (sanitized for Windows), falling back to the legacy

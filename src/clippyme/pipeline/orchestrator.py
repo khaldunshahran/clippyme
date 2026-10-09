@@ -933,6 +933,10 @@ def _maybe_plan_opening(clip, clips_data, input_video, index, metadata_file,
             index=index,
             budget=_opening_plan.get_run_budget(),
             provider=_opening_plan.get_opening_provider(),
+            provider_factory=(
+                _opening_plan.get_opening_provider_factory()
+                or _opening_plan.default_opening_provider_factory()
+            ),
             fallback_provider=_opening_plan.get_opening_fallback_provider(),
             user_preference=_opening_plan.user_preference_from_env(),
             route=route,
@@ -962,7 +966,8 @@ def _render_one_clip(
 ) -> bool:
     start, end = _clip_bounds(clip)
     expected_duration = end - start
-    _maybe_plan_opening(clip, clips_data, input_video, index, metadata_file)
+    _maybe_plan_opening(clip, clips_data, input_video, index, metadata_file,
+                        route="queued")
     title = clip.get("video_title_for_youtube_short") or clip.get("title")
     existing_name = _safe_clip_filename(clip.get("clip_filename"))
     clip_filename = existing_name or f"{clip_output_basename(title, index, video_title)}.mp4"
@@ -1431,6 +1436,10 @@ def _cleanup_completed(
 
 def run(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Task 15: each job owns a fresh opening invocation budget. Reset at
+    # the real job boundary so a later job never inherits an exhausted
+    # deadline/request count from an earlier job in this process.
+    _opening_plan.reset_run_budget()
     output_dir = os.path.abspath(resolve_output_dir(args.output, default="."))
     os.makedirs(output_dir, exist_ok=True)
     state = RuntimeState(output_dir, job_id=os.getenv("CLIPPYME_JOB_ID"))

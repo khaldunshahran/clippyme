@@ -115,9 +115,18 @@ def _center_crop_916(src_w: int, src_h: int) -> dict[str, float]:
 
 
 def _grounded_hook_overlay(
-    clip: dict[str, Any], duration: float
+    clip: dict[str, Any], duration: float,
+    current_packet: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Task 15: hook overlay + opening identity from the grounded plan.
+
+    Fail-closed emission boundary: an automatic hook overlay is emitted
+    ONLY when (a) the selected option is a member of the plan's
+    validated options, (b) the plan's packet id matches the packet id
+    recomputed from the CURRENT clip (when a current packet is
+    supplied), and (c) the selection's evidence re-validates against
+    the current packet. A forged, unvalidated, or obsolete selection
+    never becomes a grounded overlay.
 
     Returns (overlays, opening_field). The opening field is additive
     project metadata carrying the selected option identity, evidence,
@@ -133,7 +142,20 @@ def _grounded_hook_overlay(
     def _legacy_note() -> dict[str, Any] | None:
         return legacy_text or None
 
-    # Explicit user-authored override wins; marked user-authored.
+    def _none(reason: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        # No grounded choice: no automatic hook overlay. The old
+        # automatic hook stays only as unverified legacy metadata.
+        return overlays, {
+            "status": "none",
+            "schema_version": _opening_plan.OPENING_PLAN_SCHEMA_VERSION,
+            "no_selection_reason": reason,
+            "packet_id": plan.get("packet_id"),
+            "legacy_unverified_hook": _legacy_note(),
+        }
+
+    # Explicit user-authored override wins; marked user-authored. This
+    # preserves explicit authorship without depending on provider
+    # readiness or packet identity.
     if plan.get("user_authored") and plan.get("text"):
         text = plan["text"]
         overlays.append({
@@ -151,44 +173,61 @@ def _grounded_hook_overlay(
             "legacy_unverified_hook": _legacy_note(),
         }
 
+    # (a) The selected option must be a member of the validated options.
     selected = plan.get("selected")
-    if isinstance(selected, dict) and selected.get("text"):
-        disp = selected.get("display") or {}
-        try:
-            s, e = _ht.validate_hook_interval(disp.get("start"), disp.get("end"))
-            eff = _ht.effective_hook_interval(s, e, duration)
-        except _ht.HookTimingError:
-            eff = None
-        if eff is not None:
-            overlays.append({
-                "type": "hook",
-                "text": selected["text"],
-                "style": "viral",
-                "start": round(eff[0], 3),
-                "end": round(eff[1], 3),
-                "position": "top",
-            })
-            return overlays, {
-                "status": "selected",
-                "option_id": selected.get("id"),
-                "text": selected["text"],
-                "language": selected.get("language"),
-                "display_start": round(eff[0], 3),
-                "display_end": round(eff[1], 3),
-                "evidence": selected.get("evidence") or [],
-                "evidence_basis": selected.get("evidence_basis"),
-                "packet_id": plan.get("packet_id"),
-                "schema_version": _opening_plan.OPENING_PLAN_SCHEMA_VERSION,
-                "selection": plan.get("selection"),
-                "legacy_unverified_hook": _legacy_note(),
-            }
-    # No grounded choice: no automatic hook overlay. The old automatic
-    # hook stays only as unverified legacy metadata.
+    validated = plan.get("validated_options") or []
+    valid_ids = {v.get("id") for v in validated if isinstance(v, dict)}
+    if not (isinstance(selected, dict) and selected.get("id")
+            and selected.get("text")):
+        # No automatic choice at all: preserve the plan's honest reason.
+        return _none(plan.get("no_selection_reason") or "no_opening_plan")
+    if selected["id"] not in valid_ids:
+        # A selected dict that was never validated (forged/obsolete).
+        return _none("selection_not_validated")
+
+    # (b) The plan's packet id must match the packet id recomputed from
+    # the current clip (catches stale/forged plans and current-bound
+    # mutations).
+    if current_packet is not None:
+        if plan.get("packet_id") != current_packet.get("packet_id"):
+            return _none("packet_identity_changed")
+        # (c) The selection's evidence must re-validate against the
+        # current packet.
+        reselected, rejection = _opening_plan.validate_opening_option(
+            selected, packet=current_packet)
+        if rejection is not None:
+            return _none(
+                "selection_evidence_invalid:" + rejection.get("code", "?"))
+        selected = reselected
+
+    disp = selected.get("display") or {}
+    try:
+        s, e = _ht.validate_hook_interval(disp.get("start"), disp.get("end"))
+        eff = _ht.effective_hook_interval(s, e, duration)
+    except _ht.HookTimingError:
+        eff = None
+    if eff is None:
+        return _none("display_interval_invalid")
+    overlays.append({
+        "type": "hook",
+        "text": selected["text"],
+        "style": "viral",
+        "start": round(eff[0], 3),
+        "end": round(eff[1], 3),
+        "position": "top",
+    })
     return overlays, {
-        "status": "none",
-        "schema_version": _opening_plan.OPENING_PLAN_SCHEMA_VERSION,
-        "no_selection_reason": plan.get("no_selection_reason") or "no_opening_plan",
+        "status": "selected",
+        "option_id": selected.get("id"),
+        "text": selected["text"],
+        "language": selected.get("language"),
+        "display_start": round(eff[0], 3),
+        "display_end": round(eff[1], 3),
+        "evidence": selected.get("evidence") or [],
+        "evidence_basis": selected.get("evidence_basis"),
         "packet_id": plan.get("packet_id"),
+        "schema_version": _opening_plan.OPENING_PLAN_SCHEMA_VERSION,
+        "selection": plan.get("selection"),
         "legacy_unverified_hook": _legacy_note(),
     }
 
@@ -233,7 +272,13 @@ def _build_project(
     _openings_on = _opening_plan.grounded_openings_enabled()
     opening_field: dict[str, Any] | None = None
     if _openings_on:
-        overlays, opening_field = _grounded_hook_overlay(clip, duration)
+        # Recompute the packet from the CURRENT clip: the emission
+        # boundary requires the plan's packet id to match it and the
+        # selection's evidence to re-validate.
+        _current_packet = _opening_plan.current_opening_packet_or_none(
+            clip, clips_data, start, end)
+        overlays, opening_field = _grounded_hook_overlay(
+            clip, duration, current_packet=_current_packet)
     else:
         hook_text = (clip.get("hook") or clip.get("viral_hook_text") or "").strip()
         if hook_text:
