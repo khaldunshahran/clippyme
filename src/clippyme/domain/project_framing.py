@@ -462,6 +462,7 @@ def normalize_timeline(
                 "keyframes": [],
                 "fallback_reason": None,
                 "fallback_detail": None,
+                "fit": False,
             })
             continue
 
@@ -472,9 +473,19 @@ def normalize_timeline(
         raw_segments = s.get("segments")
         if not isinstance(raw_segments, list):
             raise FramingError(f"{REASON_MALFORMED}: {ctx} segments bad")
+        seg_fit = False
         for g in raw_segments:
             if not isinstance(g, dict):
                 raise FramingError(f"{REASON_MALFORMED}: {ctx} segment bad")
+            # Task 14 rev3: explicit conservative full-frame fit persisted
+            # on action wide segments. Folded to one scene-level flag:
+            # True when ANY segment fits (those ranges render as
+            # full-frame letterbox, not crops).
+            _gf = g.get("fit", False)
+            if not isinstance(_gf, bool):
+                raise FramingError(
+                    f"{REASON_MALFORMED}: {ctx} segment fit bad")
+            seg_fit = seg_fit or _gf
             for sid in g.get("subject_ids") or []:
                 if not isinstance(sid, str) or not track_id_re.match(sid):
                     raise FramingError(
@@ -531,6 +542,7 @@ def normalize_timeline(
             "keyframes": keyframes,
             "fallback_reason": fallback_reason,
             "fallback_detail": fallback_detail,
+            "fit": seg_fit if kind == "action" else False,
         })
     return out
 

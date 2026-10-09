@@ -174,6 +174,10 @@ def _run_steal_scenario():
             fast_travel_frac=1.0,
             fast_motion_widen=1.0,
             uncertain_motion_range=1.0,
+            # Temporal gate compatible with the 30-frame scenario
+            # (test is about visibility weighting, not acquisition).
+            acquisition_min_span_s=0.2,
+            acquisition_max_gap_s=0.2,
         ),
         fps=fps,
         frame_w=width,

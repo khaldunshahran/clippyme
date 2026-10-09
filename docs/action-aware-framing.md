@@ -162,3 +162,30 @@ Injected detections and synthetic landmarks do not validate real
 sports/gameplay/action accuracy, editorial taste, hook/caption quality,
 editable trajectory UI, or OpusClip parity. Those claims require the
 frozen real-footage benchmark.
+
+## Review-02 corrections (temporal gate + conservative fit)
+
+**Temporal acquisition gate:** a tight crop is authorized only with
+honest multi-frame temporal support -- at least `acquisition_min_frames`
+(3) observations in the trailing `evidence_duration_s` window, spanning
+at least `acquisition_min_span_s` (0.5 s), with no consecutive-observation
+gap above `acquisition_max_gap_s` (0.4 s). This gates initial
+acquisition, reacquisition, groups AND switches: an isolated detection
+(or two adjacent frames) can never open a tight segment, and
+short-occlusion hold applies only AFTER a supported acquisition. The gap
+bound covers the sampling cadence plus brief detector misses; longer
+dropouts keep the scene conservative. When a wide segment's justification
+changes (e.g. from "no supported evidence" to the motion gate), the
+reason is recorded honestly instead of being merged away.
+
+**Conservative fit:** uncertain wide segments (no action, ambiguous
+action, unsafe union, failed locks) are persisted with `fit=True` and an
+empty crop -- NO keyframes, NO saliency-biased wide crop. Pass 2 renders
+those ranges with the accepted GENERAL letterbox renderer
+(`create_general_frame`), retaining the full frame without redetection.
+A centered zoom-1 crop would still discard edge participants, so it is
+never used. The v4 parser enforces the contract strictly (action wide
+<=> fit, fit => empty crop); plans predating the flag default to the
+conservative contract. The project bridge folds the flag to a
+scene-level `fit` (true when any segment fits) which satisfies the
+trajectory requirement alongside keyframes and fallback reasons.

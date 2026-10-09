@@ -418,11 +418,16 @@ def test_gate5a_no_dwell_limit_decisions_bounce():
     """min_dwell_s=0 (frozen dataclass -> replaced config): decisions must
     bounce -- strictly more switches than the dwell-limited run."""
     log = _alternating_log()
-    base = dict(evidence_duration_s=0.1, cooldown_s=0.0)
+    # Temporal acquisition gate tuned to the 0.1s evidence window.
+    base = dict(evidence_duration_s=0.1, cooldown_s=0.0,
+                acquisition_min_span_s=0.05, acquisition_max_gap_s=0.05)
     cfg = af.ActionFramingConfig(min_dwell_s=1.0, **base)
     segs, _ = af.segment_actions(
         log, scene_id=0, scene_start=0, scene_end=179, config=cfg, fps=FPS,
         frame_w=FW, frame_h=FH)
+    # Strip the leading acquisition-wide (temporal gate needs a few
+    # frames); the dwell test is about the acquired singles.
+    segs = segs[1:] if segs and segs[0].kind == "wide" else segs
     assert segs and all(s.kind == "single" for s in segs)
     n_limited = _decision_switches(segs)
 
@@ -430,6 +435,7 @@ def test_gate5a_no_dwell_limit_decisions_bounce():
     segs2, _ = af.segment_actions(
         log, scene_id=0, scene_start=0, scene_end=179, config=cfg_no_dwell,
         fps=FPS, frame_w=FW, frame_h=FH)
+    segs2 = segs2[1:] if segs2 and segs2[0].kind == "wide" else segs2
     assert segs2 and all(s.kind == "single" for s in segs2)
     n_free = _decision_switches(segs2)
 
@@ -461,6 +467,8 @@ def _max_per_frame_travel(log, cfg, n_frames):
     for k in keys:
         by_frame[k.frame] = (k.x1, k.y1, k.x2, k.y2)
     for s in built:
+        if s.fit:
+            continue
         for f in range(s.start_frame, s.end_frame + 1):
             by_frame.setdefault(f, tuple(s.crop))
     mx = 0.0
@@ -569,12 +577,15 @@ def test_gate7_dropped_action_keyframes_loses_trajectory(
         for sc in scenes:
             if sc.get("scene_kind") == "action":
                 sc["keyframes"] = []
+                # Also drop the conservative fit: without keyframes AND
+                # without fit, the scene has no trajectory at all.
+                sc["fit"] = False
         return scenes
 
     monkeypatch.setattr(pf, "normalize_timeline", _drop_action_keyframes)
     # The ProjectFraming model requires an applicable scene to carry
-    # keyframes or a fallback reason: with the trajectory dropped, the
-    # bridge refuses to emit a framing field at all -- the planned
+    # keyframes, a fallback reason, or fit: with the trajectory dropped,
+    # the bridge refuses to emit a framing field at all -- the planned
     # action trajectory never reaches the project/render.
     framing2 = pf.build_project_framing(**kwargs)
     assert framing2 is None, \

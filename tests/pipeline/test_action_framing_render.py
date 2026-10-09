@@ -248,12 +248,16 @@ class TestActionRenderEndToEnd:
         assert singles, "scene 0 should lock a single subject"
         seg = singles[0]
         x1, y1, x2, y2 = seg.crop
-        # The landmark drifts x=200..350 (90px wide), y=180..300: the lock
-        # crop must contain its whole travel with padding.
-        assert x1 <= 200 and y1 < 180 and x2 >= 350 and y2 >= 300
+        # The landmark drifts x=200+60*i/59 (90px wide), y=180..300: the
+        # lock crop must contain its travel WITHIN the segment (which
+        # starts after temporal acquisition) with padding.
+        x_start = 200 + 60 * seg.start_frame / 59
+        x_end = 200 + 60 * seg.end_frame / 59 + 90
+        assert x1 <= x_start and y1 < 180 and x2 >= x_end and y2 >= 300
         # Look-ahead: the crop centre leads the +x motion (ahead of the
-        # median subject centre at x~275).
-        assert (x1 + x2) / 2 > 275
+        # segment-median subject centre).
+        x_med = 200 + 60 * (seg.start_frame + seg.end_frame) / 2 / 59 + 45
+        assert (x1 + x2) / 2 > x_med
         # Scene 1 (fast crossing) widens: the conservative wide frame
         # dominates with an explicit reason. A brief leading single is
         # the honest measurement artifact (speed not yet measurable on

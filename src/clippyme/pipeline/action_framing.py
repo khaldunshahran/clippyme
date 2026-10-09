@@ -64,7 +64,6 @@ from clippyme.pipeline.framing_plan import (
     CropKeyframe,
     FramingSegment,
 )
-from clippyme.pipeline.reframe_ops import saliency_biased_wide_crop
 
 
 # Normalized category families. The detection seam maps provider class names
@@ -207,6 +206,14 @@ class ActionFramingConfig:
                                        # fraction of frame width (a wide crop
                                        # is NEVER tightened by saliency)
     sample_every: int = 2              # pass-1 analyzes every Nth frame
+    # Task 14 rev3: honest multi-frame temporal support for tight
+    # acquisition. A track may authorize a tight crop only when the
+    # trailing evidence window holds at least acquisition_min_frames
+    # observations spanning acquisition_min_span_s seconds, with no
+    # consecutive-observation gap above acquisition_max_gap_s.
+    acquisition_min_frames: int = 3
+    acquisition_min_span_s: float = 0.5
+    acquisition_max_gap_s: float = 0.4
 
     def to_dict(self) -> dict:
         return {
@@ -234,6 +241,9 @@ class ActionFramingConfig:
             "boundary_pressure_frac": self.boundary_pressure_frac,
             "saliency_bias_frac": self.saliency_bias_frac,
             "sample_every": self.sample_every,
+            "acquisition_min_frames": self.acquisition_min_frames,
+            "acquisition_min_span_s": self.acquisition_min_span_s,
+            "acquisition_max_gap_s": self.acquisition_max_gap_s,
         }
 
     def config_digest(self) -> str:
@@ -626,6 +636,40 @@ def segment_actions(log: ActionObservationLog, *, scene_id: int,
         vals = evidence_vals(tid, t)
         return sum(vals) / len(vals) if vals else 0.0
 
+    def support_observations(tid: str, t: float) -> list[ActionObservation]:
+        wins = [o for o in track_obs[tid]
+                if t - config.evidence_duration_s - 1e-9 <= o.time_s
+                <= t + 1e-9]
+        wins.sort(key=lambda o: o.time_s)
+        return wins
+
+    def temporally_supported(tid: str, t: float) -> bool:
+        """Honest multi-frame temporal support for tight acquisition.
+
+        A track may authorize a tight crop only when the trailing
+        evidence window holds at least ``acquisition_min_frames``
+        observations spanning at least ``acquisition_min_span_s``
+        seconds, with no consecutive-observation gap above
+        ``acquisition_max_gap_s``. This gates initial acquisition,
+        reacquisition, groups and switches alike: a single isolated
+        detection (or two adjacent frames) can never open a tight
+        segment, and short-occlusion hold is granted only AFTER a
+        supported acquisition has opened the segment. The gap bound
+        covers the configured sampling cadence (``sample_every`` / fps)
+        plus brief detector misses; longer dropouts break support and
+        the scene stays conservative.
+        """
+        wins = support_observations(tid, t)
+        if len(wins) < config.acquisition_min_frames:
+            return False
+        if (wins[-1].time_s - wins[0].time_s
+                < config.acquisition_min_span_s - 1e-9):
+            return False
+        for a, b in zip(wins, wins[1:]):
+            if b.time_s - a.time_s > config.acquisition_max_gap_s + 1e-9:
+                return False
+        return True
+
     def motion_stats(tid: str, t: float) -> tuple[float, float]:
         vals = [o.motion for o in track_obs[tid]
                 if t - config.evidence_duration_s - 1e-9 <= o.time_s
@@ -795,8 +839,13 @@ def segment_actions(log: ActionObservationLog, *, scene_id: int,
         # evaluation).
         for _ in range(2):
             sus = {tid: sustained(tid, t) for tid in fobs}
+            # Tight acquisition requires sustained multi-frame temporal
+            # support, not just a strong instantaneous mean: isolated
+            # detections stay conservative (wide).
             cands = {tid: s for tid, s in sus.items()
-                     if s >= config.action_evidence_threshold}
+                     if s >= config.action_evidence_threshold
+                     and temporally_supported(tid, t)}
+
             if cur is None:
                 # Large camera motion blocks acquisition: a tight crop on
                 # a panning shot would fight the camera.
@@ -847,7 +896,14 @@ def segment_actions(log: ActionObservationLog, *, scene_id: int,
                                    "ambiguous-action-wide")
                     else:
                         best = max(cands, key=cands.get)
-                        if not motion_widen_reason(best, t):
+                        mw = motion_widen_reason(best, t)
+                        if mw:
+                            # Staying wide, but the justification changed
+                            # (e.g. from "no supported evidence" to the
+                            # motion gate): record it honestly.
+                            if cur["reason"] != mw:
+                                transition("wide", (), cur_frame, t, mw)
+                        else:
                             transition("single", (best,), cur_frame, t,
                                        "acquired-action-subject")
                             last_switch_t = t
@@ -959,7 +1015,8 @@ def segment_actions(log: ActionObservationLog, *, scene_id: int,
     merged: list[dict] = []
     for seg in closed:
         if merged and merged[-1]["kind"] == seg["kind"] \
-                and merged[-1]["subject_ids"] == seg["subject_ids"]:
+                and merged[-1]["subject_ids"] == seg["subject_ids"] \
+                and merged[-1]["reason"] == seg["reason"]:
             prev = merged[-1]
             prev["frames"].extend(seg["frames"])
             prev["occluded_frames"] += seg["occluded_frames"]
@@ -1190,6 +1247,13 @@ def build_action_keyframes(segments: list[FramingSegment],
     the segment cannot fit the transition, the previous lock is held (zero
     travel). Segments whose subject union cannot be cropped safely become
     ``wide`` with a reason. Returns ``(segments, keyframes, diagnostics)``.
+
+    Conservative fit (Task 14 rev3): uncertain wide segments (no action,
+    ambiguous action, unsafe union, failed locks) are persisted with
+    ``fit=True`` and an empty crop -- NO keyframes. Pass 2 renders those
+    ranges with the accepted GENERAL letterbox renderer, retaining the
+    full frame without redetection. A centered zoom-1 crop would still
+    discard edge participants, so it is never used here.
     """
     diagnostics: list[str] = []
     keyframes: list[CropKeyframe] = []
@@ -1203,6 +1267,7 @@ def build_action_keyframes(segments: list[FramingSegment],
         kind = seg.kind
         subject_ids = seg.subject_ids
         reason = seg.reason
+        fit = False
         if kind in ("single", "group"):
             boxes = []
             ok = True
@@ -1250,18 +1315,17 @@ def build_action_keyframes(segments: list[FramingSegment],
                 diagnostics.append(
                     f"scene {scene_id} segment @{seg.start_frame}: {reason}")
         if kind == "wide":
-            # Saliency-weighted centroid of the segment's observations
-            # biases the full-width window SLIGHTLY toward salient
-            # content — it can never tighten the crop (the window stays
-            # the widest available).
-            tot = sum(o.saliency for o in seg_obs)
-            if tot > 0:
-                sal_cx = sum((o.box[0] + o.box[2] / 2.0) * o.saliency
-                             for o in seg_obs) / tot
-            else:
-                sal_cx = frame_w / 2.0
-            lock = saliency_biased_wide_crop(
-                sal_cx, frame_w, frame_h, aspect, config.saliency_bias_frac)
+            # Explicit conservative fit: uncertain/weak/ambiguous wide
+            # composition retains the full frame via the accepted GENERAL
+            # letterbox renderer. No crop is persisted and no keyframes
+            # are emitted; pass 2 renders the full frame without
+            # redetection. A centered zoom-1 crop would still discard
+            # edge participants, so it is never used.
+            fit = True
+            lock = None
+            diagnostics.append(
+                f"scene {scene_id} segment @{seg.start_frame}: "
+                f"conservative-fit-frame ({reason})")
 
         # Per-second travel limiting (mirrors the Task 12 mechanism):
         # extend the transition over enough frames that no consecutive
@@ -1315,7 +1379,7 @@ def build_action_keyframes(segments: list[FramingSegment],
             scene_id=seg.scene_id, start_frame=seg.start_frame,
             end_frame=seg.end_frame, subject_ids=subject_ids, kind=kind,
             confidence=seg.confidence, evidence=seg.evidence, reason=reason,
-            crop=lock))
+            crop=list(lock) if lock else [], fit=fit))
         prev_lock = lock
 
     keyframes.sort(key=lambda k: k.frame)

@@ -93,15 +93,14 @@ def test_gate_saliency_cannot_authorize_tight_crop():
     assert segs, "expected segments"
     assert all(s.kind == "wide" for s in segs), \
         f"saliency authorized a tight crop: {[s.kind for s in segs]}"
-    # The wide crop itself must not tighten toward saliency either.
+    # The wide composition must be the conservative full-frame fit,
+    # not a saliency-tightened crop.
     cfg = af.ActionFramingConfig()
     built, _, _ = af.build_action_keyframes(
         segs, log, 0, cfg, FW, FH, 9 / 16, fps=FPS)
     for s in built:
-        x1, _, x2, _ = s.crop
-        # Widest 9:16 window in 640x360 is 202px wide (height-limited).
-        assert (x2 - x1) >= 200, \
-            f"saliency tightened the wide crop: {s.crop}"
+        assert s.fit is True, "uncertain wide must be marked fit"
+        assert s.crop == [], "fit segment must carry no crop"
 
 
 # GATE 4: hard-cut reset must exist.
@@ -155,6 +154,8 @@ def test_gate_dwell_and_travel_caps():
     for k in keys:
         by_frame[k.frame] = (k.x1, k.y1, k.x2, k.y2)
     for s in built:
+        if s.fit:
+            continue
         for f in range(s.start_frame, s.end_frame + 1):
             by_frame.setdefault(f, tuple(s.crop))
     capx = cfg.max_travel_frac * FW / FPS

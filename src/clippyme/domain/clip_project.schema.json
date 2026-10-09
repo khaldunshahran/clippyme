@@ -373,6 +373,11 @@
           ],
           "default": null,
           "title": "Fallback Detail"
+        },
+        "fit": {
+          "default": false,
+          "title": "Fit",
+          "type": "boolean"
         }
       },
       "required": [

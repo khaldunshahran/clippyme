@@ -429,6 +429,10 @@ class FramingSegment:
     evidence: dict = field(default_factory=dict)
     reason: str = ""
     crop: list = field(default_factory=list)
+    # Task 14 rev3: explicit conservative full-frame fit for uncertain
+    # action wide segments. When true, pass 2 renders the full frame via
+    # the accepted GENERAL letterbox renderer (no crop persisted).
+    fit: bool = False
 
 
 def _clamp01(v: float) -> float:
@@ -1018,6 +1022,22 @@ def crop_at_frame(scene_plan: "ScenePlan", frame: int) -> list | None:
     return None
 
 
+def segment_fit_at_frame(scene_plan: "ScenePlan", frame: int) -> bool:
+    """True when the plan explicitly marks this frame's action segment as
+    a conservative full-frame fit (Task 14 rev3).
+
+    Pass 2 renders fit ranges with the accepted GENERAL letterbox
+    renderer instead of slicing a crop -- no redetection, no decisions
+    recomputed here. A frame with no covering segment returns False.
+    """
+    if not scene_plan.applies or scene_plan.fallback is not None:
+        return False
+    for seg in scene_plan.segments:
+        if seg.start_frame <= frame <= seg.end_frame:
+            return bool(getattr(seg, "fit", False))
+    return False
+
+
 # --- plan container / identity / serialization -------------------------------
 
 @dataclass
@@ -1073,6 +1093,7 @@ def _segment_to_dict(seg: FramingSegment) -> dict:
         "evidence": dict(seg.evidence),
         "reason": seg.reason,
         "crop": list(seg.crop),
+        "fit": bool(seg.fit),
     }
 
 
@@ -1178,7 +1199,7 @@ _SCENE_KEYS = frozenset({
 _SCENE_KEYS_V4 = _SCENE_KEYS | frozenset({"scene_kind"})
 _SEGMENT_KEYS = frozenset({
     "scene_id", "start_frame", "end_frame", "subject_ids", "kind",
-    "confidence", "evidence", "reason", "crop",
+    "confidence", "evidence", "reason", "crop", "fit",
 })
 _KEYFRAME_KEYS = frozenset({"frame", "x1", "y1", "x2", "y2", "kind"})
 _TRACK_KEYS = frozenset({"id", "first_frame", "last_frame", "n_obs"})
@@ -1299,17 +1320,40 @@ def _parse_segment(g: dict, ctx: str, scene_id: int, start_frame: int,
     if (not isinstance(reason, str) or not reason
             or len(reason) > REASON_MAX_LEN):
         raise ValueError(f"malformed-plan: {gctx} bad reason token")
+    fit_raw = g.get("fit", None)
+    if fit_raw is None:
+        # Backward compatibility: plans persisted before the explicit
+        # fit decision (Task 14 rev1/rev2) default to the conservative
+        # contract -- uncertain action wide segments retain the frame.
+        fit = (kind == "wide") if scene_kind == "action" else False
+    else:
+        if not isinstance(fit_raw, bool):
+            raise ValueError(f"malformed-plan: {gctx} 'fit' must be a bool")
+        fit = fit_raw
+    if scene_kind == "action":
+        # The conservative contract is explicit: an action wide segment
+        # IS a full-frame fit, and a tight action segment carries a crop.
+        if fit != (kind == "wide"):
+            raise ValueError(f"malformed-plan: {gctx} action segment fit "
+                             f"must match wide kind (kind={kind!r})")
+    elif fit:
+        raise ValueError(f"malformed-plan: {gctx} 'fit' is action-only")
     crop = _req(g, "crop", gctx)
-    if (not isinstance(crop, list) or len(crop) != 4
-            or not all(_strict_int(v) for v in crop)):
-        raise ValueError(f"malformed-plan: {gctx} bad crop")
-    x1, y1, x2, y2 = crop
-    if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
-        raise ValueError(f"malformed-plan: {gctx} crop out of bounds")
+    if fit:
+        if crop != []:
+            raise ValueError(f"malformed-plan: {gctx} fit segment must "
+                             "carry an empty crop")
+    else:
+        if (not isinstance(crop, list) or len(crop) != 4
+                or not all(_strict_int(v) for v in crop)):
+            raise ValueError(f"malformed-plan: {gctx} bad crop")
+        x1, y1, x2, y2 = crop
+        if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
+            raise ValueError(f"malformed-plan: {gctx} crop out of bounds")
     return FramingSegment(
         scene_id=scene_id, start_frame=gs, end_frame=ge,
         subject_ids=tuple(sids), kind=kind, confidence=float(conf),
-        evidence=evidence, reason=reason, crop=list(crop))
+        evidence=evidence, reason=reason, crop=list(crop), fit=fit)
 
 
 def _parse_keyframe(k: dict, ctx: str, start_frame: int, end_frame: int,

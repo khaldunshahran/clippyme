@@ -289,11 +289,23 @@ class FramingSceneTimeline(BaseModel):
     keyframes: list[FramingKeyframe] = Field(default_factory=list)
     fallback_reason: Optional[str] = None
     fallback_detail: Optional[str] = None
+    # Task 14 rev3: explicit conservative full-frame fit (action scenes).
+    # When true, ranges without keyframes render as full-frame letterbox
+    # (not as crops); keyframes still give crop targets where the plan
+    # tightens. Additive optional -- old projects validate unchanged.
+    fit: bool = False
 
     @field_validator("scene_id", "start_frame", "end_frame", mode="before")
     @classmethod
     def _no_bools(cls, v):
         return _reject_bool_numeric(v)
+
+    @field_validator("fit", mode="before")
+    @classmethod
+    def _fit_is_bool(cls, v):
+        if not isinstance(v, bool):
+            raise ValueError(f"fit must be a bool, got {v!r}")
+        return v
 
     @field_validator("scene_kind")
     @classmethod
@@ -412,10 +424,10 @@ class ProjectFraming(BaseModel):
                     "eligible framing requires at least one scene")
             for scene in self.scenes:
                 if (scene.applies and not scene.keyframes
-                        and not scene.fallback_reason):
+                        and not scene.fallback_reason and not scene.fit):
                     raise ValueError(
-                        f"applicable scene {scene.scene_id} needs keyframes "
-                        "or a fallback_reason")
+                        f"applicable scene {scene.scene_id} needs keyframes, "
+                        "a fallback_reason, or fit")
         elif not self.ineligibility_reason:
             raise ValueError(
                 "ineligible framing requires ineligibility_reason")

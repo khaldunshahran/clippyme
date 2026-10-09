@@ -461,6 +461,10 @@ class TestKeyframes:
         log = _log_with_track()
         segs, keys, _ = self._built(log)
         for s in segs:
+            if s.fit:
+                # Conservative fit: no crop persisted, full frame retained.
+                assert s.kind == "wide" and s.crop == []
+                continue
             x1, y1, x2, y2 = s.crop
             assert 0 <= x1 < x2 <= FW and 0 <= y1 < y2 <= FH
             assert (x2 - x1) / (y2 - y1) == pytest.approx(9 / 16, rel=0.02)
@@ -490,6 +494,9 @@ class TestKeyframes:
         for k in keys:
             by_frame[k.frame] = (k.x1, k.y1, k.x2, k.y2)
         for s in segs:
+            if s.fit:
+                # Conservative fit: no crop, nothing to travel-cap.
+                continue
             for f in range(s.start_frame, s.end_frame + 1):
                 by_frame.setdefault(f, tuple(s.crop))
         capx = cfg.max_travel_frac * FW / fps
@@ -642,8 +649,20 @@ class TestSchemaVersions:
 
     def test_malformed_nested_action_data(self):
         d = _v4_plan_dict()
-        d["scenes"][0]["segments"][0]["crop"] = [0, 0, 99999, 10]
+        # segments[0] is a conservative-fit wide (empty crop); the
+        # out-of-bounds check applies to the tight segment.
+        tight = [s for s in d["scenes"][0]["segments"] if not s.get("fit")]
+        assert tight, "expected a tight segment in the fixture plan"
+        tight[0]["crop"] = [0, 0, 99999, 10]
         with pytest.raises(ValueError, match="out of bounds"):
+            fp.plan_from_dict(d)
+
+    def test_malformed_fit_crop_rejected(self):
+        d = _v4_plan_dict()
+        wide = [s for s in d["scenes"][0]["segments"] if s.get("fit")]
+        assert wide, "expected a fit wide segment in the fixture plan"
+        wide[0]["crop"] = [0, 0, 100, 100]
+        with pytest.raises(ValueError, match="empty crop"):
             fp.plan_from_dict(d)
 
     def test_boolean_numerics_rejected(self):

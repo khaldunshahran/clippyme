@@ -267,7 +267,11 @@ class TestVerifyAndLineage:
             job_dir=job_dir, clip_final="clip.mp4", render_w=360,
             render_h=640, render_fps=30.0, clip_frame_count=60)
         d2 = _v4_action_plan_dict()
-        d2["scenes"][0]["segments"][0]["crop"] = [50, 50, 150, 200]
+        # segments[0] is a conservative-fit wide (empty crop by
+        # contract); mutate the tight segment's crop and a keyframe.
+        tight = [s for s in d2["scenes"][0]["segments"] if not s.get("fit")]
+        assert tight, "expected a tight segment in the fixture plan"
+        tight[0]["crop"] = [50, 50, 150, 200]
         d2["scenes"][0]["keyframes"][0]["x1"] = 50
         _write_sidecar(job_dir, ref, d2)
         f2 = pf.build_project_framing(

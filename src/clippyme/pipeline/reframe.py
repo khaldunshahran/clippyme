@@ -50,6 +50,7 @@ from clippyme.pipeline.framing_plan import (
     build_framing_plan,
     config_from_env,
     crop_at_frame,
+    segment_fit_at_frame,
     load_plan,
     plan_matches,
     save_plan_atomic,
@@ -1399,14 +1400,23 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                         if (_a_scene is not None
                                 and getattr(_a_scene, "scene_kind", "none")
                                 == "action" and _a_scene.usable):
-                            _crop = crop_at_frame(_a_scene, frame_number)
-                            if _crop is not None:
-                                x1, y1, x2, y2 = (int(v) for v in _crop)
-                                if y2 > y1 and x2 > x1:
-                                    output_frame = _resize_to_output(frame[y1:y2, x1:x2], output_width, output_height)
-                                else:
-                                    output_frame = cv2.resize(frame, (output_width, output_height))
+                            if segment_fit_at_frame(_a_scene, frame_number):
+                                # Explicit conservative fit persisted in
+                                # the plan: full-frame letterbox via the
+                                # accepted GENERAL renderer, no
+                                # redetection.
+                                output_frame = create_general_frame(
+                                    frame, output_width, output_height)
                                 _a_rendered = True
+                            else:
+                                _crop = crop_at_frame(_a_scene, frame_number)
+                                if _crop is not None:
+                                    x1, y1, x2, y2 = (int(v) for v in _crop)
+                                    if y2 > y1 and x2 > x1:
+                                        output_frame = _resize_to_output(frame[y1:y2, x1:x2], output_width, output_height)
+                                    else:
+                                        output_frame = cv2.resize(frame, (output_width, output_height))
+                                    _a_rendered = True
                         if not _a_rendered:
                             output_frame = create_general_frame(frame, output_width, output_height)
                     elif strat == 'SPLIT':
