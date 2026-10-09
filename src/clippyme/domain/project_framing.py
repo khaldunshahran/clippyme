@@ -68,6 +68,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -982,10 +983,15 @@ def publish_attempt_sidecar(*, attempt_sidecar: str, stable_sidecar: str,
 #   the lineage file identity survives). Returns True only when the new
 #   generation is durably installed; False (never raising, never claiming
 #   durable recovery) when the update cannot be completed.
-# - restore_accepted_snapshot(): brings the last accepted pair back; the
-#   pipeline uses it when it DECLINES a rerender for a preserved Task 01
-#   project, so the preserved project's reframed_base keeps resolving to
-#   the preserved final video.
+# - restore_accepted_snapshot(): brings the last accepted pair back,
+#   transactionally as a video+sidecar unit (review-04): the active
+#   generation is strictly validated, the current live pair is staged
+#   before either artifact is installed, and any install failure rolls
+#   the live pair back exactly. True means the complete snapshot pair
+#   was installed; False leaves the live pair untouched. The pipeline
+#   uses it when it DECLINES a rerender for a preserved Task 01 project,
+#   so the preserved project's reframed_base keeps resolving to the
+#   preserved final video.
 
 
 def _verify_backup(src: str, dst: str) -> None:
@@ -1126,6 +1132,9 @@ _SNAPSHOT_IDENTITY_FILENAME = "identity.txt"
 _SNAPSHOT_POINTER_FILENAME = "current"
 _SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
 _SNAPSHOT_SIDECAR_FILENAME = "sidecar.json"
+_SNAPSHOT_MANIFEST_KEYS = frozenset(
+    ("clip_basename", "video_sha256", "sidecar_sha256"))
+_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _clip_snapshot_key(clip_final: str) -> str:
@@ -1211,17 +1220,85 @@ def _atomic_write_text(path: str, text: str) -> None:
         raise
 
 
-def accepted_snapshot_exists(*, job_dir: str, clip_final: str) -> bool:
-    """True when a durable, identity-checked accepted-pair snapshot exists."""
-    clip_dir = _clip_snapshot_dir(job_dir, clip_final)
+def _validate_snapshot_generation(*, clip_dir: str,
+                                  clip_final: str) -> dict | None:
+    """Strict validation of the active snapshot generation (review-04).
+
+    One validator shared by :func:`accepted_snapshot_exists` and
+    :func:`restore_accepted_snapshot`. Returns a dict
+    ``{"gen_dir", "video_sha256", "sidecar_sha256"}`` when EVERYTHING checks
+    out, else None:
+
+    - the clip directory owns the requested clip (ownership marker),
+    - the ``current`` pointer names a coherent generation directory,
+    - ``manifest.json`` parses as a dict with exactly the production
+      schema keys, ``clip_basename`` equal to the requested clip
+      basename, ``video_sha256`` a 64-char lowercase hex digest, and
+      ``sidecar_sha256`` either None or a 64-char lowercase hex digest,
+    - the video snapshot exists and hashes to the manifest digest,
+    - sidecar semantics: when the manifest records a sidecar digest, the
+      sidecar snapshot exists and hashes to it; a sidecar-less acceptance
+      records None and requires no sidecar snapshot.
+    """
     if not _snapshot_identity_ok(clip_dir, clip_final):
-        return False
+        return None
     gen = _read_snapshot_current(clip_dir)
     if gen is None:
-        return False
-    video_snap = os.path.join(
-        clip_dir, gen, _snapshot_video_name(clip_final))
-    return os.path.isfile(video_snap)
+        return None
+    gen_dir = os.path.join(clip_dir, gen)
+    manifest = _snapshot_manifest(gen_dir)
+    if not manifest:
+        return None
+    if set(manifest.keys()) != _SNAPSHOT_MANIFEST_KEYS:
+        return None
+    if manifest.get("clip_basename") != os.path.basename(clip_final):
+        return None
+    video_hash = manifest.get("video_sha256")
+    if not isinstance(video_hash, str) or not _HEX64.match(video_hash):
+        return None
+    sidecar_hash = manifest.get("sidecar_sha256")
+    if not (sidecar_hash is None
+            or (isinstance(sidecar_hash, str)
+                and _HEX64.match(sidecar_hash))):
+        return None
+    video_snap = os.path.join(gen_dir, _snapshot_video_name(clip_final))
+    if (not os.path.isfile(video_snap)
+            or _sha256_file(video_snap) != video_hash):
+        return None
+    if sidecar_hash is not None:
+        sidecar_snap = os.path.join(gen_dir, _SNAPSHOT_SIDECAR_FILENAME)
+        if (not os.path.isfile(sidecar_snap)
+                or _sha256_file(sidecar_snap) != sidecar_hash):
+            return None
+    return {"gen_dir": gen_dir, "video_sha256": video_hash,
+            "sidecar_sha256": sidecar_hash}
+
+
+def accepted_snapshot_exists(*, job_dir: str, clip_final: str) -> bool:
+    """True only when a fully VALIDATED snapshot generation is available.
+
+    Uses the strict generation validator (review-04): ownership, pointer,
+    manifest schema and clip identity, video existence/hash, and sidecar
+    presence/hash semantics. A corrupt manifest can never report available.
+    """
+    clip_dir = _clip_snapshot_dir(job_dir, clip_final)
+    return _validate_snapshot_generation(
+        clip_dir=clip_dir, clip_final=clip_final) is not None
+
+
+def snapshot_recovery_expected(*, job_dir: str, clip_final: str) -> bool:
+    """True when an accepted pair was RECORDED for this clip (review-04).
+
+    The snapshot directory carries this clip's ownership marker, so
+    recovery was expected even if the stored generation is now invalid
+    or missing. Callers use this to distinguish "no snapshot was ever
+    recorded" (the pipeline may render normally; the project file itself
+    stays preserved) from "snapshot data exists but cannot be recovered"
+    (fail clearly -- never a rerender over the preserved base and never
+    a success report).
+    """
+    clip_dir = _clip_snapshot_dir(job_dir, clip_final)
+    return _snapshot_identity_ok(clip_dir, clip_final)
 
 
 def snapshot_accepted_pair(*, job_dir: str, clip_final: str,
@@ -1339,50 +1416,111 @@ def _install_verified(src: str, dst: str) -> None:
         raise
 
 
+def _stage_live_pair(*, clip_final: str, stable_sidecar: str) -> dict | None:
+    """Stage the CURRENT live pair before a snapshot install (review-04).
+
+    Destination-local, verified ``copy2`` backups of whatever is live;
+    each file is recorded with its existence flag. Returns an opaque
+    record for :func:`_restore_live_pair`, or None when staging cannot
+    be completed -- fail-closed, the caller must not touch the live
+    pair. Never touches the global process temp.
+    """
+    import shutil
+    import tempfile
+
+    parent = os.path.dirname(os.path.abspath(clip_final)) or os.getcwd()
+    staging = None
+    try:
+        staging = tempfile.mkdtemp(prefix=".task13-live-backup-", dir=parent)
+        paths = []
+        for dst in (clip_final, stable_sidecar):
+            entry = {"dst": dst, "existed": os.path.isfile(dst),
+                     "backup": None}
+            if entry["existed"]:
+                backup = os.path.join(
+                    staging, os.path.basename(dst) + ".bak")
+                shutil.copy2(dst, backup)
+                _verify_backup(dst, backup)
+                entry["backup"] = backup
+            paths.append(entry)
+        return {"dir": staging, "paths": paths}
+    except OSError:
+        if staging:
+            _remove_tree_quietly(staging)
+        return None
+
+
+def _install_direct(src: str, dst: str) -> None:
+    """Copy bytes directly to ``dst`` (no atomic rename).
+
+    Used only for best-effort rollback when the atomic install path is
+    broken. Raises OSError on any failure.
+    """
+    import shutil
+
+    shutil.copy2(src, dst)
+    _verify_backup(src, dst)
+
+
+def _restore_live_pair(record: dict) -> None:
+    """Restore the staged live pair as exactly as possible. Never raises.
+
+    Each file that existed is reinstalled (atomically when possible,
+    direct copy as fallback); each file that did not exist is removed
+    when present. Snapshot (recovery) data is never touched.
+    """
+    for entry in record["paths"]:
+        dst = entry["dst"]
+        try:
+            if entry["existed"]:
+                try:
+                    _install_verified(entry["backup"], dst)
+                except OSError:
+                    _install_direct(entry["backup"], dst)
+            elif os.path.isfile(dst) or os.path.islink(dst):
+                os.remove(dst)
+        except OSError:
+            continue
+    _remove_tree_quietly(record["dir"])
+
+
 def restore_accepted_snapshot(*, job_dir: str, clip_final: str,
                               stable_sidecar: str) -> bool:
-    """Restore the last accepted pair from the durable snapshot.
+    """Restore the last accepted pair from the durable snapshot, transactionally.
 
-    The snapshot directory must belong to the requested clip (identity
-    check) and the active generation's manifest is verified before
-    anything is installed; each file is installed atomically
-    (destination-local temp + os.replace). Returns True when the video
-    snapshot existed and was restored (mtime preserved via copy2, so
-    lineage identity is intact). Returns False -- never raises, never
-    installs foreign or unverified bytes -- when no valid snapshot
-    exists for this clip.
+    The active generation is fully validated first (the same strict
+    validator as :func:`accepted_snapshot_exists`). The current live pair
+    is staged before either snapshot artifact is installed; if either
+    install fails, the prior live state is restored as exactly as
+    possible and the snapshot (recovery data) is left untouched.
+
+    Returns True only when the complete snapshot pair was installed.
+    Returns False -- never raises, never leaves a mixed pair -- when the
+    generation is unavailable/invalid or any install failed; False leaves
+    the live pair exactly as it was before the call.
     """
     clip_dir = _clip_snapshot_dir(job_dir, clip_final)
-    if not _snapshot_identity_ok(clip_dir, clip_final):
+    validated = _validate_snapshot_generation(
+        clip_dir=clip_dir, clip_final=clip_final)
+    if validated is None:
         return False
-    gen = _read_snapshot_current(clip_dir)
-    if gen is None:
-        return False
-    gen_dir = os.path.join(clip_dir, gen)
-    manifest = _snapshot_manifest(gen_dir)
-    if not manifest:
-        return False
+    gen_dir = validated["gen_dir"]
+    expected_sidecar = validated["sidecar_sha256"]
     video_snap = os.path.join(gen_dir, _snapshot_video_name(clip_final))
-    if (not os.path.isfile(video_snap)
-            or _sha256_file(video_snap) != manifest.get("video_sha256")):
-        return False
     sidecar_snap = os.path.join(gen_dir, _SNAPSHOT_SIDECAR_FILENAME)
-    expected_sidecar = manifest.get("sidecar_sha256")
-    if expected_sidecar and (
-            not os.path.isfile(sidecar_snap)
-            or _sha256_file(sidecar_snap) != expected_sidecar):
+    live = _stage_live_pair(clip_final=clip_final,
+                            stable_sidecar=stable_sidecar)
+    if live is None:
         return False
     try:
         _install_verified(video_snap, clip_final)
         if expected_sidecar:
             _install_verified(sidecar_snap, stable_sidecar)
-        else:
+        elif os.path.isfile(stable_sidecar):
             # Sidecar-less acceptance: the stable binding must not linger.
-            try:
-                if os.path.isfile(stable_sidecar):
-                    os.remove(stable_sidecar)
-            except OSError:
-                return False
+            os.remove(stable_sidecar)
     except OSError:
+        _restore_live_pair(live)
         return False
+    _remove_tree_quietly(live["dir"])
     return True

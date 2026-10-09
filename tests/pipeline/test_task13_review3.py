@@ -207,10 +207,16 @@ def test_reframe_only_stage_failure_aborts_and_preserves_pair(
     assert stable.read_bytes() == old_sidecar
 
 
-def test_mutation_shared_snapshot_dir_installs_wrong_clip(
+def test_mutation_shared_snapshot_dir_destroys_other_clip(
     tmp_path, monkeypatch
 ):
-    """Disabling per-clip keying lets one clip restore another's bytes."""
+    """Disabling per-clip keying destroys another clip's recovery data.
+
+    (Review-04 strengthened this gate: the manifest clip-identity check
+    now refuses the foreign generation instead of installing it, so the
+    corruption manifests as destroyed -- not wrongly installed --
+    recovery data for clip 0.)
+    """
     monkeypatch.setattr(pf, "_clip_snapshot_key",
                         lambda clip_final: "shared")
     monkeypatch.setattr(pf, "_snapshot_identity_ok",
@@ -228,13 +234,17 @@ def test_mutation_shared_snapshot_dir_installs_wrong_clip(
     assert pf.snapshot_accepted_pair(
         job_dir=str(tmp_path), clip_final=str(clip1), stable_sidecar=str(side1))
 
+    # The bug, reproduced: clip 1's snapshot clobbered clip 0's recovery
+    # data in the shared directory -- clip 0's accepted pair is gone and
+    # can no longer be restored.
     clip0.write_bytes(b"damaged-zero")
     side0.write_bytes(b"damaged-sidecar-zero")
-    assert pf.restore_accepted_snapshot(
+    assert not pf.accepted_snapshot_exists(
+        job_dir=str(tmp_path), clip_final=str(clip0))
+    assert not pf.restore_accepted_snapshot(
         job_dir=str(tmp_path), clip_final=str(clip0), stable_sidecar=str(side0))
-    # The bug, reproduced: clip 0's restore installed clip 1's bytes.
-    assert clip0.read_bytes() == b"video-one"
-    assert side0.read_bytes() == b"sidecar-one"
+    assert clip0.read_bytes() == b"damaged-zero"
+    assert side0.read_bytes() == b"damaged-sidecar-zero"
 
 
 def _legacy_inplace_snapshot_update(*, job_dir, clip_final, stable_sidecar):

@@ -1004,16 +1004,54 @@ def _render_one_clip(
                 f"(clip {index + 1}/{total}) -- keeping the accepted pair",
                 flush=True,
             )
-            _pf13decline.restore_accepted_snapshot(
+            # Review-04: the restore result MUST be checked. Mark complete
+            # only after a successful restoration and applicable media
+            # validation; a corrupt or failed recovery fails clearly --
+            # never a rerender over the preserved base and never a success
+            # report.
+            restored = _pf13decline.restore_accepted_snapshot(
                 job_dir=output_dir,
                 clip_final=clip_final,
                 stable_sidecar=_sidecar_for(legacy, clip_final),
             )
-            clip["qa"] = {"ok": True, "critical": False, "issues": [],
+            if restored and _valid_media_file(clip_final, 10_000):
+                clip["qa"] = {"ok": True, "critical": False, "issues": [],
+                              "warnings": []}
+                state.mark_clip(index, "complete", clip["qa"])
+                _save_metadata(metadata_file, clips_data)
+                return True
+            print(
+                f"clip-project: accepted-pair snapshot recovery failed "
+                f"(clip {index + 1}/{total}) -- rerender stays declined; "
+                f"the preserved project and its pixel base were not touched",
+                flush=True,
+            )
+            clip["qa"] = {"ok": False, "critical": True,
+                          "issues": ["accepted snapshot recovery failed"],
                           "warnings": []}
-            state.mark_clip(index, "complete", clip["qa"])
+            state.mark_clip(index, "failed", clip["qa"])
             _save_metadata(metadata_file, clips_data)
-            return True
+            return False
+        if _pf13decline.snapshot_recovery_expected(
+                job_dir=output_dir, clip_final=clip_final):
+            # Review-04: an accepted pair was recorded for this clip but
+            # the snapshot cannot be validated. Fail clearly -- never a
+            # rerender over the preserved base and never a success report.
+            print(
+                f"clip-project: accepted-pair snapshot for clip "
+                f"{index + 1}/{total} is unrecoverable -- failing without "
+                f"rerendering over the preserved project",
+                flush=True,
+            )
+            clip["qa"] = {"ok": False, "critical": True,
+                          "issues": ["accepted snapshot unrecoverable"],
+                          "warnings": []}
+            state.mark_clip(index, "failed", clip["qa"])
+            _save_metadata(metadata_file, clips_data)
+            return False
+        # No snapshot was ever recorded for this clip: there is no
+        # accepted pair to keep, so the render proceeds; the project file
+        # itself stays preserved by the emission guard below.
 
     state.start(
         "cutting",

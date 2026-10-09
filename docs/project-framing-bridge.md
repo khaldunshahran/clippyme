@@ -27,47 +27,72 @@ render → verify_framing_at_render      domain, called in the
    sidecar and never promotes; a retry promotes only its own plan.
 2. **Promotion (coordinated pair).** Only after render validation succeeds,
    the pipeline publishes the video first and then coordinates the sidecar
-   half via `publish_attempt_sidecar` (`project_framing.py`) — promotion,
-   retire, or preserved-project skip — in the queued orchestrator, the
-   direct CLI clip loop, and the reframe-only path alike. Promotion
-   rebinds the plan's Task 12 `source_fingerprint` to the actual render
-   input (`rebind_sidecar_source`; a byte-identity no-op in production,
-   where reframe already stamps the true identity). A promotion failure
-   is **never swallowed**: the just-published video is rolled back and
-   the attempt fails, so an accepted clip can never pair a new video
-   with a stale plan. A project must never reference `*.render.tmp*` /
-   `*.reframe.tmp*` basenames — `resolve_sidecar` rejects them with
+   half via `publish_attempt_sidecar` (`project_framing.py`) -- promotion,
+   retire, or preserved-project skip -- in the queued orchestrator, the
+   direct CLI clip loop, and the reframe-only path alike. The attempt
+   plan's Task 12 `source_fingerprint` is verified against the actual
+   render input (`verify_attempt_sidecar_source`); a plan naming a
+   different source is REJECTED -- the attempt is treated as sidecar-less,
+   never relabelled. The previous accepted video+sidecar pair is staged
+   and byte-verified BEFORE publication (destination-local staging, never
+   the global process temp); any staging, publication, or retirement
+   failure restores BOTH files and fails the attempt, so an accepted clip
+   can never pair a new video with a stale plan and a failure can never
+   destroy the old pair. A project must never reference `*.render.tmp*` /
+   `*.reframe.tmp*` basenames -- `resolve_sidecar` rejects them with
    `framing-sidecar-temp-name`.
 3. **Retire rule.** A sidecar-less attempt (render produced no plan)
    retires the previous stable binding instead of inheriting it: the
    stale sidecar is deleted and the emitted project carries no `framing`
-   field. A stable sidecar pinned by a preserved user project is left
-   in place.
+   field. Retirement failures are propagated, never reported as success.
+   A stable sidecar pinned by a preserved user project is left in place.
 4. **Preserved projects pin their plan.** A stable sidecar referenced by
-   a preserved user project (Task 01: `origin == "user"` or `version >
-   1`, matching `plan_ref` basename + `sha256`) is immutable: a later
-   attempt that produces a *different* plan does not overwrite it
-   (promotion is skipped, the attempt temp file removed), so
+   a preserved user project (the full Task 01 contract: `origin ==
+   "user"`, `version > 1`, non-empty caption edits, user-marked segments,
+   or conservatively preserved malformed) is immutable: a later attempt
+   that produces a *different* plan does not overwrite it (promotion is
+   skipped, the attempt temp file removed), so
    `verify_framing_at_render` keeps passing on the preserved project.
-3. **Emission.** `build_project_framing` resolves the stable sidecar
-   inside the job dir (real containment; traversal/symlink escape →
+   Before a queued rerender, the same working/archived project resolver
+   used at emission decides whether to decline: a declined rerender
+   restores the accepted pair from its durable snapshot and reports
+   success only after a successful restore plus media validation; an
+   unrecoverable snapshot fails the clip clearly instead of rerendering
+   over the preserved base.
+5. **Durable snapshots (per clip, atomic generations).** After a
+   successful publication the accepted video+sidecar pair is snapshotted
+   under `<job>/.task13_accepted_pair/<safe-clip-key>/`, with an
+   ownership marker so two clips never share recovery data. Updates are
+   atomic generations (`gen-a`/`gen-b` plus a single `current` pointer
+   flip): a failed update leaves either the prior coherent generation or
+   the complete new one, never a mix. Recovery is strict and
+   transactional: one validator (`_validate_snapshot_generation`) checks
+   ownership, pointer, manifest schema and clip identity, video
+   existence/hash, and sidecar presence/hash before recovery is
+   considered available; restoration stages the current live pair first
+   and rolls it back exactly on any install failure, so `True` means the
+   complete snapshot pair was installed and `False` leaves the live pair
+   untouched.
+6. **Emission.** `build_project_framing` resolves the stable sidecar
+   inside the job dir (real containment; traversal/symlink escape --
    `framing-sidecar-escape`), parses it through the Task 12 production
    parser, normalizes it, and stores the result as the additive optional
    `framing` project field. Any sidecar problem (missing, malformed,
    temp-named, escape, aspect mismatch, **cross-source**) yields **no field
-   at all** — the pre-Task-13 behavior — never a lying field, and never an
-   overwrite of an existing good project. When the caller supplies the
-   actual current source slice's Task 12 identity
+   at all** -- the pre-Task-13 behavior -- never a lying field, and never
+   an overwrite of an existing good project. Emission fails closed when
+   the actual current source slice cannot be fingerprinted. When the
+   caller supplies the actual current source slice's Task 12 identity
    (`expected_source_fingerprint`), a structurally valid plan from a
    different source is rejected (`framing-cross-source`).
-4. **Render.** In the eligible-base branch the pipeline calls
+7. **Render.** In the eligible-base branch the pipeline calls
    `verify_framing_at_render`, which re-resolves the recorded
    `plan_ref` and compares **sha256 AND source_fingerprint AND size**.
    Same-size/same-mtime content replacement is caught by the content
    hash (`framing-sidecar-mismatch`); a deleted sidecar fails with
    `framing-sidecar-missing`. Before the Task 05 base is reused, the
    verified plan's source identity is rechecked against the **actual
-   current source slice** — a cross-source sidecar swap the stored
+   current source slice** -- a cross-source sidecar swap the stored
    record predates is rejected with a clear `ProjectRenderError`.
    A project that carries `framing` but **no** `reframed_base` lineage
    fails clearly before any static materialization
