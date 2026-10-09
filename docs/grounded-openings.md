@@ -228,3 +228,41 @@ and one explicit, deterministic selection.
    the remaining budget; the remaining time is recomputed after
    client/setup work, and exhaustion stops the attempt with an
    explicit budget reason.
+
+## Review-03 corrections
+
+1. **Emission binds the authoritative original source.** Planning
+   fingerprints the original `input_video`; emission previously
+   fingerprinted `clip_source` (the cut slice), so a valid hook
+   disappeared on a real FFmpeg cut. The original source path is now
+   threaded through planning (`clip["opening_source_path"]`) and
+   emission re-fingerprints that original asset. A missing or
+   unreadable original fails closed: `current_opening_packet_or_none`
+   no longer falls back to the saved fingerprint when the current
+   identity cannot be verified. Explicit user-authored overrides are
+   unaffected.
+2. **Polarity is preserved, not just token inclusion.** Removing a
+   negation reverses meaning while every remaining token stays
+   supported ("coffee does work" from "coffee does not work"). For
+   each cited evidence item the option draws content from, the option
+   must carry the same number of negation markers; a changed count is
+   rejected as ungrounded. Contractions ("doesn't") are supported when
+   their canonical negation ("not") is evidenced.
+3. **Novel sensory actions are unverifiable by default.** A novel
+   verb-like token on the sensory path ("explodes" for "rolls") is no
+   longer assumed to be a descriptive paraphrase merely because it is
+   absent from the event/name/negation lists. It is grounded only as a
+   bounded manner paraphrase of an evidenced action ("erupts" for
+   "cheers", via a curated mapping); otherwise it is rejected as
+   unverifiable. Descriptive non-verb modifiers stay allowed.
+4. **Unrepresentable SDK timeouts stop before the call.** If the
+   remaining budget cannot represent a strictly positive SDK timeout
+   (e.g. a 0.0004s remainder floors to 0ms), the adapter raises
+   explicit budget exhaustion BEFORE `generate_content` — never sends
+   timeout=0. A failed remaining-budget callback also fails closed
+   instead of falling back to the stale request timeout. The client
+   still closes exactly once; fallback attempts remain charged.
+
+Claim support remains a deterministic approximation (token
+classification, polarity counts, verb heuristics), not full semantic
+entailment.

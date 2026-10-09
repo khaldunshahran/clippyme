@@ -860,7 +860,12 @@ class GeminiOpeningProvider:
                 try:
                     fresh = float(remaining())
                 except Exception:
-                    fresh = float(timeout_s)
+                    # The remaining-budget callback failed: the actual
+                    # remainder cannot be verified. Never fall back to
+                    # the stale request timeout; fail closed.
+                    raise OpeningBudgetExhausted(
+                        "remaining-budget callback failed before "
+                        "the SDK call")
                 effective = min(float(timeout_s), fresh)
             else:
                 effective = float(timeout_s)
@@ -868,9 +873,14 @@ class GeminiOpeningProvider:
                 raise OpeningBudgetExhausted(
                     "opening budget exhausted before the SDK call")
             # Floor, never round up: the SDK timeout must not exceed
-            # the remaining budget. A sub-millisecond remainder floors
-            # to 0 rather than granting a rounded-up millisecond.
+            # the remaining budget. If the remainder cannot represent
+            # a strictly positive SDK timeout, stop BEFORE the SDK
+            # call — never send timeout=0.
             timeout_ms = int(effective * 1000)
+            if timeout_ms < 1:
+                raise OpeningBudgetExhausted(
+                    "remaining budget below the minimum representable "
+                    "SDK timeout")
             # Single SDK attempt: no loop on transient failures. The
             # budgeted provider->fallback switch is the stage's job.
             response = client.models.generate_content(
@@ -1048,6 +1058,106 @@ _EVENT_OUTCOME_WORDS = frozenset((
     "crown", "crowned",
     "final", "finals", "semifinal", "semifinals",
 ))
+
+# Contraction negations: "doesn't" carries the same polarity as "not".
+# A contraction is supported when its canonical negation appears in the
+# cited evidence; a genuinely novel contraction is still rejected.
+_CONTRACTION_NEGATIONS = {
+    "don't": "not", "doesn't": "not", "didn't": "not",
+    "won't": "not", "can't": "not", "isn't": "not",
+    "aren't": "not", "wasn't": "not", "weren't": "not",
+    "hasn't": "not", "haven't": "not", "hadn't": "not",
+    "couldn't": "not", "shouldn't": "not", "wouldn't": "not",
+    "mustn't": "not", "cannot": "not", "n't": "not",
+}
+
+# Words that look verb-like by suffix but are not verbs. Used by the
+# sensory action-verb gate so descriptive prepositions/adjectives are
+# not mistaken for action claims.
+_NON_VERB_WORDS = frozenset({
+    "across", "towards", "toward", "besides",
+    "red",
+})
+
+# Bounded manner-paraphrase verbs for the sensory path. A novel verb is
+# NOT a supported paraphrase by default: it is allowed only when it
+# describes the manner/intensity of the evidenced action (never a new
+# action or outcome). Maps a normalized evidence action verb to the
+# allowed paraphrase verbs. Curated, reviewable, default-deny; not a
+# semantic model.
+_SENSORY_MANNER_VERBS = {
+    "cheer": {"erupt", "erupts"},
+    "cheers": {"erupt", "erupts"},
+}
+
+
+def _looks_like_verb(token: str) -> bool:
+    """Heuristic: does a normalized token look like an inflected verb?
+
+    Bounded approximation for the sensory action-verb gate. English
+    verbs inflect with -ing/-ed/-s. This is a heuristic, not a tagger;
+    it errs toward flagging (fail closed) and is documented as such.
+    """
+    if not token or token in _GLUE_TOKENS or token in _NON_VERB_WORDS:
+        return False
+    return (token.endswith("ing") or token.endswith("ed")
+            or token.endswith("s"))
+
+
+def _is_manner_paraphrase(token: str, evidence_union: set[str]) -> bool:
+    """Is this novel verb a bounded manner paraphrase of an evidenced action?"""
+    for ev_token in evidence_union:
+        allowed = _SENSORY_MANNER_VERBS.get(ev_token)
+        if allowed is not None and token in allowed:
+            return True
+    return False
+
+
+def _negation_count(tokens: list[str]) -> int:
+    # A token reclassified as glue (e.g. by a weakening mutation) is
+    # not a negation marker: the polarity check stays consistent with
+    # the token classification so the glue-vocabulary mutation stays
+    # load-bearing.
+    return sum(1 for t in tokens
+               if t in _NEGATION_TOKENS and t not in _GLUE_TOKENS)
+
+
+def _content_tokens(tokens: list[str]) -> set[str]:
+    """Non-glue, non-negation tokens: the claim-bearing words."""
+    return {t for t in tokens
+            if t and t not in _GLUE_TOKENS and t not in _NEGATION_TOKENS}
+
+
+def _check_polarity_preserved(
+    text: str, evidence: list[dict[str, Any]], *, text_key: str,
+) -> Optional[str]:
+    """Polarity preservation: dropping a negation reverses meaning.
+
+    Every remaining token can stay supported while the claim flips
+    ("coffee does work" from "coffee does not work"). For each cited
+    evidence item the option actually draws content from, the option
+    must carry the same number of negation markers; a changed count
+    means the polarity changed and the claim is not grounded.
+    """
+    opt_tokens = normalize_tokens(text)
+    opt_neg = _negation_count(opt_tokens)
+    opt_content = _content_tokens(opt_tokens)
+    drawn_neg = 0
+    drew = False
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        item_tokens = normalize_tokens(item.get(text_key) or "")
+        if _content_tokens(item_tokens) & opt_content:
+            drew = True
+            drawn_neg += _negation_count(item_tokens)
+    if drew and opt_neg != drawn_neg:
+        return (
+            "option changes the polarity of the cited evidence "
+            f"(evidence carries {drawn_neg} negation marker(s), "
+            f"option carries {opt_neg})"
+        )
+    return None
 
 _PROPER_STRIP_CHARS = " \t\n\"\u201c\u201d\u2018\u2019()[]{}:;,.!?\u00ab\u00bb\u00a1\u00bf"
 
@@ -1308,16 +1418,32 @@ def _check_material_claims(
             return (f"option introduces a person/entity {raw.strip()!r} "
                     f"not supported by cited evidence")
         if token in _NEGATION_TOKENS:
-            return (f"option introduces negation/polarity {token!r} "
-                    f"not supported by cited evidence")
+            # A contraction ("doesn't") is supported when its canonical
+            # negation ("not") is in the cited evidence; a genuinely
+            # novel negation flips polarity and is never glue.
+            canonical = _CONTRACTION_NEGATIONS.get(token, token)
+            if (token not in evidence_union
+                    and canonical not in evidence_union):
+                return (f"option introduces negation/polarity {token!r} "
+                        f"not supported by cited evidence")
+            continue
         if token in _EVENT_OUTCOME_WORDS:
             return (f"option introduces an event/outcome {token!r} "
                     f"not supported by cited evidence")
         if basis == "speech":
             return ("option introduces material claims not supported by "
                     f"cited evidence: {token!r}")
-        # Speech-free paraphrase: descriptive verbs/adjectives for the
-        # depicted event stay allowed (never people/events/polarity).
+        # Speech-free path: a novel verb-like token is an action claim,
+        # not a descriptive paraphrase by default. It is grounded only
+        # as a bounded manner paraphrase of an evidenced action
+        # ("erupts" for "cheers"); an unlisted novel action
+        # ("explodes" for "rolls") is unverifiable, never grounded.
+        if _looks_like_verb(token) and not _is_manner_paraphrase(
+                token, evidence_union):
+            return (f"option introduces an unverifiable sensory action "
+                    f"{token!r} not supported by cited evidence")
+        # Descriptive modifiers for the depicted event stay allowed
+        # (never people/events/polarity).
     if not grounded_content:
         return ("option text has no evidence-grounded content token "
                 "(unknown/unverified)")
@@ -1411,6 +1537,13 @@ def validate_opening_option(
     err = _check_hard_claims(text, quote_union)
     if err:
         return None, _reject(option_id, "hard_claim", err)
+    # Polarity preservation: dropping (or adding) a negation reverses
+    # meaning even when every remaining token is supported.
+    err = _check_polarity_preserved(
+        text, evidence,
+        text_key="quote" if basis == "speech" else "label")
+    if err:
+        return None, _reject(option_id, "text_unsupported", err)
     if basis == "speech":
         err = _check_material_claims(text, quote_union, basis="speech")
     else:
@@ -2284,18 +2417,20 @@ def current_opening_packet_or_none(
     """
     try:
         plan = clip.get("opening_plan") or {}
-        saved = clip.get("opening_source_fingerprint")
-        if current_fingerprint is not None:
-            # Authoritative recheck: the saved fingerprint must match
-            # the fingerprint recomputed from the current source file.
-            if (not isinstance(saved, str) or not saved
-                    or saved != current_fingerprint):
-                return None
-            fingerprint = current_fingerprint
-        else:
-            fingerprint = saved
-        if not isinstance(fingerprint, str) or not fingerprint:
+        # Fail closed: without an authoritative current fingerprint the
+        # current source identity cannot be verified. The saved
+        # fingerprint is never trusted on its own — a missing or failed
+        # current identity suppresses automatic emission.
+        if (not isinstance(current_fingerprint, str)
+                or not current_fingerprint):
             return None
+        saved = clip.get("opening_source_fingerprint")
+        # Authoritative recheck: the saved fingerprint must match the
+        # fingerprint recomputed from the current source file.
+        if (not isinstance(saved, str) or not saved
+                or saved != current_fingerprint):
+            return None
+        fingerprint = current_fingerprint
         if not _is_finite_number(start) or not _is_finite_number(end):
             return None
         if not (end > start >= 0):
@@ -2417,7 +2552,11 @@ def plan_clip_opening(
 
         # Additive: the emission boundary recomputes the current packet
         # from this stored fingerprint plus the clip's current content.
+        # The authoritative ORIGINAL source path is threaded through so
+        # emission re-fingerprints the original asset (never the cut
+        # slice) and fails closed when it is missing or unreadable.
         clip["opening_source_fingerprint"] = fingerprint
+        clip["opening_source_path"] = input_video
 
         provider_config = _packet_provider_config(provider, provider_factory)
 

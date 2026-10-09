@@ -499,7 +499,11 @@ def test_prompt_carries_event_ids():
 # ---------------------------------------------------------------------------
 
 def test_production_adapter_timeout_does_not_exceed_budget():
+    # Review-03: a sub-millisecond remainder cannot represent a strictly
+    # positive SDK timeout, so the adapter must stop BEFORE the SDK call
+    # with explicit budget exhaustion — never send timeout=0.
     captured = []
+    closes = []
 
     class Response:
         text = "[]"
@@ -513,14 +517,15 @@ def test_production_adapter_timeout_does_not_exceed_budget():
         models = Models()
 
         def close(self):
-            pass
+            closes.append(1)
 
     provider = op.GeminiOpeningProvider(client_factory=Client,
                                        model="injected")
-    provider.request_options({"timeout_s": .0004, "prompt": "test",
-                              "retries_disabled": True})
-    assert (captured[0]["config"]["http_options"]["timeout"] / 1000
-            <= .0004), "SDK timeout rounded above remaining deadline"
+    with pytest.raises(op.OpeningBudgetExhausted):
+        provider.request_options({"timeout_s": .0004, "prompt": "test",
+                                  "retries_disabled": True})
+    assert captured == [], "SDK must not be called with timeout=0"
+    assert closes == [1], "client still closes exactly once"
 
 
 def test_adapter_never_rounds_fractional_timeout_up():
@@ -672,9 +677,10 @@ def test_fallback_stops_when_budget_exhausted():
 # ---------------------------------------------------------------------------
 
 def test_emission_source_mutation_kills_overlay(av_job, monkeypatch):
-    """Real _build_project path: replacing the source file invalidates
-    the plan at emission (fingerprint recomputed from the current
-    source, not trusted from the saved plan)."""
+    """Real _build_project path: changing the ORIGINAL source file
+    invalidates the plan at emission. The fingerprint is recomputed
+    from the authoritative original asset (threaded through planning),
+    never the cut slice, and never trusted from the saved plan."""
     monkeypatch.setenv("CLIPPYME_GROUNDED_OPENINGS", "1")
     from clippyme.pipeline.project_emit import _build_project
     from clippyme.domain.clip_project import validate_project
@@ -690,21 +696,23 @@ def test_emission_source_mutation_kills_overlay(av_job, monkeypatch):
         clip=clip, clips_data=clips_data, input_video=src, index=0,
         budget=_budget(), provider=_FakeProvider([good]))
     assert clip["opening_plan"]["selected"] is not None
+    assert clip["opening_source_path"] == src
     data = _build_project(
         job_id="t15", index=0, start=0.0, end=6.0, clip=clip,
         clips_data=clips_data, clip_source=src, clip_final=final,
         job_dir=js)
     assert [o for o in validate_project(data).overlays
             if o.type == "hook"] != []
-    # MUTATION: a different source file (same name pattern, new bytes).
-    src2 = os.path.join(js, "source_clip0_alt.mp4")
+    # MUTATION: the original source file changed (new bytes at the same
+    # path the plan was built from). The emission identity no longer
+    # matches, so no automatic hook.
     with open(src, "rb") as fh:
         blob = fh.read()
-    with open(src2, "wb") as fh:
+    with open(src, "wb") as fh:
         fh.write(blob + b"\x00" * 70000)
     data = _build_project(
         job_id="t15", index=0, start=0.0, end=6.0, clip=clip,
-        clips_data=clips_data, clip_source=src2, clip_final=final,
+        clips_data=clips_data, clip_source=src, clip_final=final,
         job_dir=js)
     project = validate_project(data)
     assert [o for o in project.overlays if o.type == "hook"] == []

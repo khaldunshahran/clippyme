@@ -362,7 +362,13 @@ def _build_project(
         try:
             from clippyme.pipeline.framing_plan import (
                 source_fingerprint as _source_fingerprint)
-            _current_fp = _source_fingerprint(clip_source)
+            # The authoritative identity is the ORIGINAL source the plan
+            # was built from — never the cut slice. A missing or
+            # unreadable original fails closed (no automatic overlay).
+            _original = clip.get("opening_source_path")
+            _current_fp = (_source_fingerprint(_original)
+                           if isinstance(_original, str) and _original
+                           else None)
         except Exception:
             _current_fp = None
         _current_packet = _opening_plan.current_opening_packet_or_none(
