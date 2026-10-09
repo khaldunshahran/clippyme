@@ -1009,11 +1009,31 @@ def _render_one_clip(
             # validation; a corrupt or failed recovery fails clearly --
             # never a rerender over the preserved base and never a success
             # report.
-            restored = _pf13decline.restore_accepted_snapshot(
-                job_dir=output_dir,
-                clip_final=clip_final,
-                stable_sidecar=_sidecar_for(legacy, clip_final),
-            )
+            try:
+                restored = _pf13decline.restore_accepted_snapshot(
+                    job_dir=output_dir,
+                    clip_final=clip_final,
+                    stable_sidecar=_sidecar_for(legacy, clip_final),
+                )
+            except _pf13decline.FramingIntegrityError as exc:
+                # Review-05: the install failed AND the rollback could not
+                # be verified -- the live pair is indeterminate, but the
+                # verified staging backups were retained. Critical
+                # failure; never rerender over the preserved base and
+                # never report success.
+                print(
+                    f"clip-project: accepted-pair snapshot recovery "
+                    f"integrity failed (clip {index + 1}/{total}) -- {exc}; "
+                    f"rerender stays declined; staging backups retained "
+                    f"for manual recovery",
+                    flush=True,
+                )
+                clip["qa"] = {"ok": False, "critical": True,
+                              "issues": ["framing-recovery-integrity-failed"],
+                              "warnings": []}
+                state.mark_clip(index, "failed", clip["qa"])
+                _save_metadata(metadata_file, clips_data)
+                return False
             if restored and _valid_media_file(clip_final, 10_000):
                 clip["qa"] = {"ok": True, "critical": False, "issues": [],
                               "warnings": []}

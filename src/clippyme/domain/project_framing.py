@@ -107,6 +107,18 @@ class FramingError(Exception):
     """A framing problem. The message is the stable reason string."""
 
 
+class FramingIntegrityError(FramingError, OSError):
+    """A rollback/recovery integrity failure. Never collapsed into False.
+
+    Raised when a transactional live-pair rollback could not be verified
+    byte-identical to the pre-install state (review-05): the live pair is
+    indeterminate and the verified staging backups are retained on disk.
+    A distinct ``FramingError`` subtype so callers can single out the
+    integrity case; also an ``OSError`` so generic OS-failure handlers
+    still surface it.
+    """
+
+
 @dataclass(frozen=True)
 class ResolvedSidecar:
     """A validated stable sidecar: absolute path, job-relative ref, identity."""
@@ -1420,10 +1432,12 @@ def _stage_live_pair(*, clip_final: str, stable_sidecar: str) -> dict | None:
     """Stage the CURRENT live pair before a snapshot install (review-04).
 
     Destination-local, verified ``copy2`` backups of whatever is live;
-    each file is recorded with its existence flag. Returns an opaque
-    record for :func:`_restore_live_pair`, or None when staging cannot
-    be completed -- fail-closed, the caller must not touch the live
-    pair. Never touches the global process temp.
+    each file is recorded with its existence flag and, when it existed,
+    its exact pre-install sha256 (ground truth for post-rollback
+    verification). Returns an opaque record for
+    :func:`_restore_live_pair`, or None when staging cannot be completed
+    -- fail-closed, the caller must not touch the live pair. Never
+    touches the global process temp.
     """
     import shutil
     import tempfile
@@ -1435,13 +1449,19 @@ def _stage_live_pair(*, clip_final: str, stable_sidecar: str) -> dict | None:
         paths = []
         for dst in (clip_final, stable_sidecar):
             entry = {"dst": dst, "existed": os.path.isfile(dst),
-                     "backup": None}
+                     "backup": None, "sha256": None}
             if entry["existed"]:
                 backup = os.path.join(
                     staging, os.path.basename(dst) + ".bak")
                 shutil.copy2(dst, backup)
                 _verify_backup(dst, backup)
+                pre_hash = _sha256_file(dst)
+                if pre_hash is None:
+                    raise OSError(
+                        "task13 staging failed: could not hash "
+                        f"{os.path.basename(dst)}")
                 entry["backup"] = backup
+                entry["sha256"] = pre_hash
             paths.append(entry)
         return {"dir": staging, "paths": paths}
     except OSError:
@@ -1462,13 +1482,23 @@ def _install_direct(src: str, dst: str) -> None:
     _verify_backup(src, dst)
 
 
-def _restore_live_pair(record: dict) -> None:
-    """Restore the staged live pair as exactly as possible. Never raises.
+def _restore_live_pair(record: dict) -> bool:
+    """Restore the staged live pair; verified success or distinct failure.
 
     Each file that existed is reinstalled (atomically when possible,
     direct copy as fallback); each file that did not exist is removed
     when present. Snapshot (recovery) data is never touched.
+
+    After the attempt, BOTH live paths are re-verified against the exact
+    pre-install existence flag and sha256 recorded by
+    :func:`_stage_live_pair`. When both verify, the staging directory is
+    discarded and True is returned. When anything does not verify -- a
+    restore error or a post-restore existence/hash mismatch -- the
+    staging directory is RETAINED (never deleted) and
+    :class:`FramingIntegrityError` is raised, so the failure can never be
+    collapsed into ordinary False. Never returns False.
     """
+    restore_errors: list[str] = []
     for entry in record["paths"]:
         dst = entry["dst"]
         try:
@@ -1479,9 +1509,26 @@ def _restore_live_pair(record: dict) -> None:
                     _install_direct(entry["backup"], dst)
             elif os.path.isfile(dst) or os.path.islink(dst):
                 os.remove(dst)
-        except OSError:
-            continue
+        except OSError as exc:
+            restore_errors.append(f"{dst}: {exc}")
+    verify_errors: list[str] = []
+    for entry in record["paths"]:
+        dst = entry["dst"]
+        if entry["existed"]:
+            actual = _sha256_file(dst)
+            if actual is None:
+                verify_errors.append(f"{dst}: missing after rollback")
+            elif actual != entry.get("sha256"):
+                verify_errors.append(f"{dst}: hash mismatch after rollback")
+        elif os.path.isfile(dst) or os.path.islink(dst):
+            verify_errors.append(f"{dst}: present after rollback")
+    if restore_errors or verify_errors:
+        raise FramingIntegrityError(
+            "live-pair rollback failed integrity verification; verified "
+            f"staging backups retained at {record['dir']}: "
+            + "; ".join(restore_errors + verify_errors))
     _remove_tree_quietly(record["dir"])
+    return True
 
 
 def restore_accepted_snapshot(*, job_dir: str, clip_final: str,
@@ -1495,9 +1542,14 @@ def restore_accepted_snapshot(*, job_dir: str, clip_final: str,
     possible and the snapshot (recovery data) is left untouched.
 
     Returns True only when the complete snapshot pair was installed.
-    Returns False -- never raises, never leaves a mixed pair -- when the
-    generation is unavailable/invalid or any install failed; False leaves
-    the live pair exactly as it was before the call.
+    Returns False when the generation is unavailable/invalid (no live
+    mutation occurred) or when an install failed and the prior live pair
+    was rolled back and re-verified byte-identical; False leaves the
+    live pair exactly as it was before the call, never a mixed pair.
+    When the rollback itself cannot be verified,
+    :class:`FramingIntegrityError` is raised distinctly instead of
+    returning False: the live pair is indeterminate and the verified
+    staging backups are retained for manual recovery.
     """
     clip_dir = _clip_snapshot_dir(job_dir, clip_final)
     validated = _validate_snapshot_generation(
@@ -1520,6 +1572,10 @@ def restore_accepted_snapshot(*, job_dir: str, clip_final: str,
             # Sidecar-less acceptance: the stable binding must not linger.
             os.remove(stable_sidecar)
     except OSError:
+        # Review-05: _restore_live_pair returns verified success only,
+        # otherwise raises FramingIntegrityError. Verified rollback ->
+        # False (the documented byte-identical case); the integrity
+        # error propagates distinctly and is never converted to False.
         _restore_live_pair(live)
         return False
     _remove_tree_quietly(live["dir"])

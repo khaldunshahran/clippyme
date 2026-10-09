@@ -72,7 +72,17 @@ render → verify_framing_at_render      domain, called in the
    considered available; restoration stages the current live pair first
    and rolls it back exactly on any install failure, so `True` means the
    complete snapshot pair was installed and `False` leaves the live pair
-   untouched.
+   untouched. `False` from `restore_accepted_snapshot` means ONLY that no
+   live mutation occurred (snapshot unavailable/invalid) or that an
+   install failure was rolled back with the pre-install live pair
+   re-verified byte-identical. A rollback that cannot be verified raises
+   `FramingIntegrityError` -- a distinct `FramingError` subtype (also an
+   `OSError`) -- instead of returning `False`: the live pair is
+   indeterminate, and the `.task13-live-backup-*` staging directory is
+   RETAINED on disk for manual recovery. The preserved-project route
+   records this as the critical outcome
+   `framing-recovery-integrity-failed` and never rerenders over the
+   preserved base.
 6. **Emission.** `build_project_framing` resolves the stable sidecar
    inside the job dir (real containment; traversal/symlink escape --
    `framing-sidecar-escape`), parses it through the Task 12 production
