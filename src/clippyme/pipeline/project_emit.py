@@ -114,6 +114,52 @@ def _center_crop_916(src_w: int, src_h: int) -> dict[str, float]:
 
 
 
+def _provider_config_is_current(saved: Any, current: Any) -> bool:
+    """The saved provider config may be treated as current.
+
+    Lenient by design: when nothing was saved, or no authoritative
+    current config is available, there is nothing to contradict. A
+    saved config whose kind/model/fallbacks/prompt differ from the
+    current factory/provider config is stale and fails the check.
+    """
+    if not isinstance(saved, dict) or not saved:
+        return True
+    if not isinstance(current, dict) or not current:
+        return True
+    if saved.get("kind") != current.get("kind"):
+        return False
+    for key in ("model", "prompt_version"):
+        if saved.get(key) != current.get(key):
+            return False
+    if (saved.get("fallback_models") or []) != (
+            current.get("fallback_models") or []):
+        return False
+    return True
+
+
+def _current_opening_provider_config() -> dict[str, Any] | None:
+    """Authoritative current provider config, if resolvable."""
+    for getter in (_opening_plan.get_opening_provider,
+                   _opening_plan.get_opening_provider_factory,
+                   _opening_plan.default_opening_provider_factory):
+        try:
+            obj = getter()
+        except Exception:
+            obj = None
+        if obj is None:
+            continue
+        describe = getattr(obj, "describe", None)
+        if not callable(describe):
+            continue
+        try:
+            config = describe()
+        except Exception:
+            continue
+        if isinstance(config, dict) and config:
+            return config
+    return None
+
+
 def _grounded_hook_overlay(
     clip: dict[str, Any], duration: float,
     current_packet: dict[str, Any] | None = None,
@@ -121,12 +167,18 @@ def _grounded_hook_overlay(
     """Task 15: hook overlay + opening identity from the grounded plan.
 
     Fail-closed emission boundary: an automatic hook overlay is emitted
-    ONLY when (a) the selected option is a member of the plan's
-    validated options, (b) the plan's packet id matches the packet id
-    recomputed from the CURRENT clip (when a current packet is
-    supplied), and (c) the selection's evidence re-validates against
-    the current packet. A forged, unvalidated, or obsolete selection
-    never becomes a grounded overlay.
+    ONLY when (a) the plan uses the current schema version, (b) the
+    selected option is a COMPLETE normalized member of the plan's
+    validated options (not merely a matching id — a changed payload
+    with a valid id never emits), (c) a CURRENT packet was
+    successfully reconstructed (a failed reconstruction means no
+    automatic overlay — the None case never bypasses identity
+    validation), (d) the plan's packet id matches that current packet,
+    (e) the saved provider config is still current, and (f) the
+    selection's evidence re-validates against the current packet. A
+    forged, unvalidated, stale, or obsolete selection never becomes a
+    grounded overlay. Explicit user-authored overrides travel a
+    separate authorship path and never depend on provider readiness.
 
     Returns (overlays, opening_field). The opening field is additive
     project metadata carrying the selected option identity, evidence,
@@ -173,32 +225,59 @@ def _grounded_hook_overlay(
             "legacy_unverified_hook": _legacy_note(),
         }
 
-    # (a) The selected option must be a member of the validated options.
+    # (a) The plan must use the current schema version. Stale
+    # schemas (e.g. hand-written -1) never authorize an overlay.
+    if plan.get("schema_version") != _opening_plan.OPENING_PLAN_SCHEMA_VERSION:
+        return _none("stale_schema_version")
+
+    # (b) The selected option must be a COMPLETE normalized member of
+    # the validated options — not merely a matching id. A selected
+    # payload changed after validation (same id, different text) was
+    # never the saved selected option and never emits.
     selected = plan.get("selected")
     validated = plan.get("validated_options") or []
-    valid_ids = {v.get("id") for v in validated if isinstance(v, dict)}
     if not (isinstance(selected, dict) and selected.get("id")
             and selected.get("text")):
         # No automatic choice at all: preserve the plan's honest reason.
         return _none(plan.get("no_selection_reason") or "no_opening_plan")
-    if selected["id"] not in valid_ids:
+    member = next(
+        (v for v in validated
+         if isinstance(v, dict) and v.get("id") == selected["id"]),
+        None)
+    if member is None:
         # A selected dict that was never validated (forged/obsolete).
         return _none("selection_not_validated")
+    if selected != member:
+        # Same id, different payload: not the validated selection.
+        return _none("selection_payload_mismatch")
 
-    # (b) The plan's packet id must match the packet id recomputed from
+    # (c) A CURRENT packet must have been reconstructed. A failed
+    # reconstruction (None) never bypasses identity validation.
+    if current_packet is None:
+        return _none("current_packet_unavailable")
+
+    # (d) The plan's packet id must match the packet id recomputed from
     # the current clip (catches stale/forged plans and current-bound
     # mutations).
-    if current_packet is not None:
-        if plan.get("packet_id") != current_packet.get("packet_id"):
-            return _none("packet_identity_changed")
-        # (c) The selection's evidence must re-validate against the
-        # current packet.
-        reselected, rejection = _opening_plan.validate_opening_option(
-            selected, packet=current_packet)
-        if rejection is not None:
-            return _none(
-                "selection_evidence_invalid:" + rejection.get("code", "?"))
-        selected = reselected
+    if plan.get("packet_id") != current_packet.get("packet_id"):
+        return _none("packet_identity_changed")
+
+    # (e) The saved provider config must still be current: recheck
+    # it against the currently resolvable config rather than trusting
+    # the saved value by definition.
+    if not _provider_config_is_current(
+            plan.get("provider_config"),
+            _current_opening_provider_config()):
+        return _none("provider_config_changed")
+
+    # (f) The selection's evidence must re-validate against the
+    # current packet.
+    reselected, rejection = _opening_plan.validate_opening_option(
+        selected, packet=current_packet)
+    if rejection is not None:
+        return _none(
+            "selection_evidence_invalid:" + rejection.get("code", "?"))
+    selected = reselected
 
     disp = selected.get("display") or {}
     try:
@@ -274,9 +353,21 @@ def _build_project(
     if _openings_on:
         # Recompute the packet from the CURRENT clip: the emission
         # boundary requires the plan's packet id to match it and the
-        # selection's evidence to re-validate.
+        # selection's evidence to re-validate. The source fingerprint
+        # is recomputed from the actual source file (authoritative
+        # current input) rather than trusting the saved fingerprint;
+        # a mismatch or an unreadable source fails reconstruction and
+        # emits no automatic overlay. The saved provider config is
+        # likewise rechecked against the currently resolvable config.
+        try:
+            from clippyme.pipeline.framing_plan import (
+                source_fingerprint as _source_fingerprint)
+            _current_fp = _source_fingerprint(clip_source)
+        except Exception:
+            _current_fp = None
         _current_packet = _opening_plan.current_opening_packet_or_none(
-            clip, clips_data, start, end)
+            clip, clips_data, start, end,
+            current_fingerprint=_current_fp)
         overlays, opening_field = _grounded_hook_overlay(
             clip, duration, current_packet=_current_packet)
     else:

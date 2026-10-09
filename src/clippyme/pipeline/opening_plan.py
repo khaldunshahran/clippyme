@@ -429,6 +429,9 @@ def _validate_av_evidence(
             entry["event_id"] = event_id.strip()[:128]
         else:
             entry["event_id"] = f"av-{idx}"
+        provenance = item.get("source_fingerprint")
+        if isinstance(provenance, str) and provenance.strip():
+            entry["source_fingerprint"] = provenance.strip()[:256]
         out.append(entry)
     return out
 
@@ -463,6 +466,9 @@ def _av_identity_hash(evidence: list[dict[str, Any]]) -> str:
         h.update(repr(ev.get("start")).encode("ascii"))
         h.update(b"\x00")
         h.update(repr(ev.get("end")).encode("ascii"))
+        h.update(b"\x00")
+        h.update(str(ev.get("source_fingerprint", "")).encode(
+            "utf-8", errors="replace"))
         h.update(b"\x00")
     return h.hexdigest()
 
@@ -590,7 +596,8 @@ def build_opening_prompt(packet: dict[str, Any]) -> str:
         rel_start = ev["start"] - final_start_f
         rel_end = ev["end"] - final_start_f
         evidence_lines.append(
-            f"[{ev['kind']}] abs {ev['start']:.2f}-{ev['end']:.2f} "
+            f"[{ev['kind']}] id={ev.get('event_id', '?')} "
+            f"abs {ev['start']:.2f}-{ev['end']:.2f} "
             f"(clip {rel_start:.2f}-{rel_end:.2f}): {ev['label']}")
     prefs = packet.get("preferences") or {}
     pref_lines = [f"{k}: {v}" for k, v in sorted(prefs.items())]
@@ -785,6 +792,17 @@ def _parse_opening_response(response: Any) -> list[dict[str, Any]]:
     return options
 
 
+class OpeningBudgetExhausted(RuntimeError):
+    """The opening budget was exhausted before an SDK call could start.
+
+    Raised instead of granting more time than remains: a positive
+    remainder that cannot be represented, or setup work that consumed
+    the whole remainder, stops the attempt with this explicit budget
+    reason. The stage records it as budget exhaustion, not a provider
+    failure.
+    """
+
+
 class GeminiOpeningProvider:
     """Lazy production opening provider using the supported Gemini config.
 
@@ -828,13 +846,35 @@ class GeminiOpeningProvider:
         prompt = request.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("request prompt must be non-empty text")
-        timeout_ms = max(1, int(round(float(timeout_s) * 1000)))
+        # A fallback attempt may override the model for this call only.
+        model = request.get("model") or self._model
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("request model must be non-empty text")
         client = self._client_factory()
         try:
+            # Recompute the remaining budget AFTER client/setup work:
+            # setup may have consumed part of the remainder, and the
+            # adapter must never exceed what is actually left.
+            remaining = request.get("remaining_s")
+            if callable(remaining):
+                try:
+                    fresh = float(remaining())
+                except Exception:
+                    fresh = float(timeout_s)
+                effective = min(float(timeout_s), fresh)
+            else:
+                effective = float(timeout_s)
+            if not _is_finite_number(effective) or effective <= 0:
+                raise OpeningBudgetExhausted(
+                    "opening budget exhausted before the SDK call")
+            # Floor, never round up: the SDK timeout must not exceed
+            # the remaining budget. A sub-millisecond remainder floors
+            # to 0 rather than granting a rounded-up millisecond.
+            timeout_ms = int(effective * 1000)
             # Single SDK attempt: no loop on transient failures. The
             # budgeted provider->fallback switch is the stage's job.
             response = client.models.generate_content(
-                model=self._model,
+                model=model,
                 contents=prompt,
                 config={
                     "http_options": {
@@ -944,10 +984,11 @@ _SPEECH_VERBS = frozenset({
     "claim", "claims", "claimed", "stated", "states", "according",
 })
 
-# Low-information glue words an English paraphrase may add to its
-# evidence. Anything else novel in the option text is a material claim
-# the evidence does not support (invented person/event/object) and is
-# rejected. Deterministic and reviewable; not a semantic model.
+# Low-information glue words a paraphrase may add to its evidence.
+# Polarity/negation words are NEVER glue: a novel negation flips the
+# meaning of the evidence ("coffee never works" vs "coffee works") and
+# must appear in the cited evidence itself. Deterministic and
+# reviewable; not a semantic model.
 _GLUE_TOKENS = frozenset((
     "a", "an", "the", "this", "that", "these", "those",
     "i", "me", "my", "mine", "you", "your", "yours",
@@ -957,19 +998,59 @@ _GLUE_TOKENS = frozenset((
     "has", "have", "had", "do", "does", "did",
     "will", "would", "shall", "should", "can", "could",
     "may", "might", "must",
-    "and", "or", "but", "nor", "yet", "so", "for",
+    "and", "or", "but", "yet", "so", "for",
     "of", "in", "on", "at", "to", "from", "with", "by",
     "about", "as", "into", "over", "under", "after", "before",
-    "between", "through", "during", "without", "within",
+    "between", "through", "during", "within",
     "against", "among",
-    "not", "no", "yes",
+    "yes",
     "very", "really", "just", "quite", "rather", "too", "also",
     "even", "still", "already",
     "here", "there", "now", "then", "today", "tonight",
-    "always", "never", "sometimes", "often",
+    "always", "sometimes", "often",
     "oh", "wow", "hey", "hmm", "well", "okay", "ok",
     "watch", "see", "look", "listen", "hear",
 ))
+
+# Negation/polarity words. A novel negation flips the meaning of the
+# evidence ("coffee never works" against "coffee works") and is never
+# low-information glue: it must appear in the cited evidence itself to
+# be supported. Checked after the evidence/glue membership test so a
+# negation that IS in the evidence stays supported.
+_NEGATION_TOKENS = frozenset((
+    "not", "no", "never", "n't", "cannot",
+    "don't", "doesn't", "didn't", "won't", "can't",
+    "isn't", "aren't", "wasn't", "weren't",
+    "hasn't", "haven't", "hadn't",
+    "couldn't", "shouldn't", "wouldn't", "mustn't",
+    "without", "none", "nobody", "nothing", "neither", "nor",
+))
+
+# Event/outcome words. Naming a competition, prize, or outcome the
+# evidence does not show ("championship", "won", "medal") invents an
+# event. Descriptive paraphrase verbs/adjectives for the depicted
+# action ("erupts" for "cheers") are deliberately NOT in this list.
+_EVENT_OUTCOME_WORDS = frozenset((
+    "championship", "championships", "campeonato", "campeonatos",
+    "champion", "champions", "campeon", "campeones",
+    "medal", "medals", "medalla", "medallas",
+    "trophy", "trophies", "trofeo", "trofeos",
+    "title", "titles", "titulo", "titulos",
+    "victory", "victories", "victoria", "victorias",
+    "win", "wins", "won", "winner", "winners",
+    "lose", "loses", "lost", "loser", "losers",
+    "defeat", "defeats", "defeated",
+    "beat", "beats", "beaten",
+    "score", "scores", "scored",
+    "goal", "goals", "gol", "goles",
+    "prize", "prizes", "premio", "premios",
+    "award", "awards",
+    "crown", "crowned",
+    "final", "finals", "semifinal", "semifinals",
+))
+
+_PROPER_STRIP_CHARS = " \t\n\"\u201c\u201d\u2018\u2019()[]{}:;,.!?\u00ab\u00bb\u00a1\u00bf"
+
 
 
 def _reject(option_id: Any, code: str, reason: str) -> dict[str, Any]:
@@ -1056,10 +1137,19 @@ def _validate_speech_evidence(
 def _validate_sensory_evidence(
     items: list[dict[str, Any]], basis: str,
     av_evidence: list[dict[str, Any]],
+    source_fingerprint: Optional[str] = None,
 ) -> Optional[str]:
-    """Bind each sensory citation to a specific accepted event's identity
-    AND interval. A citation without an interval, or with an interval
-    that does not match its event, is rejected (fail closed)."""
+    """Bind each sensory citation to a specific accepted event's
+    identity AND interval AND source.
+
+    The cited ``event_id``, label, basis and interval must all belong
+    to ONE accepted event: a forged event_id with a matching
+    label/interval is rejected, and same-label events stay distinct
+    (a citation binds the event whose id — or, without an id, whose
+    label AND interval — it cites; a valid later event is never
+    mistaken for the first label match). An event recorded from a
+    different source is foreign evidence and is rejected. Fail closed.
+    """
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
             return f"evidence[{idx}] must be an object"
@@ -1078,24 +1168,55 @@ def _validate_sensory_evidence(
                     f"interval inside the final clip")
         if ee <= es:
             return f"evidence[{idx}] interval end must be after start"
-        # The label must correspond to a specific accepted packet event.
+        cited_id = item.get("event_id")
+        cited_id = (cited_id.strip()[:128]
+                    if isinstance(cited_id, str) and cited_id.strip()
+                    else None)
         match = None
-        for ev in av_evidence or []:
-            if ev.get("kind") != basis:
-                continue
-            if _normalize_label(ev.get("label", "")) == _normalize_label(label):
-                match = ev
-                break
-        if match is None:
-            return (f"evidence[{idx}].label does not match accepted "
-                    f"{basis} evidence inside the final interval")
-        # The cited interval must be the event's interval — a fabricated
-        # interval for a real label is rejected.
+        if cited_id is not None:
+            # Identity-first binding: the event_id selects the event;
+            # label and interval must then agree with THAT event.
+            for ev in av_evidence or []:
+                if ev.get("kind") != basis:
+                    continue
+                if ev.get("event_id") == cited_id:
+                    match = ev
+                    break
+            if match is None:
+                return (f"evidence[{idx}].event_id does not match any "
+                        f"accepted {basis} event inside the final interval")
+            if _normalize_label(match.get("label", "")) != _normalize_label(label):
+                return (f"evidence[{idx}].label does not match the cited "
+                        f"event's label")
+        else:
+            # No event_id: bind label AND interval together so a valid
+            # later same-label event is not mistaken for the first.
+            for ev in av_evidence or []:
+                if ev.get("kind") != basis:
+                    continue
+                if _normalize_label(ev.get("label", "")) != _normalize_label(label):
+                    continue
+                if (abs(float(es) - float(ev["start"])) <= 1e-6
+                        and abs(float(ee) - float(ev["end"])) <= 1e-6):
+                    match = ev
+                    break
+            if match is None:
+                return (f"evidence[{idx}] does not cite an accepted "
+                        f"{basis} event (label and interval must both "
+                        f"match inside the final interval)")
+        # The cited interval must be the bound event's interval — a
+        # fabricated interval for a real event is rejected.
         if abs(float(es) - float(match["start"])) > 1e-6 or abs(
                 float(ee) - float(match["end"])) > 1e-6:
             return (f"evidence[{idx}] interval [{es}, {ee}] does not match "
-                    f"the accepted {basis} event's interval "
+                    f"the cited {basis} event's interval "
                     f"[{match['start']}, {match['end']}]")
+        # Provenance binding: foreign-source evidence is rejected.
+        ev_source = match.get("source_fingerprint")
+        if (ev_source and source_fingerprint
+                and ev_source != source_fingerprint):
+            return (f"evidence[{idx}] cites {basis} event from a "
+                    f"different source")
     return None
 
 
@@ -1122,61 +1243,84 @@ def _check_hard_claims(text: str, quote_tokens_union: set[str]) -> Optional[str]
     return None
 
 
-def _content_tokens(text: str) -> list[str]:
-    """Content-bearing tokens (length >= 4 after normalization)."""
-    return [t for t in normalize_tokens(text) if len(t) >= 4]
+def _raw_text_tokens(text: str) -> list[str]:
+    """Raw whitespace tokens with case preserved (for entity detection)."""
+    if not isinstance(text, str):
+        return []
+    return [w for w in text.split() if w]
 
 
-def _check_speech_text_support(
-    text: str, quote_tokens_union: set[str], language: Optional[str]
-) -> Optional[str]:
-    """Material claim-support contract for speech options.
+def _looks_like_proper_noun(raw_token: str, first_token: bool) -> bool:
+    """A capitalized token names a person/entity (Bob, Alice, Alicia).
 
-    English: every content token must come from the cited evidence or
-    be a low-information glue word, and at least one content token
-    must be evidence-grounded. Novel people/events/objects (e.g.
-    'Alice', 'championship') are rejected as invented. Genuinely
-    supported paraphrases (reordering + glue) pass; English is not
-    forced on other languages.
-    Other languages: token-overlap rule only (novel-vocabulary
-    invention cannot be judged deterministically); unsupported text
-    is rejected as unknown/unverified, never promoted.
+    Sentence-initial capitalization is conventional, so the first
+    token is exempt — an invented sentence-initial person is still
+    caught by the strict speech rule or the event/outcome list.
+    Deterministic and reviewable; not a semantic model.
     """
-    content = _content_tokens(text)
-    if not content:
-        return None
-    if _canonical_language(language) == "en":
-        novel = [t for t in content
-                 if t not in quote_tokens_union and t not in _GLUE_TOKENS]
-        if novel:
-            return ("option introduces material claims not supported by "
-                    f"cited evidence: {', '.join(novel[:4])}")
-        if not any(t in quote_tokens_union for t in content):
-            return ("option text has no evidence-grounded content token "
-                    "(unknown/unverified)")
-        return None
-    overlap = sum(1 for t in content if t in quote_tokens_union)
-    if overlap * 2 < len(content):
-        return ("option text is not supported by cited evidence "
-                f"({overlap}/{len(content)} content tokens overlap)")
-    return None
+    if first_token:
+        return False
+    stripped = raw_token.strip(_PROPER_STRIP_CHARS)
+    return any(ch.isupper() for ch in stripped)
 
 
-def _check_sensory_text_support(
-    text: str, label_tokens_union: set[str]
+def _check_material_claims(
+    text: str, evidence_union: set[str], *, basis: str,
 ) -> Optional[str]:
-    """Text support for speech-free options against cited event labels."""
-    tokens = set(normalize_tokens(text))
-    if tokens & _SPEECH_VERBS:
-        return ("speech-free option describes speech "
-                "without speech evidence")
-    content = _content_tokens(text)
-    if not content:
-        return None
-    overlap = sum(1 for t in content if t in label_tokens_union)
-    if overlap * 2 < len(content):
-        return ("option text is not supported by cited evidence "
-                f"({overlap}/{len(content)} content tokens overlap)")
+    """Material claim-support contract, applied consistently across
+    languages and modalities.
+
+    Citation validity or bag-of-words overlap cannot establish
+    meaning, so every token of the option text is checked:
+    * in the cited evidence -> supported;
+    * in the low-information glue vocabulary -> allowed;
+    * otherwise the novel token is classified deterministically:
+      a capitalized token names an invented person/entity ("Bob",
+      "Alice"); a novel negation flips polarity ("coffee never
+      works"); a novel event/outcome word invents an event
+      ("championship", "won", "medal"); any other novel token in a
+      speech option is unsupported (the speech gate stays strict, and
+      the review-01 glue-vocabulary mutation stays load-bearing);
+      any other novel token in a speech-free option is a descriptive
+      paraphrase of the depicted event ("erupts" for "cheers").
+    Short names and action words are claims too: no minimum token
+    length. At least one non-glue token must be evidence-grounded, so
+    an all-glue text is never marked grounded. Genuinely supported
+    paraphrases and non-English options pass; English is never
+    forced and copied strings are never required.
+    """
+    # Module-global on purpose: the review-01 glue-vocabulary
+    # fail-then-restore mutation stays load-bearing.
+    glue = _GLUE_TOKENS
+    grounded_content = False
+    raw_tokens = _raw_text_tokens(text)
+    for pos, raw in enumerate(raw_tokens):
+        token = normalize_token(raw)
+        if not token:
+            continue
+        if token in evidence_union:
+            if token not in glue:
+                grounded_content = True
+            continue
+        if token in glue:
+            continue
+        if _looks_like_proper_noun(raw, pos == 0):
+            return (f"option introduces a person/entity {raw.strip()!r} "
+                    f"not supported by cited evidence")
+        if token in _NEGATION_TOKENS:
+            return (f"option introduces negation/polarity {token!r} "
+                    f"not supported by cited evidence")
+        if token in _EVENT_OUTCOME_WORDS:
+            return (f"option introduces an event/outcome {token!r} "
+                    f"not supported by cited evidence")
+        if basis == "speech":
+            return ("option introduces material claims not supported by "
+                    f"cited evidence: {token!r}")
+        # Speech-free paraphrase: descriptive verbs/adjectives for the
+        # depicted event stay allowed (never people/events/polarity).
+    if not grounded_content:
+        return ("option text has no evidence-grounded content token "
+                "(unknown/unverified)")
     return None
 
 
@@ -1256,7 +1400,9 @@ def validate_opening_option(
             quote_union.update(normalize_tokens(item["quote"]))
     else:
         err = _validate_sensory_evidence(
-            evidence, basis, packet.get("av_evidence") or [])
+            evidence, basis, packet.get("av_evidence") or [],
+            source_fingerprint=(packet.get("identity") or {}).get(
+                "source_fingerprint"))
         if err:
             return None, _reject(option_id, "evidence_not_accepted", err)
         for item in evidence:
@@ -1266,9 +1412,13 @@ def validate_opening_option(
     if err:
         return None, _reject(option_id, "hard_claim", err)
     if basis == "speech":
-        err = _check_speech_text_support(text, quote_union, language)
+        err = _check_material_claims(text, quote_union, basis="speech")
     else:
-        err = _check_sensory_text_support(text, label_union)
+        if set(normalize_tokens(text)) & _SPEECH_VERBS:
+            err = ("speech-free option describes speech "
+                   "without speech evidence")
+        else:
+            err = _check_material_claims(text, label_union, basis=basis)
     if err:
         return None, _reject(option_id, "text_unsupported", err)
 
@@ -1294,6 +1444,9 @@ def validate_opening_option(
             entry["label"] = " ".join(item["label"].split())
             entry["start"] = float(item["start"])
             entry["end"] = float(item["end"])
+            eid = item.get("event_id")
+            if isinstance(eid, str) and eid.strip():
+                entry["event_id"] = eid.strip()[:128]
         normalized_evidence.append(entry)
 
     return ({
@@ -1579,15 +1732,6 @@ def run_opening_stage(
     try:
         primary = _resolve("primary", provider, provider_factory)
         fallback = _resolve("fallback", fallback_provider, fallback_factory)
-        candidates: list[tuple[str, Provider]] = []
-        if primary is not None:
-            candidates.append(("primary", primary))
-        if fallback is not None:
-            candidates.append(("fallback", fallback))
-        if not candidates:
-            result["no_selection_reason"] = "no_provider_configured"
-            return result
-
         try:
             prompt = build_opening_prompt(packet)
         except Exception as exc:
@@ -1596,9 +1740,45 @@ def run_opening_stage(
             result["no_selection_reason"] = "prompt_build_failed"
             return result
 
+        def _configured_fallback_models(prov: Provider) -> list[str]:
+            """Fallback models a provider exposes for the stage to
+            drive. Only the production adapter honors a per-call model
+            override, so only it contributes a fallback chain here —
+            generic providers are never blind-called with a model they
+            would ignore."""
+            if not isinstance(prov, GeminiOpeningProvider):
+                return []
+            try:
+                config = prov.describe()
+            except Exception:
+                return []
+            fbs = (config or {}).get("fallback_models") or []
+            seen: list[str] = []
+            for fb in fbs:
+                if isinstance(fb, str) and fb.strip() and fb not in seen:
+                    seen.append(fb.strip())
+            return seen
+
+        # Attempt plan: primary, then the primary's configured fallback
+        # models, then the fallback provider and its fallback models.
+        # Every attempt is charged against the single shared budget;
+        # the adapter itself never retries (no hidden retries).
+        plan: list[tuple[str, Provider, Optional[str]]] = []
+        if primary is not None:
+            plan.append(("primary", primary, None))
+            for fb_model in _configured_fallback_models(primary):
+                plan.append((f"fallback:{fb_model}", primary, fb_model))
+        if fallback is not None:
+            plan.append(("fallback", fallback, None))
+            for fb_model in _configured_fallback_models(fallback):
+                plan.append((f"fallback:{fb_model}", fallback, fb_model))
+        if not plan:
+            result["no_selection_reason"] = "no_provider_configured"
+            return result
+
         raw_options: list[dict[str, Any]] = []
         budget_exhausted = False
-        for name, prov in candidates:
+        for name, prov, model in plan:
             ok, timeout_s = budget.try_charge()
             if not ok:
                 budget_exhausted = True
@@ -1614,7 +1794,12 @@ def run_opening_stage(
                 "timeout_s": timeout_s,
                 "max_options": MAX_OPENING_OPTIONS,
                 "retries_disabled": True,
+                # The adapter recomputes the remaining budget after
+                # client/setup work and never exceeds it.
+                "remaining_s": budget.remaining,
             }
+            if model is not None:
+                request["model"] = model
             try:
                 # No SDK-internal retries by contract: a single call per
                 # attempt, every attempt charged above. The adapter
@@ -1622,6 +1807,13 @@ def run_opening_stage(
                 options = prov.request_options(request)
                 call_ok = True
                 call_error = None
+            except OpeningBudgetExhausted as exc:
+                # The adapter stopped before the SDK call: explicit
+                # budget exhaustion, not a provider failure.
+                call_ok = False
+                call_error = f"budget_exhausted: {str(exc)[:120]}"
+                budget_exhausted = True
+                options = None
             except Exception as exc:
                 call_ok = False
                 call_error = str(exc)[:200]
@@ -1632,6 +1824,7 @@ def run_opening_stage(
                 result["fallback_calls"] += 1
             result["attempts"].append(
                 {"stage": name, "timeout_s": timeout_s, "ok": call_ok,
+                 **({"model": model} if model else {}),
                  **({"error": call_error} if call_error else {})})
             if not call_ok:
                 result["failures"].append(
@@ -1917,6 +2110,55 @@ def _window_transcript_words(
     return out
 
 
+_FRAME_AT_RE = re.compile(
+    r"^(?:frame|event|vf)-at-([0-9]+(?:\.[0-9]+)?)$")
+
+
+def _resolve_reference_time(
+    ref_id: str, frame_times: dict[str, Any],
+) -> Optional[float]:
+    """Resolve a frame/event reference to an absolute source time.
+
+    Prefers an explicit ``clips_data["av_frame_times"]`` binding
+    (production provenance); falls back to the ``frame-at-<t>`` /
+    ``event-at-<t>`` synthetic convention. Returns None when the
+    reference cannot be time-resolved — its scope is then unknown.
+    """
+    if isinstance(frame_times, dict):
+        t = frame_times.get(ref_id)
+        if _is_finite_number(t):
+            return float(t)
+    m = _FRAME_AT_RE.match(str(ref_id or "").strip())
+    if m:
+        try:
+            return float(m.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _reference_scope(
+    ref_ids: list[str], frame_times: dict[str, Any],
+    start: float, end: float,
+) -> str:
+    """Temporal scope of referenced frames/events vs the final clip.
+
+    Returns "inside" when at least one referenced frame/event is
+    inside [start, end); "outside" when at least one reference
+    resolves and none is inside; "unknown" when no references are
+    listed or none resolve (scope cannot be established — the
+    established candidate-interval behavior is kept).
+    """
+    resolved = [t for t in
+                (_resolve_reference_time(rid, frame_times) for rid in ref_ids)
+                if t is not None]
+    if not ref_ids or not resolved:
+        return "unknown"
+    if any(start <= t < end for t in resolved):
+        return "inside"
+    return "outside"
+
+
 def _opening_av_evidence_for_clip(
     clip: dict[str, Any], clips_data: dict[str, Any],
     start: float, end: float,
@@ -1926,37 +2168,75 @@ def _opening_av_evidence_for_clip(
 
     Reads ``clips_data["candidate_store"][clip["candidate_id"]]`` (the
     accepted Task 11 candidate record) and converts its visual/audio
-    evidence to packet items {kind, label, start, end} in absolute
-    source time, intersected with the final clip interval. Falls back
-    to the legacy ``clip["opening_av_evidence"]`` test alias only when
-    the Task 11 path yields nothing. Returns [] when neither has
-    usable evidence.
+    evidence to packet items {kind, label, start, end, event_id,
+    source_fingerprint} in absolute source time, intersected with the
+    final clip interval.
+
+    Scope rule: when the candidate lists frame/event references
+    (``visual_frame_ids`` / ``audio_event_ids``) whose times resolve,
+    the description is usable only if at least one referenced
+    frame/event is inside the final clip. If every resolved reference
+    is outside, the cut excludes the relevant evidence — the bridge
+    declines ([]) rather than retiming a whole-candidate summary onto
+    a cut that removed its payoff. Unresolvable references keep the
+    established candidate-interval behavior. Falls back to the legacy
+    ``clip["opening_av_evidence"]`` test alias only when the Task 11
+    path yields nothing and did not explicitly decline. Returns []
+    when neither has usable evidence.
     """
     items: list[dict[str, Any]] = []
+    declined = False
     store = (clips_data or {}).get("candidate_store")
     cid = clip.get("candidate_id")
     rec = (store.get(cid) if isinstance(store, dict)
            and isinstance(cid, str) else None)
+    frame_times = (clips_data or {}).get("av_frame_times") or {}
     if isinstance(rec, dict):
         basis = str(rec.get("evidence_basis") or "").strip().lower()
         rs, re_ = rec.get("start_s"), rec.get("end_s")
+        provenance = rec.get("source_fingerprint")
+        provenance = (provenance.strip()[:256]
+                      if isinstance(provenance, str) and provenance.strip()
+                      else None)
         if _is_finite_number(rs) and _is_finite_number(re_) and re_ > rs:
             cs, ce = max(float(rs), start), min(float(re_), end)
             if ce > cs:
                 if basis in ("visual", "multimodal"):
-                    label = rec.get("visual_description")
-                    if isinstance(label, str) and label.strip():
-                        items.append({
-                            "kind": "visual", "label": label.strip(),
-                            "start": cs, "end": ce, "event_id": cid,
-                        })
+                    scope = _reference_scope(
+                        [i for i in (rec.get("visual_frame_ids") or [])
+                         if isinstance(i, str)],
+                        frame_times, start, end)
+                    if scope == "outside":
+                        declined = True
+                    else:
+                        label = rec.get("visual_description")
+                        if isinstance(label, str) and label.strip():
+                            entry: dict[str, Any] = {
+                                "kind": "visual", "label": label.strip(),
+                                "start": cs, "end": ce, "event_id": cid,
+                            }
+                            if provenance:
+                                entry["source_fingerprint"] = provenance
+                            items.append(entry)
                 if basis in ("audio_event", "multimodal"):
-                    label = rec.get("evidence_text")
-                    if isinstance(label, str) and label.strip():
-                        items.append({
-                            "kind": "audio", "label": label.strip(),
-                            "start": cs, "end": ce, "event_id": cid,
-                        })
+                    scope = _reference_scope(
+                        [i for i in (rec.get("audio_event_ids") or [])
+                         if isinstance(i, str)],
+                        frame_times, start, end)
+                    if scope == "outside":
+                        declined = True
+                    else:
+                        label = rec.get("evidence_text")
+                        if isinstance(label, str) and label.strip():
+                            entry = {
+                                "kind": "audio", "label": label.strip(),
+                                "start": cs, "end": ce, "event_id": cid,
+                            }
+                            if provenance:
+                                entry["source_fingerprint"] = provenance
+                            items.append(entry)
+    if declined:
+        return []
     if not items:
         legacy = clip.get("opening_av_evidence")
         if isinstance(legacy, list):
@@ -1989,18 +2269,31 @@ def _packet_provider_config(
 def current_opening_packet_or_none(
     clip: dict[str, Any], clips_data: dict[str, Any],
     start: float, end: float,
+    current_fingerprint: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Recompute the current opening packet for emission checks.
 
     Uses the CURRENT clip bounds/words/AV evidence/language/
-    preferences/config plus the source fingerprint stored at plan
-    time. Returns None (never raises) when the packet cannot be
-    rebuilt — the emission boundary then fails closed on the checks
-    it can still perform (selection membership).
+    preferences/config. The source fingerprint is rechecked against
+    the authoritative current input (``current_fingerprint``, recomputed
+    by the caller from the actual source file) rather than treating
+    the saved fingerprint as current by definition: a mismatch — or
+    an unverifiable source — fails reconstruction, and the emission
+    boundary then emits no automatic overlay. Returns None (never
+    raises) when the packet cannot be rebuilt.
     """
     try:
         plan = clip.get("opening_plan") or {}
-        fingerprint = clip.get("opening_source_fingerprint")
+        saved = clip.get("opening_source_fingerprint")
+        if current_fingerprint is not None:
+            # Authoritative recheck: the saved fingerprint must match
+            # the fingerprint recomputed from the current source file.
+            if (not isinstance(saved, str) or not saved
+                    or saved != current_fingerprint):
+                return None
+            fingerprint = current_fingerprint
+        else:
+            fingerprint = saved
         if not isinstance(fingerprint, str) or not fingerprint:
             return None
         if not _is_finite_number(start) or not _is_finite_number(end):

@@ -183,3 +183,48 @@ and one explicit, deterministic selection.
   code/name and matches the packet language or the explicit
   translation target — it does not translate or verify translations
   itself.
+
+## Review-02 corrections (rev3)
+
+1. **Material claim support is consistent across languages/modalities.**
+   The old length>=4 content-token filter and the English glue list
+   admitted short invented claims ("Bob won") and polarity flips
+   ("coffee never works"); non-English and visual paths used 50%
+   token overlap and blessed invented people/events. Now every token
+   of the option text must be in the cited evidence or the
+   low-information glue vocabulary (polarity words are never glue).
+   Novel tokens are classified deterministically: capitalized tokens
+   name invented people/entities; novel negations flip polarity;
+   novel event/outcome words (championship, won, medal, ...) invent
+   events. Speech options stay strict (any other novel token is
+   unsupported); speech-free options allow descriptive paraphrase
+   verbs ("erupts" for "cheers"). At least one non-glue token must be
+   evidence-grounded. Supported paraphrases and non-English options
+   pass; English is never forced and copied strings are never
+   required. Unknown support is rejected as unverified, never marked
+   grounded.
+2. **Sensory evidence binds event identity, interval, and source.**
+   The Task 11 bridge no longer retimes a whole-candidate description
+   onto a cut that excludes its payoff: when the candidate's
+   frame/event references resolve to times outside the final clip,
+   the bridge declines. Citations must bind event_id + label + basis
+   + interval to one accepted event (forged ids rejected; same-label
+   events stay distinct), and foreign-source events are rejected.
+   Event IDs are carried into the prompt and normalized evidence.
+3. **Emission fails closed on the full current contract.**
+   Automatic emission requires the current schema version, a
+   successfully reconstructed CURRENT packet (failure means no
+   overlay), a packet-id match, a still-current provider config
+   (rechecked against the resolvable factory/provider config), and a
+   selected option that is a COMPLETE normalized member of the
+   validated options (same id, different payload never emits). The
+   source fingerprint is recomputed from the actual source file at
+   emission. Explicit user-authored overrides keep their separate
+   authorship path.
+4. **Production adapter fallback and timeout.** Configured fallback
+   models are executed as real charged attempts through the stage's
+   single shared budget (lazy clients, exactly-once close, no hidden
+   adapter retries). The SDK timeout is floored, never rounded above
+   the remaining budget; the remaining time is recomputed after
+   client/setup work, and exhaustion stops the attempt with an
+   explicit budget reason.
