@@ -11,7 +11,11 @@ import json
 import os
 from pathlib import Path
 
-from clippyme.pipeline.framing_plan import plan_from_dict, plan_to_dict
+from clippyme.pipeline.framing_plan import (
+    plan_from_dict,
+    plan_to_dict,
+    source_fingerprint,
+)
 
 
 def sidecar_for(video_path: str) -> str:
@@ -89,8 +93,31 @@ def write_task12_sidecar(video_path: str, marker: str) -> tuple[str, dict]:
     """Write a production-valid plan next to ``video_path`` (attempt-style).
 
     Returns (sidecar_path, canonical_plan_dict).
+
+    NOTE: the plan carries the default foreign ``source_fingerprint``
+    (``"fp-b…"``). Use :func:`write_task12_sidecar_for_source` for plans
+    that must verify against an actual render input (production reframe
+    always stamps the true identity).
     """
     plan = plan_to_dict(plan_from_dict(raw_task12_plan(marker)))
+    sidecar = sidecar_for(video_path)
+    Path(sidecar).write_text(
+        json.dumps(plan, sort_keys=True), encoding="utf-8")
+    return sidecar, plan
+
+
+def write_task12_sidecar_for_source(
+    video_path: str, marker: str, source_path: str
+) -> tuple[str, dict]:
+    """Write a production-valid plan bound to ``source_path`` (attempt-style).
+
+    Mirrors production ``reframe``: the plan's ``source_fingerprint`` is
+    the identity of the actual render input, so publication verification
+    accepts it. Returns (sidecar_path, canonical_plan_dict).
+    """
+    raw = raw_task12_plan(marker)
+    raw["source_fingerprint"] = source_fingerprint(source_path)
+    plan = plan_to_dict(plan_from_dict(raw))
     sidecar = sidecar_for(video_path)
     Path(sidecar).write_text(
         json.dumps(plan, sort_keys=True), encoding="utf-8")

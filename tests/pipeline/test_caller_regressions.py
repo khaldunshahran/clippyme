@@ -18,6 +18,7 @@ import pytest
 from clippyme.domain.project_render import get_project_path, latest_project_version
 from clippyme.pipeline import orchestrator as orch
 from clippyme.pipeline import project_emit
+from clippyme.domain import project_framing as _task13_project_framing
 from clippyme.pipeline import run_ops as ops
 
 
@@ -249,6 +250,7 @@ def test_direct_cli_publication_preserves_previous_artifacts(tmp_path, direct_cl
                build_cut_command=ops.build_cut_command,
                write_slice_provenance=ops.write_slice_provenance,
                validate_cut_output=validate, process_video_to_vertical=render,
+               _project_framing=_task13_project_framing,
                normalize_audio=lambda path: normalizations.append(path),
                select_cover_frame=lambda path: covers.append(path))
     exec(direct_clip_loop, env)

@@ -43,7 +43,11 @@ from tests.pipeline.test_sidecar_promotion import (
     VIDEO_BYTES,
     _direct_env,
 )
-from tests.pipeline.task13_helpers import sidecar_for, write_task12_sidecar
+from tests.pipeline.task13_helpers import (
+    sidecar_for,
+    write_task12_sidecar,
+    write_task12_sidecar_for_source,
+)
 
 
 # ===========================================================================
@@ -140,44 +144,94 @@ def test_preserved_user_project_keeps_its_referenced_sidecar(promo_job):
 # Part 2a: coordinated-publication unit tests.
 # ===========================================================================
 
-def _write_attempt(tmp_path, name="clip.render.tmp.mp4", marker="x"):
+def _write_attempt(tmp_path, name="clip.render.tmp.mp4", marker="x",
+                 source_path=None):
     video = tmp_path / name
     video.write_bytes(VIDEO_BYTES)
-    sidecar, _ = write_task12_sidecar(str(video), marker)
+    if source_path is None:
+        sidecar, _ = write_task12_sidecar(str(video), marker)
+    else:
+        # Production-shaped: the plan names the actual render input.
+        sidecar, _ = write_task12_sidecar_for_source(
+            str(video), marker, str(source_path))
     return str(video), sidecar
 
 
-def test_rebind_is_noop_when_already_bound(tmp_path):
-    video, sidecar = _write_attempt(tmp_path)
+def test_verify_accepts_plan_matching_source_and_rewrites_nothing(tmp_path):
+    # Review-02: source identity is verified, never rewritten. A plan that
+    # already names the render input is accepted byte-identical.
     src = tmp_path / "slice.mp4"
     src.write_bytes(SLICE_BYTES)
-    assert pf.rebind_sidecar_source(sidecar, source_path=str(src)) is True
+    video, sidecar = _write_attempt(tmp_path, source_path=src)
+    assert pf.verify_attempt_sidecar_source(
+        sidecar, source_path=str(src)) is True
     before = Path(sidecar).read_bytes()
-    assert pf.rebind_sidecar_source(sidecar, source_path=str(src)) is False
-    assert Path(sidecar).read_bytes() == before
+    assert pf.verify_attempt_sidecar_source(
+        sidecar, source_path=str(src)) is True
+    assert Path(sidecar).read_bytes() == before, (
+        "verification must not rewrite the plan")
 
 
-def test_rebind_rejects_malformed_sidecar(tmp_path):
+def test_verify_rejects_malformed_sidecar(tmp_path):
     bad = tmp_path / "clip.render.tmp.turn_framing_plan.json"
     bad.write_text("{not json", encoding="utf-8")
     src = tmp_path / "slice.mp4"
     src.write_bytes(SLICE_BYTES)
     with pytest.raises(pf.FramingError):
-        pf.rebind_sidecar_source(str(bad), source_path=str(src))
+        pf.verify_attempt_sidecar_source(str(bad), source_path=str(src))
 
 
-def test_publish_promotes_and_binds_source(tmp_path):
-    video, attempt = _write_attempt(tmp_path, marker="a1")
-    stable = sidecar_for(str(tmp_path / "clip.mp4"))
+def test_verify_rejects_foreign_plan_without_relabelling(tmp_path):
+    # A production-valid plan from source A is rejected for source B --
+    # never relabelled to B.
+    source_a = tmp_path / "source-a.mp4"
+    source_b = tmp_path / "source-b.mp4"
+    source_a.write_bytes(b"A" * 20000)
+    source_b.write_bytes(b"B" * 20000)
+    _, attempt = _write_attempt(tmp_path, marker="foreign",
+                                source_path=source_a)
+    before = Path(attempt).read_bytes()
+    with pytest.raises(pf.FramingError) as exc:
+        pf.verify_attempt_sidecar_source(
+            attempt, source_path=str(source_b))
+    assert "framing-cross-source" in str(exc.value)
+    assert Path(attempt).read_bytes() == before, (
+        "a rejected plan must not be relabelled")
+
+
+def test_publish_promotes_source_verified_plan(tmp_path):
     src = tmp_path / "slice.mp4"
     src.write_bytes(SLICE_BYTES)
+    video, attempt = _write_attempt(tmp_path, marker="a1", source_path=src)
+    stable = sidecar_for(str(tmp_path / "clip.mp4"))
     assert pf.publish_attempt_sidecar(
         attempt_sidecar=attempt, stable_sidecar=stable,
         source_path=str(src), job_dir=str(tmp_path)) == pf.PUBLISH_PROMOTED
     assert not os.path.exists(attempt)
     plan = json.loads(Path(stable).read_text(encoding="utf-8"))
     assert plan["config_digest"] == "cfg-a1"
-    assert plan["source_fingerprint"] == framing_plan.source_fingerprint(str(src))
+    assert plan["source_fingerprint"] == framing_plan.source_fingerprint(
+        str(src))
+
+
+def test_publish_rejects_foreign_attempt_plan_as_sidecar_less(tmp_path):
+    # Review-02: a foreign attempt plan is rejected -- the attempt is
+    # treated as sidecar-less (stale binding retired), never promoted.
+    source_a = tmp_path / "source-a.mp4"
+    source_b = tmp_path / "source-b.mp4"
+    source_a.write_bytes(b"A" * 20000)
+    source_b.write_bytes(b"B" * 20000)
+    _, attempt = _write_attempt(tmp_path, marker="foreign",
+                                source_path=source_a)
+    stable = sidecar_for(str(tmp_path / "clip.mp4"))
+    write_task12_sidecar(str(tmp_path / "clip.mp4"), "stale")
+    out = pf.publish_attempt_sidecar(
+        attempt_sidecar=attempt, stable_sidecar=stable,
+        source_path=str(source_b), job_dir=str(tmp_path))
+    assert out != pf.PUBLISH_PROMOTED
+    assert not os.path.exists(stable), (
+        "a foreign plan must not be laundered; the stale binding is retired")
+    assert not os.path.exists(attempt), "rejected attempt must not leak"
 
 
 def test_publish_retires_stale_sidecar(tmp_path):
@@ -212,9 +266,9 @@ def test_publish_skips_clobber_of_preserved_reference(tmp_path):
     }
     (tmp_path / "clip-project-0.json").write_text(
         json.dumps(project), encoding="utf-8")
-    _, attempt = _write_attempt(tmp_path, marker="new")
     src = tmp_path / "slice.mp4"
     src.write_bytes(SLICE_BYTES)
+    _, attempt = _write_attempt(tmp_path, marker="new", source_path=src)
     out = pf.publish_attempt_sidecar(
         attempt_sidecar=attempt, stable_sidecar=stable,
         source_path=str(src), job_dir=str(tmp_path))
@@ -396,12 +450,20 @@ def _fail_sidecar_replace(monkeypatch, marker):
     monkeypatch.setattr(os, "replace", failing)
 
 
-def test_direct_cli_promotion_failure_rolls_back(tmp_path, monkeypatch):
-    """Direct CLI loop: promotion failure rolls the video back, no mixed pair."""
+def test_direct_cli_promotion_failure_restores_previous_pair(
+    tmp_path, monkeypatch
+):
+    """Direct CLI loop: promotion failure restores the accepted pair.
+
+    Review-02: rollback means restoring the previous video+sidecar, not
+    deleting the video.
+    """
     ctx = _direct_env(tmp_path, "success")
+    old_video = ctx.final.read_bytes()
     _fail_sidecar_replace(monkeypatch, ".render.tmp")
     exec(_compile_main_block("loop"), ctx.env)
-    assert not ctx.final.exists(), "failed promotion must roll back the video"
+    assert ctx.final.read_bytes() == old_video, (
+        "failed promotion must restore the previous video")
     assert not os.path.exists(sidecar_for(str(ctx.final))), (
         "no stable sidecar may be left behind")
     temp_sidecar = sidecar_for(str(ctx.final) + ".render.tmp.mp4")
@@ -427,7 +489,8 @@ def _reframe_only_env(tmp_path):
 
     def render(source_path, output_path, **kwargs):
         Path(output_path).write_bytes(VIDEO_BYTES)
-        write_task12_sidecar(output_path, "reframe-only")
+        write_task12_sidecar_for_source(
+            output_path, "reframe-only", source_path)
         return True
 
     class _Sys:
@@ -520,8 +583,6 @@ def test_mutation_no_rollback_leaves_mixed_pair(promo_job, monkeypatch):
 def _no_retire_publish(*, attempt_sidecar, stable_sidecar, **kwargs):
     """Promotion without the retire rule: stale bindings linger."""
     if os.path.isfile(attempt_sidecar):
-        pf.rebind_sidecar_source(attempt_sidecar,
-                                 source_path=kwargs["source_path"])
         os.replace(attempt_sidecar, stable_sidecar)
         return pf.PUBLISH_PROMOTED
     return pf.PUBLISH_NO_SIDECAR
@@ -541,17 +602,37 @@ def test_mutation_no_retire_keeps_stale_plan(promo_job, monkeypatch):
     assert "framing" in emitted
 
 
-def test_mutation_no_rebind_trusts_foreign_fingerprint(promo_job, monkeypatch):
-    """Disabling the source rebind makes emission reject the foreign plan."""
+def _install_foreign_renderer(job):
+    """Renderer writing plans with the default foreign fingerprint.
+
+    Simulates a renderer that does NOT stamp the true render input
+    (pre-production shape); publication must reject these plans.
+    """
+    def foreign_render(source_path, dest, **kwargs):
+        job.control.attempt += 1
+        job.control.render_calls.append(dest)
+        Path(dest).write_bytes(VIDEO_BYTES)
+        write_task12_sidecar(dest, f"attempt-{job.control.attempt}")
+        return True
+
+    job.kwargs["legacy"].process_video_to_vertical = foreign_render
+
+
+def test_mutation_no_source_verification_promotes_foreign_plan(
+    promo_job, monkeypatch
+):
+    """Disabling mismatch rejection promotes a foreign plan (stale framing)."""
     job = promo_job
-    monkeypatch.setattr(pf, "rebind_sidecar_source",
-                        lambda *a, **k: False)
+    monkeypatch.setattr(pf, "verify_attempt_sidecar_source",
+                        lambda *a, **k: True)
+    _install_foreign_renderer(job)
     assert orch._render_one_clip(**job.kwargs)
-    emitted = json.loads((job.root / "clip-project-0.json").read_text(encoding="utf-8"))
-    # The bug, reproduced from the probe's perspective: without the rebind
-    # the structurally valid foreign plan cannot be trusted, so the
-    # emission-side check rejects it and no framing is emitted.
-    assert emitted.get("framing") is None
+    plan = _stable_plan(job)
+    # The bug, reproduced: the foreign plan is promoted; its stale source
+    # identity does not match the actual slice.
+    assert plan["source_fingerprint"] == "fp-" + "b" * 16
+    assert plan["source_fingerprint"] != framing_plan.source_fingerprint(
+        str(job.sl))
 
 
 def test_mutation_no_emission_check_trusts_foreign_plan(promo_job, monkeypatch):
@@ -562,9 +643,11 @@ def test_mutation_no_emission_check_trusts_foreign_plan(promo_job, monkeypatch):
         kwargs["expected_source_fingerprint"] = None
         return real_build(**kwargs)
 
-    monkeypatch.setattr(pf, "rebind_sidecar_source", lambda *a, **k: False)
+    monkeypatch.setattr(pf, "verify_attempt_sidecar_source",
+                        lambda *a, **k: True)
     monkeypatch.setattr(pf, "build_project_framing", no_check)
     job = promo_job
+    _install_foreign_renderer(job)
     assert orch._render_one_clip(**job.kwargs)
     emitted = json.loads((job.root / "clip-project-0.json").read_text(encoding="utf-8"))
     # The bug, reproduced: without the emission-side comparison the
@@ -576,7 +659,6 @@ def test_mutation_no_emission_check_trusts_foreign_plan(promo_job, monkeypatch):
 
 def _no_preserve_publish(*, attempt_sidecar, stable_sidecar, **kwargs):
     """Promotion without the preserved-project guard clobbers the artifact."""
-    pf.rebind_sidecar_source(attempt_sidecar, source_path=kwargs["source_path"])
     os.replace(attempt_sidecar, stable_sidecar)
     return pf.PUBLISH_PROMOTED
 
@@ -594,6 +676,9 @@ def test_mutation_no_preserve_guard_breaks_preserved_project(
     project_path.write_text(json.dumps(project, sort_keys=True), encoding="utf-8")
     preserved_framing = project["framing"]
     job.final.unlink()
+    # Bypass the review-02 rerender decline so the publish-time guard is
+    # exercised in isolation.
+    monkeypatch.setattr(orch, "project_has_user_edits", lambda p: False)
     monkeypatch.setattr(pf, "publish_attempt_sidecar", _no_preserve_publish)
     assert orch._render_one_clip(**job.kwargs)
     # The bug, reproduced: the preserved project's referenced sidecar was
@@ -620,3 +705,173 @@ def test_mutation_no_render_guard_silently_materializes(tmp_path, monkeypatch):
     # for a project whose recorded trajectory has no lineage base.
     assert "materialize" in calls
     assert os.path.isfile(result.output_path)
+
+
+# ===========================================================================
+# Part 2e: review-02 load-bearing mutation gates. Each disables one
+# review-02 correction and proves the corresponding probe then fails.
+# ===========================================================================
+
+def test_mutation_no_staging_destroys_previous_pair(promo_job, monkeypatch):
+    """Disabling backup staging destroys the old accepted pair on failure."""
+    job = promo_job
+    assert orch._render_one_clip(**job.kwargs)
+    old_video = job.final.read_bytes()
+    stable = Path(sidecar_for(str(job.final)))
+    old_sidecar = stable.read_bytes()
+
+    real_replace = os.replace
+
+    def fail_attempt_sidecar_replace(src, dst):
+        if (str(src).endswith(".turn_framing_plan.json")
+                and ".render.tmp" in str(src)):
+            raise OSError("injected sidecar promotion failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(orch.os, "replace", fail_attempt_sidecar_replace)
+    # Disable staging: no backup is taken, and the failure path falls back
+    # to deleting the just-published video (the old pair was already
+    # replaced by os.replace).
+    monkeypatch.setattr(
+        pf, "stage_previous_pair",
+        lambda **k: {"video": None, "sidecar": None, "dir": None})
+
+    def no_restore(record, *, clip_final, stable_sidecar):
+        try:
+            os.remove(clip_final)
+        except OSError:
+            pass
+
+    monkeypatch.setattr(pf, "restore_staged_pair", no_restore)
+
+    # Force a re-render; the injected sidecar failure then destroys the
+    # previously accepted pair.
+    job.final.unlink()
+    accepted = orch._render_one_clip(**job.kwargs)
+    # The bug, reproduced: the previous accepted video is destroyed -- the
+    # replacement was deleted and the old bytes are unrecoverable.
+    assert not accepted
+    assert not job.final.exists(), (
+        "without staging, a failed publish destroys the old accepted video")
+
+
+def test_mutation_swallowed_retire_claims_success_with_stale_file(
+    tmp_path, monkeypatch
+):
+    """Swallowing the retirement removal reintroduces the false 'retired'."""
+    stable = Path(sidecar_for(str(tmp_path / "clip.mp4")))
+    write_task12_sidecar(str(tmp_path / "clip.mp4"), "stale")
+    real_remove = os.remove
+
+    def fail_stable_remove(path):
+        if os.path.abspath(str(path)) == os.path.abspath(str(stable)):
+            raise OSError("injected retirement failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(pf.os, "remove", fail_stable_remove)
+
+    def _swallowing_retire(*, job_dir, stable_sidecar):
+        if not os.path.isfile(stable_sidecar):
+            return pf.PUBLISH_NO_SIDECAR
+        try:
+            os.remove(stable_sidecar)
+        except OSError:
+            pass
+        return pf.PUBLISH_RETIRED
+
+    monkeypatch.setattr(pf, "_retire_stable_sidecar", _swallowing_retire)
+    outcome = pf.publish_attempt_sidecar(
+        attempt_sidecar=str(tmp_path / "missing.render.tmp.turn_framing_plan.json"),
+        stable_sidecar=str(stable), source_path=str(tmp_path / "slice.mp4"),
+        job_dir=str(tmp_path))
+    # The bug, reproduced: reported "retired" while the stale file remains.
+    assert outcome == pf.PUBLISH_RETIRED
+    assert stable.exists(), "stale sidecar was not retired"
+
+
+def _origin_version_only_refs(job_dir, stable_basename, stable_sha256):
+    """The pre-review-02 narrow check: origin/version only, no edits."""
+    try:
+        names = os.listdir(job_dir)
+    except OSError:
+        return False
+    for name in names:
+        if not (name.startswith("clip-project-") and name.endswith(".json")):
+            continue
+        path = os.path.join(job_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            preserved = (data.get("origin") == "user"
+                         or int(data.get("version", 1)) > 1)
+        except (TypeError, ValueError):
+            preserved = True
+        if not preserved:
+            continue
+        framing = data.get("framing")
+        plan_id = (framing.get("plan")
+                   if isinstance(framing, dict) else None)
+        if not isinstance(plan_id, dict):
+            continue
+        ref = plan_id.get("plan_ref")
+        if not isinstance(ref, str) or ref.rsplit("/", 1)[-1] != stable_basename:
+            continue
+        if plan_id.get("sha256") == stable_sha256:
+            return True
+    return False
+
+
+def test_mutation_origin_version_only_protection_loses_caption_edited_plan(
+    promo_job, monkeypatch
+):
+    """Narrowing protection to origin/version loses caption-edited plans."""
+    job = promo_job
+    assert orch._render_one_clip(**job.kwargs)
+    project_path = job.root / "clip-project-0.json"
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    project["captions"]["edits"] = {"0": "corrected"}
+    project_path.write_text(json.dumps(project, sort_keys=True), encoding="utf-8")
+    preserved = json.loads(project_path.read_text(encoding="utf-8"))
+    assert project_emit.project_has_user_edits(str(project_path)) is True
+
+    # Bypass the rerender decline so the publish-time protector is
+    # exercised in isolation, then narrow it to origin/version only.
+    monkeypatch.setattr(orch, "project_has_user_edits", lambda p: False)
+    monkeypatch.setattr(pf, "_preserved_project_refs_sidecar",
+                        _origin_version_only_refs)
+    job.final.unlink()
+    assert orch._render_one_clip(**job.kwargs)
+    # The bug, reproduced: the caption-edited project's referenced sidecar
+    # was overwritten, so verification fails.
+    with pytest.raises(pf.FramingError):
+        pf.verify_framing_at_render(
+            job_dir=str(job.root), framing=preserved["framing"])
+
+
+def test_mutation_no_decline_replaces_preserved_pair(promo_job, monkeypatch):
+    """Disabling the rerender decline lets a rerender replace the pair."""
+    job = promo_job
+    assert orch._render_one_clip(**job.kwargs)
+    project_path = job.root / "clip-project-0.json"
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    project["origin"] = "user"
+    project["version"] = 2
+    project_path.write_text(json.dumps(project, sort_keys=True), encoding="utf-8")
+    preserved_bytes = project_path.read_bytes()
+
+    # Disable the decline (orchestrator's module-level binding).
+    monkeypatch.setattr(orch, "project_has_user_edits", lambda p: False)
+    job.final.unlink()
+    assert orch._render_one_clip(**job.kwargs)
+    from clippyme.domain import project_lineage as _pl
+    preserved = json.loads(preserved_bytes.decode("utf-8"))
+    outcome, _, reason = _pl.check_lineage_eligible(
+        preserved["reframed_base"], preserved, str(job.root))
+    assert outcome != "eligible", (
+        "without the decline, the rerender invalidates the preserved lineage"
+        f" (got {outcome}: {reason})")

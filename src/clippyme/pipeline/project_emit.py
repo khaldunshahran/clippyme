@@ -214,6 +214,9 @@ def _build_project(
             # to the ACTUAL current source slice. A structurally valid plan
             # from a different source is rejected (no framing field), never
             # trusted.
+            # Task 13 review-02: FAIL CLOSED. When the actual source cannot
+            # be fingerprinted the required comparison cannot run, so NO
+            # framing field is emitted at all -- never an unbound one.
             _expected_fp = None
             try:
                 from clippyme.pipeline.framing_plan import (
@@ -222,21 +225,24 @@ def _build_project(
                 _expected_fp = _task12_fp(clip_source)
             except Exception:
                 _expected_fp = None
-            try:
-                framing = _pf.build_project_framing(
-                    job_dir=job_dir,
-                    clip_final=clip_final,
-                    render_w=render_w,
-                    render_h=render_h,
-                    render_fps=render_fps,
-                    # The render used render_fps (probed from the accepted
-                    # final mp4); the clip is the already-cut source slice,
-                    # so its frame count is duration * render fps.
-                    clip_frame_count=int(round(duration * render_fps)),
-                    expected_source_fingerprint=_expected_fp,
-                )
-            except Exception:
+            if _expected_fp is None:
                 framing = None
+            else:
+                try:
+                    framing = _pf.build_project_framing(
+                        job_dir=job_dir,
+                        clip_final=clip_final,
+                        render_w=render_w,
+                        render_h=render_h,
+                        render_fps=render_fps,
+                        # The render used render_fps (probed from the accepted
+                        # final mp4); the clip is the already-cut source slice,
+                        # so its frame count is duration * render fps.
+                        clip_frame_count=int(round(duration * render_fps)),
+                        expected_source_fingerprint=_expected_fp,
+                    )
+                except Exception:
+                    framing = None
     if framing:
         result["framing"] = framing
     # Task 05: reframed-base lineage for automatic framing preservation.

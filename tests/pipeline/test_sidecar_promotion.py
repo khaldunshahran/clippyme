@@ -38,7 +38,11 @@ import pytest
 from clippyme.pipeline import orchestrator as orch
 from clippyme.pipeline import project_emit
 from clippyme.pipeline import run_ops as ops
-from tests.pipeline.task13_helpers import sidecar_for, write_task12_sidecar
+from tests.pipeline.task13_helpers import (
+    sidecar_for,
+    write_task12_sidecar,
+    write_task12_sidecar_for_source,
+)
 
 
 SOURCE_BYTES = b"source media" * 2000
@@ -82,8 +86,12 @@ def promo_job(tmp_path, monkeypatch, framing_impl):
         Path(dest).write_bytes(VIDEO_BYTES)
         if control.write_sidecar:
             # Production-valid Task 12 plan next to the attempt video, with
-            # a per-attempt digest so plans are distinguishable.
-            write_task12_sidecar(dest, f"attempt-{control.attempt}")
+            # a per-attempt digest so plans are distinguishable. Stamped
+            # with the actual render input's identity, like production
+            # reframe (review-02: foreign plans are rejected, not
+            # relabelled).
+            write_task12_sidecar_for_source(
+                dest, f"attempt-{control.attempt}", source_path)
         return True
 
     def inspect(path, **kwargs):
@@ -292,7 +300,8 @@ def _direct_env(tmp_path, monkey_mode="success", write_sidecar=True):
     def render(source_path, output_path, **kwargs):
         Path(output_path).write_bytes(VIDEO_BYTES)
         if write_sidecar:
-            write_task12_sidecar(output_path, "direct")
+            write_task12_sidecar_for_source(
+                output_path, "direct", source_path)
         return True
 
     def validate(path, duration):
@@ -358,7 +367,8 @@ def test_direct_reframe_only_promotes_sidecar(tmp_path, direct_reframe_only_bloc
 
     def render(source_path, output_path, **kwargs):
         Path(output_path).write_bytes(VIDEO_BYTES)
-        write_task12_sidecar(output_path, "reframe-only")
+        write_task12_sidecar_for_source(
+            output_path, "reframe-only", source_path)
         return True
 
     class _Sys:

@@ -50,10 +50,11 @@ def _write_source(job_dir):
 def _real_framing(job_dir, base_clip, marker="plan-1"):
     """Build a real framing record the way pipeline/project_emit does."""
     src = _write_source(job_dir)
-    sidecar, _ = write_task12_sidecar(base_clip, marker)
-    # Mirror the pipeline: promotion rebinds the plan's Task 12 source
-    # identity to the actual render input before the project is emitted.
-    pf.rebind_sidecar_source(sidecar, source_path=src)
+    # Mirror production reframe: the plan is stamped with the actual render
+    # input's Task 12 source identity at write time (review-02: publication
+    # verifies rather than relabels).
+    from tests.pipeline.task13_helpers import write_task12_sidecar_for_source
+    sidecar, _ = write_task12_sidecar_for_source(base_clip, marker, src)
     from clippyme.pipeline.framing_plan import source_fingerprint as _fp12
     framing = pf.build_project_framing(
         job_dir=job_dir, clip_final=base_clip,

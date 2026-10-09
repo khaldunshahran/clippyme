@@ -965,6 +965,41 @@ def _render_one_clip(
         except OSError:
             pass
 
+    # Task 13 review-02: decline the rerender for a preserved project.
+    # The Task 01 preservation contract (project_has_user_edits) pins
+    # the accepted video+sidecar pair the preserved project references;
+    # replacing either would invalidate its reframed_base lineage
+    # (invalid_asset). When an accepted pair was snapshotted, keep it --
+    # restoring the video from the snapshot when it is gone -- and
+    # return success rather than rendering a replacement. Without a
+    # snapshot there is no accepted pair to keep, so the render
+    # proceeds (the project file itself stays preserved).
+    from clippyme.pipeline.project_emit import (
+        PROJECT_FILENAME_TEMPLATE as _PFT,
+    )
+    _project_path = os.path.join(
+        output_dir, _PFT.format(index=index))
+    if os.path.isfile(_project_path) and project_has_user_edits(
+            _project_path):
+        from clippyme.domain import project_framing as _pf13decline
+        if _pf13decline.accepted_snapshot_exists(
+                job_dir=output_dir, clip_final=clip_final):
+            print(
+                f"clip-project: declining rerender for preserved project "
+                f"(clip {index + 1}/{total}) -- keeping the accepted pair",
+                flush=True,
+            )
+            _pf13decline.restore_accepted_snapshot(
+                job_dir=output_dir,
+                clip_final=clip_final,
+                stable_sidecar=_sidecar_for(legacy, clip_final),
+            )
+            clip["qa"] = {"ok": True, "critical": False, "issues": [],
+                          "warnings": []}
+            state.mark_clip(index, "complete", clip["qa"])
+            _save_metadata(metadata_file, clips_data)
+            return True
+
     state.start(
         "cutting",
         f"cutting clip {index + 1}/{total}",
@@ -1093,15 +1128,22 @@ def _render_one_clip(
                 run_signal_checks=_enabled("CLIPPYME_QA_SIGNAL"),
             )
         if last_report and not last_report.get("critical"):
-            os.replace(temp_output, clip_final)
             # Task 13 review-01: coordinated video + sidecar publication.
             # The video is published first; the sidecar half is coordinated
             # by publish_attempt_sidecar (promotion / retire /
-            # preserved-project skip). A promotion OSError is NEVER
-            # swallowed: the just-published video is rolled back and the
-            # attempt fails, so an accepted clip can never pair a new video
-            # with a stale plan.
+            # preserved-project skip).
+            # Task 13 review-02: stage the previous accepted pair BEFORE
+            # publication. A promotion/retirement OSError is NEVER
+            # swallowed: BOTH the video and the sidecar are restored from
+            # the staged pair and the attempt fails, so an accepted clip
+            # can never pair a new video with a stale plan and a failed
+            # publish can never destroy the previous accepted pair.
             from clippyme.domain import project_framing as _pf13
+            _staged_pair = _pf13.stage_previous_pair(
+                clip_final=clip_final,
+                stable_sidecar=_sidecar_for(legacy, clip_final),
+            )
+            os.replace(temp_output, clip_final)
             _promotion_ok = True
             _pub_outcome = _pf13.PUBLISH_NO_SIDECAR
             try:
@@ -1114,14 +1156,15 @@ def _render_one_clip(
             except OSError as _pub_exc:
                 _promotion_ok = False
                 print(
-                    f"   Task 13: sidecar promotion failed ({_pub_exc}); "
-                    f"rolling back accepted video for clip {index + 1}/{total}",
+                    f"   Task 13: sidecar publish failed ({_pub_exc}); "
+                    f"restoring staged pair for clip {index + 1}/{total}",
                     flush=True,
                 )
-                try:
-                    os.remove(clip_final)
-                except OSError:
-                    pass
+                _pf13.restore_staged_pair(
+                    _staged_pair,
+                    clip_final=clip_final,
+                    stable_sidecar=_sidecar_for(legacy, clip_final),
+                )
                 try:
                     _abandoned = _sidecar_for(legacy, temp_output)
                     if os.path.isfile(_abandoned):
@@ -1138,6 +1181,15 @@ def _render_one_clip(
                     "warnings": [],
                 }
             else:
+                _pf13.discard_staged_pair(_staged_pair)
+                # Task 13 review-02: snapshot the accepted pair so a
+                # later declined rerender (preserved project) can restore
+                # the exact video+sidecar the project references.
+                _pf13.snapshot_accepted_pair(
+                    job_dir=output_dir,
+                    clip_final=clip_final,
+                    stable_sidecar=_sidecar_for(legacy, clip_final),
+                )
                 if _pub_outcome != _pf13.PUBLISH_PROMOTED:
                     print(
                         f"   Task 13: sidecar publish outcome "
