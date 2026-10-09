@@ -473,6 +473,233 @@
       "title": "Grade",
       "type": "object"
     },
+    "OpeningEvidenceRef": {
+      "description": "One cited evidence item behind a grounded opening option.",
+      "properties": {
+        "basis": {
+          "enum": [
+            "speech",
+            "visual",
+            "audio"
+          ],
+          "title": "Basis",
+          "type": "string"
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quote"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "end": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End"
+        }
+      },
+      "required": [
+        "basis"
+      ],
+      "title": "OpeningEvidenceRef",
+      "type": "object"
+    },
+    "OpeningSelection": {
+      "description": "Task 15: grounded opening (hook) identity carried by the project.\n\nAdditive optional field. ``status=\"selected\"`` carries the validated\nselected option (identity, evidence, clip-relative display timing,\npacket identity, versions). ``status=\"user_authored\"`` marks an\nexplicit user-authored override. ``status=\"none\"`` records an honest\nno-selection with the reason. ``legacy_unverified_hook`` keeps the\nold automatic hook text only as clearly unverified legacy metadata —\nnever promoted as grounded.",
+      "properties": {
+        "status": {
+          "enum": [
+            "selected",
+            "user_authored",
+            "none"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "option_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Option Id"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Language"
+        },
+        "display_start": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Start"
+        },
+        "display_end": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display End"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/OpeningEvidenceRef"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "evidence_basis": {
+          "anyOf": [
+            {
+              "enum": [
+                "speech",
+                "visual",
+                "audio"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence Basis"
+        },
+        "packet_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Packet Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "selection": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selection"
+        },
+        "no_selection_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "No Selection Reason"
+        },
+        "legacy_unverified_hook": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Legacy Unverified Hook"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "OpeningSelection",
+      "type": "object"
+    },
     "Overlay": {
       "description": "Text overlays: hooks, banners.",
       "properties": {
@@ -851,6 +1078,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/ProjectFraming"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "opening": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OpeningSelection"
         },
         {
           "type": "null"

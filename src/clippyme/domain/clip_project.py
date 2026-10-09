@@ -104,6 +104,44 @@ class Overlay(BaseModel):
     position: str = "top"
 
 
+class OpeningEvidenceRef(BaseModel):
+    """One cited evidence item behind a grounded opening option."""
+
+    basis: Literal["speech", "visual", "audio"]
+    quote: Optional[str] = Field(default=None)
+    label: Optional[str] = Field(default=None)
+    start: Optional[float] = Field(default=None)
+    end: Optional[float] = Field(default=None)
+
+
+class OpeningSelection(BaseModel):
+    """Task 15: grounded opening (hook) identity carried by the project.
+
+    Additive optional field. ``status="selected"`` carries the validated
+    selected option (identity, evidence, clip-relative display timing,
+    packet identity, versions). ``status="user_authored"`` marks an
+    explicit user-authored override. ``status="none"`` records an honest
+    no-selection with the reason. ``legacy_unverified_hook`` keeps the
+    old automatic hook text only as clearly unverified legacy metadata —
+    never promoted as grounded.
+    """
+
+    status: Literal["selected", "user_authored", "none"]
+    option_id: Optional[str] = Field(default=None)
+    text: Optional[str] = Field(default=None)
+    language: Optional[str] = Field(default=None)
+    display_start: Optional[float] = Field(default=None, ge=0)
+    display_end: Optional[float] = Field(default=None, ge=0)
+    evidence: list[OpeningEvidenceRef] = Field(default_factory=list)
+    evidence_basis: Optional[Literal["speech", "visual", "audio"]] = Field(
+        default=None)
+    packet_id: Optional[str] = Field(default=None)
+    schema_version: int = Field(default=1, ge=1)
+    selection: Optional[dict] = Field(default=None)
+    no_selection_reason: Optional[str] = Field(default=None)
+    legacy_unverified_hook: Optional[str] = Field(default=None)
+
+
 class AudioTrack(BaseModel):
     file: Optional[str] = Field(
         default=None, description="music file; null = no music (v1)"
@@ -521,6 +559,13 @@ class ClipProject(BaseModel):
     # Additive optional Task 13 field; old projects without it validate,
     # save/load, undo, preview and render through existing paths.
     framing: Optional[ProjectFraming] = Field(default=None)
+
+    # Task 15: grounded opening identity. Optional; when present,
+    # records the validated selected option (or user-authored override,
+    # or honest no-selection) plus packet identity and versions.
+    # Additive optional Task 15 field; old projects without it validate,
+    # save/load, undo, preview and render through existing paths.
+    opening: Optional[OpeningSelection] = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod

@@ -30,6 +30,7 @@ from typing import Any
 from clippyme.domain.runtime_state import RuntimeState
 from clippyme.pipeline.media_qa import inspect_clip, probe_media
 from clippyme.pipeline.project_emit import emit_clip_project, project_has_user_edits
+from clippyme.pipeline import opening_plan as _opening_plan
 from clippyme.pipeline.preflight import (
     PreflightInputs,
     PreflightRejected,
@@ -912,6 +913,38 @@ def _maybe_emit_clip_project(**kwargs):
 
 
 
+def _maybe_plan_opening(clip, clips_data, input_video, index, metadata_file,
+                        route="direct"):
+    """Task 15: grounded opening choice for one clip.
+
+    Built AFTER the last accepted boundary repair: clip start/end are
+    the final cutter bounds, so the packet is grounded in exactly what
+    the cutter will cut. Flag-gated; disabled mode is a no-op with zero
+    provider calls (Task 14 behavior). The direct and queued routes
+    share this helper (``route`` records provenance only).
+    """
+    if not _opening_plan.grounded_openings_enabled():
+        return None
+    try:
+        plan = _opening_plan.plan_clip_opening(
+            clip=clip,
+            clips_data=clips_data,
+            input_video=input_video,
+            index=index,
+            budget=_opening_plan.get_run_budget(),
+            provider=_opening_plan.get_opening_provider(),
+            fallback_provider=_opening_plan.get_opening_fallback_provider(),
+            user_preference=_opening_plan.user_preference_from_env(),
+            route=route,
+        )
+        _save_metadata(metadata_file, clips_data)
+        return plan
+    except Exception:
+        logger.warning("task15: opening plan failed for clip %d",
+                       index, exc_info=True)
+        return None
+
+
 def _render_one_clip(
     *,
     index: int,
@@ -929,6 +962,7 @@ def _render_one_clip(
 ) -> bool:
     start, end = _clip_bounds(clip)
     expected_duration = end - start
+    _maybe_plan_opening(clip, clips_data, input_video, index, metadata_file)
     title = clip.get("video_title_for_youtube_short") or clip.get("title")
     existing_name = _safe_clip_filename(clip.get("clip_filename"))
     clip_filename = existing_name or f"{clip_output_basename(title, index, video_title)}.mp4"

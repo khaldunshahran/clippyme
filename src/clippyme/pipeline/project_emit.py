@@ -52,6 +52,7 @@ from clippyme.domain.clip_project import SCHEMA_TAG, project_to_json, validate_p
 from clippyme.domain.project_lineage import build_lineage
 from clippyme.domain.encode import video_encoder
 from clippyme.pipeline.media_qa import probe_media
+from clippyme.pipeline import opening_plan as _opening_plan
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,86 @@ def _center_crop_916(src_w: int, src_h: int) -> dict[str, float]:
     }
 
 
+
+def _grounded_hook_overlay(
+    clip: dict[str, Any], duration: float
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Task 15: hook overlay + opening identity from the grounded plan.
+
+    Returns (overlays, opening_field). The opening field is additive
+    project metadata carrying the selected option identity, evidence,
+    timing, packet identity and versions — plus the old automatic hook
+    kept only as clearly unverified legacy metadata.
+    """
+    from clippyme.domain import hook_timing as _ht
+
+    plan = clip.get("opening_plan") or {}
+    legacy_text = (clip.get("hook") or clip.get("viral_hook_text") or "").strip()
+    overlays: list[dict[str, Any]] = []
+
+    def _legacy_note() -> dict[str, Any] | None:
+        return legacy_text or None
+
+    # Explicit user-authored override wins; marked user-authored.
+    if plan.get("user_authored") and plan.get("text"):
+        text = plan["text"]
+        overlays.append({
+            "type": "hook",
+            "text": text,
+            "style": "viral",
+            "start": 0.0,
+            "end": round(min(3.0, duration), 3),
+            "position": "top",
+        })
+        return overlays, {
+            "status": "user_authored",
+            "text": text,
+            "schema_version": _opening_plan.OPENING_PLAN_SCHEMA_VERSION,
+            "legacy_unverified_hook": _legacy_note(),
+        }
+
+    selected = plan.get("selected")
+    if isinstance(selected, dict) and selected.get("text"):
+        disp = selected.get("display") or {}
+        try:
+            s, e = _ht.validate_hook_interval(disp.get("start"), disp.get("end"))
+            eff = _ht.effective_hook_interval(s, e, duration)
+        except _ht.HookTimingError:
+            eff = None
+        if eff is not None:
+            overlays.append({
+                "type": "hook",
+                "text": selected["text"],
+                "style": "viral",
+                "start": round(eff[0], 3),
+                "end": round(eff[1], 3),
+                "position": "top",
+            })
+            return overlays, {
+                "status": "selected",
+                "option_id": selected.get("id"),
+                "text": selected["text"],
+                "language": selected.get("language"),
+                "display_start": round(eff[0], 3),
+                "display_end": round(eff[1], 3),
+                "evidence": selected.get("evidence") or [],
+                "evidence_basis": selected.get("evidence_basis"),
+                "packet_id": plan.get("packet_id"),
+                "schema_version": _opening_plan.OPENING_PLAN_SCHEMA_VERSION,
+                "selection": plan.get("selection"),
+                "legacy_unverified_hook": _legacy_note(),
+            }
+    # No grounded choice: no automatic hook overlay. The old automatic
+    # hook stays only as unverified legacy metadata.
+    return overlays, {
+        "status": "none",
+        "schema_version": _opening_plan.OPENING_PLAN_SCHEMA_VERSION,
+        "no_selection_reason": plan.get("no_selection_reason") or "no_opening_plan",
+        "packet_id": plan.get("packet_id"),
+        "legacy_unverified_hook": _legacy_note(),
+    }
+
+
 def _build_project(
     *,
     job_id: str,
@@ -142,20 +223,30 @@ def _build_project(
     transcript = clips_data.get("transcript") or {}
     words = _clip_relative_words(transcript, start, end)
 
-    hook_text = (clip.get("hook") or clip.get("viral_hook_text") or "").strip()
     duration = end - start
     overlays: list[dict[str, Any]] = []
-    if hook_text:
-        overlays.append(
-            {
-                "type": "hook",
-                "text": hook_text,
-                "style": "viral",
-                "start": 0.0,
-                "end": round(min(3.0, duration), 3),
-                "position": "top",
-            }
-        )
+    # Task 15: grounded openings. Flag OFF keeps the legacy behavior
+    # exactly. Flag ON uses only a validated selected option (or an
+    # explicit user-authored override), or emits no automatic hook when
+    # no grounded choice is available. The old automatic hook is kept
+    # only as clearly unverified legacy metadata, never as an overlay.
+    _openings_on = _opening_plan.grounded_openings_enabled()
+    opening_field: dict[str, Any] | None = None
+    if _openings_on:
+        overlays, opening_field = _grounded_hook_overlay(clip, duration)
+    else:
+        hook_text = (clip.get("hook") or clip.get("viral_hook_text") or "").strip()
+        if hook_text:
+            overlays.append(
+                {
+                    "type": "hook",
+                    "text": hook_text,
+                    "style": "viral",
+                    "start": 0.0,
+                    "end": round(min(3.0, duration), 3),
+                    "position": "top",
+                }
+            )
 
     result = {
         "schema": SCHEMA_TAG,
@@ -188,6 +279,10 @@ def _build_project(
             "edits": {},
         },
         "overlays": overlays,
+        # Task 15: additive opening identity (present only with the
+        # flag ON; popped below when None so flag-OFF projects keep the
+        # exact pre-Task-15 shape).
+        "opening": opening_field,
         "audio": [{"file": None, "volume": 1.0, "offset": 0.0}],
         "grade": {"preset": "default"},
         "render": {
@@ -350,6 +445,10 @@ def emit_clip_project(
         if project.framing is None:
             _doc = json.loads(payload)
             _doc.pop("framing", None)
+            payload = json.dumps(_doc, indent=2, ensure_ascii=False)
+        if project.opening is None:
+            _doc = json.loads(payload)
+            _doc.pop("opening", None)
             payload = json.dumps(_doc, indent=2, ensure_ascii=False)
         tmp_path = path + ".tmp"
         try:
