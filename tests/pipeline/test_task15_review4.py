@@ -210,19 +210,25 @@ def test_added_negation_still_rejected():
 def test_mutation_verb_position_gate_is_load_bearing():
     pkt, event = _visual_packet()
     bad = _visual_option("red ball can explode", event)
-    accepted, _ = op.validate_opening_option(bad, packet=pkt)
+    accepted, rejected = op.validate_opening_option(bad, packet=pkt)
     assert accepted is None
-    # MUTATION: drop the verb-position markers -> the uninflected
-    # action is no longer detected and the option passes.
+    assert "sensory action" in rejected["reason"]
+    # MUTATION: drop the verb-position markers. Under the removed
+    # catch-all permission the uninflected action would pass as a
+    # descriptive modifier; under default-deny it is still rejected
+    # (now as unverifiable content), proving the default-deny branch
+    # is the backstop. The structural classification is preserved.
     real = _mutate("_VERB_POSITION_MARKERS", frozenset())
     try:
-        accepted, _ = op.validate_opening_option(bad, packet=pkt)
-        assert accepted is not None, "mutation did not break the gate"
+        accepted, rejected = op.validate_opening_option(bad, packet=pkt)
+        assert accepted is None, "default-deny backstop failed"
+        assert "unverifiable" in rejected["reason"]
     finally:
         _mutate("_VERB_POSITION_MARKERS", real)
     # RESTORE.
-    accepted, _ = op.validate_opening_option(bad, packet=pkt)
+    accepted, rejected = op.validate_opening_option(bad, packet=pkt)
     assert accepted is None
+    assert "sensory action" in rejected["reason"]
 
 
 def test_mutation_clause_scope_gate_is_load_bearing():

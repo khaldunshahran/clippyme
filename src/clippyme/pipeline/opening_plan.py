@@ -1144,6 +1144,16 @@ def _is_manner_paraphrase(token: str, evidence_union: set[str]) -> bool:
     return False
 
 
+# Default-deny for novel sensory content. When True (the accepted
+# contract), every novel non-glue sensory token needs explicit bounded
+# support (evidence membership or the curated manner-paraphrase
+# authorization); otherwise it is rejected as unverifiable. The False
+# setting restores the legacy catch-all permission for unrecognized
+# modifiers and must never be used outside the fail-then-restore
+# mutation that proves this branch is load-bearing.
+_SENSORY_DEFAULT_DENY_UNKNOWN = True
+
+
 def _negation_count(tokens: list[str]) -> int:
     # A token reclassified as glue (e.g. by a weakening mutation) is
     # not a negation marker: the polarity check stays consistent with
@@ -1475,13 +1485,17 @@ def _check_material_claims(
       ("championship", "won", "medal"); any other novel token in a
       speech option is unsupported (the speech gate stays strict, and
       the review-01 glue-vocabulary mutation stays load-bearing);
-      any other novel token in a speech-free option is an action claim
-      only when it sits in a verb slot (inflected form, or base form
-      after a modal/auxiliary/"to"): action claims are grounded solely
-      through the explicit bounded manner-paraphrase authorization
-      ("erupts" for "cheers"); anything else novel and unverifiable is
-      rejected, while descriptive modifiers (nouns/adjectives in
-      non-verb positions) stay allowed.
+      any other novel token in a speech-free option is default-deny:
+      it is grounded only through the explicit bounded
+      manner-paraphrase authorization ("erupts"/"erupt" for "cheers").
+      Action claims are still identified structurally (inflected form,
+      or base form after a modal/auxiliary/"to") to label the
+      rejection, but identification alone never grounds: an unlisted
+      novel token ("explodes"/"explode", "explosive") is unverifiable,
+      never grounded. Unknown descriptive properties are claims too;
+      being grammatically an adjective does not establish evidence
+      support. There is no catch-all permission for unrecognized
+      modifiers/actions.
     Short names and action words are claims too: no minimum token
     length. At least one non-glue token must be evidence-grounded, so
     an all-glue text is never marked grounded. Genuinely supported
@@ -1523,21 +1537,34 @@ def _check_material_claims(
         if basis == "speech":
             return ("option introduces material claims not supported by "
                     f"cited evidence: {token!r}")
-        # Speech-free path: a novel action claim is not a descriptive
-        # paraphrase by default. It is grounded only as a bounded
-        # manner paraphrase of an evidenced action ("erupts" for
-        # "cheers"); an unlisted novel action ("explodes"/"explode"
-        # for "rolls") is unverifiable, never grounded. Action claims
-        # are detected structurally: inflected forms via the suffix
-        # heuristic, uninflected base forms via verb position (after a
-        # modal/auxiliary or "to").
+        # Speech-free path: default-deny. A novel sensory token is
+        # grounded only through explicit bounded support: evidence
+        # membership (handled above) or the curated manner-paraphrase
+        # authorization ("erupts"/"erupt" for "cheers"), checked for
+        # every novel token. Action claims are still identified
+        # structurally (inflected forms, or base forms in verb position
+        # after a modal/auxiliary/"to") to label the rejection, but
+        # identification alone never grounds. An unlisted novel token
+        # ("explodes"/"explode", "explosive") is unverifiable, never
+        # grounded: unknown descriptive properties are claims too, and
+        # being grammatically an adjective does not establish evidence
+        # support. The catch-all permission for unrecognized
+        # modifiers/actions is removed.
         prev_token = norm_tokens[pos - 1] if pos > 0 else ""
-        if _is_sensory_action_claim(token, prev_token) and not _is_manner_paraphrase(
-                token, evidence_union):
+        if _is_manner_paraphrase(token, evidence_union):
+            continue
+        if _is_sensory_action_claim(token, prev_token):
             return (f"option introduces an unverifiable sensory action "
                     f"{token!r} not supported by cited evidence")
-        # Descriptive modifiers for the depicted event stay allowed
-        # (never people/events/polarity).
+        if not _SENSORY_DEFAULT_DENY_UNKNOWN:
+            # Legacy catch-all permission (test seam only): when
+            # disabled, unrecognized descriptive modifiers were
+            # allowed. Must never be disabled in production; the
+            # fail-then-restore mutation proves this branch stays
+            # load-bearing.
+            continue
+        return (f"option introduces unverifiable sensory content "
+                f"{token!r} not supported by cited evidence")
     if not grounded_content:
         return ("option text has no evidence-grounded content token "
                 "(unknown/unverified)")

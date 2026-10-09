@@ -237,19 +237,25 @@ def test_mutation_event_word_gate_is_load_bearing():
     bad = _option(text="red ball rolls championship", evidence_basis="visual",
                   evidence=[{"basis": "visual", "label": "red ball rolls",
                              "start": 11., "end": 12., "event_id": "a"}])
-    accepted, _ = op.validate_opening_option(bad, packet=pkt)
+    accepted, rejected = op.validate_opening_option(bad, packet=pkt)
     assert accepted is None
-    # MUTATION: drop "championship" from the event list -> passes.
+    assert "event/outcome" in rejected["reason"]
+    # MUTATION: drop "championship" from the event list. Under the
+    # removed catch-all permission it would pass as a descriptive
+    # modifier; under default-deny it is still rejected (now as
+    # unverifiable), proving the default-deny branch is the backstop.
     real = _mutate("_EVENT_OUTCOME_WORDS",
                    op._EVENT_OUTCOME_WORDS - {"championship"})
     try:
-        accepted, _ = op.validate_opening_option(bad, packet=pkt)
-        assert accepted is not None, "mutation did not break the gate"
+        accepted, rejected = op.validate_opening_option(bad, packet=pkt)
+        assert accepted is None, "default-deny backstop failed"
+        assert "unverifiable" in rejected["reason"]
     finally:
         _mutate("_EVENT_OUTCOME_WORDS", real)
     # RESTORE.
-    accepted, _ = op.validate_opening_option(bad, packet=pkt)
+    accepted, rejected = op.validate_opening_option(bad, packet=pkt)
     assert accepted is None
+    assert "event/outcome" in rejected["reason"]
 
 
 def test_mutation_proper_noun_gate_is_load_bearing():
@@ -259,18 +265,25 @@ def test_mutation_proper_noun_gate_is_load_bearing():
     bad = _option(text="red ball rolls with Alice", evidence_basis="visual",
                   evidence=[{"basis": "visual", "label": "red ball rolls",
                              "start": 11., "end": 12., "event_id": "a"}])
-    accepted, _ = op.validate_opening_option(bad, packet=pkt)
+    accepted, rejected = op.validate_opening_option(bad, packet=pkt)
     assert accepted is None
-    # MUTATION: disable proper-noun detection -> invented person passes.
+    assert "person/entity" in rejected["reason"]
+    # MUTATION: disable proper-noun detection. Under the removed
+    # catch-all permission the invented person would pass as a
+    # descriptive modifier; under default-deny it is still rejected
+    # (now as unverifiable), proving the default-deny branch is the
+    # backstop.
     real = _mutate("_looks_like_proper_noun", lambda raw, first: False)
     try:
-        accepted, _ = op.validate_opening_option(bad, packet=pkt)
-        assert accepted is not None, "mutation did not break the gate"
+        accepted, rejected = op.validate_opening_option(bad, packet=pkt)
+        assert accepted is None, "default-deny backstop failed"
+        assert "unverifiable" in rejected["reason"]
     finally:
         _mutate("_looks_like_proper_noun", real)
     # RESTORE.
-    accepted, _ = op.validate_opening_option(bad, packet=pkt)
+    accepted, rejected = op.validate_opening_option(bad, packet=pkt)
     assert accepted is None
+    assert "person/entity" in rejected["reason"]
 
 
 # ---------------------------------------------------------------------------

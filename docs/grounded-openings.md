@@ -294,3 +294,32 @@ entailment.
 Claim support remains a deterministic approximation (token
 classification, per-clause polarity, structural verb detection,
 curated manner verbs), not full semantic entailment.
+
+## Review-05 corrections
+
+Default-deny for novel sensory content (review 05).
+
+The sensory material-content gate previously allowed unrecognized
+descriptive modifiers by default: a novel token that was not an
+action claim fell through as a "descriptive modifier" and was
+marked grounded. `red ball is explosive` passed against
+`red ball rolls` because being grammatically an adjective does not
+establish evidence support.
+
+The catch-all permission is removed. Every novel non-glue sensory
+token now needs explicit bounded support: evidence membership or
+the curated manner-paraphrase authorization
+(`_SENSORY_MANNER_VERBS`), checked for every novel token. An
+unlisted novel token is unverifiable, never grounded. Unknown
+descriptive properties are claims too.
+
+The structural action-claim identification (inflected forms, base
+forms in verb position after a modal/auxiliary/"to") is preserved
+to label rejections, but identification alone never grounds. The
+`_SENSORY_DEFAULT_DENY_UNKNOWN` module flag exists so the
+fail-then-restore mutation can prove the default-deny branch is
+load-bearing; it must never be disabled in production.
+
+Claim support remains a deterministic approximation (token
+classification, per-clause polarity, structural verb detection,
+curated manner verbs, default-deny), not full semantic entailment.
