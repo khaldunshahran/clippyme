@@ -955,45 +955,117 @@ def publish_attempt_sidecar(*, attempt_sidecar: str, stable_sidecar: str,
 # Review-02: the accepted video+sidecar pair is never destroyed by a
 # failed publication.
 #
-# - stage_previous_pair(): the caller stages the CURRENT accepted pair
-#   BEFORE replacing the final video. restore_staged_pair() puts BOTH
-#   files back on any publication/retirement OSError; when no previous
-#   video was staged, the just-published (failed) video is removed.
-#   discard_staged_pair() cleans up after success. All best-effort, never
-#   raising -- staging must not fail a good render.
+# Review-03 corrections:
+#  1. Staging is FAIL-CLOSED. stage_previous_pair() backs up the current
+#     accepted video AND stable sidecar and VERIFIES both backups
+#     byte-identical before returning. Any staging/verification failure
+#     raises OSError -- callers must abort publication and leave the
+#     accepted pair untouched. Staging lives in a destination-local
+#     directory (alongside the final video, or an explicitly supplied
+#     staging_dir); the global process temp is never used. A staging
+#     failure therefore can never silently produce an incomplete record.
+#     restore_staged_pair() propagates failures too and discards recovery
+#     data only after verified restoration.
+#  2. Durable snapshots are keyed PER CLIP:
+#     <job>/.task13_accepted_pair/<safe-clip-key>/, with an identity.txt
+#     recording the exact clip basename. Restore refuses data that does
+#     not belong to the requested clip -- two clips never share snapshot
+#     files.
+#  3. Snapshot updates are atomic generations. The new pair is written to
+#     a destination-local temp staging dir, verified, installed as the
+#     inactive generation, and published with ONE atomic pointer flip
+#     (``current``: "gen-a" | "gen-b"). A failed update never touches the
+#     live generation: restore afterwards sees either the prior coherent
+#     pair or the complete new pair -- never a mix.
 # - snapshot_accepted_pair(): after a SUCCESSFUL coordinated publication
 #   the accepted pair is snapshotted durably (copy2 preserves mtime, so
-#   the lineage file identity survives). restore_accepted_snapshot()
-#   brings the last accepted pair back; the pipeline uses it when it
-#   DECLINES a rerender for a preserved Task 01 project, so the preserved
-#   project's reframed_base keeps resolving to the preserved final video.
+#   the lineage file identity survives). Returns True only when the new
+#   generation is durably installed; False (never raising, never claiming
+#   durable recovery) when the update cannot be completed.
+# - restore_accepted_snapshot(): brings the last accepted pair back; the
+#   pipeline uses it when it DECLINES a rerender for a preserved Task 01
+#   project, so the preserved project's reframed_base keeps resolving to
+#   the preserved final video.
 
 
-def stage_previous_pair(*, clip_final: str, stable_sidecar: str) -> dict:
+def _verify_backup(src: str, dst: str) -> None:
+    """Fail closed: the backup must be byte-identical to the source.
+
+    Raises OSError when either side cannot be hashed or the digests
+    differ.
+    """
+    src_hash = _sha256_file(src)
+    dst_hash = _sha256_file(dst)
+    if src_hash is None or dst_hash is None or src_hash != dst_hash:
+        raise OSError(
+            "task13 staging verification failed: backup of "
+            f"{os.path.basename(src)} is not byte-identical")
+
+
+def _remove_tree_quietly(path: str) -> None:
+    """Best-effort directory removal; never raises."""
+    import shutil
+
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def stage_previous_pair(*, clip_final: str, stable_sidecar: str,
+                        staging_dir: str | None = None) -> dict:
     """Back up the current accepted pair before a new publication.
 
+    FAIL-CLOSED: the complete previous video+sidecar pair is backed up
+    and VERIFIED byte-identical before the record is returned. Any
+    staging or verification failure raises OSError -- the caller must
+    abort publication and leave the accepted pair untouched. A staging
+    failure is never converted into an incomplete record.
+
+    The staging directory is destination-local: ``<final-dir>/
+    .task13_staging/``, or the explicitly supplied ``staging_dir``. The
+    global process temp is never used, so staging works regardless of
+    where TEMP/TMP/TMPDIR point.
+
     Returns an opaque record for :func:`restore_staged_pair` /
-    :func:`discard_staged_pair`. ``copy2`` preserves mtimes. Best-effort:
-    never raises.
+    :func:`discard_staged_pair`. ``copy2`` preserves mtimes.
+
+    Raises:
+        OSError: the staging directory could not be created or a backup
+            could not be created/verified. The accepted pair itself is
+            untouched; the partial staging directory is removed.
     """
     import shutil
     import tempfile
 
-    record: dict[str, Any] = {"video": None, "sidecar": None, "dir": None}
+    if staging_dir is None:
+        parent = os.path.dirname(os.path.abspath(clip_final)) or os.getcwd()
+        staging_parent = os.path.join(parent, ".task13_staging")
+    else:
+        staging_parent = staging_dir
+    os.makedirs(staging_parent, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix="pair-", dir=staging_parent)
+    record: dict[str, Any] = {"video": None, "sidecar": None, "dir": staging}
     try:
-        staging = tempfile.mkdtemp(prefix="task13-pair-")
-        record["dir"] = staging
         if os.path.isfile(clip_final):
             dst = os.path.join(
                 staging, "video" + os.path.splitext(clip_final)[1])
             shutil.copy2(clip_final, dst)
+            _verify_backup(clip_final, dst)
             record["video"] = dst
         if os.path.isfile(stable_sidecar):
             dst = os.path.join(staging, "sidecar.json")
             shutil.copy2(stable_sidecar, dst)
+            _verify_backup(stable_sidecar, dst)
             record["sidecar"] = dst
     except OSError:
-        pass
+        # Fail closed: never hand out a partial or unverified record.
+        # The accepted pair was not touched; drop the staging dir.
+        _remove_tree_quietly(staging)
+        record["video"] = None
+        record["sidecar"] = None
+        record["dir"] = None
+        raise
     return record
 
 
@@ -1001,42 +1073,38 @@ def restore_staged_pair(record: dict, *, clip_final: str,
                         stable_sidecar: str) -> None:
     """Restore the staged pair after a publication/retirement failure.
 
-    Both the video and the sidecar are put back; when no previous video
-    was staged, the just-published (failed) video is removed instead.
-    Never leaves a broken pair. Best-effort: never raises.
+    Both the video and the sidecar are put back and VERIFIED
+    byte-identical; when no previous video was staged, the just-published
+    (failed) video is removed instead. Recovery data is discarded only
+    after verified restoration -- on any failure the staging directory
+    is KEPT (for forensics/retry) and the OSError PROPAGATES, never
+    swallowed: the caller must treat the attempt as failed, loudly.
+
+    Raises:
+        OSError: a staged file could not be restored or verified.
     """
     import shutil
 
-    try:
-        if record.get("video"):
-            shutil.copy2(record["video"], clip_final)
-        else:
-            try:
-                if os.path.isfile(clip_final):
-                    os.remove(clip_final)
-            except OSError:
-                pass
-        if record.get("sidecar"):
-            shutil.copy2(record["sidecar"], stable_sidecar)
-        # No sidecar backup: the failed publish left the stable sidecar in
-        # its pre-call state (os.replace/os.remove are atomic), so there
-        # is nothing to repair.
-    except OSError:
-        pass
-    finally:
-        discard_staged_pair(record)
+    if record.get("video"):
+        shutil.copy2(record["video"], clip_final)
+        _verify_backup(record["video"], clip_final)
+    else:
+        if os.path.isfile(clip_final):
+            os.remove(clip_final)
+    if record.get("sidecar"):
+        shutil.copy2(record["sidecar"], stable_sidecar)
+        _verify_backup(record["sidecar"], stable_sidecar)
+    # No sidecar backup: the failed publish left the stable sidecar in
+    # its pre-call state (os.replace/os.remove are atomic), so there is
+    # nothing to repair.
+    discard_staged_pair(record)
 
 
 def discard_staged_pair(record: dict) -> None:
     """Clean up staging after a successful publication. Never raises."""
-    import shutil
-
     staging = record.get("dir")
     if staging:
-        try:
-            shutil.rmtree(staging, ignore_errors=True)
-        except OSError:
-            pass
+        _remove_tree_quietly(staging)
     record["video"] = None
     record["sidecar"] = None
     record["dir"] = None
@@ -1044,73 +1112,277 @@ def discard_staged_pair(record: dict) -> None:
 
 #: Durable snapshot of the last accepted video+sidecar pair, inside the
 #: job dir. Restored when a rerender is declined for a preserved project.
+#: Per-clip layout (review-03)::
+#:
+#:     .task13_accepted_pair/<safe-clip-key>/
+#:         identity.txt          # exact clip_final basename (ownership)
+#:         current               # "gen-a" | "gen-b" (atomic pointer)
+#:         gen-a/ video<ext> sidecar.json manifest.json
+#:         gen-b/ ...
 ACCEPTED_SNAPSHOT_DIRNAME = ".task13_accepted_pair"
 
+_SNAPSHOT_GENERATIONS = ("gen-a", "gen-b")
+_SNAPSHOT_IDENTITY_FILENAME = "identity.txt"
+_SNAPSHOT_POINTER_FILENAME = "current"
+_SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
+_SNAPSHOT_SIDECAR_FILENAME = "sidecar.json"
 
-def _snapshot_dir(job_dir: str) -> str:
-    return os.path.join(job_dir, ACCEPTED_SNAPSHOT_DIRNAME)
+
+def _clip_snapshot_key(clip_final: str) -> str:
+    """Safe per-clip snapshot key from the clip final basename.
+
+    Alphanumerics plus ``-_.`` survive; every other character becomes
+    ``_``, so the key can never traverse directories. Leading dots are
+    stripped (``..`` can never be a key).
+    """
+    base = os.path.basename(clip_final)
+    safe = "".join(
+        c if (c.isalnum() or c in "-_.") else "_" for c in base)
+    safe = safe.lstrip(".")
+    if not safe:
+        safe = "clip-" + hashlib.sha256(
+            base.encode("utf-8", "replace")).hexdigest()[:16]
+    return safe
+
+
+def _clip_snapshot_dir(job_dir: str, clip_final: str) -> str:
+    """Per-clip snapshot directory: two clips never share snapshot files."""
+    return os.path.join(
+        job_dir, ACCEPTED_SNAPSHOT_DIRNAME, _clip_snapshot_key(clip_final))
+
+
+def _snapshot_identity_ok(clip_dir: str, clip_final: str) -> bool:
+    """True when the snapshot directory belongs to the requested clip."""
+    ident = os.path.join(clip_dir, _SNAPSHOT_IDENTITY_FILENAME)
+    try:
+        with open(ident, "r", encoding="utf-8") as fh:
+            return fh.read().strip() == os.path.basename(clip_final)
+    except OSError:
+        return False
+
+
+def _read_snapshot_current(clip_dir: str) -> str | None:
+    """The active generation, or None when no coherent generation exists."""
+    pointer = os.path.join(clip_dir, _SNAPSHOT_POINTER_FILENAME)
+    try:
+        with open(pointer, "r", encoding="utf-8") as fh:
+            gen = fh.read().strip()
+    except OSError:
+        return None
+    if gen not in _SNAPSHOT_GENERATIONS:
+        return None
+    if not os.path.isdir(os.path.join(clip_dir, gen)):
+        return None
+    return gen
+
+
+def _snapshot_video_name(clip_final: str) -> str:
+    return "video" + os.path.splitext(clip_final)[1]
+
+
+def _snapshot_manifest(gen_dir: str) -> dict | None:
+    path = os.path.join(gen_dir, _SNAPSHOT_MANIFEST_FILENAME)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """Write a small file atomically (destination-local temp + os.replace).
+
+    Never touches the global process temp. Raises OSError on failure.
+    """
+    import tempfile
+
+    parent = os.path.dirname(os.path.abspath(path)) or os.getcwd()
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def accepted_snapshot_exists(*, job_dir: str, clip_final: str) -> bool:
-    """True when a durable accepted-pair video snapshot exists."""
-    snap = os.path.join(
-        _snapshot_dir(job_dir),
-        "video" + os.path.splitext(clip_final)[1])
-    return os.path.isfile(snap)
+    """True when a durable, identity-checked accepted-pair snapshot exists."""
+    clip_dir = _clip_snapshot_dir(job_dir, clip_final)
+    if not _snapshot_identity_ok(clip_dir, clip_final):
+        return False
+    gen = _read_snapshot_current(clip_dir)
+    if gen is None:
+        return False
+    video_snap = os.path.join(
+        clip_dir, gen, _snapshot_video_name(clip_final))
+    return os.path.isfile(video_snap)
 
 
 def snapshot_accepted_pair(*, job_dir: str, clip_final: str,
-                           stable_sidecar: str) -> None:
+                           stable_sidecar: str) -> bool:
     """Persist the last accepted pair after successful publication.
 
-    ``copy2`` preserves mtimes so a later restore keeps the lineage file
-    identity byte- and mtime-identical. A sidecar-less acceptance clears
-    any stale sidecar snapshot. Best-effort: never raises.
+    The new generation is staged in a destination-local temp dir,
+    VERIFIED (sha256 of both files against the live pair), installed as
+    the inactive generation, and published with ONE atomic pointer flip.
+    A failed update never touches the live generation: a later restore
+    sees either the prior coherent pair or the complete new pair --
+    never a mixed generation.
+
+    Returns True only when the new generation is durably installed.
+    Returns False -- never raises, never claims durable recovery -- when
+    the update cannot be completed; the previously installed generation,
+    if any, is left untouched. Callers must handle False (the pair
+    itself is accepted; only durable recovery is unavailable).
+
+    ``copy2`` preserves mtimes so a later restore keeps the lineage
+    file identity byte- and mtime-identical. A sidecar-less acceptance
+    records no sidecar snapshot (any stale one is retired on the next
+    install).
     """
     import shutil
+    import tempfile
 
+    clip_dir = _clip_snapshot_dir(job_dir, clip_final)
     try:
-        snap = _snapshot_dir(job_dir)
-        os.makedirs(snap, exist_ok=True)
-        if os.path.isfile(clip_final):
-            shutil.copy2(
-                clip_final,
-                os.path.join(
-                    snap, "video" + os.path.splitext(clip_final)[1]))
-        sidecar_snap = os.path.join(snap, "sidecar.json")
-        if os.path.isfile(stable_sidecar):
-            shutil.copy2(stable_sidecar, sidecar_snap)
-        else:
-            try:
-                if os.path.isfile(sidecar_snap):
-                    os.remove(sidecar_snap)
-            except OSError:
-                pass
+        os.makedirs(clip_dir, exist_ok=True)
     except OSError:
-        pass
+        return False
+    ident_path = os.path.join(clip_dir, _SNAPSHOT_IDENTITY_FILENAME)
+    if os.path.isfile(ident_path) and not _snapshot_identity_ok(
+            clip_dir, clip_final):
+        # Another clip owns this key: never clobber its recovery data.
+        return False
+    current = _read_snapshot_current(clip_dir)
+    target = "gen-b" if current == "gen-a" else "gen-a"
+    staging = None
+    try:
+        # Ownership first: this clip's identity is recorded before the
+        # new generation becomes visible.
+        _atomic_write_text(ident_path, os.path.basename(clip_final))
+        staging = tempfile.mkdtemp(prefix="gen-", dir=clip_dir)
+        video_name = _snapshot_video_name(clip_final)
+        staged_video = os.path.join(staging, video_name)
+        staged_sidecar = os.path.join(staging, _SNAPSHOT_SIDECAR_FILENAME)
+        if not os.path.isfile(clip_final):
+            raise OSError("snapshot source video vanished")
+        shutil.copy2(clip_final, staged_video)
+        sidecar_src = stable_sidecar if os.path.isfile(stable_sidecar) else None
+        if sidecar_src:
+            shutil.copy2(sidecar_src, staged_sidecar)
+        # Verify the staged generation against the live pair BEFORE it
+        # can become visible.
+        video_hash = _sha256_file(staged_video)
+        if video_hash is None or video_hash != _sha256_file(clip_final):
+            raise OSError("snapshot video verification failed")
+        sidecar_hash = None
+        if sidecar_src:
+            sidecar_hash = _sha256_file(staged_sidecar)
+            if (sidecar_hash is None
+                    or sidecar_hash != _sha256_file(stable_sidecar)):
+                raise OSError("snapshot sidecar verification failed")
+        with open(os.path.join(staging, _SNAPSHOT_MANIFEST_FILENAME),
+                  "w", encoding="utf-8") as fh:
+            json.dump({
+                "clip_basename": os.path.basename(clip_final),
+                "video_sha256": video_hash,
+                "sidecar_sha256": sidecar_hash,
+            }, fh, sort_keys=True)
+        # Install as the inactive generation, then flip the pointer with
+        # one atomic rename. The live generation is untouched until the
+        # flip, so an exception anywhere above leaves it coherent.
+        target_dir = os.path.join(clip_dir, target)
+        _remove_tree_quietly(target_dir)
+        os.rename(staging, target_dir)
+        staging = None  # now owned by target_dir
+        _atomic_write_text(
+            os.path.join(clip_dir, _SNAPSHOT_POINTER_FILENAME), target)
+        # Retire the superseded generation (best-effort; the next
+        # snapshot reuses the slot anyway).
+        if current and current != target:
+            _remove_tree_quietly(os.path.join(clip_dir, current))
+        return True
+    except OSError:
+        if staging:
+            _remove_tree_quietly(staging)
+        return False
+
+
+def _install_verified(src: str, dst: str) -> None:
+    """Install ``src`` at ``dst`` atomically after verifying byte identity.
+
+    Copies to a destination-local temp file, verifies sha256, then
+    os.replace()s into place. Raises OSError on any failure; ``dst`` is
+    never left half-written. Never touches the global process temp.
+    """
+    import shutil
+    import tempfile
+
+    parent = os.path.dirname(os.path.abspath(dst)) or os.getcwd()
+    fd, tmp = tempfile.mkstemp(prefix=".task13-restore-", dir=parent)
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        _verify_backup(src, tmp)
+        os.replace(tmp, dst)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def restore_accepted_snapshot(*, job_dir: str, clip_final: str,
                               stable_sidecar: str) -> bool:
     """Restore the last accepted pair from the durable snapshot.
 
-    Returns True when a video snapshot existed and was restored (mtime
-    preserved via copy2, so lineage identity is intact). Best-effort:
-    never raises.
+    The snapshot directory must belong to the requested clip (identity
+    check) and the active generation's manifest is verified before
+    anything is installed; each file is installed atomically
+    (destination-local temp + os.replace). Returns True when the video
+    snapshot existed and was restored (mtime preserved via copy2, so
+    lineage identity is intact). Returns False -- never raises, never
+    installs foreign or unverified bytes -- when no valid snapshot
+    exists for this clip.
     """
-    import shutil
-
-    restored = False
+    clip_dir = _clip_snapshot_dir(job_dir, clip_final)
+    if not _snapshot_identity_ok(clip_dir, clip_final):
+        return False
+    gen = _read_snapshot_current(clip_dir)
+    if gen is None:
+        return False
+    gen_dir = os.path.join(clip_dir, gen)
+    manifest = _snapshot_manifest(gen_dir)
+    if not manifest:
+        return False
+    video_snap = os.path.join(gen_dir, _snapshot_video_name(clip_final))
+    if (not os.path.isfile(video_snap)
+            or _sha256_file(video_snap) != manifest.get("video_sha256")):
+        return False
+    sidecar_snap = os.path.join(gen_dir, _SNAPSHOT_SIDECAR_FILENAME)
+    expected_sidecar = manifest.get("sidecar_sha256")
+    if expected_sidecar and (
+            not os.path.isfile(sidecar_snap)
+            or _sha256_file(sidecar_snap) != expected_sidecar):
+        return False
     try:
-        snap = _snapshot_dir(job_dir)
-        video_snap = os.path.join(
-            snap, "video" + os.path.splitext(clip_final)[1])
-        if os.path.isfile(video_snap):
-            shutil.copy2(video_snap, clip_final)
-            restored = True
-        sidecar_snap = os.path.join(snap, "sidecar.json")
-        if os.path.isfile(sidecar_snap):
-            shutil.copy2(sidecar_snap, stable_sidecar)
+        _install_verified(video_snap, clip_final)
+        if expected_sidecar:
+            _install_verified(sidecar_snap, stable_sidecar)
+        else:
+            # Sidecar-less acceptance: the stable binding must not linger.
+            try:
+                if os.path.isfile(stable_sidecar):
+                    os.remove(stable_sidecar)
+            except OSError:
+                return False
     except OSError:
-        pass
-    return restored
+        return False
+    return True

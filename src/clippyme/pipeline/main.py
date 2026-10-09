@@ -977,14 +977,21 @@ if __name__ == '__main__':
                 sys.exit(1)
             normalize_audio(tmp_output)
             select_cover_frame(tmp_output)
-            # Task 13 review-02: stage the previous accepted pair BEFORE
-            # publication. A promotion/retirement failure restores BOTH
-            # the video and the sidecar and exits non-zero -- never a
-            # success with a stale mixed pair, never a destroyed old pair.
-            _staged = _project_framing.stage_previous_pair(
-                clip_final=final_output,
-                stable_sidecar=turn_framing_sidecar_for(final_output),
-            )
+            # Task 13 review-02/03: stage the previous accepted pair BEFORE
+            # publication. Review-03: staging is FAIL-CLOSED -- if the
+            # previous pair cannot be backed up AND verified, exit
+            # non-zero WITHOUT touching the final output. A
+            # promotion/retirement failure restores BOTH the video and the
+            # sidecar and exits non-zero -- never a success with a stale
+            # mixed pair, never a destroyed old pair.
+            try:
+                _staged = _project_framing.stage_previous_pair(
+                    clip_final=final_output,
+                    stable_sidecar=turn_framing_sidecar_for(final_output),
+                )
+            except OSError as _stage_exc:
+                print(f"❌ Reframe-only: pair staging failed ({_stage_exc}); previous pair kept.")
+                sys.exit(1)
             os.replace(tmp_output, final_output)
             try:
                 _pub_outcome = _project_framing.publish_attempt_sidecar(
@@ -995,11 +1002,14 @@ if __name__ == '__main__':
                 )
             except OSError as _pub_exc:
                 print(f"❌ Reframe-only: sidecar publish failed ({_pub_exc}); restoring staged pair.")
-                _project_framing.restore_staged_pair(
-                    _staged,
-                    clip_final=final_output,
-                    stable_sidecar=turn_framing_sidecar_for(final_output),
-                )
+                try:
+                    _project_framing.restore_staged_pair(
+                        _staged,
+                        clip_final=final_output,
+                        stable_sidecar=turn_framing_sidecar_for(final_output),
+                    )
+                except OSError as _restore_exc:
+                    print(f"❌ Reframe-only: CRITICAL staged-pair restore failed ({_restore_exc}); pair state uncertain.")
                 try:
                     _tmp_sc = turn_framing_sidecar_for(tmp_output)
                     if os.path.isfile(_tmp_sc):
@@ -1398,43 +1408,68 @@ if __name__ == '__main__':
                             pass
                         success = False
                 if success:
-                    # Task 13 review-02: stage the previous accepted pair
+                    # Task 13 review-02/03: stage the previous accepted pair
                     # BEFORE publication (same contract as
-                    # orchestrator._render_one_clip). A promotion/retirement
-                    # failure restores BOTH the video and the sidecar and
-                    # fails the clip -- never a success with a stale mixed
-                    # pair, never a destroyed old pair. Inlined basename
-                    # rule (see comment above): this loop is AST-compiled
-                    # by tests with a restricted injected env, and
-                    # `_project_framing` is provided there.
+                    # orchestrator._render_one_clip). Review-03: staging is
+                    # FAIL-CLOSED -- if the previous pair cannot be backed
+                    # up AND verified, publication is aborted here and the
+                    # accepted pair stays untouched (no os.replace). A
+                    # promotion/retirement failure restores BOTH the video
+                    # and the sidecar and fails the clip -- never a success
+                    # with a stale mixed pair, never a destroyed old pair.
+                    # Inlined basename rule (see comment above): this loop
+                    # is AST-compiled by tests with a restricted injected
+                    # env, so no new names may be referenced; only
+                    # `_project_framing` attributes are used.
                     _stable_sc = os.path.splitext(clip_final_path)[0] + ".turn_framing_plan.json"
-                    _staged = _project_framing.stage_previous_pair(
-                        clip_final=clip_final_path,
-                        stable_sidecar=_stable_sc,
-                    )
-                    os.replace(_temp_final, clip_final_path)
-                    _pub_ok = True
                     try:
-                        _pub_outcome = _project_framing.publish_attempt_sidecar(
-                            attempt_sidecar=os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json",
-                            stable_sidecar=_stable_sc,
-                            source_path=clip_source_path,
-                            job_dir=output_dir,
-                        )
-                    except OSError as _pub_exc:
-                        _pub_ok = False
-                        print(f"   Task 13: sidecar publish failed ({_pub_exc}); restoring staged pair for clip {i+1}", flush=True)
-                        _project_framing.restore_staged_pair(
-                            _staged,
+                        _staged = _project_framing.stage_previous_pair(
                             clip_final=clip_final_path,
                             stable_sidecar=_stable_sc,
                         )
+                    except OSError as _stage_exc:
+                        print(f"   Task 13: pair staging failed ({_stage_exc}); keeping previous pair for clip {i+1}", flush=True)
+                        _pub_ok = False
+                        # The render itself is fine but cannot be published
+                        # safely: drop the temp artifacts (best-effort).
                         try:
-                            _abandoned = os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json"
-                            if os.path.isfile(_abandoned):
-                                os.remove(_abandoned)
+                            if os.path.isfile(_temp_final):
+                                os.remove(_temp_final)
                         except OSError:
                             pass
+                        try:
+                            _staged_sidecar = os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json"
+                            if os.path.isfile(_staged_sidecar):
+                                os.remove(_staged_sidecar)
+                        except OSError:
+                            pass
+                    else:
+                        os.replace(_temp_final, clip_final_path)
+                        _pub_ok = True
+                        try:
+                            _pub_outcome = _project_framing.publish_attempt_sidecar(
+                                attempt_sidecar=os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json",
+                                stable_sidecar=_stable_sc,
+                                source_path=clip_source_path,
+                                job_dir=output_dir,
+                            )
+                        except OSError as _pub_exc:
+                            _pub_ok = False
+                            print(f"   Task 13: sidecar publish failed ({_pub_exc}); restoring staged pair for clip {i+1}", flush=True)
+                            try:
+                                _project_framing.restore_staged_pair(
+                                    _staged,
+                                    clip_final=clip_final_path,
+                                    stable_sidecar=_stable_sc,
+                                )
+                            except OSError as _restore_exc:
+                                print(f"   Task 13: CRITICAL staged-pair restore failed ({_restore_exc}); pair state uncertain for clip {i+1}", flush=True)
+                            try:
+                                _abandoned = os.path.splitext(_temp_final)[0] + ".turn_framing_plan.json"
+                                if os.path.isfile(_abandoned):
+                                    os.remove(_abandoned)
+                            except OSError:
+                                pass
                     if _pub_ok:
                         _project_framing.discard_staged_pair(_staged)
                         if _pub_outcome != _project_framing.PUBLISH_PROMOTED:

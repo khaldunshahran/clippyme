@@ -852,6 +852,33 @@ def _sidecar_for(legacy, video_path: str) -> str:
     return os.path.splitext(video_path)[0] + ".turn_framing_plan.json"
 
 
+def _resolve_project_for_preservation(output_dir, index):
+    """Task 01 project resolver shared by the pre-render rerender guard and
+    the emission guard (review-03 correction 4).
+
+    Returns the working ``clip-project-<index>.json`` when present, else
+    the latest version-map-backed archived project via
+    ``project_render.get_project_path`` (the Task 01 working/archived
+    fallback contract), else None. Callers apply ``project_has_user_edits``
+    to the resolved path -- one resolver, so the two guards can never
+    drift apart (an archived-only user project pins its accepted pair
+    before rendering exactly as it pins its sidecar at emission).
+    """
+    from clippyme.pipeline.project_emit import PROJECT_FILENAME_TEMPLATE
+
+    working = os.path.join(
+        output_dir, PROJECT_FILENAME_TEMPLATE.format(index=index)
+    )
+    if os.path.isfile(working):
+        return working
+    try:
+        from clippyme.domain.project_render import get_project_path
+
+        return get_project_path(output_dir, index)
+    except Exception:
+        return None
+
+
 def _maybe_emit_clip_project(**kwargs):
     """Emit the default-edit project unless the user already edited it.
 
@@ -859,9 +886,9 @@ def _maybe_emit_clip_project(**kwargs):
     user edits. Overwriting it with a fresh version-1 would silently
     discard their work or hide an archived user version.
 
-    Resolution contract: check the WORKING file first; if absent, resolve
-    via ``get_project_path`` which falls back to the latest archived
-    version. Preserve any resolved project with user edits -- including
+    Resolution contract: the shared working/archived resolver -- working
+    file first, else the latest version-map-backed archived project.
+    Preserve any resolved project with user edits -- including
     archived-only state -- by not emitting a new default.
     """
     from clippyme.pipeline.project_emit import PROJECT_FILENAME_TEMPLATE
@@ -869,30 +896,18 @@ def _maybe_emit_clip_project(**kwargs):
     output_dir = kwargs.get("output_dir")
     index = kwargs.get("index")
     if output_dir is not None and index is not None:
-        working = os.path.join(
-            output_dir, PROJECT_FILENAME_TEMPLATE.format(index=index)
-        )
-        # 1. Working file exists: preserve if it has user edits.
-        if os.path.isfile(working) and project_has_user_edits(working):
+        resolved = _resolve_project_for_preservation(output_dir, index)
+        if resolved and project_has_user_edits(resolved):
+            archived = os.path.basename(resolved) != (
+                PROJECT_FILENAME_TEMPLATE.format(index=index)
+            )
             print(
-                f"clip-project: preserving user-edited project for clip {index + 1}",
+                f"clip-project: preserving "
+                f"{'archived user' if archived else 'user-edited'} "
+                f"project for clip {index + 1}",
                 flush=True,
             )
-            return working
-        # 2. No working file: resolve via the fallback contract (archived).
-        if not os.path.isfile(working):
-            try:
-                from clippyme.domain.project_render import get_project_path
-
-                resolved = get_project_path(output_dir, index)
-            except Exception:
-                resolved = None
-            if resolved and project_has_user_edits(resolved):
-                print(
-                    f"clip-project: preserving archived user project for clip {index + 1}",
-                    flush=True,
-                )
-                return resolved
+            return resolved
     return emit_clip_project(**kwargs)
 
 
@@ -965,22 +980,22 @@ def _render_one_clip(
         except OSError:
             pass
 
-    # Task 13 review-02: decline the rerender for a preserved project.
+    # Task 13 review-02/03: decline the rerender for a preserved project.
     # The Task 01 preservation contract (project_has_user_edits) pins
     # the accepted video+sidecar pair the preserved project references;
     # replacing either would invalidate its reframed_base lineage
-    # (invalid_asset). When an accepted pair was snapshotted, keep it --
-    # restoring the video from the snapshot when it is gone -- and
-    # return success rather than rendering a replacement. Without a
-    # snapshot there is no accepted pair to keep, so the render
-    # proceeds (the project file itself stays preserved).
-    from clippyme.pipeline.project_emit import (
-        PROJECT_FILENAME_TEMPLATE as _PFT,
-    )
-    _project_path = os.path.join(
-        output_dir, _PFT.format(index=index))
-    if os.path.isfile(_project_path) and project_has_user_edits(
-            _project_path):
+    # (invalid_asset). Review-03: the guard uses the SAME working/archived
+    # resolver as the emission guard, so a version-map-backed
+    # archived-only user project also declines the rerender BEFORE its
+    # pixel base changes (it stays lineage-eligible and renderable).
+    # When an accepted pair was snapshotted, keep it -- restoring the
+    # pair from the snapshot when it is gone -- and return success rather
+    # than rendering a replacement. Without a snapshot there is no
+    # accepted pair to keep, so the render proceeds (the project file
+    # itself stays preserved).
+    _preserved_project = _resolve_project_for_preservation(
+        output_dir, index)
+    if _preserved_project and project_has_user_edits(_preserved_project):
         from clippyme.domain import project_framing as _pf13decline
         if _pf13decline.accepted_snapshot_exists(
                 job_dir=output_dir, clip_final=clip_final):
@@ -1132,100 +1147,139 @@ def _render_one_clip(
             # The video is published first; the sidecar half is coordinated
             # by publish_attempt_sidecar (promotion / retire /
             # preserved-project skip).
-            # Task 13 review-02: stage the previous accepted pair BEFORE
-            # publication. A promotion/retirement OSError is NEVER
-            # swallowed: BOTH the video and the sidecar are restored from
-            # the staged pair and the attempt fails, so an accepted clip
-            # can never pair a new video with a stale plan and a failed
-            # publish can never destroy the previous accepted pair.
+            # Task 13 review-02/03: stage the previous accepted pair BEFORE
+            # publication. Review-03: staging is FAIL-CLOSED -- if the
+            # previous pair cannot be backed up AND verified, publication
+            # is aborted here and the accepted pair stays untouched (no
+            # os.replace, no half-published state). A promotion/retirement
+            # OSError is NEVER swallowed: BOTH the video and the sidecar
+            # are restored from the staged pair and the attempt fails, so
+            # an accepted clip can never pair a new video with a stale
+            # plan and a failed publish can never destroy the previous
+            # accepted pair.
             from clippyme.domain import project_framing as _pf13
-            _staged_pair = _pf13.stage_previous_pair(
-                clip_final=clip_final,
-                stable_sidecar=_sidecar_for(legacy, clip_final),
-            )
-            os.replace(temp_output, clip_final)
-            _promotion_ok = True
-            _pub_outcome = _pf13.PUBLISH_NO_SIDECAR
+            _staged_pair = None
             try:
-                _pub_outcome = _pf13.publish_attempt_sidecar(
-                    attempt_sidecar=_sidecar_for(legacy, temp_output),
-                    stable_sidecar=_sidecar_for(legacy, clip_final),
-                    source_path=clip_source,
-                    job_dir=output_dir,
-                )
-            except OSError as _pub_exc:
-                _promotion_ok = False
-                print(
-                    f"   Task 13: sidecar publish failed ({_pub_exc}); "
-                    f"restoring staged pair for clip {index + 1}/{total}",
-                    flush=True,
-                )
-                _pf13.restore_staged_pair(
-                    _staged_pair,
+                _staged_pair = _pf13.stage_previous_pair(
                     clip_final=clip_final,
                     stable_sidecar=_sidecar_for(legacy, clip_final),
                 )
-                try:
-                    _abandoned = _sidecar_for(legacy, temp_output)
-                    if os.path.isfile(_abandoned):
-                        os.remove(_abandoned)
-                except OSError:
-                    pass
-            if not _promotion_ok:
-                # Fall through to the attempt-failure handling below: the
-                # retry loop may try again; exhaustion returns False.
+            except OSError as _stage_exc:
+                print(
+                    f"   Task 13: pair staging failed ({_stage_exc}); "
+                    f"keeping previous pair for clip {index + 1}/{total}",
+                    flush=True,
+                )
                 last_report = {
                     "ok": False,
                     "critical": True,
-                    "issues": ["sidecar promotion failed; video rolled back"],
+                    "issues": ["pair staging failed; previous pair kept"],
                     "warnings": [],
                 }
             else:
-                _pf13.discard_staged_pair(_staged_pair)
-                # Task 13 review-02: snapshot the accepted pair so a
-                # later declined rerender (preserved project) can restore
-                # the exact video+sidecar the project references.
-                _pf13.snapshot_accepted_pair(
-                    job_dir=output_dir,
-                    clip_final=clip_final,
-                    stable_sidecar=_sidecar_for(legacy, clip_final),
-                )
-                if _pub_outcome != _pf13.PUBLISH_PROMOTED:
+                os.replace(temp_output, clip_final)
+                _promotion_ok = True
+                _pub_outcome = _pf13.PUBLISH_NO_SIDECAR
+                try:
+                    _pub_outcome = _pf13.publish_attempt_sidecar(
+                        attempt_sidecar=_sidecar_for(legacy, temp_output),
+                        stable_sidecar=_sidecar_for(legacy, clip_final),
+                        source_path=clip_source,
+                        job_dir=output_dir,
+                    )
+                except OSError as _pub_exc:
+                    _promotion_ok = False
                     print(
-                        f"   Task 13: sidecar publish outcome "
-                        f"'{_pub_outcome}' for clip {index + 1}/{total}",
+                        f"   Task 13: sidecar publish failed ({_pub_exc}); "
+                        f"restoring staged pair for clip {index + 1}/{total}",
                         flush=True,
                     )
-                # The cover must be based on the stable final basename; generating it
-                # from the temporary render would orphan `*.render.tmp_cover.jpg`.
-                legacy.select_cover_frame(clip_final)
-                clip["qa"] = last_report
-                status = _qa_status(last_report)
-                state.mark_clip(index, status, last_report)
-                _save_metadata(metadata_file, clips_data)
-                # Phase 1 (clip editor): emit the default-edit project. Additive
-                # only -- emit_clip_project never raises.
-                _maybe_emit_clip_project(
-                    output_dir=output_dir,
-                    job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
-                    index=index,
-                    start=start,
-                    end=end,
-                    clip=clip,
-                    clips_data=clips_data,
-                    clip_source=clip_source,
-                    clip_final=clip_final,
-                )
-                warning_text = (
-                    f" with {len(last_report.get('warnings') or [])} warning(s)"
-                    if status == "warning"
-                    else ""
-                )
-                print(
-                    f"✅ Clip {index + 1}/{total} ready{warning_text}: {clip_filename}",
-                    flush=True,
-                )
-                return True
+                    try:
+                        _pf13.restore_staged_pair(
+                            _staged_pair,
+                            clip_final=clip_final,
+                            stable_sidecar=_sidecar_for(legacy, clip_final),
+                        )
+                    except OSError as _restore_exc:
+                        # Fail loudly: the pair state is unverifiable.
+                        # The attempt still fails; nothing is reported
+                        # as successfully published.
+                        print(
+                            f"   Task 13: CRITICAL staged-pair restore "
+                            f"failed ({_restore_exc}); pair state uncertain "
+                            f"for clip {index + 1}/{total}",
+                            flush=True,
+                        )
+                    try:
+                        _abandoned = _sidecar_for(legacy, temp_output)
+                        if os.path.isfile(_abandoned):
+                            os.remove(_abandoned)
+                    except OSError:
+                        pass
+                if not _promotion_ok:
+                    # Fall through to the attempt-failure handling below: the
+                    # retry loop may try again; exhaustion returns False.
+                    last_report = {
+                        "ok": False,
+                        "critical": True,
+                        "issues": ["sidecar promotion failed; video rolled back"],
+                        "warnings": [],
+                    }
+                else:
+                    _pf13.discard_staged_pair(_staged_pair)
+                    # Task 13 review-02: snapshot the accepted pair so a
+                    # later declined rerender (preserved project) can restore
+                    # the exact video+sidecar the project references.
+                    # Review-03: atomic per-clip generations. A False return
+                    # means durable recovery is unavailable -- warn, but do
+                    # not fail the accepted clip over it.
+                    if not _pf13.snapshot_accepted_pair(
+                        job_dir=output_dir,
+                        clip_final=clip_final,
+                        stable_sidecar=_sidecar_for(legacy, clip_final),
+                    ):
+                        print(
+                            f"   Task 13: WARNING accepted-pair snapshot "
+                            f"not durable for clip {index + 1}/{total}; "
+                            f"declined-rerender recovery unavailable",
+                            flush=True,
+                        )
+                    if _pub_outcome != _pf13.PUBLISH_PROMOTED:
+                        print(
+                            f"   Task 13: sidecar publish outcome "
+                            f"'{_pub_outcome}' for clip {index + 1}/{total}",
+                            flush=True,
+                        )
+                    # The cover must be based on the stable final basename; generating it
+                    # from the temporary render would orphan `*.render.tmp_cover.jpg`.
+                    legacy.select_cover_frame(clip_final)
+                    clip["qa"] = last_report
+                    status = _qa_status(last_report)
+                    state.mark_clip(index, status, last_report)
+                    _save_metadata(metadata_file, clips_data)
+                    # Phase 1 (clip editor): emit the default-edit project. Additive
+                    # only -- emit_clip_project never raises.
+                    _maybe_emit_clip_project(
+                        output_dir=output_dir,
+                        job_id=os.getenv("CLIPPYME_JOB_ID") or os.path.basename(output_dir),
+                        index=index,
+                        start=start,
+                        end=end,
+                        clip=clip,
+                        clips_data=clips_data,
+                        clip_source=clip_source,
+                        clip_final=clip_final,
+                    )
+                    warning_text = (
+                        f" with {len(last_report.get('warnings') or [])} warning(s)"
+                        if status == "warning"
+                        else ""
+                    )
+                    print(
+                        f"✅ Clip {index + 1}/{total} ready{warning_text}: {clip_filename}",
+                        flush=True,
+                    )
+                    return True
         try:
             os.remove(temp_output)
         except OSError:
