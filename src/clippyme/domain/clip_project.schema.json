@@ -324,6 +324,18 @@
           "title": "Applies",
           "type": "boolean"
         },
+        "scene_kind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scene Kind"
+        },
         "subject_ids": {
           "items": {
             "type": "string"

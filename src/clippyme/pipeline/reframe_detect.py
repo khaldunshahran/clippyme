@@ -175,3 +175,81 @@ def detect_person_yolo(frame):
                 best_box = [x1, y1, w, h]
                 
     return best_box
+
+
+# --- Task 14: action observation seam ---------------------------------------
+# Normalized category families for action framing. The detector maps the
+# provider's class names onto this fixed vocabulary; anything unmapped is
+# dropped here so the pure observation contract only ever sees supported
+# families (it additionally rejects anything outside the vocabulary).
+
+ACTION_CATEGORY_FAMILIES = ("person", "animal", "vehicle", "object")
+
+_ACTION_CLASS_TO_FAMILY = {
+    # person
+    "person": "person",
+    # animals
+    "dog": "animal", "cat": "animal", "horse": "animal", "bird": "animal",
+    "cow": "animal", "sheep": "animal", "elephant": "animal",
+    "bear": "animal", "zebra": "animal", "giraffe": "animal",
+    # vehicles
+    "car": "vehicle", "motorcycle": "vehicle", "bicycle": "vehicle",
+    "bus": "vehicle", "truck": "vehicle", "boat": "vehicle",
+    "airplane": "vehicle", "train": "vehicle",
+    # commonly-demoed held objects / products / sports gear
+    "sports ball": "object", "bottle": "object", "cup": "object",
+    "wine glass": "object", "cell phone": "object", "laptop": "object",
+    "book": "object", "handbag": "object", "backpack": "object",
+    "suitcase": "object", "skis": "object", "snowboard": "object",
+    "skateboard": "object", "surfboard": "object", "tennis racket": "object",
+    "frisbee": "object", "kite": "object", "baseball bat": "object",
+    "baseball glove": "object",
+}
+
+
+def detect_action_candidates(frame, min_confidence: float = 0.25):
+    """Detect action-subject candidates for the Task 14 action planner.
+
+    Reuses the existing lazily-loaded YOLOv8 singleton (no second network,
+    no new dependency, no live provider call): one forward pass, all COCO
+    classes, mapped onto the normalized ``ACTION_CATEGORY_FAMILIES``
+    vocabulary. Returns a list of ``{"box": (x, y, w, h), "confidence":
+    float, "category": family}`` with float pixel boxes.
+
+    Raises ``RuntimeError`` when the model cannot be loaded (the caller
+    treats this as detector-unavailable and keeps the accepted GENERAL
+    fallback with an explicit reason). Unmapped classes are dropped, and
+    detections below ``min_confidence`` are dropped — weak evidence must
+    never authorize a tight crop.
+    """
+    try:
+        model = _get_yolo_model()
+    except Exception as exc:
+        raise RuntimeError(f"yolo-unavailable: {exc}") from exc
+    if model is None:
+        raise RuntimeError("yolo-unavailable: model is None")
+    results = model(frame, verbose=False)  # all classes, single inference
+    names = getattr(model, "names", {}) or {}
+    out = []
+    for result in results:
+        for box in getattr(result, "boxes", []):
+            cls_name = str(names.get(int(box.cls[0]), "")).lower()
+            family = _ACTION_CLASS_TO_FAMILY.get(cls_name)
+            if family is None:
+                continue
+            try:
+                conf = float(box.conf[0])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not (0.0 <= conf <= 1.0) or conf < min_confidence:
+                continue
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+            w, h = x2 - x1, y2 - y1
+            if w <= 0 or h <= 0:
+                continue
+            out.append({
+                "box": (x1, y1, w, h),
+                "confidence": conf,
+                "category": family,
+            })
+    return out

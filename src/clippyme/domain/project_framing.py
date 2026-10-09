@@ -146,12 +146,14 @@ def _task12() -> dict[str, Any]:
             TRACK_ID_RE,
             plan_from_dict,
             plan_to_dict,
+            scene_kind_of,
         )
         _plan_api = {
             "FACE_STRATEGIES": FACE_STRATEGIES,
             "TRACK_ID_RE": TRACK_ID_RE,
             "plan_from_dict": plan_from_dict,
             "plan_to_dict": plan_to_dict,
+            "scene_kind_of": scene_kind_of,
         }
     return _plan_api
 
@@ -309,13 +311,17 @@ def normalize_timeline(
     <= clip_end < clip_frame_count``; keyframes ordered with unique
     frames inside their scene; coords finite ints with ``0 <= x1 < x2 <=
     frame_w`` (same for y vs ``frame_h``); strategy strings preserved
-    verbatim; non-face strategies (anything not TRACK/WIDE) keep NO
-    keyframes (``[]``) and ``applies`` False -- keyframes are never
-    manufactured for them; fallback reason/detail tokens preserved.
+    verbatim; the explicit ``scene_kind`` contract is honored — ``"none"``
+    scenes (SPLIT/SCREENCAST/DISABLED/old GENERAL) keep NO keyframes
+    (``[]``) and ``applies`` False, ``"face"`` scenes (TRACK/WIDE) and
+    ``"action"`` scenes (GENERAL, Task 14) normalize their trajectories;
+    keyframes are never manufactured for non-applicable scenes; fallback
+    reason/detail tokens preserved.
 
     Returns a list of scene dicts: ``{scene_id, strategy, start_frame,
-    end_frame, applies, subject_ids, keyframes, fallback_reason,
-    fallback_detail}`` with clip-relative inclusive frames.
+    end_frame, applies, scene_kind, subject_ids, keyframes,
+    fallback_reason, fallback_detail}`` with clip-relative inclusive
+    frames.
 
     Raises:
         FramingError: on any malformed input (never silently coerces).
@@ -338,6 +344,7 @@ def normalize_timeline(
     api = _task12()
     face_strategies = api["FACE_STRATEGIES"]
     track_id_re = api["TRACK_ID_RE"]
+    scene_kind_of = api["scene_kind_of"]
 
     frame_w = _strict_int("plan.frame_w", plan.get("frame_w"))
     frame_h = _strict_int("plan.frame_h", plan.get("frame_h"))
@@ -380,8 +387,12 @@ def normalize_timeline(
         if not isinstance(applies, bool):
             raise FramingError(f"{REASON_MALFORMED}: {ctx} applies must be bool")
 
+        # Explicit versioned scene contract (Task 14): the parser
+        # distinguishes face, action, and non-applicable scenes; the
+        # bridge normalizes each contract on its own terms.
+        kind = scene_kind_of(s)
         is_face_strategy = strategy in face_strategies
-        if not is_face_strategy:
+        if kind == "none":
             # Non-face strategies (SPLIT/SCREENCAST/GENERAL/DISABLED/…)
             # keep NO keyframes: their renderer is static/wide and we never
             # manufacture crop targets. A non-face scene claiming
@@ -406,15 +417,31 @@ def normalize_timeline(
                 "start_frame": start,
                 "end_frame": end,
                 "applies": False,
+                "scene_kind": "none",
                 "subject_ids": [],
                 "keyframes": [],
                 "fallback_reason": None,
                 "fallback_detail": None,
             })
             continue
+        if kind == "face":
+            if not is_face_strategy:
+                raise FramingError(
+                    f"{REASON_MALFORMED}: {ctx} face scene with non-face "
+                    f"strategy {strategy!r}")
+        elif kind == "action":
+            # Defense in depth: the v4 parser already binds action scenes
+            # to GENERAL; the bridge re-checks on the canonical form.
+            if strategy != "GENERAL":
+                raise FramingError(
+                    f"{REASON_MALFORMED}: {ctx} action scene with "
+                    f"non-GENERAL strategy {strategy!r}")
+        else:  # pragma: no cover — scene_kind_of only returns the three
+            raise FramingError(
+                f"{REASON_MALFORMED}: {ctx} unknown scene kind {kind!r}")
         if not applies:
-            # Face strategy the plan did not apply (production never emits
-            # this): no trajectory, same strict content ban.
+            # Applicable-kind scene the plan did not apply (production
+            # never emits this): no trajectory, same strict content ban.
             for key in ("segments", "keyframes", "tracks"):
                 if s.get(key):
                     raise FramingError(
@@ -430,6 +457,7 @@ def normalize_timeline(
                 "start_frame": start,
                 "end_frame": end,
                 "applies": False,
+                "scene_kind": kind,
                 "subject_ids": [],
                 "keyframes": [],
                 "fallback_reason": None,
@@ -437,8 +465,9 @@ def normalize_timeline(
             })
             continue
 
-        # Face scene (TRACK/WIDE, applies): anonymous subject ids from the
-        # scene's segments, in first-appearance order.
+        # Applicable face (TRACK/WIDE) or action (GENERAL) scene:
+        # anonymous subject ids from the scene's segments, in
+        # first-appearance order.
         subject_ids: list[str] = []
         raw_segments = s.get("segments")
         if not isinstance(raw_segments, list):
@@ -497,6 +526,7 @@ def normalize_timeline(
             "start_frame": start,
             "end_frame": end,
             "applies": True,
+            "scene_kind": kind,
             "subject_ids": subject_ids,
             "keyframes": keyframes,
             "fallback_reason": fallback_reason,

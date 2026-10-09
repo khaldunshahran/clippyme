@@ -46,7 +46,11 @@ import time
 from dataclasses import dataclass, field
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+#: Schema versions the parser still accepts. Task 12/13 sidecars (v3)
+#: remain valid: they parse, validate, normalize, publish and preserve
+#: exactly as before — they are never silently treated as v4 action plans.
+SUPPORTED_SCHEMA_VERSIONS = (3, 4)
 PLAN_PRODUCER = "clippyme-turn-framing-plan"
 
 # Bound for per-observation mouth-motion evidence. Mirrors the tracker's
@@ -62,8 +66,18 @@ PROVENANCE_VALUES = ("detector", "tracker", "injected-test", "smoother-hold")
 REASON_MAX_LEN = 64
 
 # Scene strategies the plan governs. GENERAL/SPLIT/SCREENCAST/DISABLED keep
-# their existing renderers and never reach the plan builder.
+# their existing renderers and never reach the face plan builder.
 FACE_STRATEGIES = ("TRACK", "WIDE")
+
+#: Strategies eligible for Task 14 action planning. Only automatic GENERAL
+#: scenes reach the action planner.
+ACTION_STRATEGIES = ("GENERAL",)
+
+#: Explicit versioned scene kinds (v4 schema). v3 plans carry no scene_kind
+#: key: an applied face-strategy scene derives to "face", anything else to
+#: "none" — old non-face scenes are never silently treated as face plans.
+SCENE_KINDS = ("face", "action", "none")
+ACTION_SCENE_KIND = "action"
 
 
 # --- flag + config ----------------------------------------------------------
@@ -1013,6 +1027,7 @@ class ScenePlan:
     start_frame: int
     end_frame: int
     applies: bool
+    scene_kind: str = "none"  # "face" | "action" | "none" (v4; v3 derives it)
     tracks: list = field(default_factory=list)
     segments: list = field(default_factory=list)   # FramingSegment
     keyframes: list = field(default_factory=list)  # CropKeyframe
@@ -1067,6 +1082,27 @@ def _keyframe_to_dict(kf: CropKeyframe) -> dict:
 
 
 def plan_to_dict(plan: FramingPlan) -> dict:
+    # v4 persists the explicit versioned scene kind per scene. v3 omits it
+    # (byte-identical to the Task 12/13 output when the action path is off).
+    is_v4 = plan.schema_version == SCHEMA_VERSION
+    scenes_out = []
+    for sp in plan.scenes:
+        sd = {
+            "scene_id": sp.scene_id,
+            "strategy": sp.strategy,
+            "start_frame": sp.start_frame,
+            "end_frame": sp.end_frame,
+            "applies": sp.applies,
+            "tracks": [dict(t) for t in sp.tracks],
+            "segments": [_segment_to_dict(s) for s in sp.segments],
+            "keyframes": [_keyframe_to_dict(k) for k in sp.keyframes],
+            "fallback": dict(sp.fallback) if sp.fallback else None,
+            "fallback_crop": list(sp.fallback_crop)
+            if sp.fallback_crop else None,
+        }
+        if is_v4:
+            sd["scene_kind"] = sp.scene_kind
+        scenes_out.append(sd)
     return {
         "schema_version": plan.schema_version,
         "producer": plan.producer,
@@ -1081,23 +1117,25 @@ def plan_to_dict(plan: FramingPlan) -> dict:
         "tracker_digest": plan.tracker_digest,
         "analysis_complete": plan.analysis_complete,
         "created_at": plan.created_at,
-        "scenes": [
-            {
-                "scene_id": sp.scene_id,
-                "strategy": sp.strategy,
-                "start_frame": sp.start_frame,
-                "end_frame": sp.end_frame,
-                "applies": sp.applies,
-                "tracks": [dict(t) for t in sp.tracks],
-                "segments": [_segment_to_dict(s) for s in sp.segments],
-                "keyframes": [_keyframe_to_dict(k) for k in sp.keyframes],
-                "fallback": dict(sp.fallback) if sp.fallback else None,
-                "fallback_crop": list(sp.fallback_crop)
-                if sp.fallback_crop else None,
-            }
-            for sp in plan.scenes
-        ],
+        "scenes": scenes_out,
     }
+
+
+def scene_kind_of(scene: dict) -> str:
+    """The scene's contract kind: explicit v4 ``scene_kind``, or the
+    v3-derived contract (an applied face-strategy scene is ``"face"``,
+    anything else is ``"none"``).
+
+    Used by the domain bridge (``project_framing.normalize_timeline``) so
+    face, action, and non-applicable scenes are distinguished on the
+    canonical parsed form of both schema versions.
+    """
+    kind = scene.get("scene_kind")
+    if kind in SCENE_KINDS:
+        return kind
+    if scene.get("applies") and scene.get("strategy") in FACE_STRATEGIES:
+        return "face"
+    return "none"
 
 
 def _strict_int(v) -> bool:
@@ -1135,6 +1173,9 @@ _SCENE_KEYS = frozenset({
     "scene_id", "strategy", "start_frame", "end_frame", "applies",
     "tracks", "segments", "keyframes", "fallback", "fallback_crop",
 })
+# v4 adds the explicit versioned scene kind; v3 dicts must NOT carry it
+# (unknown keys are rejected, so a v3 sidecar can never smuggle a kind).
+_SCENE_KEYS_V4 = _SCENE_KEYS | frozenset({"scene_kind"})
 _SEGMENT_KEYS = frozenset({
     "scene_id", "start_frame", "end_frame", "subject_ids", "kind",
     "confidence", "evidence", "reason", "crop",
@@ -1145,6 +1186,19 @@ _FALLBACK_KEYS = frozenset({"reason", "detail"})
 # Allowed segment evidence keys with bounded scalar values only.
 _EVIDENCE_SPEC = {
     "mouth_mean": (0.0, MOUTH_MOTION_MAX),
+    "margin_mean": (0.0, 100.0),
+    "n_evidence_frames": "count",
+    "occluded_frames": "count",
+}
+
+# Allowed ACTION segment evidence keys with bounded scalar values only.
+# Distinct from the face contract's keys so parsing can tell face and
+# action scenes apart (an action scene carrying mouth-motion keys — or a
+# face scene carrying action keys — is malformed).
+ACTION_EVIDENCE_SPEC = {
+    "evidence_mean": (0.0, 1.0),
+    "motion_mean": (0.0, 1.0),
+    "saliency_mean": (0.0, 1.0),
     "margin_mean": (0.0, 100.0),
     "n_evidence_frames": "count",
     "occluded_frames": "count",
@@ -1171,25 +1225,27 @@ def _parse_track(t: dict, ctx: str, frame_count: int) -> dict:
             "n_obs": n_obs}
 
 
-def _parse_evidence(ev: dict, ctx: str) -> dict:
+def _parse_evidence(ev: dict, ctx: str, spec: dict | None = None) -> dict:
     ectx = ctx + ".evidence"
+    if spec is None:
+        spec = _EVIDENCE_SPEC
     if not isinstance(ev, dict):
         raise ValueError(f"malformed-plan: {ectx} must be a dict")
-    unknown = set(ev) - set(_EVIDENCE_SPEC)
+    unknown = set(ev) - set(spec)
     if unknown:
         raise ValueError(
             f"malformed-plan: {ectx} unknown keys {sorted(unknown)!r}")
     out: dict = {}
-    for key, spec in _EVIDENCE_SPEC.items():
+    for key, key_spec in spec.items():
         if key not in ev:
             continue
         v = ev[key]
-        if spec == "count":
+        if key_spec == "count":
             if not _strict_int(v) or v < 0:
                 raise ValueError(f"malformed-plan: {ectx} bad '{key}'")
             out[key] = int(v)
         else:
-            lo, hi = spec
+            lo, hi = key_spec
             if not _strict_num(v) or not lo <= v <= hi:
                 raise ValueError(f"malformed-plan: {ectx} bad '{key}'")
             out[key] = float(v)
@@ -1197,7 +1253,8 @@ def _parse_evidence(ev: dict, ctx: str) -> dict:
 
 
 def _parse_segment(g: dict, ctx: str, scene_id: int, start_frame: int,
-                   end_frame: int, frame_w: int, frame_h: int) -> FramingSegment:
+                   end_frame: int, frame_w: int, frame_h: int,
+                   scene_kind: str = "face") -> FramingSegment:
     gctx = ctx + ".segment"
     if not isinstance(g, dict):
         raise ValueError(f"malformed-plan: {gctx} must be a dict")
@@ -1211,23 +1268,33 @@ def _parse_segment(g: dict, ctx: str, scene_id: int, start_frame: int,
             or not start_frame <= gs <= ge <= end_frame):
         raise ValueError(f"malformed-plan: {gctx} frames out of range")
     kind = _req(g, "kind", gctx)
-    if kind not in ("single", "two-subject", "wide"):
-        raise ValueError(f"malformed-plan: {gctx} bad kind {kind!r}")
+    # Face and action scenes have distinct segment-kind contracts; a
+    # segment kind from the wrong contract is malformed.
+    if scene_kind == "action":
+        allowed_kinds = ("single", "group", "wide")
+        want_n = {"single": 1, "group": 2, "wide": 0}
+    else:
+        allowed_kinds = ("single", "two-subject", "wide")
+        want_n = {"single": 1, "two-subject": 2, "wide": 0}
+    if kind not in allowed_kinds:
+        raise ValueError(f"malformed-plan: {gctx} bad kind {kind!r} for "
+                         f"{scene_kind} scene")
     sids = _req(g, "subject_ids", gctx)
     if (not isinstance(sids, list)
             or any(not isinstance(i, str) or not TRACK_ID_RE.match(i)
                    for i in sids)):
         raise ValueError(f"malformed-plan: {gctx} non-anonymous subject id")
-    want_n = {"single": 1, "two-subject": 2, "wide": 0}[kind]
-    if len(sids) != want_n:
+    if len(sids) != want_n[kind]:
         raise ValueError(f"malformed-plan: {gctx} kind/subject-count mismatch")
-    if kind == "two-subject" and len(set(sids)) != 2:
-        raise ValueError(f"malformed-plan: {gctx} two-subject ids must "
-                         "be distinct")
+    if kind in ("two-subject", "group") and len(set(sids)) != 2:
+        raise ValueError(f"malformed-plan: {gctx} {kind} ids must be "
+                         "distinct")
     conf = _req(g, "confidence", gctx)
     if not _strict_num(conf) or not 0.0 <= conf <= 1.0:
         raise ValueError(f"malformed-plan: {gctx} bad confidence")
-    evidence = _parse_evidence(_req(g, "evidence", gctx), gctx)
+    evidence = _parse_evidence(
+        _req(g, "evidence", gctx), gctx,
+        ACTION_EVIDENCE_SPEC if scene_kind == "action" else None)
     reason = _req(g, "reason", gctx)
     if (not isinstance(reason, str) or not reason
             or len(reason) > REASON_MAX_LEN):
@@ -1325,10 +1392,12 @@ def plan_from_dict(d: dict) -> FramingPlan:
         raise ValueError("malformed-plan: top-level object must be a dict")
     _no_unknown(d, _PLAN_TOP_KEYS, "plan")
     schema_version = _req(d, "schema_version", "plan")
-    if not _strict_int(schema_version) or schema_version != SCHEMA_VERSION:
+    if not _strict_int(schema_version) \
+            or schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(
             f"malformed-plan: unsupported schema_version "
-            f"{d.get('schema_version')!r} (expected {SCHEMA_VERSION})")
+            f"{d.get('schema_version')!r} (expected one of "
+            f"{SUPPORTED_SCHEMA_VERSIONS})")
     producer = _req(d, "producer", "plan")
     if not isinstance(producer, str) or not producer or len(producer) > 128:
         raise ValueError("malformed-plan: invalid 'producer'")
@@ -1382,11 +1451,12 @@ def plan_from_dict(d: dict) -> FramingPlan:
         raise ValueError("malformed-plan: scenes/scene_intervals length "
                          "mismatch")
     scenes = []
+    is_v4 = schema_version == SCHEMA_VERSION
     for idx, s in enumerate(raw_scenes):
         ctx = f"scene[{idx}]"
         if not isinstance(s, dict):
             raise ValueError(f"malformed-plan: {ctx} must be a dict")
-        _no_unknown(s, _SCENE_KEYS, ctx)
+        _no_unknown(s, _SCENE_KEYS_V4 if is_v4 else _SCENE_KEYS, ctx)
         scene_id = _req(s, "scene_id", ctx)
         if not _strict_int(scene_id) or scene_id != idx:
             raise ValueError(f"malformed-plan: {ctx} scene_id must be the "
@@ -1405,6 +1475,34 @@ def plan_from_dict(d: dict) -> FramingPlan:
         if (not isinstance(strategy, str) or not strategy
                 or len(strategy) > 32):
             raise ValueError(f"malformed-plan: {ctx} invalid 'strategy'")
+        if is_v4:
+            # Explicit versioned scene kind: parsing distinguishes the
+            # face, action, and non-applicable contracts — an old
+            # non-face scene is never silently treated as a face plan.
+            scene_kind = _req(s, "scene_kind", ctx)
+            if scene_kind not in SCENE_KINDS:
+                raise ValueError(f"malformed-plan: {ctx} bad scene_kind "
+                                 f"{scene_kind!r}")
+            if scene_kind == "face":
+                if strategy not in FACE_STRATEGIES or not applies:
+                    raise ValueError(
+                        f"malformed-plan: {ctx} face scene needs a face "
+                        f"strategy and applies=true")
+            elif scene_kind == "action":
+                if strategy not in ACTION_STRATEGIES or not applies:
+                    raise ValueError(
+                        f"malformed-plan: {ctx} action scene needs a "
+                        f"GENERAL strategy and applies=true")
+            elif applies:
+                raise ValueError(f"malformed-plan: {ctx} non-applicable "
+                                 f"scene must not claim applies")
+        else:
+            # v3 legacy derivation: an applied face-strategy scene is a
+            # face scene; anything else is non-applicable. The v3
+            # validation below is unchanged (Task 12/13 sidecars parse
+            # exactly as before).
+            scene_kind = ("face" if applies and strategy in FACE_STRATEGIES
+                          else "none")
         raw_tracks = _req(s, "tracks", ctx)
         if not isinstance(raw_tracks, list):
             raise ValueError(f"malformed-plan: {ctx} invalid 'tracks'")
@@ -1416,7 +1514,7 @@ def plan_from_dict(d: dict) -> FramingPlan:
         prev_end = start_frame - 1
         for g in raw_segments:
             seg = _parse_segment(g, ctx, scene_id, start_frame, end_frame,
-                                 frame_w, frame_h)
+                                 frame_w, frame_h, scene_kind)
             if seg.start_frame != prev_end + 1:
                 raise ValueError(f"malformed-plan: {ctx} segments must "
                                  "be contiguous without gaps or "
@@ -1474,16 +1572,19 @@ def plan_from_dict(d: dict) -> FramingPlan:
         if not applies and (segments or keyframes or tracks
                            or fallback is not None
                            or fallback_crop is not None):
+            # v3 keeps the accepted message verbatim.
+            content_word = "face" if not is_v4 else scene_kind
             raise ValueError(f"malformed-plan: {ctx} non-applicable "
-                             "scene must not carry planned face "
-                             "content")
+                             "scene must not carry planned "
+                             f"{content_word} content")
         scenes.append(ScenePlan(
             scene_id=scene_id, strategy=strategy, start_frame=start_frame,
-            end_frame=end_frame, applies=applies, tracks=tracks,
+            end_frame=end_frame, applies=applies, scene_kind=scene_kind,
+            tracks=tracks,
             segments=segments, keyframes=keyframes, fallback=fallback,
             fallback_crop=fallback_crop))
     return FramingPlan(
-        schema_version=SCHEMA_VERSION,
+        schema_version=int(schema_version),
         producer=producer,
         source_fingerprint=source_fingerprint,
         frame_w=frame_w, frame_h=frame_h, fps=float(fps),
@@ -1553,7 +1654,11 @@ def plan_matches(plan: FramingPlan, *, source_fingerprint: str, frame_w: int,
 
     Returns ``(True, "match")`` or ``(False, "<stale-field>")``.
     """
-    if plan.schema_version != SCHEMA_VERSION:
+    # Both supported schemas (3 and 4) are current: a v3 sidecar parses
+    # and may match when every identity input aligns. Cross-flag reuse is
+    # still impossible — the v4 combined config digest never equals a v3
+    # turn-only digest, so a stale flag state rebuilds via stale-config.
+    if plan.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         return False, f"stale-schema:{plan.schema_version}"
     if not plan.analysis_complete:
         # An exhausted/incomplete sidecar may render safely, but it is
@@ -1626,7 +1731,7 @@ def build_scene_plan(log: ObservationLog, *, scene_id: int, strategy: str,
     diagnostics = seg_diag + kf_diag
     return ScenePlan(
         scene_id=scene_id, strategy=strategy, start_frame=scene_start,
-        end_frame=scene_end, applies=True,
+        end_frame=scene_end, applies=True, scene_kind="face",
         tracks=log.track_summary(scene_id), segments=segments,
         keyframes=keyframes, fallback=None)
 
@@ -1636,20 +1741,52 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
                        frame_w: float, frame_h: float, frame_count: int,
                        source_fingerprint: str,
                        aspect: float = 9 / 16,
-                       tracker_digest: str = "") -> FramingPlan:
+                       tracker_digest: str = "",
+                       action_log=None,
+                       action_config=None,
+                       action_camera_motion=None,
+                       action_scene_fallbacks=None,
+                       plan_face: bool = True,
+                       config_digest: str | None = None) -> FramingPlan:
     """Build one versioned plan for the whole clip.
 
-    Only ``TRACK``/``WIDE`` scenes are planned; every other strategy keeps its
-    existing renderer (``applies=False``). Per-scene failures are isolated: an
-    invalid face scene gets a fallback entry with the reason and the renderer
-    keeps the accepted static/wide behavior for it.
+    Only ``TRACK``/``WIDE`` scenes are face-planned; every other strategy
+    keeps its existing renderer (``applies=False``). Per-scene failures are
+    isolated: an invalid face scene gets a fallback entry with the reason
+    and the renderer keeps the accepted static/wide behavior for it.
+
+    Task 14: when ``action_log`` is given, eligible automatic ``GENERAL``
+    scenes are additionally action-planned (see ``action_framing``) and the
+    plan is written with schema version 4 and an explicit per-scene
+    ``scene_kind`` (``"face"`` / ``"action"`` / ``"none"``). With
+    ``action_log=None`` (and ``plan_face=True``) the output is the Task 13
+    v3 plan byte-for-byte.
 
     The plan's identity binds the actual render ``aspect``, the ordered scene
     ``strategies`` (persisted per scene) and the ``tracker_digest`` of the
     tracker decision config that produced the observations, so a sidecar is
     never reused across a different output shape, strategy assignment or
-    tracker configuration.
+    tracker configuration. ``config_digest`` overrides the computed digest
+    (the production path passes the combined turn+action digest so build and
+    ``plan_matches`` use one value).
     """
+    # Lazy: action_framing imports this module at ITS top level, so this
+    # import must stay function-local (no cycle).
+    from clippyme.pipeline import action_framing as af
+
+    action_on = action_log is not None
+    if action_on and action_config is None:
+        action_config = af.ActionFramingConfig()
+    # v4 whenever the action path (or a face-planning change) is involved;
+    # otherwise the Task 13 v3 bytes are reproduced exactly.
+    use_v4 = action_on or not plan_face
+    schema_version = SCHEMA_VERSION if use_v4 else 3
+    if config_digest is None:
+        if action_on:
+            config_digest = af.plan_config_digest(
+                config.config_digest(), action_config, turn_on=plan_face)
+        else:
+            config_digest = config.config_digest()
     # Task 12 review 02: structured budget-exhaustion state. The pass-1
     # detector/MAR calls stop on AnalysisBudget expiry, but the planner
     # must not turn partial observations into a normal reusable plan.
@@ -1665,7 +1802,21 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
                 exhaustion_reason = _d
                 break
     exhaustion_frame = log.exhaustion_frame
-    analysis_complete = exhaustion_reason is None
+
+    action_exhaustion_reason = None
+    action_exhaustion_frame = None
+    if action_on:
+        action_exhaustion_reason = action_log.exhaustion_reason
+        if action_exhaustion_reason is None:
+            for _d in action_log.diagnostics:
+                if _d in ("analysis_budget_exhausted",
+                          "analysis-frame-budget-exhausted"):
+                    action_exhaustion_reason = _d
+                    break
+        action_exhaustion_frame = action_log.exhaustion_frame
+
+    analysis_complete = (exhaustion_reason is None
+                         and action_exhaustion_reason is None)
 
     def _scene_fully_analyzed(s: int, e: int) -> bool:
         if exhaustion_reason is None:
@@ -1677,59 +1828,133 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
         return (exhaustion_frame is not None
                 and int(e) < int(exhaustion_frame))
 
+    def _action_scene_fully_analyzed(s: int, e: int) -> bool:
+        if action_exhaustion_reason is None:
+            return True
+        return (action_exhaustion_frame is not None
+                and int(e) < int(action_exhaustion_frame))
+
     def _exhaustion_fallback(idx: int, strategy: str, s: int, e: int,
                              reason: str) -> ScenePlan:
         return ScenePlan(
             scene_id=idx, strategy=strategy, start_frame=int(s),
-            end_frame=int(e), applies=True,
+            end_frame=int(e), applies=True, scene_kind="face",
             tracks=log.track_summary(idx), fallback={
                 "reason": reason,
                 "detail": ("pass-1 analysis stopped before this scene "
                            "was fully observed; re-analysis required")})
 
+    def _action_exhaustion_fallback(idx: int, strategy: str, s: int, e: int,
+                                    reason: str) -> ScenePlan:
+        return ScenePlan(
+            scene_id=idx, strategy=strategy, start_frame=int(s),
+            end_frame=int(e), applies=True, scene_kind="action",
+            tracks=action_log.track_summary(idx), fallback={
+                "reason": reason,
+                "detail": ("pass-1 action analysis stopped before this "
+                           "scene was fully observed; re-analysis "
+                           "required")})
+
+    def _build_action_scene(idx: int, strategy: str, s: int, e: int
+                            ) -> ScenePlan:
+        forced = (action_scene_fallbacks or {}).get(idx)
+        if forced is not None:
+            reason, detail = forced
+            return ScenePlan(
+                scene_id=idx, strategy=strategy, start_frame=int(s),
+                end_frame=int(e), applies=True, scene_kind="action",
+                tracks=action_log.track_summary(idx),
+                fallback={"reason": str(reason),
+                          "detail": str(detail)[:256]})
+        try:
+            segments, _seg_diag = af.segment_actions(
+                action_log, scene_id=idx, scene_start=int(s),
+                scene_end=int(e), config=action_config, fps=fps,
+                frame_w=frame_w, frame_h=frame_h, aspect=aspect,
+                camera_motion=action_camera_motion)
+            segments, keyframes, _kf_diag = af.build_action_keyframes(
+                segments, action_log, idx, action_config, frame_w, frame_h,
+                aspect, fps=fps)
+        except af.ActionPlanError as exc:
+            return ScenePlan(
+                scene_id=idx, strategy=strategy, start_frame=int(s),
+                end_frame=int(e), applies=True, scene_kind="action",
+                tracks=action_log.track_summary(idx),
+                fallback={"reason": exc.reason, "detail": exc.detail})
+        except Exception as exc:  # isolate scene failures, never abort
+            return ScenePlan(
+                scene_id=idx, strategy=strategy, start_frame=int(s),
+                end_frame=int(e), applies=True, scene_kind="action",
+                tracks=action_log.track_summary(idx),
+                fallback={"reason": "action-segmentation-failed",
+                          "detail": type(exc).__name__})
+        return ScenePlan(
+            scene_id=idx, strategy=strategy, start_frame=int(s),
+            end_frame=int(e), applies=True, scene_kind="action",
+            tracks=action_log.track_summary(idx), segments=segments,
+            keyframes=keyframes, fallback=None)
+
     scene_plans: list[ScenePlan] = []
     for idx, (start, end) in enumerate(scenes):
         strategy = strategies[idx] if idx < len(strategies) else "TRACK"
-        # Task 12 review 03: exhaustion fallbacks apply only to TRACK/WIDE
-        # face scenes. Non-face strategies keep applies=False with no
-        # fallback, tracks, segments, or keyframes, even when analysis
-        # exhausted earlier.
-        if strategy not in FACE_STRATEGIES:
-            scene_plans.append(ScenePlan(
-                scene_id=idx, strategy=strategy, start_frame=int(start),
-                end_frame=int(end), applies=False))
+        if strategy in FACE_STRATEGIES:
+            if not plan_face:
+                # Turn-aware planning off: the scene keeps its accepted
+                # renderer (the pass-2 smoothed trajectory); the plan
+                # records it as a non-applicable face scene.
+                scene_plans.append(ScenePlan(
+                    scene_id=idx, strategy=strategy, start_frame=int(start),
+                    end_frame=int(end), applies=False, scene_kind="face"))
+                continue
+            # Task 12 review 03: exhaustion fallbacks apply only to
+            # TRACK/WIDE face scenes.
+            if not _scene_fully_analyzed(int(start), int(end)):
+                scene_plans.append(_exhaustion_fallback(
+                    idx, strategy, start, end, exhaustion_reason))
+                continue
+            try:
+                sp = build_scene_plan(
+                    log, scene_id=idx, strategy=strategy,
+                    scene_start=int(start), scene_end=int(end),
+                    config=config, fps=fps, frame_w=frame_w,
+                    frame_h=frame_h, aspect=aspect)
+            except _PlanBuildError as e:
+                sp = ScenePlan(
+                    scene_id=idx, strategy=strategy, start_frame=int(start),
+                    end_frame=int(end), applies=True, scene_kind="face",
+                    tracks=log.track_summary(idx), fallback={
+                        "reason": e.reason, "detail": e.detail})
+            except Exception as e:  # isolate scene failures, never abort
+                sp = ScenePlan(
+                    scene_id=idx, strategy=strategy, start_frame=int(start),
+                    end_frame=int(end), applies=True, scene_kind="face",
+                    tracks=log.track_summary(idx), fallback={
+                        "reason": "segmentation-failed",
+                        "detail": type(e).__name__})
+            scene_plans.append(sp)
             continue
-        if not _scene_fully_analyzed(int(start), int(end)):
-            scene_plans.append(_exhaustion_fallback(
-                idx, strategy, start, end, exhaustion_reason))
+        # Task 14: eligible automatic GENERAL scenes get action-planned.
+        # Positive SPLIT/SCREENCAST decisions stay authoritative and every
+        # other non-face strategy keeps applies=False.
+        if action_on and strategy in af.ACTION_STRATEGIES:
+            if not _action_scene_fully_analyzed(int(start), int(end)):
+                scene_plans.append(_action_exhaustion_fallback(
+                    idx, strategy, start, end, action_exhaustion_reason))
+            else:
+                scene_plans.append(_build_action_scene(idx, strategy,
+                                                       start, end))
             continue
-        try:
-            sp = build_scene_plan(
-                log, scene_id=idx, strategy=strategy, scene_start=int(start),
-                scene_end=int(end), config=config, fps=fps, frame_w=frame_w,
-                frame_h=frame_h, aspect=aspect)
-        except _PlanBuildError as e:
-            sp = ScenePlan(
-                scene_id=idx, strategy=strategy, start_frame=int(start),
-                end_frame=int(end), applies=True,
-                tracks=log.track_summary(idx), fallback={
-                    "reason": e.reason, "detail": e.detail})
-        except Exception as e:  # isolate scene failures, never abort the clip
-            sp = ScenePlan(
-                scene_id=idx, strategy=strategy, start_frame=int(start),
-                end_frame=int(end), applies=True,
-                tracks=log.track_summary(idx), fallback={
-                    "reason": "segmentation-failed",
-                    "detail": type(e).__name__})
-        scene_plans.append(sp)
+        scene_plans.append(ScenePlan(
+            scene_id=idx, strategy=strategy, start_frame=int(start),
+            end_frame=int(end), applies=False, scene_kind="none"))
     return FramingPlan(
-        schema_version=SCHEMA_VERSION,
+        schema_version=schema_version,
         producer=PLAN_PRODUCER,
         source_fingerprint=source_fingerprint,
         frame_w=int(frame_w), frame_h=int(frame_h), fps=float(fps),
         frame_count=int(frame_count),
         scene_intervals=[[int(s), int(e)] for s, e in scenes],
-        config_digest=config.config_digest(),
+        config_digest=config_digest,
         output_aspect=float(aspect),
         tracker_digest=str(tracker_digest),
         analysis_complete=analysis_complete,

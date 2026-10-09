@@ -84,7 +84,7 @@ def _stub_heavy_modules(monkeypatch):
             return [{"box": [160.0, 360.0, 80.0, 80.0]}]
         return []
     fake.detect_face_candidates = detector
-    for name in ["detect_faces", "detect_person_yolo"]:
+    for name in ["detect_faces", "detect_person_yolo", "detect_action_candidates"]:
         setattr(fake, name, lambda *a, **k: [])
     fake.compute_mouth_aspect_ratio = lambda *a, **k: 0.0
     for name in ["_get_face_detection", "_get_face_mesh", "_get_yolo_model"]:

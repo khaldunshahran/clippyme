@@ -281,6 +281,10 @@ class FramingSceneTimeline(BaseModel):
     start_frame: int = Field(ge=0)
     end_frame: int = Field(ge=0)
     applies: bool
+    # Task 14: explicit versioned scene contract ("face" | "action" |
+    # "none"). Additive optional — old projects without it validate
+    # unchanged.
+    scene_kind: Optional[str] = None
     subject_ids: list[str] = Field(default_factory=list)
     keyframes: list[FramingKeyframe] = Field(default_factory=list)
     fallback_reason: Optional[str] = None
@@ -290,6 +294,14 @@ class FramingSceneTimeline(BaseModel):
     @classmethod
     def _no_bools(cls, v):
         return _reject_bool_numeric(v)
+
+    @field_validator("scene_kind")
+    @classmethod
+    def _kind_allowed(cls, v):
+        if v is not None and v not in ("face", "action", "none"):
+            raise ValueError(
+                f"scene_kind must be face/action/none, got {v!r}")
+        return v
 
     @field_validator("subject_ids")
     @classmethod

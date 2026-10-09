@@ -252,6 +252,34 @@ def salient_crop_center(column_energy, crop_w: float, frame_w: float,
     return center
 
 
+def saliency_biased_wide_crop(saliency_cx: float, frame_w: float,
+                              frame_h: float, aspect: float,
+                              max_bias_frac: float = 0.05) -> list:
+    """Widest available crop, biased slightly toward salient content.
+
+    The window is ALWAYS the full-width ``aspect`` window at zoom 1.0 — the
+    widest accepted framing — centred at most ``max_bias_frac`` of the frame
+    width away from frame centre toward ``saliency_cx``. Saliency may bias
+    a wide crop slightly but can NEVER tighten it: this is the Task 14
+    action path's wide composition. Pure math (no cv2).
+    """
+    crop_h = float(frame_h)
+    crop_w = crop_h * aspect
+    if crop_w > frame_w:
+        crop_w = float(frame_w)
+        crop_h = crop_w / aspect
+    bias = max(-max_bias_frac * frame_w,
+               min(max_bias_frac * frame_w, saliency_cx - frame_w / 2.0))
+    cx = min(max(frame_w / 2.0 + bias, crop_w / 2.0), frame_w - crop_w / 2.0)
+    cy = frame_h / 2.0
+    cy = min(max(cy, crop_h / 2.0), frame_h - crop_h / 2.0)
+    x1 = max(0, int(round(cx - crop_w / 2.0)))
+    y1 = max(0, int(round(cy - crop_h / 2.0)))
+    x2 = min(int(frame_w), int(round(cx + crop_w / 2.0)))
+    y2 = min(int(frame_h), int(round(cy + crop_h / 2.0)))
+    return [x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)]
+
+
 def weighted_interest_center(boxes):
     """Weighted centroid of detected interest objects for faceless reframing.
 

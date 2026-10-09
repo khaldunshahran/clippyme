@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import math
 
 import cv2
 import numpy as np
@@ -55,6 +56,16 @@ from clippyme.pipeline.framing_plan import (
     source_fingerprint,
     turn_aware_enabled,
 )
+from clippyme.pipeline.action_framing import (
+    ActionFramingConfig,
+    ActionObservation,
+    ActionObservationLog,
+    ActionObservationRejected,
+    ActionTracker,
+    action_aware_enabled,
+    action_config_from_env,
+    plan_config_digest,
+)
 
 
 # Monotonic-clock seam for the pass-1 analysis budget (Task 12, correction 2).
@@ -71,6 +82,7 @@ from clippyme.pipeline.reframe_detect import (  # noqa: F401
     _get_face_mesh,
     _get_yolo_model,
     compute_mouth_aspect_ratio,
+    detect_action_candidates,
     detect_face_candidates,
     detect_person_yolo,
 )
@@ -661,6 +673,68 @@ def _turn_aware_framing_active(static_auto: bool) -> bool:
     return turn_aware_enabled() and bool(static_auto)
 
 
+def _action_aware_framing_active(static_auto: bool) -> bool:
+    """Task 14: action-aware framing plans for automatic GENERAL scenes.
+
+    Enabled by default via ``CLIPPYME_ACTION_AWARE_FRAMING``; the explicit
+    negatives ``0``/``false``/``no``/``off`` restore the accepted Task 13
+    GENERAL behavior byte-for-byte (no action analysis cost, v3 plans).
+    Only the quality two-pass automatic route takes part — TRACK, WIDE,
+    SPLIT, SCREENCAST, DISABLED, explicit subject/object modes and manually
+    selected layouts keep their accepted routing and incur no
+    action-analysis cost.
+    """
+    return action_aware_enabled() and bool(static_auto)
+
+
+# Downscale width for the default action saliency / camera-motion
+# measurement: cheap, deterministic, and resolution-independent.
+_ACTION_SALIENCY_WIDTH = 160
+
+
+def _default_action_observe(frame_bgr, detections, prev_small,
+                            frame_w: float, frame_h: float):
+    """Default local measurement for action observations (cv2 glue).
+
+    Returns ``(saliencies, camera_motion, this_small)``:
+
+    * ``saliencies`` — per-detection local saliency support in [0, 1]:
+      the mean Sobel gradient magnitude inside the detection box,
+      normalized by the frame's peak magnitude;
+    * ``camera_motion`` — global motion score in [0, 1]: the mean
+      absolute difference of consecutive downscaled grayscale frames
+      (None when no previous analyzed frame exists);
+    * ``this_small`` — the downscaled grayscale frame for the next call.
+
+    Injectable in tests via ``_pass1_track(action_observe_fn=...)``.
+    """
+    small_w = _ACTION_SALIENCY_WIDTH
+    scale = small_w / max(1.0, float(frame_w))
+    small_h = max(1, int(round(float(frame_h) * scale)))
+    small = cv2.resize(frame_bgr, (small_w, small_h),
+                       interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    mmax = float(mag.max()) if mag.size else 0.0
+    saliencies = []
+    for det in detections:
+        x, y, w, h = (float(v) for v in det["box"])
+        x1 = max(0, int(x * scale))
+        y1 = max(0, int(y * scale))
+        x2 = min(small_w, int((x + w) * scale))
+        y2 = min(small_h, int((y + h) * scale))
+        if x2 > x1 and y2 > y1 and mmax > 0:
+            saliencies.append(float(np.mean(mag[y1:y2, x1:x2]) / mmax))
+        else:
+            saliencies.append(0.0)
+    camera_motion = None
+    if prev_small is not None and prev_small.shape == gray.shape:
+        camera_motion = float(np.mean(cv2.absdiff(prev_small, gray)) / 255.0)
+    return saliencies, camera_motion, gray
+
+
 def _record_decision_observations(recorder, decision, frame_number, fps,
                                   scene_index):
     """Record one validated observation per matched face-track candidate.
@@ -695,11 +769,16 @@ def _attach_plan_fallback_crops(plan, targets, scene_ids, strategies,
     behavior: reuse ``collapse_scene_targets`` on the recorded pass-1 targets
     and store one ``(cx, cy, zoom)`` per invalid scene inside the plan itself,
     so the reuse path (which skips detection) still renders them identically.
+
+    Task 14: only face-kind fallback scenes get a static crop. Action-kind
+    fallback scenes keep the accepted GENERAL renderer (``create_general_frame``)
+    — a face-geometry static crop must never be attached to them.
     """
     if plan is None:
         return
     need = [sp for sp in plan.scenes
-            if sp.applies and sp.fallback is not None]
+            if sp.applies and sp.fallback is not None
+            and getattr(sp, "scene_kind", "face") == "face"]
     if not need:
         return
     collapsed = collapse_scene_targets(
@@ -721,12 +800,92 @@ def _attach_plan_fallback_crops(plan, targets, scene_ids, strategies,
 _NONFACE_PASS1 = ('DISABLED', 'GENERAL', 'SPLIT', 'SCREENCAST')
 
 
+def _analyze_action_frame(frame, frame_number, fps, scene_index,
+                          action_log, action_tracker, action_camera_motion,
+                          action_scene_fallbacks, action_detect_fn,
+                          action_observe_fn, budget_ok_or_stop,
+                          original_width, original_height, prev_small):
+    """Task 14: one analyzed frame of an eligible GENERAL scene.
+
+    Runs the object detector (budget-gated), measures local saliency
+    support and the global camera-motion score (budget-gated), assigns
+    anonymous local track ids, and records one validated
+    ``ActionObservation`` per matched detection. Detector exceptions are
+    recorded per scene with an explicit reason (``detector-unavailable`` /
+    ``detector-failed``) and the scene keeps the accepted GENERAL
+    fallback — no redetection is attempted for its remaining frames.
+    Rejections are noted as diagnostics, never raised.
+
+    Returns the new ``prev_small`` frame for camera-motion measurement.
+    """
+    detections = []
+    if budget_ok_or_stop():
+        # Expensive step: object detection.
+        try:
+            detections = action_detect_fn(frame) or []
+        except Exception as exc:
+            msg = str(exc).lower()
+            reason = ("detector-unavailable"
+                      if "unavailable" in msg else "detector-failed")
+            action_scene_fallbacks[scene_index] = (
+                reason, type(exc).__name__)
+            action_log.note(
+                f"scene {scene_index}: action detector {reason} "
+                f"({type(exc).__name__})")
+            detections = []
+    saliencies: list[float] = []
+    camera_motion = None
+    new_small = prev_small
+    if budget_ok_or_stop():
+        # Expensive step: motion/saliency measurement.
+        try:
+            saliencies, camera_motion, new_small = action_observe_fn(
+                frame, detections, prev_small,
+                original_width, original_height)
+        except Exception:
+            saliencies, camera_motion = [], None
+    matches = action_tracker.update(frame_number, detections)
+    saliencies = list(saliencies) + [0.0] * len(matches)
+    area_scale = max(1.0, original_width * original_height * 0.02)
+    t = frame_number / fps if fps > 0 else 0.0
+    for match, saliency in zip(matches, saliencies):
+        x, y, w, h = (float(v) for v in match["box"])
+        visibility = min(1.0, max(0.0, w * h) / area_scale)
+        try:
+            action_log.add(ActionObservation(
+                frame=int(frame_number), time_s=float(t),
+                scene_id=int(scene_index), track_id=match["track_id"],
+                box=(x, y, w, h),
+                confidence=min(1.0, max(0.0, float(match["confidence"]))),
+                category=str(match["category"]),
+                motion=min(1.0, max(0.0, float(match["motion"]))),
+                saliency=min(1.0, max(0.0, float(saliency))),
+                visibility=visibility,
+                provenance="detector",
+                reason="action-detection",
+            ))
+        except ActionObservationRejected as exc:
+            action_log.note(
+                f"frame {frame_number}: rejected action observation ({exc})")
+    if camera_motion is not None:
+        try:
+            cm = float(camera_motion)
+        except (TypeError, ValueError):
+            cm = None
+        if cm is not None and math.isfinite(cm):
+            action_camera_motion[frame_number] = min(1.0, max(0.0, cm))
+    return new_small
+
+
 def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
                  speaker_tracker, detection_smoother, cameraman,
                  turn_cfg, turn_aware, plan_reused,
                  original_width, original_height, total_frames, fps,
                  clock=None, detect_fn=None, mar_fn=None, person_fn=None,
-                 capture_factory=None, show_progress=True):
+                 capture_factory=None, show_progress=True,
+                 action_aware=False, action_cfg=None,
+                 action_detect_fn=None, action_observe_fn=None,
+                 action_out=None):
     """Pass 1: decode the clip and record the raw camera trajectory.
 
     Also records validated face observations for the turn-aware framing plan
@@ -740,16 +899,30 @@ def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
     and the loop keeps cheap frame bookkeeping so the render continues
     safely. The capture is released exactly once.
 
+    Task 14: when ``action_aware`` is true, eligible automatic GENERAL scenes
+    additionally get object-detector + motion/saliency analysis on sampled
+    frames, recorded as validated action observations on a second log. The
+    SAME single budget gates decode, detector work, motion/saliency analysis
+    and (later) planning; exhaustion latches both logs off. Detector
+    failures are recorded per scene with an explicit reason and the scene
+    keeps the accepted GENERAL fallback. ``action_out`` (a caller-owned
+    dict, may be None) is filled with ``log``, ``camera_motion``,
+    ``scene_fallbacks`` when action analysis ran.
+
     Injectable seams for tests: ``clock`` (a monotonic callable), ``detect_fn``,
-    ``mar_fn``, ``person_fn`` and ``capture_factory``. Each defaults to the
-    module-level production implementation, resolved at call time so
-    monkeypatching keeps working.
+    ``mar_fn``, ``person_fn``, ``action_detect_fn``, ``action_observe_fn``
+    and ``capture_factory``. Each defaults to the module-level production
+    implementation, resolved at call time so monkeypatching keeps working.
 
     Returns ``(targets, scene_ids, strategies, recorder, budget)``.
     """
     _detect = detect_fn if detect_fn is not None else detect_face_candidates
     _mar = mar_fn if mar_fn is not None else compute_mouth_aspect_ratio
     _person = person_fn if person_fn is not None else detect_person_yolo
+    _action_detect = (action_detect_fn if action_detect_fn is not None
+                      else detect_action_candidates)
+    _action_observe = (action_observe_fn if action_observe_fn is not None
+                       else _default_action_observe)
     _clock = clock if clock is not None else _monotonic
     _open = capture_factory if capture_factory is not None else cv2.VideoCapture
 
@@ -764,17 +937,38 @@ def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
 
     analysis_live = recorder is not None
 
+    # Task 14 action state (all None/inactive unless action_aware).
+    action_log = None
+    action_tracker = None
+    action_camera_motion: dict[int, float] = {}
+    action_scene_fallbacks: dict[int, tuple[str, str]] = {}
+    action_prev_small = None
+    if action_aware and not plan_reused:
+        action_log = ActionObservationLog(
+            original_width, original_height,
+            max_observations=turn_cfg.max_analysis_frames)
+        action_tracker = ActionTracker()
+    action_live = action_log is not None
+    action_sample_every = max(1, int(getattr(action_cfg, "sample_every", 2)
+                                     or 2))
+
     def _stop_analysis(reason):
         # Latch off: no new expensive analysis from here on. The observation
         # log already recorded "analysis-frame-budget-exhausted" itself on its
         # first drop; the wall-time deadline is recorded here, once — with
         # structured frame/scene context so the planner can prove which
         # scenes were fully analyzed (Task 12 review 02).
-        nonlocal analysis_live
+        nonlocal analysis_live, action_live
         if analysis_live:
             analysis_live = False
             if recorder is not None:
                 recorder.mark_exhaustion(
+                    reason, frame=frame_number,
+                    scene_id=current_scene_index)
+        if action_live:
+            action_live = False
+            if action_log is not None:
+                action_log.mark_exhaustion(
                     reason, frame=frame_number,
                     scene_id=current_scene_index)
 
@@ -815,6 +1009,12 @@ def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
                         # skew the whole scene's collapsed median crop.
                         speaker_tracker.reset(frame_number)
                         detection_smoother.reset()
+                        # Hard cut: action track identities reset too — no
+                        # cross-cut identity carryover (the action log
+                        # rejects it as well).
+                        if action_tracker is not None:
+                            action_tracker.reset()
+                        action_prev_small = None
                 strat = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
                 # Budget gate: the observation cap (the log notes its own
                 # "analysis-frame-budget-exhausted" on the first drop) or the
@@ -825,13 +1025,30 @@ def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
                         _stop_analysis("analysis-frame-budget-exhausted")
                     else:
                         _budget_ok_or_stop()
-                needs_pixels = strat not in _NONFACE_PASS1 and frame_number % 2 == 0 and not plan_reused and analysis_live
+                if action_live:
+                    if action_log.dropped > 0:
+                        _stop_analysis("analysis-frame-budget-exhausted")
+                    else:
+                        _budget_ok_or_stop()
+                face_needs = strat not in _NONFACE_PASS1 and frame_number % 2 == 0 and not plan_reused and analysis_live
+                # Task 14: eligible automatic GENERAL scenes get action
+                # analysis on sampled frames. A scene whose detector already
+                # failed keeps the accepted fallback without further cost.
+                action_needs = (
+                    action_live
+                    and strat == 'GENERAL'
+                    and frame_number % action_sample_every == 0
+                    and current_scene_index not in action_scene_fallbacks
+                )
+                needs_pixels = face_needs or action_needs
                 if needs_pixels:
                     # Expensive step: frame decode/retrieve — re-check the
                     # budget immediately before paying for it.
                     if not _budget_ok_or_stop():
                         ret = cap.grab()
                         needs_pixels = False
+                        face_needs = False
+                        action_needs = False
                     else:
                         budget.consume()
                         ret, frame = cap.read()
@@ -842,6 +1059,14 @@ def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
                 strategies.append(strat)
                 scene_ids.append(current_scene_index)
                 if strat in _NONFACE_PASS1:
+                    if action_needs and action_live and strat == 'GENERAL':
+                        action_prev_small = _analyze_action_frame(
+                            frame, frame_number, fps, current_scene_index,
+                            action_log, action_tracker,
+                            action_camera_motion, action_scene_fallbacks,
+                            _action_detect, _action_observe,
+                            _budget_ok_or_stop, original_width,
+                            original_height, action_prev_small)
                     targets.append(None)
                 else:
                     if needs_pixels and analysis_live:
@@ -881,6 +1106,12 @@ def _pass1_track(input_video, *, scene_boundaries, scene_strategies,
                 pbar.update(1)
     finally:
         cap.release()
+    if action_out is not None:
+        action_out.update({
+            "log": action_log,
+            "camera_motion": action_camera_motion,
+            "scene_fallbacks": action_scene_fallbacks,
+        })
     return targets, scene_ids, strategies, recorder, budget
 
 def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracker,
@@ -916,6 +1147,17 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
     # and rendered verbatim in pass 2.
     turn_cfg = config_from_env()
     turn_aware = _turn_aware_framing_active(static_auto)
+    # Task 14: action-aware framing plans for eligible automatic GENERAL
+    # scenes (same two-pass route, same single budget, v4 plan schema).
+    action_cfg = action_config_from_env()
+    action_aware = _action_aware_framing_active(static_auto)
+    # The plan identity binds the turn config digest, or the combined
+    # turn+action digest when the action path is on (a config or routing
+    # change invalidates reuse).
+    plan_config_digest_value = (
+        plan_config_digest(turn_cfg.config_digest(), action_cfg,
+                           turn_on=turn_aware)
+        if action_aware else turn_cfg.config_digest())
     plan = None
     plan_reused = False
     # The plan's crops are built for the ACTUAL render aspect — a sidecar is
@@ -923,7 +1165,7 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
     # tracker decision config (Task 12, correction 1).
     render_aspect = output_width / output_height if output_height else 9 / 16
     tracker_digest = speaker_tracker.decision_digest()
-    if turn_aware and plan_path:
+    if (turn_aware or action_aware) and plan_path:
         try:
             _candidate = load_plan(plan_path)
         except FileNotFoundError:
@@ -940,7 +1182,7 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                 # scene_boundaries ends are exclusive (PySceneDetect);
                 # the plan module uses inclusive ends.
                 scene_intervals=[(s, max(s, e - 1)) for s, e in scene_boundaries],
-                config_digest=turn_cfg.config_digest(),
+                config_digest=plan_config_digest_value,
                 aspect=render_aspect,
                 strategies=scene_strategies,
                 tracker_digest=tracker_digest,
@@ -952,6 +1194,7 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                 print(f"   ♻️ turn-aware framing plan stale ({_why}) — rebuilding.")
     # --- Pass 1: record raw trajectory -------------------------------------
     # (budget-gated decode/detect/MAR with injectable seams — see _pass1_track).
+    action_out: dict = {}
     targets, scene_ids, strategies, recorder, _analysis_budget = _pass1_track(
         input_video,
         scene_boundaries=scene_boundaries, scene_strategies=scene_strategies,
@@ -959,6 +1202,8 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
         cameraman=cameraman, turn_cfg=turn_cfg, turn_aware=turn_aware,
         plan_reused=plan_reused, original_width=original_width,
         original_height=original_height, total_frames=total_frames, fps=fps,
+        action_aware=action_aware, action_cfg=action_cfg,
+        action_out=action_out,
     )
 
 
@@ -1009,12 +1254,14 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
             lock_zoom=lock_zoom,
         )
 
-    # --- Task 12: build + persist the turn-aware framing plan ----------------
+    # --- Task 12/14: build + persist the framing plan -----------------------
     # One plan per clip: pass 1 recorded the observations, the plan is built
     # once here, persisted atomically, and pass 2 renders from the persisted
-    # artifact (re-loaded from disk, never the in-memory object).
+    # artifact (re-loaded from disk, never the in-memory object). Task 14
+    # adds eligible automatic GENERAL scenes as explicit "action" scenes of
+    # the v4 schema; with the action flag off the v3 bytes are reproduced.
     plan_scenes = {}
-    if turn_aware:
+    if turn_aware or action_aware:
         if plan is None:
             _build_t0 = time.time()
             try:
@@ -1023,17 +1270,22 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                 # observations (unobserved scenes get the accepted static/wide
                 # fallback); the diagnostic was recorded when the budget first
                 # exhausted in pass 1.
-                if not _analysis_budget.ok() and recorder is not None:
+                if not _analysis_budget.ok():
                     # Structured exhaustion (no frame context this late:
-                    # the planner conservatively falls back every face
-                    # scene). build_framing_plan reads the log's
-                    # exhaustion state and skips turn segmentation and
-                    # keyframe construction for affected scenes; the
-                    # persisted plan is marked incomplete and ineligible
-                    # for reuse (Task 12 review 02).
-                    recorder.mark_exhaustion(
-                        _analysis_budget.exhaust_reason
-                        or "analysis_budget_exhausted")
+                    # the planner conservatively falls back affected
+                    # scenes). build_framing_plan reads each log's
+                    # exhaustion state and skips segmentation and keyframe
+                    # construction for affected scenes; the persisted plan
+                    # is marked incomplete and ineligible for reuse
+                    # (Task 12 review 02).
+                    if recorder is not None:
+                        recorder.mark_exhaustion(
+                            _analysis_budget.exhaust_reason
+                            or "analysis_budget_exhausted")
+                    if action_out.get("log") is not None:
+                        action_out["log"].mark_exhaustion(
+                            _analysis_budget.exhaust_reason
+                            or "analysis_budget_exhausted")
                 plan = build_framing_plan(
                     log=recorder if recorder is not None else ObservationLog(
                         original_width, original_height),
@@ -1047,6 +1299,15 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                     source_fingerprint=source_fingerprint(input_video),
                     aspect=render_aspect,
                     tracker_digest=tracker_digest,
+                    action_log=action_out.get("log")
+                    if action_aware else None,
+                    action_config=action_cfg if action_aware else None,
+                    action_camera_motion=action_out.get("camera_motion")
+                    if action_aware else None,
+                    action_scene_fallbacks=action_out.get("scene_fallbacks")
+                    if action_aware else None,
+                    plan_face=turn_aware,
+                    config_digest=plan_config_digest_value,
                 )
                 _attach_plan_fallback_crops(
                     plan, targets, scene_ids, strategies,
@@ -1087,7 +1348,26 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
                     if strat == 'DISABLED':
                         output_frame = create_disabled_reframe(frame, output_width, output_height)
                     elif strat == 'GENERAL':
-                        output_frame = create_general_frame(frame, output_width, output_height)
+                        # Task 14: a usable action plan scene renders its
+                        # persisted crop verbatim (reloaded from the stable
+                        # sidecar — never redetected here). Action fallback
+                        # scenes and plan-less scenes keep the accepted
+                        # GENERAL renderer.
+                        _a_rendered = False
+                        _a_scene = plan_scenes.get(current_scene_idx)
+                        if (_a_scene is not None
+                                and getattr(_a_scene, "scene_kind", "none")
+                                == "action" and _a_scene.usable):
+                            _crop = crop_at_frame(_a_scene, frame_number)
+                            if _crop is not None:
+                                x1, y1, x2, y2 = (int(v) for v in _crop)
+                                if y2 > y1 and x2 > x1:
+                                    output_frame = _resize_to_output(frame[y1:y2, x1:x2], output_width, output_height)
+                                else:
+                                    output_frame = cv2.resize(frame, (output_width, output_height))
+                                _a_rendered = True
+                        if not _a_rendered:
+                            output_frame = create_general_frame(frame, output_width, output_height)
                     elif strat == 'SPLIT':
                         from clippyme.pipeline.layouts.split_layout import create_split_frame
                         split_entry = (split_metadata or {}).get(

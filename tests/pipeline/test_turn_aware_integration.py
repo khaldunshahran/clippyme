@@ -210,6 +210,9 @@ def _install_fakes(monkeypatch, turn_at=20):
     monkeypatch.setattr(reframe_detect, "detect_face_candidates", fake_detect)
     monkeypatch.setattr(reframe, "compute_mouth_aspect_ratio", fake_mar)
     monkeypatch.setattr(reframe, "detect_person_yolo", lambda frame: None)
+    # Task 14: the action detector seam is orthogonal to turn evidence; keep
+    # it silent so these tests exercise the accepted GENERAL fallback.
+    monkeypatch.setattr(reframe, "detect_action_candidates", lambda frame: [])
     # The SPLIT upgrade is orthogonal to Task 12; keep the scene WIDE.
     import clippyme.pipeline.layouts.split_layout as split_layout
     monkeypatch.setattr(split_layout, "detect_split_scenes",
@@ -287,12 +290,23 @@ def test_turn_aware_two_pass_end_to_end(tmp_path, monkeypatch, capsys):
     assert plan.frame_count == N_FRAMES
     assert len(plan.scene_intervals) == 3, \
         f"expected 3 scenes, got {plan.scene_intervals}"
-    assert plan.config_digest == fp.config_from_env().config_digest()
+    # Task 14: with action-aware framing on (the default), the plan binds
+    # the combined turn+action config digest, not the turn-only digest.
+    import clippyme.pipeline.action_framing as af
+    assert plan.config_digest == af.plan_config_digest(
+        fp.config_from_env().config_digest(), af.action_config_from_env())
 
     by_id = {sp.scene_id: sp for sp in plan.scenes}
     assert by_id[0].strategy == "WIDE" and by_id[0].usable
     assert by_id[1].strategy == "TRACK" and by_id[1].usable
-    assert by_id[2].strategy == "GENERAL" and not by_id[2].applies
+    # Task 14: GENERAL scenes are action-planned (v4). With the action
+    # detector silenced, this scene carries the accepted no-observations
+    # fallback: applies but not usable, no segments, full-frame render.
+    assert by_id[2].strategy == "GENERAL" and by_id[2].scene_kind == "action"
+    assert by_id[2].applies and not by_id[2].usable
+    assert by_id[2].segments == []
+    assert by_id[2].fallback and \
+        by_id[2].fallback["reason"] == "no-observations"
 
     # --- the turn: scene 0 reframes mid-scene between the two speakers ---
     singles = [s for s in by_id[0].segments if s.kind == "single"]
@@ -450,6 +464,9 @@ def test_disabled_flag_restores_static_comfort(tmp_path, monkeypatch, capsys):
     out = str(tmp_path / "out.mp4")
     _install_fakes(monkeypatch, turn_at=20)
     monkeypatch.setenv("CLIPPYME_TURN_AWARE_FRAMING", "0")
+    # Task 14: the action flag is independent — disable it too so the
+    # accepted "disabled means no plan, static comfort" contract holds.
+    monkeypatch.setenv("CLIPPYME_ACTION_AWARE_FRAMING", "0")
 
     assert reframe.process_video_to_vertical(src, out, reframe_mode="auto") is True
     logged = capsys.readouterr().out
@@ -516,6 +533,7 @@ def test_fresh_reframe_import_honors_fake_detect_module(monkeypatch):
             "compute_mouth_aspect_ratio",
             "detect_face_candidates",
             "detect_person_yolo",
+            "detect_action_candidates",
         ):
             setattr(fake, _fn, lambda *a, **k: None)
         monkeypatch.setitem(sys.modules, "clippyme.pipeline.reframe_detect", fake)
