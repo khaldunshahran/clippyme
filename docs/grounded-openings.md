@@ -266,3 +266,31 @@ and one explicit, deterministic selection.
 Claim support remains a deterministic approximation (token
 classification, polarity counts, verb heuristics), not full semantic
 entailment.
+
+## Review-04 corrections
+
+1. **Sensory action claims are detected structurally, not just by
+   inflection.** The suffix heuristic caught "explodes" but missed the
+   uninflected base form in "red ball can explode". A novel token is now
+   an action claim when it is inflected (-ing/-ed/-s) OR sits in a verb
+   slot directly after a modal/auxiliary or "to" (a closed class of
+   function words — a structural signal, not a content blacklist).
+   Action claims are grounded only through the explicit bounded
+   manner-paraphrase authorization ("erupts" for "cheers"); unknown
+   support fails closed. Descriptive modifiers (nouns/adjectives in
+   non-verb positions) stay allowed.
+
+2. **Negation scope is validated per claim/subject, superseding the
+   review-03 whole-quote count.** "coffee does work but tea does not
+   work" kept one negation while reversing both claims of "coffee does
+   not work but tea does work". Each option clause is now paired with
+   the evidence clause it draws content from (best content-token
+   overlap; ties with differing polarity fail closed), and the paired
+   clauses must carry the same number of negation markers. Genuine
+   multi-clause options with matching polarity, partial clause
+   selections, and supported contractions ("doesn't" for evidenced
+   "not") still pass.
+
+Claim support remains a deterministic approximation (token
+classification, per-clause polarity, structural verb detection,
+curated manner verbs), not full semantic entailment.

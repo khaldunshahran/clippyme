@@ -1104,6 +1104,37 @@ def _looks_like_verb(token: str) -> bool:
             or token.endswith("s"))
 
 
+# Verb-position markers: a closed class of modals/auxiliaries plus the
+# infinitive marker "to". A novel token directly after one of these
+# sits in a verb slot ("can explode", "to detonate") even when the
+# base form carries no inflectional suffix for _looks_like_verb to
+# catch. This is a structural grammatical signal, not a content-word
+# blacklist: it generalizes to any uninflected action without naming
+# words.
+_VERB_POSITION_MARKERS = frozenset({
+    "can", "could", "will", "would", "shall", "should",
+    "may", "might", "must", "to",
+})
+
+
+def _is_sensory_action_claim(token: str, prev_token: str) -> bool:
+    """Is this novel token an action claim rather than a descriptive modifier?
+
+    Two bounded structural signals, no content blacklist:
+    * the inflection heuristic (_looks_like_verb) catches inflected
+      forms ("explodes", "erupts");
+    * verb position (directly after a modal/auxiliary or "to") catches
+      uninflected base forms ("explode" in "can explode").
+    An action claim is grounded only through the explicit bounded
+    manner-paraphrase authorization; descriptive modifiers (nouns,
+    adjectives in non-verb positions, e.g. "championship" used
+    descriptively) stay allowed.
+    """
+    if _looks_like_verb(token):
+        return True
+    return bool(prev_token) and prev_token in _VERB_POSITION_MARKERS
+
+
 def _is_manner_paraphrase(token: str, evidence_union: set[str]) -> bool:
     """Is this novel verb a bounded manner paraphrase of an evidenced action?"""
     for ev_token in evidence_union:
@@ -1128,35 +1159,88 @@ def _content_tokens(tokens: list[str]) -> set[str]:
             if t and t not in _GLUE_TOKENS and t not in _NEGATION_TOKENS}
 
 
+# Clause boundaries for per-claim polarity validation: coordinate and
+# adversative conjunctions that join independent claims ("but", "and",
+# "or", ...). Polarity is validated per claim/subject, not per quote,
+# so a negation cannot be transferred from one claim to another.
+_CLAUSE_BOUNDARY_TOKENS = frozenset({
+    "but", "and", "or", "yet", "so", "nor",
+    "while", "whereas", "although", "though", "however",
+})
+
+_CLAUSE_SPLIT_PUNCT_RE = re.compile(r"[,;:—–]")
+
+
+def _split_clauses(text: str) -> list[list[str]]:
+    """Split text into clauses (ordered normalized token lists).
+
+    Splits on clause punctuation and boundary conjunctions. Empty
+    fragments are dropped. Deterministic; not a parser.
+    """
+    clauses: list[list[str]] = []
+    for part in _CLAUSE_SPLIT_PUNCT_RE.split(text or ""):
+        current: list[str] = []
+        for token in normalize_tokens(part):
+            if token in _CLAUSE_BOUNDARY_TOKENS:
+                if current:
+                    clauses.append(current)
+                current = []
+            else:
+                current.append(token)
+        if current:
+            clauses.append(current)
+    return clauses
+
+
 def _check_polarity_preserved(
     text: str, evidence: list[dict[str, Any]], *, text_key: str,
 ) -> Optional[str]:
-    """Polarity preservation: dropping a negation reverses meaning.
+    """Polarity preservation per claim/subject.
 
-    Every remaining token can stay supported while the claim flips
-    ("coffee does work" from "coffee does not work"). For each cited
-    evidence item the option actually draws content from, the option
-    must carry the same number of negation markers; a changed count
-    means the polarity changed and the claim is not grounded.
+    Dropping (or adding) a negation reverses meaning even when every
+    remaining token is supported ("coffee does work" from "coffee does
+    not work"). Counting markers over the whole quote is not enough:
+    "coffee does work but tea does not work" keeps one negation while
+    reversing both claims of "coffee does not work but tea does work".
+    Each option clause is therefore paired with the evidence clause it
+    draws content from (best content-token overlap); the paired
+    clauses must carry the same number of negation markers. A tie for
+    best overlap with differing polarity fails closed (unverifiable
+    relation); a clause with no evidence overlap is left to the
+    material-claims gate.
     """
-    opt_tokens = normalize_tokens(text)
-    opt_neg = _negation_count(opt_tokens)
-    opt_content = _content_tokens(opt_tokens)
-    drawn_neg = 0
-    drew = False
+    opt_clauses = _split_clauses(text)
+    ev_clauses: list[list[str]] = []
     for item in evidence or []:
         if not isinstance(item, dict):
             continue
-        item_tokens = normalize_tokens(item.get(text_key) or "")
-        if _content_tokens(item_tokens) & opt_content:
-            drew = True
-            drawn_neg += _negation_count(item_tokens)
-    if drew and opt_neg != drawn_neg:
-        return (
-            "option changes the polarity of the cited evidence "
-            f"(evidence carries {drawn_neg} negation marker(s), "
-            f"option carries {opt_neg})"
-        )
+        ev_clauses.extend(_split_clauses(item.get(text_key) or ""))
+    for opt_tokens in opt_clauses:
+        opt_content = _content_tokens(opt_tokens)
+        if not opt_content:
+            continue
+        best = -1
+        best_negs: set[int] = set()
+        for ev_tokens in ev_clauses:
+            overlap = len(opt_content & _content_tokens(ev_tokens))
+            if overlap == 0:
+                continue
+            neg = _negation_count(ev_tokens)
+            if overlap > best:
+                best = overlap
+                best_negs = {neg}
+            elif overlap == best:
+                best_negs.add(neg)
+        if best < 0:
+            # No evidence overlap: the material-claims gate decides.
+            continue
+        opt_neg = _negation_count(opt_tokens)
+        if len(best_negs) != 1 or opt_neg not in best_negs:
+            return (
+                "option changes the polarity of the cited evidence "
+                "(no evidence clause with matching negation scope; "
+                f"option clause carries {opt_neg} negation marker(s))"
+            )
     return None
 
 _PROPER_STRIP_CHARS = " \t\n\"\u201c\u201d\u2018\u2019()[]{}:;,.!?\u00ab\u00bb\u00a1\u00bf"
@@ -1391,8 +1475,13 @@ def _check_material_claims(
       ("championship", "won", "medal"); any other novel token in a
       speech option is unsupported (the speech gate stays strict, and
       the review-01 glue-vocabulary mutation stays load-bearing);
-      any other novel token in a speech-free option is a descriptive
-      paraphrase of the depicted event ("erupts" for "cheers").
+      any other novel token in a speech-free option is an action claim
+      only when it sits in a verb slot (inflected form, or base form
+      after a modal/auxiliary/"to"): action claims are grounded solely
+      through the explicit bounded manner-paraphrase authorization
+      ("erupts" for "cheers"); anything else novel and unverifiable is
+      rejected, while descriptive modifiers (nouns/adjectives in
+      non-verb positions) stay allowed.
     Short names and action words are claims too: no minimum token
     length. At least one non-glue token must be evidence-grounded, so
     an all-glue text is never marked grounded. Genuinely supported
@@ -1404,8 +1493,9 @@ def _check_material_claims(
     glue = _GLUE_TOKENS
     grounded_content = False
     raw_tokens = _raw_text_tokens(text)
+    norm_tokens = [normalize_token(r) for r in raw_tokens]
     for pos, raw in enumerate(raw_tokens):
-        token = normalize_token(raw)
+        token = norm_tokens[pos]
         if not token:
             continue
         if token in evidence_union:
@@ -1433,12 +1523,16 @@ def _check_material_claims(
         if basis == "speech":
             return ("option introduces material claims not supported by "
                     f"cited evidence: {token!r}")
-        # Speech-free path: a novel verb-like token is an action claim,
-        # not a descriptive paraphrase by default. It is grounded only
-        # as a bounded manner paraphrase of an evidenced action
-        # ("erupts" for "cheers"); an unlisted novel action
-        # ("explodes" for "rolls") is unverifiable, never grounded.
-        if _looks_like_verb(token) and not _is_manner_paraphrase(
+        # Speech-free path: a novel action claim is not a descriptive
+        # paraphrase by default. It is grounded only as a bounded
+        # manner paraphrase of an evidenced action ("erupts" for
+        # "cheers"); an unlisted novel action ("explodes"/"explode"
+        # for "rolls") is unverifiable, never grounded. Action claims
+        # are detected structurally: inflected forms via the suffix
+        # heuristic, uninflected base forms via verb position (after a
+        # modal/auxiliary or "to").
+        prev_token = norm_tokens[pos - 1] if pos > 0 else ""
+        if _is_sensory_action_claim(token, prev_token) and not _is_manner_paraphrase(
                 token, evidence_union):
             return (f"option introduces an unverifiable sensory action "
                     f"{token!r} not supported by cited evidence")
