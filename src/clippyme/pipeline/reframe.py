@@ -65,6 +65,7 @@ from clippyme.pipeline.action_framing import (
     action_aware_enabled,
     action_config_from_env,
     plan_config_digest,
+    validate_action_detection,
 )
 
 
@@ -800,6 +801,20 @@ def _attach_plan_fallback_crops(plan, targets, scene_ids, strategies,
 _NONFACE_PASS1 = ('DISABLED', 'GENERAL', 'SPLIT', 'SCREENCAST')
 
 
+def _action_detection_visibility(box, frame_w, frame_h) -> float:
+    """Visibility for a validated detector observation.
+
+    Task 14 review 01: visibility means actual visibility/occlusion,
+    never box-area occupancy. The detector exposes no occlusion signal,
+    so every validated detection is recorded fully visible (1.0); box
+    size must not manufacture action evidence. Motion and saliency are
+    recorded as separate support signals and may rank
+    detector-grounded tracks, but never independently authorize a
+    tight crop.
+    """
+    return 1.0
+
+
 def _analyze_action_frame(frame, frame_number, fps, scene_index,
                           action_log, action_tracker, action_camera_motion,
                           action_scene_fallbacks, action_detect_fn,
@@ -822,7 +837,7 @@ def _analyze_action_frame(frame, frame_number, fps, scene_index,
     if budget_ok_or_stop():
         # Expensive step: object detection.
         try:
-            detections = action_detect_fn(frame) or []
+            raw_detections = action_detect_fn(frame) or []
         except Exception as exc:
             msg = str(exc).lower()
             reason = ("detector-unavailable"
@@ -832,7 +847,33 @@ def _analyze_action_frame(frame, frame_number, fps, scene_index,
             action_log.note(
                 f"scene {scene_index}: action detector {reason} "
                 f"({type(exc).__name__})")
-            detections = []
+            raw_detections = []
+        # Task 14 review 01: validate every detector item BEFORE
+        # saliency/tracking. A malformed box must never reach
+        # ActionTracker.update() (or the saliency measurement) and abort
+        # pass 1: malformed items are dropped individually; when nothing
+        # usable remains the scene keeps the accepted GENERAL fallback
+        # with an explicit reason.
+        n_rejected = 0
+        if isinstance(raw_detections, (list, tuple)):
+            for _det in raw_detections:
+                _valid = validate_action_detection(
+                    _det, original_width, original_height)
+                if _valid is None:
+                    n_rejected += 1
+                else:
+                    detections.append(_valid)
+        elif raw_detections:
+            n_rejected = 1
+        if n_rejected:
+            action_log.note(
+                f"frame {frame_number}: rejected {n_rejected} malformed "
+                f"action detection(s)")
+            if not detections:
+                action_scene_fallbacks[scene_index] = (
+                    "invalid-detection",
+                    f"{n_rejected} malformed detector item(s); no usable "
+                    f"detections")
     saliencies: list[float] = []
     camera_motion = None
     new_small = prev_small
@@ -846,11 +887,11 @@ def _analyze_action_frame(frame, frame_number, fps, scene_index,
             saliencies, camera_motion = [], None
     matches = action_tracker.update(frame_number, detections)
     saliencies = list(saliencies) + [0.0] * len(matches)
-    area_scale = max(1.0, original_width * original_height * 0.02)
     t = frame_number / fps if fps > 0 else 0.0
     for match, saliency in zip(matches, saliencies):
         x, y, w, h = (float(v) for v in match["box"])
-        visibility = min(1.0, max(0.0, w * h) / area_scale)
+        visibility = _action_detection_visibility(
+            (x, y, w, h), original_width, original_height)
         try:
             action_log.add(ActionObservation(
                 frame=int(frame_number), time_s=float(t),

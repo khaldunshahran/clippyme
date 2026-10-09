@@ -38,7 +38,7 @@ Strict pure record, validated on add (rejects — never coerces):
 - normalized `category` family: `person` | `animal` | `vehicle` | `object`
   (anything else is rejected — no free-form label enters a plan)
 - `motion` (per-track box motion 1−IoU), `saliency` (local support),
-  `visibility` — each in [0, 1]
+  `visibility` — each in [0, 1] `visibility` means actual visibility/occlusion, never box-area occupancy: the detector exposes no occlusion signal, so every validated detection is recorded fully visible (`1.0`). Box size must not manufacture action evidence.
 - `provenance` (`detector` | `tracker` | `injected-test` |
   `smoother-hold`), short machine-readable `reason`
 - no booleans anywhere, no duplicate `(frame, track_id)`, no cross-scene

@@ -1901,10 +1901,13 @@ def build_framing_plan(*, log: ObservationLog, scenes: list,
             if not plan_face:
                 # Turn-aware planning off: the scene keeps its accepted
                 # renderer (the pass-2 smoothed trajectory); the plan
-                # records it as a non-applicable face scene.
+                # records it through the non-applicable contract. A
+                # "face" scene_kind with applies=False is rejected by the
+                # v4 parser, so "none" keeps the whole plan (including
+                # valid GENERAL action scenes) reusable.
                 scene_plans.append(ScenePlan(
                     scene_id=idx, strategy=strategy, start_frame=int(start),
-                    end_frame=int(end), applies=False, scene_kind="face"))
+                    end_frame=int(end), applies=False, scene_kind="none"))
                 continue
             # Task 12 review 03: exhaustion fallbacks apply only to
             # TRACK/WIDE face scenes.

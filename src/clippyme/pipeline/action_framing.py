@@ -429,6 +429,54 @@ class ActionObservationLog:
                       f"{obs.scene_id}")
 
 
+def validate_action_detection(det, frame_w, frame_h):
+    """Validate one raw detector item before saliency/tracking.
+
+    Returns a normalized ``{"box", "confidence", "category"}`` dict, or
+    ``None`` when the item is malformed. Never raises: a malformed box
+    must never reach ``ActionTracker.update()`` (or the saliency
+    measurement) and abort pass 1. The caller drops malformed items
+    individually and records a bounded scene fallback when nothing
+    usable remains.
+
+    Category families are NOT filtered here; the observation contract
+    still rejects unsupported categories per observation (isolated).
+    """
+    if not isinstance(det, dict):
+        return None
+    box = det.get("box")
+    if not isinstance(box, (tuple, list)) or len(box) != 4:
+        return None
+    if any(isinstance(v, bool) for v in box):
+        # Booleans are never valid numerics (observation contract).
+        return None
+    try:
+        x, y, w, h = (float(v) for v in box)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        return None
+    if w <= 0 or h <= 0 or x < 0 or y < 0:
+        return None
+    if x + w > frame_w + 1e-6 or y + h > frame_h + 1e-6:
+        return None
+    confidence_raw = det.get("confidence", 0.0)
+    if isinstance(confidence_raw, bool):
+        return None
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(confidence):
+        return None
+    category = det.get("category", "object")
+    if not isinstance(category, str) or not category:
+        return None
+    return {"box": (x, y, w, h),
+            "confidence": min(1.0, max(0.0, confidence)),
+            "category": category}
+
+
 # --- pure local tracker -----------------------------------------------------
 
 
