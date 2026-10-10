@@ -694,3 +694,253 @@ describe('useChat host wiring — the real sendMessage', () => {
     expect(storage.getItem(SELECTION_LS_KEY)).toBeNull();
   });
 });
+
+// =====================================================================
+// review-01 corrections — refresh coherence, proposal lifetime, bulk scope
+// =====================================================================
+describe('review-01: refresh restores one coherent identity', () => {
+  const render = () => { hooks.index = 0; return useChat(); };
+  const T = (id, jobId) => ({ id, title: id, phase: 'done', jobId, clips: [{ title: 'one' }], messages: [], settings: {} });
+  const seed = (threads, selection) => {
+    storage.setItem('nugget-chat-threads-v1', JSON.stringify(threads));
+    if (selection) storage.setItem(SELECTION_LS_KEY, JSON.stringify(selection));
+    else storage.removeItem(SELECTION_LS_KEY);
+  };
+
+  it('activates the persisted selection thread instead of the newest thread', () => {
+    seed([T('newest', 'job2'), T('selected', 'job1')], { threadId: 'selected', jobId: 'job1', clipIndex: 0 });
+    const chat = render();
+    expect(chat.selectedClip).toEqual({ threadId: 'selected', jobId: 'job1', clipIndex: 0 });
+    expect(chat.activeId).toBe('selected');
+  });
+
+  it('keeps a normal valid refresh intact (selection thread is newest)', () => {
+    seed([T('t1', 'j')], { threadId: 't1', jobId: 'j', clipIndex: 0 });
+    const chat = render();
+    expect(chat.selectedClip).toEqual({ threadId: 't1', jobId: 'j', clipIndex: 0 });
+    expect(chat.activeId).toBe('t1');
+  });
+
+  it('drops a stale persisted selection (job changed) and falls back to the newest thread', () => {
+    seed([T('newest', 'job2'), T('selected', 'job1')], { threadId: 'selected', jobId: 'CHANGED', clipIndex: 0 });
+    const chat = render();
+    expect(chat.selectedClip).toBeNull();
+    expect(storage.getItem(SELECTION_LS_KEY)).toBeNull();
+    expect(chat.activeId).toBe('newest');
+  });
+
+  it('drops a persisted selection whose clip is gone', () => {
+    seed([T('newest', 'job2'), T('selected', 'job1')], { threadId: 'selected', jobId: 'job1', clipIndex: 5 });
+    const chat = render();
+    expect(chat.selectedClip).toBeNull();
+    expect(chat.activeId).toBe('newest');
+  });
+
+  it('drops a persisted selection whose thread is gone', () => {
+    seed([T('newest', 'job2')], { threadId: 'ghost', jobId: 'job1', clipIndex: 0 });
+    const chat = render();
+    expect(chat.selectedClip).toBeNull();
+    expect(chat.activeId).toBe('newest');
+  });
+
+  it('with no persisted selection the newest thread stays active', () => {
+    seed([T('newest', 'job2'), T('older', 'job1')]);
+    const chat = render();
+    expect(chat.selectedClip).toBeNull();
+    expect(chat.activeId).toBe('newest');
+  });
+});
+
+// =====================================================================
+describe('review-01: proposal selection/session lifetime', () => {
+  const render = () => { hooks.index = 0; return useChat(); };
+  const seed = () => {
+    storage.setItem('nugget-chat-threads-v1', JSON.stringify([
+      { id: 't1', title: 't1', phase: 'done', jobId: 'j', clips: [{ title: 'one' }], messages: [], settings: {} },
+    ]));
+    storage.setItem(SELECTION_LS_KEY, JSON.stringify({ threadId: 't1', jobId: 'j', clipIndex: 0 }));
+    return render();
+  };
+  const threadOf = (chat, id) => chat.threads.find((t) => t.id === id);
+  const proposalOf = (chat, id) => threadOf(chat, id).messages.find((m) => m.kind === 'proposal');
+  async function wired() {
+    const chat = seed();
+    const f = makeFixture('A', 0, 'j');
+    await f.c.load();
+    chat.workspaceRef.current = { controller: f.c };
+    return { chat, f };
+  }
+
+  it('a pending proposal cannot become ready after a session reset', async () => {
+    let release;
+    apiMocks.editAiPatch.mockImplementation(() => new Promise((r) => { release = r; }));
+    let { chat } = await wired();
+    const pending = chat.sendMessage('change hook');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    sessionResetCbs.forEach((cb) => cb());
+    release({ project: project(1, 'A'), patch: {} });
+    await pending;
+    chat = render();
+    const p = proposalOf(chat, 't1');
+    expect(p?.data.state).not.toBe('ready');
+    expect(p?.data.state).toBe('stale');
+  });
+
+  it('a ready proposal cannot be applied after reset + reselecting identical ids', async () => {
+    apiMocks.editAiPatch.mockResolvedValue({ project: project(1, 'A'), patch: {} });
+    let { chat } = await wired();
+    await chat.sendMessage('change hook');
+    chat = render();
+    const id = proposalOf(chat, 't1').id;
+    expect(proposalOf(chat, 't1').data.state).toBe('ready');
+    sessionResetCbs.forEach((cb) => cb());
+    chat = render();
+    expect(proposalOf(chat, 't1').data.state).toBe('stale');
+    chat.selectClip('t1', 0); // identical ids — must not revive
+    chat = render();
+    const fresh = makeFixture('B', 0, 'j');
+    await fresh.c.load();
+    chat.workspaceRef.current = { controller: fresh.c };
+    await chat.applyProposal('t1', id);
+    expect(fresh.saves).toHaveLength(0);
+  });
+
+  it('a pending proposal invalidated by clearSelection cannot revive on reselect', async () => {
+    let release;
+    apiMocks.editAiPatch.mockImplementation(() => new Promise((r) => { release = r; }));
+    let { chat } = await wired();
+    const pending = chat.sendMessage('change hook');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    chat.clearSelection();
+    chat = render();
+    chat.selectClip('t1', 0);
+    chat = render();
+    release({ project: project(1, 'A'), patch: {} });
+    await pending;
+    chat = render();
+    expect(proposalOf(chat, 't1')?.data.state).not.toBe('ready');
+  });
+
+  it('a discarded proposal is never overwritten by a late response', async () => {
+    let release;
+    apiMocks.editAiPatch.mockImplementation(() => new Promise((r) => { release = r; }));
+    let { chat } = await wired();
+    const pending = chat.sendMessage('change hook');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    chat = render();
+    const id = proposalOf(chat, 't1').id;
+    chat.discardProposal('t1', id);
+    release({ project: project(1, 'A'), patch: {} });
+    await pending;
+    chat = render();
+    expect(proposalOf(chat, 't1')?.data.state).toBe('discarded');
+  });
+
+  it('proposals restored from storage are stale and refuse apply with zero saves', async () => {
+    const readyMsg = {
+      id: 'm1', ts: 1, role: 'ai', kind: 'proposal',
+      data: { state: 'ready', identity: { jobId: 'j', clipIndex: 0 }, baseVersion: 1, project: project(1, 'A'), gen: 99, threadId: 't1' },
+    };
+    const thinkingMsg = {
+      id: 'm2', ts: 2, role: 'ai', kind: 'proposal',
+      data: { state: 'thinking', identity: { jobId: 'j', clipIndex: 0 }, gen: 99, threadId: 't1' },
+    };
+    storage.setItem('nugget-chat-threads-v1', JSON.stringify([
+      { id: 't1', title: 't1', phase: 'done', jobId: 'j', clips: [{ title: 'one' }], messages: [readyMsg, thinkingMsg], settings: {} },
+    ]));
+    storage.setItem(SELECTION_LS_KEY, JSON.stringify({ threadId: 't1', jobId: 'j', clipIndex: 0 }));
+    let chat = render();
+    const msgs = threadOf(chat, 't1').messages;
+    expect(msgs.find((m) => m.id === 'm1').data.state).toBe('stale');
+    expect(msgs.find((m) => m.id === 'm2').data.state).toBe('stale');
+    // history retained, payload not actionable
+    expect(msgs.find((m) => m.id === 'm1').data.project.version).toBe(1);
+    const f = makeFixture('A', 0, 'j');
+    await f.c.load();
+    chat.workspaceRef.current = { controller: f.c };
+    await chat.applyProposal('t1', 'm1');
+    expect(f.saves).toHaveLength(0);
+  });
+
+  it('reselecting identical ids WITHOUT a lifetime change keeps the proposal applicable', async () => {
+    apiMocks.editAiPatch.mockResolvedValue({ project: { ...project(1, 'A'), hook: { text: 'WOW' } }, patch: {} });
+    let { chat, f } = await wired();
+    await chat.sendMessage('change hook');
+    chat = render();
+    const id = proposalOf(chat, 't1').id;
+    expect(proposalOf(chat, 't1').data.state).toBe('ready');
+    chat.selectClip('t1', 0); // same identity, no lifetime end
+    chat = render();
+    expect(proposalOf(chat, 't1').data.state).toBe('ready');
+    await chat.applyProposal('t1', id);
+    expect(f.saves).toHaveLength(1);
+    chat = render();
+    expect(proposalOf(chat, 't1').data.state).toBe('applied');
+  });
+
+  it('a thread switch ends the lifetime: late response settles stale, apply refuses', async () => {
+    let release;
+    apiMocks.editAiPatch.mockImplementation(() => new Promise((r) => { release = r; }));
+    let { chat } = await wired();
+    const pending = chat.sendMessage('change hook');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const other = chat.createThread();
+    chat = render();
+    chat.selectThread(other);
+    chat = render();
+    release({ project: project(1, 'A'), patch: {} });
+    await pending;
+    chat = render();
+    expect(proposalOf(chat, 't1')?.data.state).not.toBe('ready');
+  });
+});
+
+// =====================================================================
+describe('review-01: bulk scope is explicit multi-clip intent only', () => {
+  const CTX = { phase: 'done', jobId: 'j', selection: { threadId: 't1', jobId: 'j', clipIndex: 0 } };
+
+  it('plural in-clip operations route as single-clip edits', () => {
+    for (const t of [
+      'Make all captions in this clip yellow',
+      'Edit the selected clip',
+      'make all the words in this clip yellow',
+      'make each caption bigger',
+      'brighten every word on screen',
+    ]) {
+      expect(routeChatMessage(t, CTX).type).toBe('edit');
+    }
+  });
+
+  it('explicit multi-clip intent stays bulk-unsupported', () => {
+    for (const t of [
+      'make all clips punchier',
+      'apply this to every clip please',
+      'each of these clips needs louder audio',
+      'these selected clips are too dark',
+      'edit every single clip',
+      'bulk brighten my clips',
+    ]) {
+      expect(routeChatMessage(t, CTX).type).toBe('bulk-unsupported');
+    }
+  });
+
+  it('bulk-unsupported via the host makes zero provider calls and zero saves', async () => {
+    const render = () => { hooks.index = 0; return useChat(); };
+    let chat = render();
+    const threadId = chat.createThread();
+    chat = render();
+    chat.patchThread(threadId, { phase: 'done', jobId: 'job1', clips: [{ index: 0, title: 'Clip 1' }] });
+    chat = render();
+    chat.selectClip(threadId, 0);
+    const f = makeFixture('A', 0, 'job1');
+    await f.c.load();
+    chat = render();
+    chat.workspaceRef.current = { controller: f.c };
+    await chat.sendMessage('apply this to every clip please');
+    expect(apiMocks.editAiPatch).not.toHaveBeenCalled();
+    expect(f.saves).toHaveLength(0);
+    chat = render();
+    const msgs = chat.threads.find((t) => t.id === threadId).messages;
+    expect(msgs[msgs.length - 1].kind).toBe('notice');
+  });
+});

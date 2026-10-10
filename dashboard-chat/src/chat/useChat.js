@@ -78,9 +78,45 @@ function loadValidSelection() {
   return sel;
 }
 
+// A proposal message is actionable only while its selection session is
+// alive. These are the non-terminal proposal states.
+const PROPOSAL_OPEN = (s) => s === 'thinking' || s === 'ready';
+
+// A proposal whose lifetime cannot be established is never left actionable:
+// it stays in history as 'stale' instead of 'thinking'/'ready'.
+// Conversation history is retained; the payload is not actionable.
+function staleOpenProposals(thread, reason) {
+  if (!thread || !Array.isArray(thread.messages)) return thread;
+  let changed = false;
+  const messages = thread.messages.map((m) => {
+    if (m && m.kind === 'proposal' && PROPOSAL_OPEN(m.data?.state)) {
+      changed = true;
+      return { ...m, data: { ...(m.data || {}), state: 'stale', staleReason: reason } };
+    }
+    return m;
+  });
+  return changed ? { ...thread, updatedAt: Date.now(), messages } : thread;
+}
+
+// Coherent restore: the persisted selection and the active thread are ONE
+// identity, and proposals restored from storage are never actionable (their
+// lifetime belongs to a previous page session). A valid restored selection
+// activates its OWN thread — never the newest thread paired with another
+// thread's clip/editor. An invalid selection is dropped, never resurrected.
+function loadRestoredIdentity() {
+  const threads = loadThreads().map((t) => staleOpenProposals(t, 'session-restart'));
+  const selection = loadValidSelection();
+  return {
+    threads,
+    selection,
+    activeId: selection?.threadId || threads[0]?.id || null,
+  };
+}
+
 export function useChat() {
-  const [threads, setThreads] = useState(loadThreads);
-  const [activeId, setActiveId] = useState(() => loadThreads()[0]?.id || null);
+  const [restored] = useState(loadRestoredIdentity);
+  const [threads, setThreads] = useState(restored.threads);
+  const [activeId, setActiveId] = useState(restored.activeId);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [gridOpen, setGridOpen] = useState(false);
   const [popupClip, setPopupClip] = useState(null); // {threadId, index}
@@ -88,7 +124,13 @@ export function useChat() {
   // Safe metadata only (persisted via selection.js); the live project
   // controller for it is owned by App's useWorkspaceController and shared
   // through workspaceRef (never stored in state or localStorage).
-  const [selectedClip, setSelectedClip] = useState(loadValidSelection);
+  const [selectedClip, setSelectedClip] = useState(restored.selection);
+  // Selection-session generation (review-01): every proposal is born with
+  // the current generation; any end of the selection's lifetime (session
+  // reset, clear, thread/selection switch, new conversation) bumps it. A
+  // proposal from an older generation can never become ready or be applied
+  // — not even by reselecting identical ids.
+  const selGenRef = useRef(0);
   const workspaceRef = useRef(null); // { controller } — wired by App
   const pollRef = useRef({});
 
@@ -129,48 +171,94 @@ export function useChat() {
       : t)));
   }, []);
 
+
+  // Mark open proposals ('thinking'/'ready') as 'stale'. threadIds=null
+  // sweeps every thread (session reset). History is retained; the payloads
+  // stop being actionable. A terminal card is never touched.
+  const invalidateProposals = useCallback((threadIds, reason) => {
+    setThreads((ts) => {
+      let changed = false;
+      const next = ts.map((t) => {
+        if (threadIds && !threadIds.includes(t.id)) return t;
+        const r = staleOpenProposals(t, reason);
+        if (r !== t) changed = true;
+        return r;
+      });
+      return changed ? next : ts;
+    });
+  }, []);
+
   const clearSelection = useCallback(() => {
+    const prev = selectedClip;
     setSelectedClip(null);
     clearStoredSelection();
-  }, []);
+    if (prev) {
+      // The selection's lifetime ends here: its pending/ready proposals die
+      // with it and can never be revived by reselecting identical ids.
+      selGenRef.current += 1;
+      invalidateProposals([prev.threadId], 'selection-changed');
+    }
+  }, [selectedClip, invalidateProposals]);
 
   const selectClip = useCallback((threadId, clipIndex) => {
     const t = threads.find((x) => x.id === threadId);
     if (!t?.jobId || !Array.isArray(t.clips) || !t.clips[clipIndex]) return;
+    const prev = selectedClip;
+    const same = !!prev
+      && prev.threadId === threadId
+      && prev.jobId === t.jobId
+      && prev.clipIndex === clipIndex;
     const sel = { threadId, jobId: t.jobId, clipIndex };
     setSelectedClip(sel);
     saveSelection(sel);
+    if (!same) {
+      // A new selection session: the previous lifetime (and its proposals)
+      // ends, so identical ids can never revive an old proposal.
+      selGenRef.current += 1;
+      if (prev) invalidateProposals([prev.threadId], 'selection-changed');
+    }
     setActiveId(threadId);
     setGridOpen(false);
     setPopupClip(null);
-  }, [threads]);
+  }, [threads, selectedClip, invalidateProposals]);
 
   const createThread = useCallback(() => {
     const t = newThread();
     setThreads((ts) => [t, ...ts]);
     setActiveId(t.id);
-    // A new conversation starts with no selection.
+    // A new conversation starts with no selection — the previous
+    // selection's lifetime (and its proposals) ends here.
+    if (selectedClip) {
+      selGenRef.current += 1;
+      invalidateProposals([selectedClip.threadId], 'selection-changed');
+    }
     setSelectedClip(null);
     clearStoredSelection();
     return t.id;
-  }, []);
+  }, [selectedClip, invalidateProposals]);
 
   const selectThread = useCallback((id) => {
     setActiveId(id);
     setGridOpen(false);
     setPopupClip(null);
     // A selection belongs to exactly one thread: switching threads drops a
-    // selection that belongs to another thread.
+    // selection that belongs to another thread, ending its lifetime.
     if (selectedClip && selectedClip.threadId !== id) {
+      const prevThread = selectedClip.threadId;
       setSelectedClip(null);
       clearStoredSelection();
+      selGenRef.current += 1;
+      invalidateProposals([prevThread], 'selection-changed');
     }
-  }, [selectedClip]);
+  }, [selectedClip, invalidateProposals]);
 
   const deleteThread = useCallback((id) => {
     if (selectedClip && selectedClip.threadId === id) {
       setSelectedClip(null);
       clearStoredSelection();
+      // The thread (and its proposals) is gone; still end the lifetime so
+      // an in-flight request for it can never settle as ready.
+      selGenRef.current += 1;
     }
     setThreads((ts) => {
       const next = ts.filter((t) => t.id !== id);
@@ -180,12 +268,15 @@ export function useChat() {
   }, [selectedClip]);
 
   // Session reset (sign-out / user change): the workspace controller resets
-  // itself via its own registration; here the selection is dropped so a
-  // proposal can never be applied against another user's clip.
+  // itself via its own registration; here the selection is dropped and every
+  // open proposal in every thread is invalidated, so a proposal can never be
+  // applied against another user's clip — or revive afterwards.
   useEffect(() => onSessionReset(() => {
+    selGenRef.current += 1;
     setSelectedClip(null);
     clearStoredSelection();
-  }), []);
+    invalidateProposals(null, 'session-reset');
+  }), [invalidateProposals]);
 
   // ---------------- validation ----------------
   const runValidation = useCallback(async (threadId, url) => {
@@ -340,10 +431,13 @@ export function useChat() {
   // ---------------- chat proposals ----------------
   // Ordinary edit for the selected clip: generate a validated patch proposal
   // (never saved), then let the user apply it explicitly. The proposal is
-  // bound to the captured identity + base version from the start.
+  // bound to the captured identity + base version AND the selection-session
+  // generation from the start: a reset or selection change in between ends
+  // its lifetime, and the card settles to 'stale' instead of 'ready'.
   const runChatEdit = useCallback(async (thread, selection, instruction) => {
     const threadId = thread.id;
     const identity = { jobId: selection.jobId, clipIndex: selection.clipIndex };
+    const birthGen = selGenRef.current;
     const clipTitle = thread.clips?.[selection.clipIndex]?.title || null;
     const controller = workspaceRef.current?.controller || null;
     if (!controller) {
@@ -352,7 +446,18 @@ export function useChat() {
     }
     const msgId = pushMsg(threadId, {
       role: 'ai', kind: 'proposal',
-      data: { state: 'thinking', text: instruction, identity, clipTitle },
+      data: { state: 'thinking', text: instruction, identity, clipTitle, gen: birthGen, threadId },
+    });
+    // Settle the card only while it is still pending AND its selection
+    // session is still the live one. A terminal card (discarded by the user,
+    // or invalidated by a reset/selection change) is never overwritten by a
+    // late response.
+    const settle = (patch) => updateMsg(threadId, msgId, (m) => {
+      if (!m || m.kind !== 'proposal' || m.data?.state !== 'thinking') return {};
+      if (selGenRef.current !== birthGen) {
+        return { data: { state: 'stale', staleReason: 'selection-changed' } };
+      }
+      return patch;
     });
     try {
       const res = await requestChatProposal({
@@ -361,7 +466,7 @@ export function useChat() {
         clipIndex: identity.clipIndex,
         instruction,
       });
-      updateMsg(threadId, msgId, {
+      settle({
         data: {
           state: 'ready',
           explanation: res.explanation,
@@ -369,23 +474,37 @@ export function useChat() {
           project: res.project,
           identity: res.identity,
           baseVersion: res.baseVersion,
+          gen: birthGen,
+          threadId,
         },
       });
     } catch (e) {
-      updateMsg(threadId, msgId, {
+      settle({
         data: { state: 'error', error: e?.message || 'The AI edit failed. Nothing was changed — try again.' },
       });
     }
   }, [pushMsg, updateMsg]);
 
-  // Apply a ready proposal through the shared controller. Identity and
-  // version are re-checked here: a clip/thread/session switch between
-  // proposal and apply refuses instead of touching the wrong target.
+  // Apply a ready proposal through the shared controller. Identity, version
+  // AND selection-session lifetime are re-checked here: a clip/thread switch,
+  // a session reset, or reselecting identical ids after any of those refuses
+  // instead of touching the wrong (or a dead) target.
   const applyProposal = useCallback(async (threadId, msgId) => {
     const thread = threads.find((t) => t.id === threadId);
     const msg = thread?.messages.find((m) => m.id === msgId);
     const d = msg?.data;
     if (!msg || msg.kind !== 'proposal' || !d || d.state !== 'ready') return;
+    // Lifetime: the proposal belongs to the selection session that created
+    // it. Anything else — including identical ids after a reset — refuses
+    // with zero api calls and marks the card honestly.
+    const sel = selectedClip;
+    const lifetimeOk = d.gen === selGenRef.current
+      && sel && sel.threadId === threadId && sel.threadId === d.threadId
+      && sel.jobId === d.identity?.jobId && sel.clipIndex === d.identity?.clipIndex;
+    if (!lifetimeOk) {
+      updateMsg(threadId, msgId, { data: { state: 'stale', staleReason: 'selection-changed' } });
+      return;
+    }
     updateMsg(threadId, msgId, { data: { state: 'applying' } });
     const controller = workspaceRef.current?.controller || null;
     try {
@@ -413,11 +532,14 @@ export function useChat() {
         updateMsg(threadId, msgId, { data: { state: 'error', error: `Apply failed: ${e?.message || 'unknown error'}. Nothing was overwritten.` } });
       }
     }
-  }, [threads, updateMsg, pushMsg]);
+  }, [threads, selectedClip, updateMsg, pushMsg]);
+
+
 
   const discardProposal = useCallback((threadId, msgId) => {
     updateMsg(threadId, msgId, { data: { state: 'discarded' } });
   }, [updateMsg]);
+
 
   // ---------------- send / steer ----------------
   const sendMessage = useCallback(async (text) => {
@@ -428,8 +550,17 @@ export function useChat() {
     if (!clean) return;
     pushMsg(threadId, { role: 'user', kind: 'text', text: clean });
 
-    // A selection belongs to exactly one thread: never leak it across threads.
-    const selection = selectedClip && selectedClip.threadId === threadId ? selectedClip : null;
+    // A selection belongs to exactly one thread AND its live job/clip:
+    // thread, job and clip are validated together — never leak a selection
+    // across threads or route it against a stale job.
+    const sel = selectedClip;
+    const selection = (
+      sel
+      && sel.threadId === threadId
+      && thread.jobId === sel.jobId
+      && Array.isArray(thread.clips)
+      && thread.clips[sel.clipIndex]
+    ) ? sel : null;
     const route = routeChatMessage(clean, { phase: thread.phase, jobId: thread.jobId, selection });
 
     // (a) While clipping, a message is a steering prompt for the AI.

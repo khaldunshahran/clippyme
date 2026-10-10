@@ -9,7 +9,8 @@
  *  (a) running job (clipping/submitting + jobId)       -> 'steer'
  *      (existing steering preserved)
  *  (b) /hyperframes command                            -> 'hyperframes'
- *  (c) bulk scope ("all/every/each/these/selected clips", "bulk")
+ *  (c) explicit multi-clip scope ("all clips", "every clip",
+ *      "each of these clips", "these selected clips", "bulk")
  *                                                      -> 'bulk-unsupported' (never mutates)
  *  (d) explicit clip selection                         -> 'edit'
  *      (even when the text contains a URL — embedded links stay edits;
@@ -27,8 +28,13 @@ import { extractUrl } from '../api/chatApi.js';
 
 const HYPERFRAMES_RE = /^\s*\/hyperframes\b/i;
 const BULK_WORD_RE = /\bbulk\b/i;
-// "all clips", "every clip", "each of these clips", "these selected clips"…
-const BULK_SCOPE_RE = /\b(all|every|each|these|selected)\b[^.!?]{0,48}\bclips?\b/i;
+// Explicit multi-clip intent ONLY: a scope word aimed at the plural
+// "clips" ("all clips", "these selected clips", "my clips"), or every/each
+// ranging over clips ("every clip", "each of these clips"). Plural in-clip
+// operations ("make all captions in this clip yellow", "edit the selected
+// clip") are ordinary single-clip edits — never bulk.
+const BULK_SCOPE_RE = /\b(all|these|those|selected|my)\b[^.!?]{0,48}\bclips\b/i;
+const BULK_EVERY_RE = /\b(every|each)\b[^.!?]{0,48}\bclips?\b/i;
 
 function hasSelection(selection) {
   return !!(
@@ -52,8 +58,9 @@ export function routeChatMessage(text, ctx = {}) {
   if (HYPERFRAMES_RE.test(clean)) {
     return { type: 'hyperframes' };
   }
-  // (c) Bulk scope is honestly unsupported — never mutate several clips.
-  if (BULK_WORD_RE.test(clean) || BULK_SCOPE_RE.test(clean)) {
+  // (c) Explicit multi-clip scope is honestly unsupported — never mutate
+  // several clips. Singular in-clip wording never reaches this branch.
+  if (BULK_WORD_RE.test(clean) || BULK_SCOPE_RE.test(clean) || BULK_EVERY_RE.test(clean)) {
     return { type: 'bulk-unsupported' };
   }
   // (d) Explicit selection: an ordinary edit, even with an embedded link.
