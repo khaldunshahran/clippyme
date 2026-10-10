@@ -1,0 +1,132 @@
+/* Task 17 — single-clip chat editing workspace layout.
+ *
+ * Desktop: the main area is a flex row — the chat column (thread +
+ * selection bar + composer) beside a ~560px workspace panel holding the
+ * editor. Below 900px a Chat/Editor toggle (rendered only on narrow
+ * screens) switches which column is visible; both stay mounted so the
+ * toggle never loses composer or selection state.
+ */
+
+.nc-workspace-row {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
+.nc-chat-col {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nc-workspace-panel {
+  width: 560px;
+  flex-shrink: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--nc-border);
+  background: var(--nc-bg);
+  overflow: hidden;
+}
+
+/* Selected-clip identity beside the composer. */
+.nc-selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--nc-border);
+  background: var(--nc-bg-soft);
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+
+.nc-selection-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--nc-accent);
+  box-shadow: 0 0 8px var(--nc-accent);
+  flex-shrink: 0;
+}
+
+.nc-selection-editing {
+  font-weight: 700;
+  color: var(--nc-accent);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.nc-selection-title {
+  font-weight: 600;
+  color: var(--nc-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.nc-selection-version {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--nc-text-faint);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--nc-border);
+  border-radius: 99px;
+  padding: 2px 8px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.nc-selection-btn {
+  flex-shrink: 0;
+}
+
+/* Chat/Editor toggle: hidden on desktop, shown only below 900px. */
+.nc-mobile-toggle {
+  display: none;
+  flex-shrink: 0;
+  padding: 8px 14px 0;
+  gap: 6px;
+}
+
+.nc-mobile-toggle button {
+  flex: 1;
+  padding: 8px 0;
+  border-radius: 10px;
+  border: 1px solid var(--nc-border);
+  background: transparent;
+  color: var(--nc-text-dim);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.nc-mobile-toggle button.active {
+  background: var(--nc-accent-soft);
+  color: var(--nc-accent);
+  border-color: transparent;
+}
+
+@media (max-width: 900px) {
+  .nc-mobile-toggle {
+    display: flex;
+  }
+  .nc-workspace-panel {
+    width: 100%;
+    border-left: none;
+  }
+  .nc-workspace-row[data-mview='chat'] .nc-workspace-panel {
+    display: none;
+  }
+  .nc-workspace-row[data-mview='editor'] .nc-chat-col {
+    display: none;
+  }
+}

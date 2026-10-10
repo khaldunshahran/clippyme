@@ -6,7 +6,7 @@ import { ArrowUp, Square, Plus, Settings2, ClipboardPaste } from 'lucide-react';
  * bottom row inside the box: [+] attach on the left, gear + dark send on the right.
  * No chip strip. Aspect/length/captions live in the settings popup + caption carousel.
  */
-export default function Composer({ onSend, disabled, phase, onOpenSettings }) {
+export default function Composer({ onSend, disabled, phase, onOpenSettings, inputRef, placeholder }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -51,9 +51,10 @@ export default function Composer({ onSend, disabled, phase, onOpenSettings }) {
     } catch { /* clipboard denied — user can paste manually */ }
   };
 
-  const placeholder = phase === 'clipping'
+  const defaultPlaceholder = phase === 'clipping'
     ? 'Prompt the AI while it clips — e.g. "focus on the funny moments"…'
     : 'Paste a YouTube, Twitch or any video link…';
+  const placeholderText = placeholder || defaultPlaceholder;
 
   const canSend = text.trim() && !disabled && !busy && !sending;
 
@@ -77,14 +78,20 @@ export default function Composer({ onSend, disabled, phase, onOpenSettings }) {
           }}
         >
           <textarea
-            ref={taRef}
+            ref={(el) => {
+              taRef.current = el;
+              if (inputRef) {
+                if (typeof inputRef === 'function') inputRef(el);
+                else inputRef.current = el;
+              }
+            }}
             className="nc-scroll nc-composer-input"
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
             }}
-            placeholder={placeholder}
+            placeholder={placeholderText}
             rows={1}
             disabled={disabled}
             style={{

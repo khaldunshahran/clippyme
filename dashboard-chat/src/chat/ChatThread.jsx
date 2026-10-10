@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { Loader2, TriangleAlert, Info, Link2 } from 'lucide-react';
+import { Loader2, TriangleAlert, Info, Link2, Check, X, Sparkles } from 'lucide-react';
 import { ProgressBody } from './ProgressPill.jsx';
 import ClipRow from './ClipRow.jsx';
 import CaptionCarousel from './CaptionCarousel.jsx';
@@ -78,7 +78,161 @@ function ValidateMsg({ data, thread }) {
   );
 }
 
-export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue }) {
+function patchSummary(patch) {
+  if (!patch || typeof patch !== 'object') return 'project patch';
+  const keys = Object.keys(patch).filter((k) => k !== 'schema');
+  if (!keys.length) return 'project patch';
+  return keys.map((k) => {
+    const v = patch[k];
+    const short = typeof v === 'string' && v.length > 42 ? `${v.slice(0, 42)}…` : JSON.stringify(v)?.slice(0, 42);
+    return `${k} → ${short}`;
+  }).join(' · ');
+}
+
+/**
+ * Task 17 — a chat edit proposal for the selected clip.
+ * States: thinking | ready | applying | applied | stale | error | discarded.
+ * A ready proposal shows its originating clip + base version, is explicitly
+ * NOT saved yet, and offers Apply / Discard.
+ */
+function ProposalMsg({ data, onApply, onDiscard }) {
+  const d = data || {};
+  const state = d.state || 'thinking';
+  const clipN = d.identity && Number.isInteger(d.identity.clipIndex) ? d.identity.clipIndex + 1 : null;
+  const scopeLine = clipN != null
+    ? `Clip ${clipN}${d.clipTitle ? ` — ${d.clipTitle}` : ''}${d.baseVersion != null ? ` · based on v${d.baseVersion}` : ''}`
+    : null;
+
+  const frame = (children, accent) => (
+    <div className="nc-card nc-anim-fade-up" style={{ padding: 14, maxWidth: 520, borderColor: accent || 'var(--nc-border)' }}>
+      {children}
+    </div>
+  );
+
+  if (state === 'thinking') {
+    return frame(
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+        <Loader2 size={16} style={{ animation: 'nc-spin 1.2s linear infinite', color: 'var(--nc-accent)', flexShrink: 0 }} />
+        <div style={{ fontSize: 13.5, color: 'var(--nc-text-dim)' }}>
+          Working on your edit{clipN != null ? ` for clip ${clipN}` : ''}…
+        </div>
+      </div>
+    );
+  }
+
+  if (state === 'ready') {
+    return frame(
+      <div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+          <Sparkles size={15} style={{ color: 'var(--nc-accent)', flexShrink: 0, marginTop: 2 }} />
+          <div style={{ fontSize: 13.5, lineHeight: 1.55 }}>{d.explanation || 'Patch ready.'}</div>
+        </div>
+        {d.patch && (
+          <div style={{
+            marginTop: 8, padding: '8px 10px', borderRadius: 10,
+            background: 'rgba(255,255,255,0.04)', border: '1px solid var(--nc-border)',
+            color: 'var(--nc-text-dim)', fontSize: 12,
+          }}>
+            Changed: {patchSummary(d.patch)}
+          </div>
+        )}
+        <div style={{ marginTop: 8, fontSize: 12, color: 'var(--nc-text-faint)', lineHeight: 1.5 }}>
+          {scopeLine && <div>{scopeLine}</div>}
+          <div>Not saved yet — review it in the workspace, then apply.</div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+          <button className="nc-btn-primary" style={{ fontSize: 13, padding: '8px 16px' }} onClick={onApply}>
+            <Check size={14} /> Apply to project
+          </button>
+          <button className="nc-btn-ghost" style={{ fontSize: 13, padding: '8px 16px' }} onClick={onDiscard}>
+            <X size={14} /> Discard
+          </button>
+        </div>
+      </div>,
+      'rgba(10,129,217,0.4)'
+    );
+  }
+
+  if (state === 'applying') {
+    return frame(
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+        <Loader2 size={16} style={{ animation: 'nc-spin 1.2s linear infinite', color: 'var(--nc-accent)', flexShrink: 0 }} />
+        <div style={{ fontSize: 13.5, color: 'var(--nc-text-dim)' }}>Applying to the project…</div>
+      </div>
+    );
+  }
+
+  if (state === 'applied') {
+    return frame(
+      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+        <Check size={15} style={{ color: 'var(--nc-green)', flexShrink: 0, marginTop: 2 }} />
+        <div style={{ fontSize: 13.5, lineHeight: 1.55 }}>
+          Applied{clipN != null ? ` to clip ${clipN}` : ''} — the workspace shows the updated project. Undo is available in the editor.
+        </div>
+      </div>,
+      'rgba(52,199,123,0.35)'
+    );
+  }
+
+  if (state === 'stale') {
+    const why = d.staleReason === 'version'
+      ? `This proposal was based on v${d.baseVersion}, but the clip has newer edits — nothing was overwritten. Send the edit again to regenerate it.`
+      : 'The selection changed since this proposal was made — nothing was applied. Select the clip again and send the edit to regenerate it.';
+    return frame(
+      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+        <TriangleAlert size={15} style={{ color: 'var(--nc-accent)', flexShrink: 0, marginTop: 2 }} />
+        <div style={{ fontSize: 13.5, lineHeight: 1.55, color: 'var(--nc-text-dim)' }}>{why}</div>
+      </div>,
+      'rgba(10,129,217,0.4)'
+    );
+  }
+
+  if (state === 'error') {
+    return frame(
+      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+        <TriangleAlert size={15} style={{ color: 'var(--nc-red)', flexShrink: 0, marginTop: 2 }} />
+        <div style={{ fontSize: 13.5, lineHeight: 1.55, color: 'var(--nc-text-dim)' }}>{d.error || 'The edit failed. Nothing was changed.'}</div>
+      </div>,
+      'rgba(243,18,96,0.4)'
+    );
+  }
+
+  // discarded
+  return (
+    <div className="nc-anim-fade-up" style={{ fontSize: 12.5, color: 'var(--nc-text-faint)' }}>
+      Proposal discarded.
+    </div>
+  );
+}
+
+/**
+ * Task 17 — the /hyperframes command. Honest pending-adapter state: shows
+ * the command and the selected scope (or "no clip selected"), and says the
+ * adapter lands in Task 18. This message is pushed with zero provider calls
+ * and zero mutations — ordinary edits stay available.
+ */
+function HyperframesMsg({ data }) {
+  const d = data || {};
+  const scope = d.scope && Number.isInteger(d.scope.clipIndex)
+    ? `Clip ${d.scope.clipIndex + 1}`
+    : 'no clip selected';
+  return (
+    <div className="nc-card nc-anim-fade-up" style={{ padding: 14, maxWidth: 520, borderColor: 'rgba(10,129,217,0.4)' }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+        <Sparkles size={15} style={{ color: 'var(--nc-accent)', flexShrink: 0 }} />
+        <code style={{ fontSize: 13, color: 'var(--nc-text)', wordBreak: 'break-all' }}>{d.command || '/hyperframes'}</code>
+      </div>
+      <div style={{ fontSize: 12.5, color: 'var(--nc-text-dim)', lineHeight: 1.55 }}>
+        Scope: {scope} — not available yet. The Hyperframes adapter lands in Task 18; this command did nothing.
+      </div>
+      <div style={{ fontSize: 12.5, color: 'var(--nc-text-dim)', lineHeight: 1.55, marginTop: 6 }}>
+        Ordinary caption, hook and trim edits work now — select a clip and describe the change.
+      </div>
+    </div>
+  );
+}
+
+export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue, onApplyProposal, onDiscardProposal }) {
   const bottomRef = useRef(null);
   const msgs = thread?.messages || [];
 
@@ -139,6 +293,18 @@ export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleC
                   />
                 </div>
               );
+            case 'proposal':
+              return (
+                <div key={m.id}>
+                  <ProposalMsg
+                    data={m.data}
+                    onApply={() => onApplyProposal && onApplyProposal(m.id)}
+                    onDiscard={() => onDiscardProposal && onDiscardProposal(m.id)}
+                  />
+                </div>
+              );
+            case 'hyperframes':
+              return <div key={m.id}><HyperframesMsg data={m.data} /></div>;
             case 'notice':
               return (
                 <div key={m.id} className="nc-anim-fade-up" style={{ display: 'flex', gap: 8, alignItems: 'flex-start', maxWidth: 640 }}>

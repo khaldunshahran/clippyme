@@ -1,22 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo } from 'react';
 import { ArrowLeft } from 'lucide-react';
 import '../editor/tokens.css';
 import '../editor/app.css';
 import { ClipEditorView } from '../editor/clipEditor.jsx';
 import CopilotPanel from './CopilotPanel.jsx';
 import TranscriptPanel from '../editor-timeline/TranscriptPanel.jsx';
-import { createProjectController } from './projectController.js';
-import { onSessionReset } from '../api/sessionReset.js';
-import {
-  clipVideoSrc,
-  getClipProject,
-  saveClipProject,
-  composeProject,
-  backfillClipProjects,
-  listClipProjectVersions,
-  editClipAI,
-  uploadAudio,
-} from '../api/realApi.js';
+import { useWorkspaceController } from './useWorkspaceController.js';
+import { clipVideoSrc } from '../api/realApi.js';
 
 /**
  * Deep editor, slice 1: transcript-first editing.
@@ -32,67 +22,35 @@ import {
  * restore/reset, undo/redo, and save/export all route through it; the
  * nested ClipEditorView runs in controlled mode and never keeps its own
  * copy.
+ *
+ * Task 17: the editor renders INLINE in the workspace side panel (no more
+ * fixed full-screen overlay) and receives the shared project authority as
+ * props {controller, snap, resetKey, toast} from the host's
+ * useWorkspaceController — the SAME controller main-chat proposals,
+ * undo/redo and export route through. In this mode it never
+ * creates/disposes/loads its own controller.
+ *
+ * Back-compat (pinned by the Task 16 host-lifecycle tests): when no
+ * controller prop is passed, it creates exactly one per (jobId, clipIndex)
+ * via useWorkspaceController with the same lifecycle as before.
  */
-export default function EditorView({ jobId, clipIndex, clip, onBack }) {
-  const [snap, setSnap] = useState(null);
-  const [toast, setToast] = useState(null);
-  // Bumped on session reset so the TranscriptPanel remounts and drops its
-  // selection / editing state along with the cleared project.
-  const [resetKey, setResetKey] = useState(0);
-
-  const pushToast = useCallback((msg) => {
-    setToast(msg);
-    clearTimeout(pushToast._t);
-    pushToast._t = setTimeout(() => setToast(null), 2600);
-    console.log('[editor]', msg);
-  }, []);
-
-  // The single project authority for this clip (condition 4). Recreated on
-  // clip switch; the old controller is disposed so its late responses can
-  // never touch the new clip's state.
-  const controller = useMemo(
-    () =>
-      createProjectController({
-        jobId,
-        clipIndex,
-        api: {
-          getClipProject,
-          saveClipProject,
-          composeProject,
-          backfillClipProjects,
-          listClipProjectVersions,
-          editClipAI,
-          uploadAudio,
-        },
-        onToast: pushToast,
-      }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [jobId, clipIndex]
-  );
-
-  useEffect(() => {
-    const unsubscribe = controller.subscribe(setSnap);
-    controller.load().catch(() => {});
-    controller.listVersions();
-    return () => {
-      unsubscribe();
-      controller.dispose();
-    };
-  }, [controller]);
-
-  // Session reset (sign-out or signed-in user change): drop the undo/redo
-  // history, the cached project, and force the transcript panel to remount
-  // so selection/editing state can't leak across users.
-  useEffect(() => {
-    return onSessionReset(() => {
-      controller.resetSession();
-      setResetKey((k) => k + 1);
-    });
-  }, [controller]);
+export default function EditorView({
+  jobId, clipIndex, clip, onBack,
+  controller: controllerProp = null,
+  snap: snapProp = null,
+  resetKey: resetKeyProp = 0,
+  toast: toastProp = null,
+}) {
+  const internal = useWorkspaceController({ jobId, clipIndex, disabled: !!controllerProp });
+  const controller = controllerProp || internal.controller;
+  const snap = controllerProp ? snapProp : internal.snap;
+  const resetKey = controllerProp ? resetKeyProp : internal.resetKey;
+  const toast = controllerProp ? toastProp : internal.toast;
 
   // Global undo/redo with the inline-editor guard (condition 6):
   // never fire when focus is inside an input/textarea/select/contenteditable.
   useEffect(() => {
+    if (!controller) return undefined;
     const onKey = (e) => {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod || e.key.toLowerCase() !== 'z') return;
@@ -128,11 +86,13 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
     }
   }, [clip]);
 
+  if (!controller) return null;
+
   return (
     <div
       className="nc-anim-fade-in"
       style={{
-        position: 'fixed', inset: 0, zIndex: 70, background: 'var(--nc-bg)',
+        flex: 1, minHeight: 0, background: 'var(--nc-bg)',
         display: 'flex', flexDirection: 'column',
       }}
     >
@@ -165,7 +125,7 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
               project={project}
               videoSrc={videoSrc}
               applyEdit={controller.applyEdit}
-              pushToast={pushToast}
+              pushToast={internal.pushToast}
               disabled={!project}
             />
           )}
@@ -178,7 +138,7 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
             clipIndex={clipIndex}
             clip={clip?.raw || clip}
             onBack={onBack}
-            pushToast={pushToast}
+            pushToast={internal.pushToast}
             controller={controller}
           />
           {/* Condition 4: copilot edits route through the same queue.

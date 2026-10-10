@@ -1,6 +1,7 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Menu, CalendarClock, Loader2, X, Check } from 'lucide-react';
 import { useChat } from './chat/useChat.js';
+import { useWorkspaceController } from './chat/useWorkspaceController.js';
 import Sidebar from './chat/Sidebar.jsx';
 import WelcomeView from './chat/WelcomeView.jsx';
 import ChatThread from './chat/ChatThread.jsx';
@@ -9,7 +10,9 @@ import SettingsPopup from './chat/SettingsPopup.jsx';
 import ClipGrid from './chat/ClipGrid.jsx';
 import ClipPopup from './chat/ClipPopup.jsx';
 import EditorView from './chat/EditorView.jsx';
+import SelectionBar from './chat/SelectionBar.jsx';
 import AuthGate from './chat/AuthGate.jsx';
+import './chat/workspace.css';
 import { scheduleClipPost, getZernioAccounts, zernioTargets, getJobClips, normClip } from './api/chatApi.js';
 
 const DEPLOY_SHA = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_DEPLOY_SHA) || '';
@@ -41,9 +44,11 @@ function AppShell() {
     settingsOpen, setSettingsOpen,
     gridOpen, setGridOpen,
     popupClip, setPopupClip,
-    editorTarget, setEditorTarget,
+    selectedClip, selectClip, clearSelection,
+    workspaceRef,
     createThread, selectThread, deleteThread,
-    sendMessage, confirmSettings, proceedToSettings, patchThread,
+    sendMessage, applyProposal, discardProposal,
+    confirmSettings, proceedToSettings, patchThread,
     DEFAULT_SETTINGS,
   } = chat;
 
@@ -52,6 +57,21 @@ function AppShell() {
   const [schedWhen, setSchedWhen] = useState('');
   const [schedBusy, setSchedBusy] = useState(false);
   const [schedMsg, setSchedMsg] = useState(null);
+  // Narrow-screen (<900px) Chat/Editor toggle. Both columns stay mounted —
+  // the toggle only flips CSS visibility, so composer/selection state is kept.
+  const [mobileView, setMobileView] = useState('chat'); // 'chat' | 'editor'
+  const composerRef = useRef(null);
+
+  // Task 17 — one shared project authority for the selected clip. The
+  // workspace panel, main-chat proposals, undo/redo and export all route
+  // through this controller; sendMessage reads it via workspaceRef.
+  const ws = useWorkspaceController({
+    jobId: selectedClip?.jobId,
+    clipIndex: selectedClip?.clipIndex,
+  });
+  useEffect(() => {
+    workspaceRef.current = { controller: ws.controller };
+  }, [workspaceRef, ws.controller]);
 
   const ensureThread = useCallback(() => {
     if (activeId) return activeId;
@@ -72,12 +92,12 @@ function AppShell() {
     });
   }, [threads, setPopupClip]);
 
-  const openEditor = useCallback((threadId, index) => {
-    const t = threads.find((x) => x.id === threadId);
-    if (!t?.jobId) return;
-    setPopupClip(null);
-    setEditorTarget({ threadId, jobId: t.jobId, clipIndex: index, clip: t.clips[index] });
-  }, [threads, setEditorTarget, setPopupClip]);
+  // Task 17: "Edit" no longer opens a full-screen overlay — it selects the
+  // clip, opening the persistent workspace (chat + editor side by side).
+  const handleSelectClip = useCallback((threadId, index) => {
+    selectClip(threadId, index);
+    setMobileView('editor');
+  }, [selectClip]);
 
   const refreshClips = useCallback(async (threadId, jobId) => {
     try {
@@ -127,6 +147,18 @@ function AppShell() {
   const showWelcome = !active || (active.messages.length === 0 && active.phase === 'idle');
   const popupThread = popupClip ? threads.find((t) => t.id === popupClip.threadId) : null;
 
+  // The selected clip's display data (selection is always bound to its thread).
+  const selThread = selectedClip ? threads.find((t) => t.id === selectedClip.threadId) : null;
+  const selClip = selThread?.clips?.[selectedClip?.clipIndex] || null;
+  const selVersion = ws.snap?.project?.version ?? null;
+
+  const handleNewSource = useCallback(() => {
+    clearSelection();
+    setMobileView('chat');
+    // Let the selection clear commit before focusing the composer.
+    setTimeout(() => composerRef.current?.focus(), 0);
+  }, [clearSelection]);
+
   return (
     <div style={{ display: 'flex', height: '100%', background: 'var(--nc-bg)', color: 'var(--nc-text)', overflow: 'hidden' }}>
       <Sidebar
@@ -165,31 +197,86 @@ function AppShell() {
           </div>
         </header>
 
-        {showWelcome ? (
-          <WelcomeView onExample={(url) => { const id = ensureThread(); sendMessage(url); }} />
-        ) : (
-          <ChatThread
-            thread={active}
-            onOpenClip={(i) => openClip(activeId, i)}
-            onEditClip={(i) => openEditor(activeId, i)}
-            onScheduleClip={(i) => openSchedule(activeId, i)}
-            onViewAll={() => setGridOpen(true)}
-            onCaptionSelect={(id) => activeId && patchThread(activeId, { settings: { ...(active?.settings || {}), captions: id } })}
-            onCaptionContinue={() => activeId && proceedToSettings(activeId)}
-          />
+        {/* narrow-screen Chat/Editor toggle (visible only below 900px via CSS) */}
+        {selectedClip && selClip && (
+          <div className="nc-mobile-toggle" role="tablist" aria-label="Switch between chat and editor">
+            <button
+              role="tab" aria-selected={mobileView === 'chat'}
+              className={mobileView === 'chat' ? 'active' : ''}
+              onClick={() => setMobileView('chat')}
+            >
+              Chat
+            </button>
+            <button
+              role="tab" aria-selected={mobileView === 'editor'}
+              className={mobileView === 'editor' ? 'active' : ''}
+              onClick={() => setMobileView('editor')}
+            >
+              Editor
+            </button>
+          </div>
         )}
 
-        <Composer
-          onSend={sendMessage}
-          disabled={false}
-          phase={active?.phase || 'idle'}
-          settings={active?.settings || DEFAULT_SETTINGS}
-          onSettingsChange={(s) => activeId && patchThread(activeId, { settings: s })}
-          onOpenSettings={() => {
-            ensureThread();
-            setSettingsOpen(true);
-          }}
-        />
+        <div className="nc-workspace-row" data-mview={mobileView}>
+          {/* chat column */}
+          <section className="nc-chat-col" aria-label="Chat">
+            {showWelcome ? (
+              <WelcomeView onExample={(url) => { const id = ensureThread(); sendMessage(url); }} />
+            ) : (
+              <ChatThread
+                thread={active}
+                onOpenClip={(i) => openClip(activeId, i)}
+                onEditClip={(i) => handleSelectClip(activeId, i)}
+                onScheduleClip={(i) => openSchedule(activeId, i)}
+                onViewAll={() => setGridOpen(true)}
+                onCaptionSelect={(id) => activeId && patchThread(activeId, { settings: { ...(active?.settings || {}), captions: id } })}
+                onCaptionContinue={() => activeId && proceedToSettings(activeId)}
+                onApplyProposal={(msgId) => activeId && applyProposal(activeId, msgId)}
+                onDiscardProposal={(msgId) => activeId && discardProposal(activeId, msgId)}
+              />
+            )}
+
+            {selectedClip && selClip && (
+              <SelectionBar
+                clipIndex={selectedClip.clipIndex}
+                title={selClip.title}
+                version={selVersion}
+                onNewSource={handleNewSource}
+                onClose={clearSelection}
+              />
+            )}
+
+            <Composer
+              onSend={sendMessage}
+              disabled={false}
+              phase={active?.phase || 'idle'}
+              settings={active?.settings || DEFAULT_SETTINGS}
+              onSettingsChange={(s) => activeId && patchThread(activeId, { settings: s })}
+              onOpenSettings={() => {
+                ensureThread();
+                setSettingsOpen(true);
+              }}
+              inputRef={composerRef}
+              placeholder={selectedClip && selClip ? `Describe the edit for clip ${selectedClip.clipIndex + 1}…` : undefined}
+            />
+          </section>
+
+          {/* workspace panel: the selected clip's editor, inline */}
+          {selectedClip && selClip && (
+            <aside className="nc-workspace-panel" aria-label="Clip editor">
+              <EditorView
+                controller={ws.controller}
+                snap={ws.snap}
+                resetKey={ws.resetKey}
+                toast={ws.toast}
+                jobId={selectedClip.jobId}
+                clipIndex={selectedClip.clipIndex}
+                clip={selClip}
+                onBack={clearSelection}
+              />
+            </aside>
+          )}
+        </div>
       </main>
 
       {/* settings popup */}
@@ -213,7 +300,7 @@ function AppShell() {
           title={active.title}
           onClose={() => setGridOpen(false)}
           onOpenClip={(i) => { setGridOpen(false); openClip(activeId, i); }}
-          onEditClip={(i) => { setGridOpen(false); openEditor(activeId, i); }}
+          onEditClip={(i) => { setGridOpen(false); handleSelectClip(activeId, i); }}
           onScheduleClip={(i) => openSchedule(activeId, i)}
         />
       )}
@@ -227,18 +314,8 @@ function AppShell() {
           onClose={() => setPopupClip(null)}
           onPrev={() => stepClip(-1)}
           onNext={() => stepClip(1)}
-          onEdit={(i) => openEditor(popupThread.id, i)}
+          onEdit={(i) => handleSelectClip(popupThread.id, i)}
           onDuplicate={() => handleDuplicate(popupThread.id, popupThread.jobId)}
-        />
-      )}
-
-      {/* deep editor */}
-      {editorTarget && (
-        <EditorView
-          jobId={editorTarget.jobId}
-          clipIndex={editorTarget.clipIndex}
-          clip={editorTarget.clip}
-          onBack={() => setEditorTarget(null)}
         />
       )}
 

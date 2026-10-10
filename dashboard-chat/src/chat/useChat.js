@@ -1,8 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   validateUrl, submitJob, getProgress, steerJob, getHistory,
-  getJobClips, extractUrl, normClip,
+  getJobClips, extractUrl, normClip, editAiPatch,
 } from '../api/chatApi.js';
+import { onSessionReset } from '../api/sessionReset.js';
+import { routeChatMessage } from './messageRouter.js';
+import { requestChatProposal, applyChatProposal } from './proposals.js';
+import {
+  loadSelection, saveSelection, clearStoredSelection, isValidSelection,
+} from './selection.js';
 
 const LS_KEY = 'nugget-chat-threads-v1';
 const POLL_MS = 2000;
@@ -59,13 +65,31 @@ function loadThreads() {
   } catch { return []; }
 }
 
+// A persisted selection is only restored when its thread still exists with
+// the same job and clip — otherwise it is dropped, never resurrected.
+function loadValidSelection() {
+  const sel = loadSelection();
+  if (!isValidSelection(sel)) return null;
+  const t = loadThreads().find((x) => x.id === sel.threadId);
+  if (!t || t.jobId !== sel.jobId || !Array.isArray(t.clips) || !t.clips[sel.clipIndex]) {
+    clearStoredSelection();
+    return null;
+  }
+  return sel;
+}
+
 export function useChat() {
   const [threads, setThreads] = useState(loadThreads);
   const [activeId, setActiveId] = useState(() => loadThreads()[0]?.id || null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [gridOpen, setGridOpen] = useState(false);
   const [popupClip, setPopupClip] = useState(null); // {threadId, index}
-  const [editorTarget, setEditorTarget] = useState(null); // {threadId, jobId, clipIndex, clip}
+  // Task 17 — explicit single-clip selection: {threadId, jobId, clipIndex}.
+  // Safe metadata only (persisted via selection.js); the live project
+  // controller for it is owned by App's useWorkspaceController and shared
+  // through workspaceRef (never stored in state or localStorage).
+  const [selectedClip, setSelectedClip] = useState(loadValidSelection);
+  const workspaceRef = useRef(null); // { controller } — wired by App
   const pollRef = useRef({});
 
   const active = useMemo(
@@ -90,10 +114,44 @@ export function useChat() {
     return m.id;
   }, []);
 
+  // Patch one message's data in place (proposal state machine).
+  const updateMsg = useCallback((threadId, msgId, patch) => {
+    setThreads((ts) => ts.map((t) => (t.id === threadId
+      ? {
+        ...t,
+        updatedAt: Date.now(),
+        messages: t.messages.map((m) => {
+          if (m.id !== msgId) return m;
+          const p = typeof patch === 'function' ? patch(m) : patch;
+          return { ...m, ...p, data: { ...(m.data || {}), ...((p && p.data) || {}) } };
+        }),
+      }
+      : t)));
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    setSelectedClip(null);
+    clearStoredSelection();
+  }, []);
+
+  const selectClip = useCallback((threadId, clipIndex) => {
+    const t = threads.find((x) => x.id === threadId);
+    if (!t?.jobId || !Array.isArray(t.clips) || !t.clips[clipIndex]) return;
+    const sel = { threadId, jobId: t.jobId, clipIndex };
+    setSelectedClip(sel);
+    saveSelection(sel);
+    setActiveId(threadId);
+    setGridOpen(false);
+    setPopupClip(null);
+  }, [threads]);
+
   const createThread = useCallback(() => {
     const t = newThread();
     setThreads((ts) => [t, ...ts]);
     setActiveId(t.id);
+    // A new conversation starts with no selection.
+    setSelectedClip(null);
+    clearStoredSelection();
     return t.id;
   }, []);
 
@@ -101,15 +159,33 @@ export function useChat() {
     setActiveId(id);
     setGridOpen(false);
     setPopupClip(null);
-  }, []);
+    // A selection belongs to exactly one thread: switching threads drops a
+    // selection that belongs to another thread.
+    if (selectedClip && selectedClip.threadId !== id) {
+      setSelectedClip(null);
+      clearStoredSelection();
+    }
+  }, [selectedClip]);
 
   const deleteThread = useCallback((id) => {
+    if (selectedClip && selectedClip.threadId === id) {
+      setSelectedClip(null);
+      clearStoredSelection();
+    }
     setThreads((ts) => {
       const next = ts.filter((t) => t.id !== id);
       setActiveId((cur) => (cur === id ? next[0]?.id || null : cur));
       return next;
     });
-  }, []);
+  }, [selectedClip]);
+
+  // Session reset (sign-out / user change): the workspace controller resets
+  // itself via its own registration; here the selection is dropped so a
+  // proposal can never be applied against another user's clip.
+  useEffect(() => onSessionReset(() => {
+    setSelectedClip(null);
+    clearStoredSelection();
+  }), []);
 
   // ---------------- validation ----------------
   const runValidation = useCallback(async (threadId, url) => {
@@ -261,6 +337,88 @@ export function useChat() {
     }
   }, [threads, patchThread, pushMsg, startPoll]);
 
+  // ---------------- chat proposals ----------------
+  // Ordinary edit for the selected clip: generate a validated patch proposal
+  // (never saved), then let the user apply it explicitly. The proposal is
+  // bound to the captured identity + base version from the start.
+  const runChatEdit = useCallback(async (thread, selection, instruction) => {
+    const threadId = thread.id;
+    const identity = { jobId: selection.jobId, clipIndex: selection.clipIndex };
+    const clipTitle = thread.clips?.[selection.clipIndex]?.title || null;
+    const controller = workspaceRef.current?.controller || null;
+    if (!controller) {
+      pushMsg(threadId, { role: 'ai', kind: 'error', text: 'The editor isn\'t ready for that clip yet — try again in a moment.' });
+      return;
+    }
+    const msgId = pushMsg(threadId, {
+      role: 'ai', kind: 'proposal',
+      data: { state: 'thinking', text: instruction, identity, clipTitle },
+    });
+    try {
+      const res = await requestChatProposal({
+        editAiPatchFn: editAiPatch,
+        jobId: identity.jobId,
+        clipIndex: identity.clipIndex,
+        instruction,
+      });
+      updateMsg(threadId, msgId, {
+        data: {
+          state: 'ready',
+          explanation: res.explanation,
+          patch: res.patch,
+          project: res.project,
+          identity: res.identity,
+          baseVersion: res.baseVersion,
+        },
+      });
+    } catch (e) {
+      updateMsg(threadId, msgId, {
+        data: { state: 'error', error: e?.message || 'The AI edit failed. Nothing was changed — try again.' },
+      });
+    }
+  }, [pushMsg, updateMsg]);
+
+  // Apply a ready proposal through the shared controller. Identity and
+  // version are re-checked here: a clip/thread/session switch between
+  // proposal and apply refuses instead of touching the wrong target.
+  const applyProposal = useCallback(async (threadId, msgId) => {
+    const thread = threads.find((t) => t.id === threadId);
+    const msg = thread?.messages.find((m) => m.id === msgId);
+    const d = msg?.data;
+    if (!msg || msg.kind !== 'proposal' || !d || d.state !== 'ready') return;
+    updateMsg(threadId, msgId, { data: { state: 'applying' } });
+    const controller = workspaceRef.current?.controller || null;
+    try {
+      await applyChatProposal({
+        controller,
+        identity: d.identity,
+        baseVersion: d.baseVersion,
+        project: d.project,
+        label: `chat: ${(d.text || 'edit').slice(0, 60)}`,
+      });
+      updateMsg(threadId, msgId, { data: { state: 'applied' } });
+    } catch (e) {
+      if (e?.code === 'STALE_SELECTION') {
+        updateMsg(threadId, msgId, { data: { state: 'stale', staleReason: 'selection-changed' } });
+        pushMsg(threadId, { role: 'ai', kind: 'notice', text: 'The selection changed since that proposal was made, so nothing was applied. Select the clip again and send the edit to regenerate it.' });
+      } else if (e?.status === 409 || /stale project version/i.test(e?.message || '')) {
+        updateMsg(threadId, msgId, { data: { state: 'stale', staleReason: 'version', baseVersion: d.baseVersion } });
+        pushMsg(threadId, {
+          role: 'ai', kind: 'notice',
+          text: `That proposal was based on v${d.baseVersion} but the clip has newer edits — nothing was overwritten. Send the edit again and I'll regenerate it against the latest version.`,
+        });
+      } else if (e?.code === 'DISPOSED' || e?.code === 'QUEUE_CANCELLED') {
+        updateMsg(threadId, msgId, { data: { state: 'error', error: 'The editor was reset while applying — nothing was applied. Try again.' } });
+      } else {
+        updateMsg(threadId, msgId, { data: { state: 'error', error: `Apply failed: ${e?.message || 'unknown error'}. Nothing was overwritten.` } });
+      }
+    }
+  }, [threads, updateMsg, pushMsg]);
+
+  const discardProposal = useCallback((threadId, msgId) => {
+    updateMsg(threadId, msgId, { data: { state: 'discarded' } });
+  }, [updateMsg]);
+
   // ---------------- send / steer ----------------
   const sendMessage = useCallback(async (text) => {
     let threadId = activeId;
@@ -270,8 +428,12 @@ export function useChat() {
     if (!clean) return;
     pushMsg(threadId, { role: 'user', kind: 'text', text: clean });
 
-    // While clipping, a message is a steering prompt for the AI.
-    if ((thread.phase === 'clipping' || thread.phase === 'submitting') && thread.jobId) {
+    // A selection belongs to exactly one thread: never leak it across threads.
+    const selection = selectedClip && selectedClip.threadId === threadId ? selectedClip : null;
+    const route = routeChatMessage(clean, { phase: thread.phase, jobId: thread.jobId, selection });
+
+    // (a) While clipping, a message is a steering prompt for the AI.
+    if (route.type === 'steer') {
       try {
         const r = await steerJob(thread.jobId, clean);
         if (r && r.accepted) {
@@ -287,16 +449,63 @@ export function useChat() {
       return;
     }
 
-    const url = extractUrl(clean);
-    if (url) {
-      // A fresh link starts a fresh flow on this thread (reset prior job state).
+    // (b) /hyperframes: honest pending-adapter state. Zero provider calls,
+    // zero mutations — the message is the whole response.
+    if (route.type === 'hyperframes') {
+      pushMsg(threadId, {
+        role: 'ai', kind: 'hyperframes',
+        data: {
+          command: clean,
+          scope: selection
+            ? { threadId: selection.threadId, jobId: selection.jobId, clipIndex: selection.clipIndex }
+            : null,
+        },
+      });
+      return;
+    }
+
+    // (c) Bulk scope: honest feedback, never mutate multiple clips.
+    if (route.type === 'bulk-unsupported') {
+      pushMsg(threadId, {
+        role: 'ai', kind: 'notice',
+        text: 'I can only edit one clip at a time right now, so I left all clips untouched. Select a single clip and describe the change — I\'ll propose the edit for that clip before anything is saved.',
+      });
+      return;
+    }
+
+    // (d) Ordinary edit for the explicitly selected clip.
+    if (route.type === 'edit') {
+      await runChatEdit(thread, route.selection, clean);
+      return;
+    }
+
+    // (e) A fresh link starts a fresh flow on this thread: reset prior job
+    // state AND the selection (a new source owns the thread again).
+    if (route.type === 'new-source') {
       stopPoll(threadId);
       patchThread(threadId, { jobId: null, clips: [], progress: null });
-      runValidation(threadId, url);
-    } else if (thread.phase === 'idle') {
-      pushMsg(threadId, { role: 'ai', kind: 'text', text: 'Paste a video link (YouTube, Twitch, …) and I\'ll check it, then we\'ll set it up together.' });
+      clearSelection();
+      runValidation(threadId, route.url);
+      return;
     }
-  }, [activeId, threads, createThread, pushMsg, patchThread, runValidation, stopPoll]);
+
+    // (f) Clips done, nothing selected: actionable, never guess clip0.
+    if (route.type === 'need-selection') {
+      pushMsg(threadId, {
+        role: 'ai', kind: 'notice',
+        text: 'Your clips are ready — select a clip to edit it (tap Edit on any clip), then tell me what to change, e.g. “make the hook punchier”.',
+      });
+      return;
+    }
+
+    // (g) Fresh thread: the existing idle hint.
+    if (route.type === 'idle-hint') {
+      pushMsg(threadId, { role: 'ai', kind: 'text', text: 'Paste a video link (YouTube, Twitch, …) and I\'ll check it, then we\'ll set it up together.' });
+      return;
+    }
+
+    // (none) validating / caption-pick / settings / error: stay silent, as before.
+  }, [activeId, threads, selectedClip, createThread, pushMsg, patchThread, runValidation, stopPoll, clearSelection, runChatEdit]);
 
   // Resume polling for threads that were mid-clip when the app loaded.
   useEffect(() => {
@@ -331,9 +540,11 @@ export function useChat() {
     settingsOpen, setSettingsOpen,
     gridOpen, setGridOpen,
     popupClip, setPopupClip,
-    editorTarget, setEditorTarget,
+    selectedClip, selectClip, clearSelection,
+    workspaceRef,
     createThread, selectThread, deleteThread,
-    sendMessage, confirmSettings, proceedToSettings, patchThread,
+    sendMessage, applyProposal, discardProposal,
+    confirmSettings, proceedToSettings, patchThread,
     DEFAULT_SETTINGS,
   };
 }
