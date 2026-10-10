@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   validateUrl, submitJob, getProgress, steerJob, getHistory,
   getJobClips, extractUrl, normClip, editAiPatch,
@@ -526,7 +526,18 @@ export function useChat() {
           role: 'ai', kind: 'notice',
           text: `That proposal was based on v${d.baseVersion} but the clip has newer edits — nothing was overwritten. Send the edit again and I'll regenerate it against the latest version.`,
         });
+      } else if (e?.code === 'SAVE_INTERRUPTED') {
+        // The save request was ISSUED under the originating lifetime before
+        // the session ended; cancellation only dropped the confirmation. The
+        // server may already have committed, so claiming "nothing was applied"
+        // would be a lie the backend can disprove. Report the uncertainty
+        // honestly and point at the safe reconciliation path: the user reloads
+        // the clip in the CURRENT session (no old-session follow-up API calls,
+        // no blind retry, no reversal of a possibly-committed save).
+        updateMsg(threadId, msgId, { data: { state: 'error', error: 'The editor was reset while the save was being confirmed, so I can\'t tell whether it saved. Reload the clip to check the saved revision before editing again.' } });
       } else if (e?.code === 'DISPOSED' || e?.code === 'QUEUE_CANCELLED') {
+        // Rejected before the save API was ever issued (entry guard or
+        // pre-save queue cancellation): "nothing was applied" is a fact here.
         updateMsg(threadId, msgId, { data: { state: 'error', error: 'The editor was reset while applying — nothing was applied. Try again.' } });
       } else {
         updateMsg(threadId, msgId, { data: { state: 'error', error: `Apply failed: ${e?.message || 'unknown error'}. Nothing was overwritten.` } });

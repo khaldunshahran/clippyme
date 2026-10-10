@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Task 17 — the real chat dispatcher for useChat.sendMessage.
  *
  * React-free and pure: given the message text and the thread context it
@@ -34,7 +34,13 @@ const BULK_WORD_RE = /\bbulk\b/i;
 // operations ("make all captions in this clip yellow", "edit the selected
 // clip") are ordinary single-clip edits — never bulk.
 const BULK_SCOPE_RE = /\b(all|these|those|selected|my)\b[^.!?]{0,48}\bclips\b/i;
-const BULK_EVERY_RE = /\b(every|each)\b[^.!?]{0,48}\bclips?\b/i;
+// every/each ranging over CLIPS only ("every clip", "every single clip",
+// "each of these clips", "every one of the clips"). Between the quantifier
+// and clip(s) only a closed set of glue words may appear (of/the/these/my,
+// one/single/selected/other/...); a different head noun ("highlight every
+// word in this clip", "make each caption bold") means the quantifier does
+// NOT govern clips, so those stay ordinary single-clip edits. No broad NLP.
+const BULK_EVERY_RE = /\b(every|each)(?:\s+of\s+(?:the|these|those|my)|\s+(?:one|single|selected|other|individual|remaining))*\s+clips?\b/i;
 
 function hasSelection(selection) {
   return !!(

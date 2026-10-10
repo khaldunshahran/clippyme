@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Single serialized mutation queue for the transcript editor.
  *
  * EVERY project mutation -- word edit, split, drop, copilot apply, undo,
@@ -34,6 +34,15 @@ export function createEditQueue({
   function cancelled(label) {
     const e = new Error(`cancelled: ${label} (queue cleared)`);
     e.code = 'QUEUE_CANCELLED';
+    return e;
+  }
+
+  // A save whose request was already issued when the session ended.
+  // Cancellation only drops the confirmation -- it cannot undo the request,
+  // so callers must report honest uncertainty, never "nothing was applied".
+  function saveInterrupted(label) {
+    const e = new Error(`interrupted: ${label} (save request issued; confirmation cancelled by session reset or dispose)`);
+    e.code = 'SAVE_INTERRUPTED';
     return e;
   }
 
@@ -89,7 +98,11 @@ export function createEditQueue({
         if (current()) onError?.(label, e); // save failed (incl. 409): snapshot discarded
         throw e;
       }
-      if (!current()) throw cancelled(label); // cleared mid-save: no resurrection
+      // Cleared after the save request was issued: the server may already
+      // have committed. Report honest uncertainty (SAVE_INTERRUPTED) --
+      // cancellation cannot undo an issued request, so callers must never
+      // claim "nothing was applied" for this case.
+      if (!current()) throw saveInterrupted(label);
       undoStack.push({ label, project: before });
       if (undoStack.length > MAX_DEPTH) undoStack.shift();
       redoStack.length = 0;
