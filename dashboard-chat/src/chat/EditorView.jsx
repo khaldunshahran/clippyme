@@ -145,7 +145,7 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
           <ArrowLeft size={17} />
         </button>
         <div style={{ fontSize: 14, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          Editing — {clip?.title || `Clip ${clipIndex + 1}`}
+          Editing ΓÇö {clip?.title || `Clip ${clipIndex + 1}`}
         </div>
         <div style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--nc-text-faint)' }}>
           {project ? `v${project.version}` : ''}
@@ -181,8 +181,11 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
             pushToast={pushToast}
             controller={controller}
           />
-          {/* Condition 4: copilot edits route through the same queue. */}
+          {/* Condition 4: copilot edits route through the same queue.
+              Keyed by clip identity + session: a clip switch or session
+              reset remounts the panel, dropping any stale AI result. */}
           <CopilotPanel
+            key={`${jobId}:${clipIndex}:${resetKey}`}
             jobId={jobId}
             clipIndex={clipIndex}
             applyEdit={controller.applyEdit}

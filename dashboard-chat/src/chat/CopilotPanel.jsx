@@ -23,17 +23,31 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
   const [applying, setApplying] = useState(false);
   const [applied, setApplied] = useState(false);
 
+  // A generated patch is bound to the (jobId, clipIndex) identity that
+  // produced it. If the host switches clips (or the session resets) the
+  // stale result is neither shown nor appliable. Only useState is used
+  // here (no refs/effects) so the panel stays testable with a minimal
+  // hook harness.
+  const identityMatches = (id) =>
+    !!id && id.jobId === jobId && id.clipIndex === clipIndex;
+  const visibleResult =
+    !result ? null : result.ok ? (identityMatches(result.identity) ? result : null) : result;
+
   const run = async () => {
     const instruction = prompt.trim();
     if (!instruction || busy) return;
+    // Capture the identity at request time: a clip switch while the AI is
+    // thinking must not let the late response attach to the new clip.
+    const identity = { jobId, clipIndex };
     setBusy(true); setResult(null); setApplied(false);
     try {
-      const r = await editAiPatch(jobId, clipIndex, instruction);
+      const r = await editAiPatch(identity.jobId, identity.clipIndex, instruction);
       setResult({
         ok: true,
         explanation: r?.explanation || 'Patch ready.',
         patch: r?.patch || null,
         project: r?.project || null,
+        identity,
       });
     } catch (e) {
       setResult({ ok: false, error: e?.data?.detail || e.message });
@@ -44,6 +58,12 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
 
   const applyPatch = async () => {
     if (!result?.project || applying) return;
+    // Never apply a result across clip/session identity: drop the stale
+    // result instead of pushing another clip's project through applyEdit.
+    if (!identityMatches(result.identity)) {
+      setResult(null);
+      return;
+    }
     setApplying(true);
     try {
       const patched = result.project;
@@ -76,9 +96,9 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
     if (!keys.length) return 'project patch';
     return keys.map((k) => {
       const v = patch[k];
-      const short = typeof v === 'string' && v.length > 42 ? `${v.slice(0, 42)}…` : JSON.stringify(v)?.slice(0, 42);
-      return `${k} → ${short}`;
-    }).join(' · ');
+      const short = typeof v === 'string' && v.length > 42 ? `${v.slice(0, 42)}ΓÇª` : JSON.stringify(v)?.slice(0, 42);
+      return `${k} ΓåÆ ${short}`;
+    }).join(' ┬╖ ');
   };
 
   if (!open) {
@@ -142,13 +162,13 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
           </button>
         </div>
 
-        {result?.ok && (
+        {visibleResult?.ok && (
           <div className="nc-anim-fade-in" style={{ fontSize: 12.5, lineHeight: 1.55 }}>
             <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start', color: 'var(--nc-text)' }}>
               <Check size={14} style={{ color: 'var(--nc-green)', flexShrink: 0, marginTop: 2 }} />
-              <span>{result.explanation}</span>
+              <span>{visibleResult.explanation}</span>
             </div>
-            {result.patch && (
+            {visibleResult.patch && (
               <div style={{
                 marginTop: 8, padding: '8px 10px', borderRadius: 10,
                 background: 'rgba(255,255,255,0.04)', border: '1px solid var(--nc-border)',
@@ -160,19 +180,19 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
             {!applied ? (
               <button className="nc-btn-primary" style={{ width: '100%', marginTop: 10, fontSize: 13 }} disabled={applying} onClick={applyPatch}>
                 {applying ? <Loader2 size={14} style={{ animation: 'nc-spin 1s linear infinite' }} /> : <Check size={14} />}
-                {applying ? 'Applying…' : 'Apply to project'}
+                {applying ? 'ApplyingΓÇª' : 'Apply to project'}
               </button>
             ) : (
               <div style={{ marginTop: 10, fontSize: 12.5, color: 'var(--nc-green)', display: 'flex', alignItems: 'center', gap: 6 }}>
-                <Check size={14} /> Applied — re-export from the editor to render it.
+                <Check size={14} /> Applied ΓÇö re-export from the editor to render it.
               </div>
             )}
           </div>
         )}
 
-        {result && !result.ok && (
+        {visibleResult && !visibleResult.ok && (
           <div className="nc-anim-fade-in" style={{ fontSize: 12.5, color: 'var(--nc-red)', lineHeight: 1.5 }}>
-            {result.error}
+            {visibleResult.error}
           </div>
         )}
 

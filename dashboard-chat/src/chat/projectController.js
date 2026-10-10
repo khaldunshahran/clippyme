@@ -1,5 +1,5 @@
 /**
- * Task 16 — single authoritative project controller for the chat editor.
+ * Task 16 ΓÇö single authoritative project controller for the chat editor.
  *
  * Before Task 16 the outer EditorView owned a project + edit queue while the
  * nested ClipEditorView independently fetched, mutated, saved, and exported
@@ -17,7 +17,7 @@
  *  - version restore / reset-to-AI-cut (draft-only, keeps the restored
  *    version's idempotency key so an unchanged export dedups),
  *  - export: drains the queue, snapshots the acknowledged project+version,
- *    and composes EXACTLY that snapshot — edits made while the compose is
+ *    and composes EXACTLY that snapshot ΓÇö edits made while the compose is
  *    in flight queue behind it and cannot change the export's identity,
  *  - generation tokens: load/restore/reset/dispose bump a generation so
  *    late async responses can never update another clip's (or user's) state.
@@ -26,7 +26,7 @@
  * and mint a fresh idempotency_key (so the next export is a NEW render,
  * never a dedup hit). Version restore/reset keep the restored version's key.
  * Undo/redo restore snapshots with their original keys (existing queue
- * behavior — honest stacks and honest saved state).
+ * behavior ΓÇö honest stacks and honest saved state).
  *
  * Framework-agnostic (no React): EditorView instantiates one per clip and
  * subscribes; the nested ClipEditorView renders controller state in
@@ -75,10 +75,30 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   if (!api) throw new Error('createProjectController: api is required');
   const toast = onToast || (() => {});
 
-  // Generation token: bumped on every load/restore/reset/dispose so late
-  // async responses are dropped instead of updating another clip's state.
+  // Generation token: bumped on load/reset/dispose so late async responses
+  // are dropped instead of updating another clip's state. Ordinary
+  // serialized operations (version restore / reset-to-AI-cut) do NOT bump
+  // it: they queue behind in-flight work instead of cancelling it.
   let gen = 0;
   const alive = (token) => token === gen;
+
+  // Disposal is terminal for new operations: a disposed controller rejects
+  // every new mutation/query before any transform or API call, so a delayed
+  // callback (upload/AI response) can never save through it. load() is the
+  // explicit lifecycle restart and revives a disposed controller -- the host
+  // calls load() after a StrictMode remount whose cleanup disposed the
+  // shared controller, so a terminal load() would wedge the editor in dev.
+  let disposed = false;
+  function disposedError(what) {
+    const e = new Error(`${what} rejected: project controller is disposed`);
+    e.code = 'DISPOSED';
+    return e;
+  }
+  // Returns a rejected promise when disposed, else null.
+  function rejectIfDisposed(what) {
+    if (disposed) return Promise.reject(disposedError(what));
+    return null;
+  }
 
   let state = {
     status: 'loading', // loading | ready | error
@@ -135,7 +155,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
       const stale = isStaleError(e);
       toast(
         stale
-          ? 'Someone else saved first — reloading the latest version.'
+          ? 'Someone else saved first ΓÇö reloading the latest version.'
           : `Couldn't save (${label}): ${e?.message || 'unknown error'}`
       );
       if (stale) load().catch(() => {});
@@ -144,6 +164,8 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
 
   /** Load the latest project; 404 -> backfill once, then retry. */
   async function load() {
+    // Explicit lifecycle (re)start: revives a disposed controller.
+    disposed = false;
     const token = ++gen;
     set({ status: 'loading', loadError: '' });
     try {
@@ -181,6 +203,8 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
    * `mutate` is the queue's pure project transform.
    */
   function applyEdit(label, mutate, opts = {}) {
+    const rejected = rejectIfDisposed('applyEdit');
+    if (rejected) return rejected;
     return queue.applyEdit(
       label,
       async (before) => {
@@ -196,10 +220,14 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   }
 
   function undo() {
+    const rejected = rejectIfDisposed('undo');
+    if (rejected) return rejected;
     return queue.undo();
   }
 
   function redo() {
+    const rejected = rejectIfDisposed('redo');
+    if (rejected) return rejected;
     return queue.redo();
   }
 
@@ -209,6 +237,8 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
    * Always carries expectedVersion = the last acknowledged version.
    */
   function saveDraft() {
+    const rejected = rejectIfDisposed('saveDraft');
+    if (rejected) return rejected;
     if (!state.project || !state.dirty) return Promise.resolve(null);
     const token = gen;
     return queue
@@ -234,7 +264,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
         const stale = isStaleError(e);
         toast(
           stale
-            ? 'Someone else saved first — reloading the latest version.'
+            ? 'Someone else saved first ΓÇö reloading the latest version.'
             : `Couldn't save (save draft): ${e?.message || 'unknown error'}`
         );
         if (stale) load().catch(() => {});
@@ -249,6 +279,8 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
    * in-flight export's identity. Returns { ...composeResult, identity }.
    */
   function exportProject() {
+    const rejected = rejectIfDisposed('exportProject');
+    if (rejected) return rejected;
     if (!state.project) return Promise.reject(new Error('no project loaded'));
     const token = gen;
     return queue.drain(async () => {
@@ -284,7 +316,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
         const stale = isStaleError(e);
         toast(
           stale
-            ? 'Someone else saved first — reloading the latest version.'
+            ? 'Someone else saved first ΓÇö reloading the latest version.'
             : `Export failed: ${e?.message || 'unknown error'}`
         );
         if (stale) load().catch(() => {});
@@ -296,7 +328,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   }
 
   // Draft-only restore: keeps the restored version's idempotency key (an
-  // unchanged export dedups to the identical file — a true undo) and marks
+  // unchanged export dedups to the identical file ΓÇö a true undo) and marks
   // dirty. ackVersion stays at the last acknowledged version so the
   // follow-up save carries a valid expectedVersion, not a stale one.
   async function restoreLocked(version, token) {
@@ -309,13 +341,23 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
 
   /** Load a recorded version into the draft (dirty, unsaved). */
   function restoreVersion(version) {
-    const token = ++gen;
+    const rejected = rejectIfDisposed('restoreVersion');
+    if (rejected) return rejected;
+    // Ordinary serialized restore: does NOT bump the generation. It queues
+    // behind in-flight work (e.g. an export awaiting compose) instead of
+    // cancelling it. resetSession()/dispose() still cancel it through their
+    // own invalidation.
+    const token = gen;
     return queue.drain(() => restoreLocked(version, token));
   }
 
   /** Reset the draft to the earliest AI cut (dirty, unsaved). */
   function resetToAiCut() {
-    const token = ++gen;
+    const rejected = rejectIfDisposed('resetToAiCut');
+    if (rejected) return rejected;
+    // Same serialized semantics as restoreVersion: queues behind in-flight
+    // work instead of invalidating it.
+    const token = gen;
     return queue.drain(async () => {
       const r = await api.listClipProjectVersions(jobId, clipIndex);
       const vs = r?.versions || [];
@@ -328,6 +370,8 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
 
   /** Refresh the version-history list (passive: never bumps the generation). */
   function listVersions() {
+    const rejected = rejectIfDisposed('listVersions');
+    if (rejected) return rejected;
     const token = gen;
     set({ versionsLoading: true });
     return api.listClipProjectVersions(jobId, clipIndex).then(
@@ -346,6 +390,8 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
 
   /** AI trim: ask the backend for drop ranges (generation-guarded). */
   function aiTrim(instruction) {
+    const rejected = rejectIfDisposed('aiTrim');
+    if (rejected) return rejected;
     const token = gen;
     return api.editClipAI(jobId, clipIndex, instruction).then((r) => {
       if (!alive(token)) throw new Error('clip changed while the AI was thinking');
@@ -354,16 +400,19 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   }
 
   function uploadAudio(file) {
+    const rejected = rejectIfDisposed('uploadAudio');
+    if (rejected) return rejected;
     return api.uploadAudio(jobId, file);
   }
 
   /**
    * Session reset (sign-out / signed-in user change): drop undo/redo
-   * history, the cached project, and invalidate in-flight responses —
+   * history, the cached project, and invalidate in-flight responses ΓÇö
    * the existing session-reset behavior (queue.clear, project null,
    * remount via the host's reset key).
    */
   function resetSession() {
+    if (disposed) return; // already terminally shut down; nothing to reset
     gen += 1;
     queue.clear();
     set({
@@ -380,8 +429,13 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
     });
   }
 
-  /** Clip switch / unmount: invalidate in-flight work, drop listeners. */
+  /**
+   * Clip switch / unmount: invalidate in-flight work, drop listeners, and
+   * reject every future operation. Terminal -- only load() restarts.
+   */
   function dispose() {
+    if (disposed) return;
+    disposed = true;
     gen += 1;
     queue.clear(); // pending queue work never starts; in-flight results are dropped
     listeners.clear();
