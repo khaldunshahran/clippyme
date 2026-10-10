@@ -3,6 +3,7 @@ import { Loader2, TriangleAlert, Info, Link2, Check, X, Sparkles } from 'lucide-
 import { ProgressBody } from './ProgressPill.jsx';
 import ClipRow from './ClipRow.jsx';
 import CaptionCarousel from './CaptionCarousel.jsx';
+import HyperframesCard from './HyperframesCard.jsx';
 
 /**
  * Single card for a validated link. It MORPHS in place through the job
@@ -206,33 +207,30 @@ function ProposalMsg({ data, onApply, onDiscard }) {
 }
 
 /**
- * Task 17 — the /hyperframes command. Honest pending-adapter state: shows
- * the command and the selected scope (or "no clip selected"), and says the
- * adapter lands in Task 18. This message is pushed with zero provider calls
- * and zero mutations — ordinary edits stay available.
+ * Task 17 (pending adapter) + Task 18 (real capability card): the
+ * /hyperframes command message is pushed with zero provider calls and zero
+ * mutations (contract: ordinary edits stay available). The card itself
+ * carries the real capability proposal/apply/preview/render states, and
+ * contract 8 is enforced via activeSelectionKey: delayed async responses
+ * can never replace another selection's preview.
  */
-function HyperframesMsg({ data }) {
+function HyperframesMsg({ data, activeSelectionKey }) {
   const d = data || {};
-  const scope = d.scope && Number.isInteger(d.scope.clipIndex)
-    ? `Clip ${d.scope.clipIndex + 1}`
-    : 'no clip selected';
+  const scope = d.scope || {};
   return (
-    <div className="nc-card nc-anim-fade-up" style={{ padding: 14, maxWidth: 520, borderColor: 'rgba(10,129,217,0.4)' }}>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
-        <Sparkles size={15} style={{ color: 'var(--nc-accent)', flexShrink: 0 }} />
-        <code style={{ fontSize: 13, color: 'var(--nc-text)', wordBreak: 'break-all' }}>{d.command || '/hyperframes'}</code>
-      </div>
-      <div style={{ fontSize: 12.5, color: 'var(--nc-text-dim)', lineHeight: 1.55 }}>
-        Scope: {scope} — not available yet. The Hyperframes adapter lands in Task 18; this command did nothing.
-      </div>
-      <div style={{ fontSize: 12.5, color: 'var(--nc-text-dim)', lineHeight: 1.55, marginTop: 6 }}>
-        Ordinary caption, hook and trim edits work now — select a clip and describe the change.
-      </div>
-    </div>
+    <HyperframesCard
+      data={{
+        command: d.command || '/hyperframes',
+        jobId: scope.jobId ?? null,
+        index: Number.isInteger(scope.clipIndex) ? scope.clipIndex : null,
+        scope: scope.jobId != null && Number.isInteger(scope.clipIndex) ? 'single' : 'global',
+      }}
+      activeSelectionKey={activeSelectionKey}
+    />
   );
 }
 
-export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue, onApplyProposal, onDiscardProposal }) {
+export default function ChatThread({ thread, activeSelectionKey, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue, onApplyProposal, onDiscardProposal }) {
   const bottomRef = useRef(null);
   const msgs = thread?.messages || [];
 
@@ -304,7 +302,7 @@ export default function ChatThread({ thread, onOpenClip, onEditClip, onScheduleC
                 </div>
               );
             case 'hyperframes':
-              return <div key={m.id}><HyperframesMsg data={m.data} /></div>;
+              return <div key={m.id}><HyperframesMsg data={m.data} activeSelectionKey={activeSelectionKey} /></div>;
             case 'notice':
               return (
                 <div key={m.id} className="nc-anim-fade-up" style={{ display: 'flex', gap: 8, alignItems: 'flex-start', maxWidth: 640 }}>

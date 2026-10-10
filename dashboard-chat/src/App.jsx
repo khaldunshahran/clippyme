@@ -225,6 +225,7 @@ function AppShell() {
             ) : (
               <ChatThread
                 thread={active}
+                activeSelectionKey={selectedClip ? `${selectedClip.jobId}:${selectedClip.clipIndex}` : null}
                 onOpenClip={(i) => openClip(activeId, i)}
                 onEditClip={(i) => handleSelectClip(activeId, i)}
                 onScheduleClip={(i) => openSchedule(activeId, i)}

@@ -93,6 +93,7 @@ from clippyme.api.dubbing_routes import router as dubbing_router
 from clippyme.api.studio_routes import router as studio_router
 from clippyme.api.ugc_routes import router as ugc_router
 from clippyme.api.highlight_routes import router as highlight_router
+from clippyme.api.hyperframes_routes import router as hyperframes_router
 from clippyme.api.billing_routes import router as billing_router
 from clippyme.api.trend_routes import make_trend_router
 from clippyme.api.channel_routes import router as channel_router
@@ -453,6 +454,7 @@ app.include_router(dubbing_router)
 app.include_router(studio_router)
 app.include_router(ugc_router)
 app.include_router(highlight_router)
+app.include_router(hyperframes_router)
 app.include_router(billing_router)
 trend_router = make_trend_router(
     jobs=jobs,

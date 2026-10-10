@@ -81,3 +81,6 @@ output_test/
 
 # editor-program backup files
 *.bak-*
+
+# Task 18: isolated Hyperframes worker Chromium (re-downloadable, ~150MB)
+hyperframes-worker/.puppeteer-cache/

@@ -522,6 +522,23 @@ class ProjectFraming(BaseModel):
         return self
 
 
+class HyperframesFinishing(BaseModel):
+    """Task 18: optional Hyperframes finishing selection (additive, default OFF).
+
+    ``renderer="hyperframes"`` is the explicit opt-in; the default
+    ``"legacy"`` keeps the accepted renderer. ``template`` and the caption
+    enums are closed sets validated by the finishing compiler. Old projects
+    without this field validate, save/load, undo, preview and render through
+    existing paths.
+    """
+
+    renderer: Literal["legacy", "hyperframes"] = "legacy"
+    template: Optional[Literal["clean-captions", "emphasized-word",
+                              "timed-opening"]] = None
+    caption_size: Literal["small", "medium", "large"] = "medium"
+    caption_position: Literal["lower-third", "middle"] = "lower-third"
+
+
 class ClipProject(BaseModel):
     # NOTE: the field name "schema" intentionally matches the plan's contract
     # ("nugget.clip-project/1"). Pydantic v2 emits a harmless UserWarning that
@@ -566,6 +583,11 @@ class ClipProject(BaseModel):
     # Additive optional Task 15 field; old projects without it validate,
     # save/load, undo, preview and render through existing paths.
     opening: Optional[OpeningSelection] = Field(default=None)
+
+    # Task 18: optional Hyperframes finishing selection. Additive optional
+    # field; default renderer is "legacy" (OFF). Old projects without it
+    # validate, save/load, undo, preview and render through existing paths.
+    finishing: Optional[HyperframesFinishing] = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod

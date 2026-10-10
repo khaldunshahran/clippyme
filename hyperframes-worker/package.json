@@ -1,0 +1,16 @@
+{
+  "name": "nugget-hyperframes-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated local Hyperframes render worker for Nugget Task 18 (pilot). Pinned official packages only.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "render": "node render.js"
+  },
+  "dependencies": {
+    "@hyperframes/core": "0.8.145",
+    "@hyperframes/engine": "0.8.145",
+    "@hyperframes/player": "0.8.145"
+  }
+}

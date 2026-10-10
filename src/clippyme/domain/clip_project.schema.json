@@ -473,6 +473,58 @@
       "title": "Grade",
       "type": "object"
     },
+    "HyperframesFinishing": {
+      "description": "Task 18: optional Hyperframes finishing selection (additive, default OFF).\n\n``renderer=\"hyperframes\"`` is the explicit opt-in; the default\n``\"legacy\"`` keeps the accepted renderer. ``template`` and the caption\nenums are closed sets validated by the finishing compiler. Old projects\nwithout this field validate, save/load, undo, preview and render through\nexisting paths.",
+      "properties": {
+        "renderer": {
+          "default": "legacy",
+          "enum": [
+            "legacy",
+            "hyperframes"
+          ],
+          "title": "Renderer",
+          "type": "string"
+        },
+        "template": {
+          "anyOf": [
+            {
+              "enum": [
+                "clean-captions",
+                "emphasized-word",
+                "timed-opening"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Template"
+        },
+        "caption_size": {
+          "default": "medium",
+          "enum": [
+            "small",
+            "medium",
+            "large"
+          ],
+          "title": "Caption Size",
+          "type": "string"
+        },
+        "caption_position": {
+          "default": "lower-third",
+          "enum": [
+            "lower-third",
+            "middle"
+          ],
+          "title": "Caption Position",
+          "type": "string"
+        }
+      },
+      "title": "HyperframesFinishing",
+      "type": "object"
+    },
     "OpeningEvidenceRef": {
       "description": "One cited evidence item behind a grounded opening option.",
       "properties": {
@@ -541,7 +593,7 @@
       "type": "object"
     },
     "OpeningSelection": {
-      "description": "Task 15: grounded opening (hook) identity carried by the project.\n\nAdditive optional field. ``status=\"selected\"`` carries the validated\nselected option (identity, evidence, clip-relative display timing,\npacket identity, versions). ``status=\"user_authored\"`` marks an\nexplicit user-authored override. ``status=\"none\"`` records an honest\nno-selection with the reason. ``legacy_unverified_hook`` keeps the\nold automatic hook text only as clearly unverified legacy metadata —\nnever promoted as grounded.",
+      "description": "Task 15: grounded opening (hook) identity carried by the project.\n\nAdditive optional field. ``status=\"selected\"`` carries the validated\nselected option (identity, evidence, clip-relative display timing,\npacket identity, versions). ``status=\"user_authored\"`` marks an\nexplicit user-authored override. ``status=\"none\"`` records an honest\nno-selection with the reason. ``legacy_unverified_hook`` keeps the\nold automatic hook text only as clearly unverified legacy metadata \u2014\nnever promoted as grounded.",
       "properties": {
         "status": {
           "enum": [
@@ -1095,9 +1147,21 @@
         }
       ],
       "default": null
+    },
+    "finishing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HyperframesFinishing"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [
+    "schema",
     "job_id",
     "clip_index",
     "source",
