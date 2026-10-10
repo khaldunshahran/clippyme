@@ -52,6 +52,19 @@ function isStaleError(e) {
   return e?.status === 409 || /stale project version/i.test(e?.message || '');
 }
 
+// Cancellation (session reset / controller dispose) is expected, not a
+// failure: callers observe a rejection, but nothing toasts and no state
+// is resurrected.
+function cancelledOp(what) {
+  const e = new Error(`${what} cancelled (session reset or controller disposed)`);
+  e.code = 'QUEUE_CANCELLED';
+  return e;
+}
+
+function isCancelled(e) {
+  return e?.code === 'QUEUE_CANCELLED';
+}
+
 // getClipProject resolves to either the bare project or (older callers)
 // { project }; normalize both.
 function normalizeProject(res) {
@@ -102,6 +115,12 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   const queue = createEditQueue({
     getProject: () => state.project,
     saveProject: (p, opts) => api.saveClipProject(jobId, clipIndex, p, opts),
+    // The authoritative concurrency version for normal saves. After a
+    // version restore the draft keeps its historical version while the
+    // server sits at ackVersion -- saves must target the acknowledged
+    // version, not the stale draft one. Explicit opts.expectedVersion
+    // (the AI base-version guard) always wins.
+    getExpectedVersion: () => state.ackVersion,
     onUpdate: (_label, saved) => {
       const proj = normalizeProject(saved);
       set({
@@ -191,12 +210,15 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
    */
   function saveDraft() {
     if (!state.project || !state.dirty) return Promise.resolve(null);
-    set({ saving: true });
+    const token = gen;
     return queue
       .drain(async () => {
+        if (!alive(token)) throw cancelledOp('save draft');
+        set({ saving: true });
         const saved = await api.saveClipProject(jobId, clipIndex, state.project, {
           expectedVersion: state.ackVersion,
         });
+        if (!alive(token)) throw cancelledOp('save draft');
         const proj = normalizeProject(saved);
         set({
           project: proj ? clone(proj) : state.project,
@@ -207,6 +229,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
         return saved;
       })
       .catch((e) => {
+        if (isCancelled(e) || !alive(token)) throw e; // stale: silent
         set({ saving: false });
         const stale = isStaleError(e);
         toast(
@@ -227,13 +250,18 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
    */
   function exportProject() {
     if (!state.project) return Promise.reject(new Error('no project loaded'));
-    set({ exporting: true });
+    const token = gen;
     return queue.drain(async () => {
+      // A reset/dispose captured under an older lifetime must not let a
+      // completed export replace the current preview or record lastExport.
+      if (!alive(token)) throw cancelledOp('export');
+      set({ exporting: true });
       try {
         if (state.dirty) {
           const saved = await api.saveClipProject(jobId, clipIndex, state.project, {
             expectedVersion: state.ackVersion,
           });
+          if (!alive(token)) throw cancelledOp('export');
           const proj = normalizeProject(saved);
           set({
             project: proj ? clone(proj) : state.project,
@@ -247,10 +275,12 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
           idempotency_key: snapshot?.idempotency_key ?? null,
         };
         const res = await api.composeProject(jobId, clipIndex, snapshot);
+        if (!alive(token)) throw cancelledOp('export');
         const out = { ...(res || {}), identity };
         set({ lastExport: { identity, result: res || null } });
         return out;
       } catch (e) {
+        if (isCancelled(e) || !alive(token)) throw e; // stale: silent, no toast
         const stale = isStaleError(e);
         toast(
           stale
@@ -260,7 +290,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
         if (stale) load().catch(() => {});
         throw e;
       } finally {
-        set({ exporting: false });
+        if (alive(token)) set({ exporting: false });
       }
     });
   }
@@ -353,6 +383,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   /** Clip switch / unmount: invalidate in-flight work, drop listeners. */
   function dispose() {
     gen += 1;
+    queue.clear(); // pending queue work never starts; in-flight results are dropped
     listeners.clear();
   }
 

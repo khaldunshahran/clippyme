@@ -58,8 +58,33 @@ export function createControlledActions(controller, view = {}) {
     }
   };
   return {
-    /** User edit -> the controller's serialized queue (stamps origin/key). */
-    mutate: (label, fn) => controller.applyEdit(label, fn),
+    /**
+     * User edit -> the controller's serialized queue (stamps origin/key).
+     *
+     * The real panel callbacks mutate the draft in place and return
+     * nothing; the queue expects (clone) => nextProject. Adapt: run the
+     * callback on the provided clone and keep the mutated clone when it
+     * returns undefined. A non-object return is a programming error, not a
+     * project -- reject it instead of saving garbage. Standalone behavior
+     * is untouched (this bridge only exists in controlled mode).
+     *
+     * Panel callbacks are fire-and-forget: the queue already surfaces
+     * failures via onError/toast, so swallow here to avoid unhandled
+     * rejections. Callers that await still observe the rejection, and no
+     * success is ever signalled before the save is acknowledged.
+     */
+    mutate: (label, fn) => {
+      const p = controller.applyEdit(label, async (before) => {
+        const out = await fn(before);
+        if (out === undefined) return before;
+        if (out && typeof out === 'object') return out;
+        throw new Error(
+          `controlled mutate: callback must mutate in place or return a project (got ${typeof out})`
+        );
+      });
+      p.catch(() => {});
+      return p;
+    },
     save: async () => {
       const saved = await controller.saveDraft();
       if (saved) toast(`Draft saved as v${saved.version ?? saved?.project?.version ?? ''}`);
