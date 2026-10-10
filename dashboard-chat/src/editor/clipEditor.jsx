@@ -18,6 +18,89 @@ import {
   uploadAudio,
 } from '../api/realApi';
 
+// ------------------------------------------------------- authority mode
+// Task 16: one save authority. When hosted by EditorView the nested editor
+// is CONTROLLED (a project controller is provided): it renders the
+// controller's project and forwards every mutation through it -- it never
+// fetches, saves, or exports its own copy. An explicit `standalone` prop
+// keeps the original self-contained behavior for independent callers. Any
+// other combination is a configuration error, never a silent second
+// authority.
+
+/**
+ * Decide which authority mode the nested editor runs in.
+ * - controller provided -> 'controlled'
+ * - standalone === true -> 'standalone'
+ * - anything else        -> 'unconfigured' (rendered as an error)
+ * A controller always wins over `standalone`: exactly one save authority.
+ */
+export function resolveEditorMode({ controller, standalone }) {
+  if (controller) return 'controlled';
+  if (standalone === true) return 'standalone';
+  return 'unconfigured';
+}
+
+/**
+ * Controlled-mode actions: the exact forwarding ClipEditorView uses when a
+ * project controller is provided. Module-level so tests can exercise this
+ * real path (real controller + stubbed API) and prove the nested view never
+ * touches the API directly in controlled mode.
+ *
+ * `view` carries the small view-owned hooks the actions need:
+ * pushToast, setSelSeg, onExported(res).
+ */
+export function createControlledActions(controller, view = {}) {
+  const toast = (msg) => {
+    try {
+      view.pushToast?.(msg);
+    } catch {
+      /* ignore */
+    }
+  };
+  return {
+    /** User edit -> the controller's serialized queue (stamps origin/key). */
+    mutate: (label, fn) => controller.applyEdit(label, fn),
+    save: async () => {
+      const saved = await controller.saveDraft();
+      if (saved) toast(`Draft saved as v${saved.version ?? saved?.project?.version ?? ''}`);
+      return saved;
+    },
+    exportProject: async () => {
+      const res = await controller.exportProject();
+      try {
+        view.onExported?.(res);
+      } catch {
+        /* ignore */
+      }
+      return res;
+    },
+    /** Version restore -> controller (keeps the restored key, marks dirty). */
+    loadVersion: async (v) => {
+      const proj = await controller.restoreVersion(v);
+      try {
+        view.setSelSeg?.(0);
+      } catch {
+        /* ignore */
+      }
+      toast(`Loaded v${v} into the draft — save or export to keep it`);
+      return proj;
+    },
+    resetToAiCut: async () => {
+      const proj = await controller.resetToAiCut();
+      try {
+        view.setSelSeg?.(0);
+      } catch {
+        /* ignore */
+      }
+      toast(`Reset to the AI cut (v${proj?.version ?? ''}) — save or export to keep it`);
+      return proj;
+    },
+    refreshVersions: () => controller.listVersions(),
+    aiTrim: (instruction) => controller.aiTrim(instruction),
+    uploadAudio: (file) => controller.uploadAudio(file),
+  };
+}
+
 // ---------------------------------------------------------------- helpers
 
 const fmtT = (s) => {
@@ -573,40 +656,82 @@ function VersionsPanel({ versions, currentVersion, onLoad, onPreviewVersion, loa
 
 // ---------------------------------------------------------- main editor view
 
-export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
-  const [status, setStatus] = useState('loading'); // loading | ready | error
-  const [loadError, setLoadError] = useState('');
-  const [project, setProject] = useState(null);
-  const [savedVersion, setSavedVersion] = useState(null);
-  const [dirty, setDirty] = useState(false);
-  const [versions, setVersions] = useState([]);
-  const [versionsLoading, setVersionsLoading] = useState(false);
+export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, controller = null, standalone = false }) {
+  const [statusLocal, setStatusLocal] = useState('loading'); // loading | ready | error
+  const [loadErrorLocal, setLoadErrorLocal] = useState('');
+  const [projectLocal, setProjectLocal] = useState(null);
+  const [savedVersionLocal, setSavedVersionLocal] = useState(null);
+  const [dirtyLocal, setDirtyLocal] = useState(false);
+  const [versionsLocal, setVersionsLocal] = useState([]);
+  const [versionsLoadingLocal, setVersionsLoadingLocal] = useState(false);
   const [videoSrc, setVideoSrc] = useState('');
   const [playhead, setPlayhead] = useState(0);
   const [selSeg, setSelSeg] = useState(0);
   const [loopSeg, setLoopSeg] = useState(true);
   const [panel, setPanel] = useState('trim');
-  const [saving, setSaving] = useState(false);
-  const [exporting, setExporting] = useState(false);
+  const [savingLocal, setSavingLocal] = useState(false);
+  const [exportingLocal, setExportingLocal] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [aiText, setAiText] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
   const [aiMsg, setAiMsg] = useState('');
   const videoRef = useRef(null);
 
+  // Task 16 authority mode: controlled (via the project controller) or
+  // standalone (explicit). Authority-owned state reads from the controller
+  // in controlled mode; standalone keeps its local state.
+  const mode = resolveEditorMode({ controller, standalone });
+  const ctl = useMemo(
+    () =>
+      mode === 'controlled'
+        ? createControlledActions(controller, {
+            pushToast,
+            setSelSeg,
+            onExported: (res) => {
+              if (res && res.composed_url) {
+                const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
+                setVideoSrc(safeResolveUrl(res.composed_url) + bust);
+                setPlayhead(0);
+              }
+              pushToast?.(
+                res && res.deduped
+                  ? `v${res.version} unchanged — reused the existing render`
+                  : `Exported v${res.version} — previewing the exact render`
+              );
+            },
+          })
+        : null,
+    // pushToast/setSelSeg/setVideoSrc/setPlayhead are stable (prop callback / setState).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [mode, controller]
+  );
+  const ctlSnap = mode === 'controlled' ? controller.getState() : null;
+  const status = mode === 'controlled' ? ctlSnap.status : statusLocal;
+  const loadError = mode === 'controlled' ? ctlSnap.loadError : loadErrorLocal;
+  const project = mode === 'controlled' ? ctlSnap.project : projectLocal;
+  const savedVersion = mode === 'controlled' ? ctlSnap.project?.version ?? null : savedVersionLocal;
+  const dirty = mode === 'controlled' ? ctlSnap.dirty : dirtyLocal;
+  const versions = mode === 'controlled' ? ctlSnap.versions : versionsLocal;
+  const versionsLoading = mode === 'controlled' ? ctlSnap.versionsLoading : versionsLoadingLocal;
+  const saving = mode === 'controlled' ? ctlSnap.saving : savingLocal;
+  const exporting = mode === 'controlled' ? ctlSnap.exporting : exportingLocal;
+
   const title = (clip && (clip.video_title_for_youtube_short || clip.title)) || `Clip ${clipIndex + 1}`;
 
   const refreshVersions = useCallback(async () => {
-    setVersionsLoading(true);
+    if (ctl) { await ctl.refreshVersions(); return; }
+    setVersionsLoadingLocal(true);
     try {
       const r = await listClipProjectVersions(jobId, clipIndex);
-      setVersions(r.versions || []);
+      setVersionsLocal(r.versions || []);
     } catch { /* keep previous list */ }
-    finally { setVersionsLoading(false); }
-  }, [jobId, clipIndex]);
+    finally { setVersionsLoadingLocal(false); }
+  }, [jobId, clipIndex, ctl]);
 
   // Load: latest project; backfill first if this clip has none (old job).
+  // Standalone only -- in controlled mode the controller owns loading.
   useEffect(() => {
+    if (mode === 'controlled') return;
     let alive = true;
     (async () => {
       try {
@@ -620,31 +745,43 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
           } else { throw e; }
         }
         if (!alive) return;
-        setProject(proj);
-        setSavedVersion(proj.version);
+        setProjectLocal(proj);
+        setSavedVersionLocal(proj.version);
         setVideoSrc(clipPreviewSrc(clip, null));
-        setStatus('ready');
+        setStatusLocal('ready');
         refreshVersions();
       } catch (e) {
         if (!alive) return;
-        setLoadError((e && e.message) || 'Could not load the clip project.');
-        setStatus('error');
+        setLoadErrorLocal((e && e.message) || 'Could not load the clip project.');
+        setStatusLocal('error');
       }
     })();
     return () => { alive = false; };
     // clip is a stable prop from the results list; intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, clipIndex]);
+  }, [jobId, clipIndex, mode]);
+
+  // Controlled mode: the controller owns the project; seed the preview from
+  // the clip (the controller swaps it to the exact render on export).
+  useEffect(() => {
+    if (mode !== 'controlled') return;
+    setVideoSrc(clipPreviewSrc(clip, null));
+    // clip is a stable prop from the results list; intentionally not a dep.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, jobId, clipIndex]);
 
   // Keep the selected segment in range when segments change.
   useEffect(() => {
     if (project && selSeg >= project.segments.length) setSelSeg(0);
   }, [project, selSeg]);
 
-  // Every user edit: deep-mutate the draft, mark origin=user, mint a fresh
-  // idempotency key (so the next export is a NEW render, never a dedup hit).
-  const mutate = useCallback((fn) => {
-    setProject((prev) => {
+  // Standalone: every user edit deep-mutates the local draft, marks
+  // origin=user, and mints a fresh idempotency key (so the next export is a
+  // NEW render, never a dedup hit). Controlled: forward to the project
+  // controller's queue (which stamps origin/idempotency itself).
+  const mutate = useCallback((fn, label = 'edit') => {
+    if (ctl) return ctl.mutate(label, fn);
+    setProjectLocal((prev) => {
       if (!prev) return prev;
       const next = JSON.parse(JSON.stringify(prev));
       fn(next);
@@ -652,8 +789,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
       next.idempotency_key = newKey();
       return next;
     });
-    setDirty(true);
-  }, []);
+    setDirtyLocal(true);
+  }, [ctl]);
 
   const duration = (project && project.source && project.source.duration) || 0;
   const segs = (project && project.segments) || [];
@@ -683,7 +820,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
   const onSegTimes = (start, end) => mutate((p) => {
     const s = p.segments[selSeg];
     if (s) { s.start = start; s.end = end; }
-  });
+  }, 'trim segment');
   const onSplit = () => {
     const s = segs[selSeg];
     if (!s) return;
@@ -698,13 +835,13 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
         crop: cur.crop ? { ...cur.crop } : defaultCrop(p), transition_in: 'cut' };
       cur.end = t;
       p.segments.splice(selSeg + 1, 0, right);
-    });
+    }, 'split segment');
     pushToast?.('success', `Split into ${segs.length + 1} segments`);
   };
   const onDeleteSeg = () => {
     if (segs.length < 2) return;
     if (!window.confirm('Delete this segment?')) return;
-    mutate((p) => { p.segments.splice(selSeg, 1); });
+    mutate((p) => { p.segments.splice(selSeg, 1); }, 'delete segment');
     setSelSeg(0);
   };
 
@@ -712,13 +849,13 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
   const onMoveSeg = (i, dir) => {
     const j = i + dir;
     if (j < 0 || j >= segs.length) return;
-    mutate((p) => { const [s] = p.segments.splice(i, 1); p.segments.splice(j, 0, s); });
+    mutate((p) => { const [s] = p.segments.splice(i, 1); p.segments.splice(j, 0, s); }, 'move segment');
     setSelSeg(j);
   };
   const onTransition = (i, t) => mutate((p) => {
     const s = p.segments[i];
     if (s) s.transition_in = t === 'fade' ? 'fade' : 'cut';
-  });
+  }, 'segment transition');
   const clampCrop = (p, x, y) => {
     const W = (p.source && p.source.width) || 1920;
     const H = (p.source && p.source.height) || 1080;
@@ -733,20 +870,20 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
     const s = p.segments[selSeg];
     const c = (s && s.crop) || defaultCrop(p);
     clampCrop(p, c.x + dx, c.y + dy);
-  });
-  const onCropXY = (x, y) => mutate((p) => clampCrop(p, x, y));
+  }, 'crop');
+  const onCropXY = (x, y) => mutate((p) => clampCrop(p, x, y), 'crop');
   const onCropReset = () => mutate((p) => {
     const s = p.segments[selSeg];
     if (s) s.crop = defaultCrop(p);
-  });
+  }, 'crop');
 
   // --- 3b: music ---------------------------------------------------------------
   const onAudioUpload = async (file) => {
     if (uploading) return;
     setUploading(true);
     try {
-      const { file: rel } = await uploadAudio(jobId, file);
-      mutate((pp) => { pp.audio = [{ file: rel, volume: 1.0, offset: 0.0 }]; });
+      const { file: rel } = ctl ? await ctl.uploadAudio(file) : await uploadAudio(jobId, file);
+      mutate((pp) => { pp.audio = [{ file: rel, volume: 1.0, offset: 0.0 }]; }, 'music');
       pushToast?.('success', 'Music attached — mixed at export');
     } catch (e) {
       pushToast?.('error', 'Upload failed: ' + ((e && e.message) || e).slice(0, 140));
@@ -757,39 +894,39 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
   const onAudioVolume = (v) => mutate((pp) => {
     pp.audio = pp.audio && pp.audio.length ? pp.audio : [{ file: null, volume: 1.0, offset: 0.0 }];
     pp.audio[0].volume = clamp(v, 0, 1.5);
-  });
+  }, 'music');
   const onAudioOffset = (v) => mutate((pp) => {
     pp.audio = pp.audio && pp.audio.length ? pp.audio : [{ file: null, volume: 1.0, offset: 0.0 }];
     pp.audio[0].offset = Math.max(0, v);
-  });
+  }, 'music');
   const onAudioRemove = () => mutate((pp) => {
     pp.audio = [{ file: null, volume: 1.0, offset: 0.0 }];
-  });
+  }, 'music');
 
   // --- captions ----------------------------------------------------------
-  const onStyle = (style) => mutate((p) => { p.captions.style = style; });
-  const onPosition = (position) => mutate((p) => { p.captions.position = position; });
+  const onStyle = (style) => mutate((p) => { p.captions.style = style; }, 'caption style');
+  const onPosition = (position) => mutate((p) => { p.captions.position = position; }, 'caption position');
   const onWordEdit = (i, text, orig) => mutate((p) => {
     const ed = (p.captions.edits = p.captions.edits || {});
     if (text === orig) delete ed[String(i)];
     else ed[String(i)] = text;
-  });
-  const onClearEdits = () => mutate((p) => { p.captions.edits = {}; });
+  }, 'edit word');
+  const onClearEdits = () => mutate((p) => { p.captions.edits = {}; }, 'clear word edits');
 
   // --- hook ---------------------------------------------------------------
   const onHookChange = (patch) => mutate((p) => {
     const h = (p.overlays || []).find((o) => o.type === 'hook');
     if (h) Object.assign(h, patch);
-  });
+  }, 'hook');
   const onAddHook = () => mutate((p) => {
     const dur = (p.source && p.source.duration) || 10;
     p.overlays = p.overlays || [];
     p.overlays.push({ type: 'hook', text: '', style: 'viral',
       start: 0, end: r2(Math.min(3, dur)), position: 'top' });
-  });
+  }, 'add hook');
   const onRemoveHook = () => mutate((p) => {
     p.overlays = (p.overlays || []).filter((o) => o.type !== 'hook');
-  });
+  }, 'remove hook');
 
   // --- AI trim ("cut the intro" magic button) ------------------------------
   const onAskAi = async () => {
@@ -798,7 +935,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
     setAiBusy(true);
     setAiMsg('');
     try {
-      const { drop_ranges = [], explanation = '' } = await editClipAI(jobId, clipIndex, instr);
+      const { drop_ranges = [], explanation = '' } = ctl ? await ctl.aiTrim(instr) : await editClipAI(jobId, clipIndex, instr);
       if (!drop_ranges.length) { setAiMsg(explanation || 'Nothing to cut for that instruction.'); return; }
       const spans = keptSpans(duration, drop_ranges).filter(([s, e]) => e - s >= 0.5);
       if (!spans.length) { setAiMsg('That would cut the whole clip — nothing changed.'); return; }
@@ -809,7 +946,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
           id: `seg-${Date.now()}-${i}`, start: r2(s), end: r2(e),
           crop: crop0 ? { ...crop0 } : defaultCrop(p), transition_in: 'cut',
         }));
-      });
+      }, 'ai trim');
       setSelSeg(0);
       setAiMsg(explanation || `Cut into ${spans.length} segment${spans.length === 1 ? '' : 's'} — review the timeline, then save.`);
     } catch (e) {
@@ -824,12 +961,23 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
     if (!project || saving) return null;
     const errs = validateDraft(project);
     if (errs.length) { pushToast?.('error', errs[0]); return null; }
-    setSaving(true);
+    if (ctl) {
+      // Controlled: the draft is the controller's acknowledged project;
+      // saveDraft persists it (only dirty after restore/reset) with
+      // expectedVersion. createControlledActions toasts on success.
+      try {
+        return await ctl.save();
+      } catch (e) {
+        pushToast?.('Save failed: ' + ((e && e.message) || e).slice(0, 140));
+        return null;
+      }
+    }
+    setSavingLocal(true);
     try {
       const { version, project: saved } = await saveClipProject(jobId, clipIndex, project);
-      setProject(saved);
-      setSavedVersion(version);
-      setDirty(false);
+      setProjectLocal(saved);
+      setSavedVersionLocal(version);
+      setDirtyLocal(false);
       await refreshVersions();
       pushToast?.('success', `Draft saved as v${version}`);
       return saved;
@@ -837,7 +985,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
       pushToast?.('error', 'Save failed: ' + ((e && e.message) || e).slice(0, 140));
       return null;
     } finally {
-      setSaving(false);
+      setSavingLocal(false);
     }
   };
 
@@ -845,7 +993,17 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
     if (!project || exporting || saving) return;
     const errs = validateDraft(project);
     if (errs.length) { pushToast?.('error', errs[0]); return; }
-    setExporting(true);
+    if (ctl) {
+      // Controlled: drain the queue and compose the acknowledged snapshot.
+      // createControlledActions swaps the preview to the exact render.
+      try {
+        await ctl.exportProject();
+      } catch (e) {
+        pushToast?.('Export failed: ' + ((e && e.message) || e).slice(0, 140));
+      }
+      return;
+    }
+    setExportingLocal(true);
     try {
       // Export always saves first: the render is versioned, and the
       // version→file mapping stays truthful (no stale-version overwrites).
@@ -856,7 +1014,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
         toRender = saved;
       }
       const res = await composeProject(jobId, clipIndex, toRender);
-      setSavedVersion(res.version);
+      setSavedVersionLocal(res.version);
       const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
       setVideoSrc(safeResolveUrl(res.composed_url) + bust);
       setPlayhead(0);
@@ -867,20 +1025,30 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
     } catch (e) {
       pushToast?.('error', 'Export failed: ' + ((e && e.message) || e).slice(0, 140));
     } finally {
-      setExporting(false);
+      setExportingLocal(false);
     }
   };
 
   // Undo: load an older version into the draft (keeps ITS idempotency key, so
   // exporting it unchanged dedups to the identical file — a true undo).
   const onLoadVersion = async (v) => {
-    if (dirty && !window.confirm(`Discard unsaved changes and load v${v}?`)) return;
+    if (ctl) {
+      // Controlled: through the controller -- no confirm needed (the draft is
+      // always acknowledged state); keeps the restored key, marks dirty.
+      try {
+        await ctl.loadVersion(v);
+      } catch (e) {
+        pushToast?.('Load failed: ' + ((e && e.message) || e).slice(0, 120));
+      }
+      return;
+    }
+    if (dirtyLocal && !window.confirm(`Discard unsaved changes and load v${v}?`)) return;
     try {
       const proj = await getClipProject(jobId, clipIndex, v);
-      setProject(proj);
-      setSavedVersion(proj.version);
+      setProjectLocal(proj);
+      setSavedVersionLocal(proj.version);
       setSelSeg(0);
-      setDirty(true);
+      setDirtyLocal(true);
       pushToast?.('info', `Loaded v${v} into the draft — save or export to keep it`);
     } catch (e) {
       pushToast?.('error', 'Load failed: ' + ((e && e.message) || e).slice(0, 120));
@@ -894,17 +1062,26 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
   };
 
   const onResetAi = async () => {
-    if (dirty && !window.confirm('Discard all edits and reset to the AI cut?')) return;
+    if (ctl) {
+      // Controlled: through the controller (earliest AI cut, keeps its key).
+      try {
+        await ctl.resetToAiCut();
+      } catch (e) {
+        pushToast?.('Reset failed: ' + ((e && e.message) || e).slice(0, 120));
+      }
+      return;
+    }
+    if (dirtyLocal && !window.confirm('Discard all edits and reset to the AI cut?')) return;
     const auto = (versions || [])
       .filter((v) => v.origin === 'auto')
       .sort((a, b) => a.version - b.version)[0];
     const v = auto ? auto.version : 1;
     try {
       const proj = await getClipProject(jobId, clipIndex, v);
-      setProject(proj);
-      setSavedVersion(proj.version);
+      setProjectLocal(proj);
+      setSavedVersionLocal(proj.version);
       setSelSeg(0);
-      setDirty(true);
+      setDirtyLocal(true);
       pushToast?.('info', `Reset to the AI cut (v${proj.version}) — save or export to keep it`);
     } catch (e) {
       pushToast?.('error', 'Reset failed: ' + ((e && e.message) || e).slice(0, 120));
@@ -917,6 +1094,14 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
   };
 
   // --- render --------------------------------------------------------------
+  if (mode === 'unconfigured') {
+    return (
+      <main className="container fade-in" style={{ paddingTop: 48, textAlign: 'center' }}>
+        <p style={{ color: 'var(--ink, #222)' }}>The clip editor needs a project controller or explicit standalone mode.</p>
+        <Btn variant="ghost" icon="arrow-left" onClick={onBack} style={{ marginTop: 12 }}>Back</Btn>
+      </main>
+    );
+  }
   if (status === 'loading') {
     return (
       <main className="container fade-in" style={{ paddingTop: 48, textAlign: 'center' }}>

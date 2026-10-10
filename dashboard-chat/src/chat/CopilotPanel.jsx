@@ -8,9 +8,12 @@ import { saveClipProject } from '../api/realApi.js';
  * Sends prompt-based edits via edit-ai mode=patch, reports what changed,
  * and lets the user apply the validated patch to the stored project.
  *
- * Condition 4: applying routes through the editor's serialized edit queue
- * (props.applyEdit) so copilot edits are undoable and never race panel
- * edits. Falls back to a direct save only when no queue is provided.
+ * Task 16: applying routes through the project controller's serialized edit
+ * queue (props.applyEdit) so copilot edits are undoable, carry optimistic
+ * concurrency (a patch computed against an old version is rejected, never
+ * applied over newer edits), and never race panel edits. The controller
+ * always provides a queue; the direct-save fallback is kept ONLY for
+ * standalone/no-controller mounts and is marked as such (contract item 6).
  */
 export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
   const [open, setOpen] = useState(true);
@@ -53,6 +56,10 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
           expectedVersion: patched.version,
         });
       } else {
+        // STANDALONE FALLBACK (kept deliberately, contract item 6): no
+        // controller/queue above us, so save the patched project directly.
+        // EditorView always passes the controller's queue-backed applyEdit,
+        // so this path is inert there.
         await saveClipProject(jobId, clipIndex, patched);
       }
       setApplied(true);

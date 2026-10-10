@@ -113,11 +113,22 @@ export function createEditQueue({ getProject, saveProject, onUpdate, onError }) 
     redoStack.length = 0;
   }
 
+  /**
+   * Task 16 drain primitive: run `fn` after all previously queued work has
+   * settled. The project controller uses it for export (drain the queue,
+   * then snapshot the acknowledged project) and for version restore/reset.
+   * Failures propagate to the caller; the chain itself stays alive.
+   */
+  function drain(fn) {
+    return enqueue(fn);
+  }
+
   return {
     applyEdit,
     undo,
     redo,
     clear,
+    drain,
     canUndo: () => undoStack.length > 0,
     canRedo: () => redoStack.length > 0,
     // Test seam.
