@@ -1,5 +1,5 @@
 /**
- * Task 16 ΓÇö single authoritative project controller for the chat editor.
+ * Task 16 — single authoritative project controller for the chat editor.
  *
  * Before Task 16 the outer EditorView owned a project + edit queue while the
  * nested ClipEditorView independently fetched, mutated, saved, and exported
@@ -17,7 +17,7 @@
  *  - version restore / reset-to-AI-cut (draft-only, keeps the restored
  *    version's idempotency key so an unchanged export dedups),
  *  - export: drains the queue, snapshots the acknowledged project+version,
- *    and composes EXACTLY that snapshot ΓÇö edits made while the compose is
+ *    and composes EXACTLY that snapshot — edits made while the compose is
  *    in flight queue behind it and cannot change the export's identity,
  *  - generation tokens: load/restore/reset/dispose bump a generation so
  *    late async responses can never update another clip's (or user's) state.
@@ -26,7 +26,7 @@
  * and mint a fresh idempotency_key (so the next export is a NEW render,
  * never a dedup hit). Version restore/reset keep the restored version's key.
  * Undo/redo restore snapshots with their original keys (existing queue
- * behavior ΓÇö honest stacks and honest saved state).
+ * behavior — honest stacks and honest saved state).
  *
  * Framework-agnostic (no React): EditorView instantiates one per clip and
  * subscribes; the nested ClipEditorView renders controller state in
@@ -155,7 +155,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
       const stale = isStaleError(e);
       toast(
         stale
-          ? 'Someone else saved first ΓÇö reloading the latest version.'
+          ? 'Someone else saved first — reloading the latest version.'
           : `Couldn't save (${label}): ${e?.message || 'unknown error'}`
       );
       if (stale) load().catch(() => {});
@@ -264,7 +264,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
         const stale = isStaleError(e);
         toast(
           stale
-            ? 'Someone else saved first ΓÇö reloading the latest version.'
+            ? 'Someone else saved first — reloading the latest version.'
             : `Couldn't save (save draft): ${e?.message || 'unknown error'}`
         );
         if (stale) load().catch(() => {});
@@ -316,7 +316,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
         const stale = isStaleError(e);
         toast(
           stale
-            ? 'Someone else saved first ΓÇö reloading the latest version.'
+            ? 'Someone else saved first — reloading the latest version.'
             : `Export failed: ${e?.message || 'unknown error'}`
         );
         if (stale) load().catch(() => {});
@@ -328,10 +328,14 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   }
 
   // Draft-only restore: keeps the restored version's idempotency key (an
-  // unchanged export dedups to the identical file ΓÇö a true undo) and marks
+  // unchanged export dedups to the identical file — a true undo) and marks
   // dirty. ackVersion stays at the last acknowledged version so the
   // follow-up save carries a valid expectedVersion, not a stale one.
   async function restoreLocked(version, token) {
+    // Check BEFORE the follow-up API call, not only after its response: a
+    // reset/dispose during version listing must not start a historical
+    // project fetch. Already-issued requests keep their post-response check.
+    if (!alive(token)) throw cancelledOp('restore');
     const res = await api.getClipProject(jobId, clipIndex, version);
     if (!alive(token)) return null;
     const proj = normalizeProject(res);
@@ -402,12 +406,20 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   function uploadAudio(file) {
     const rejected = rejectIfDisposed('uploadAudio');
     if (rejected) return rejected;
-    return api.uploadAudio(jobId, file);
+    // Lifetime-bound like aiTrim: capture the generation around the awaited
+    // response. A reset/dispose while the upload is in flight rejects the
+    // stale completion, so a panel continuation can never attach old audio
+    // to the next session through this controller.
+    const token = gen;
+    return api.uploadAudio(jobId, file).then((r) => {
+      if (!alive(token)) throw cancelledOp('uploadAudio');
+      return r;
+    });
   }
 
   /**
    * Session reset (sign-out / signed-in user change): drop undo/redo
-   * history, the cached project, and invalidate in-flight responses ΓÇö
+   * history, the cached project, and invalidate in-flight responses —
    * the existing session-reset behavior (queue.clear, project null,
    * remount via the host's reset key).
    */

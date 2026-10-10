@@ -145,7 +145,7 @@ export default function EditorView({ jobId, clipIndex, clip, onBack }) {
           <ArrowLeft size={17} />
         </button>
         <div style={{ fontSize: 14, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          Editing ΓÇö {clip?.title || `Clip ${clipIndex + 1}`}
+          Editing — {clip?.title || `Clip ${clipIndex + 1}`}
         </div>
         <div style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--nc-text-faint)' }}>
           {project ? `v${project.version}` : ''}

@@ -96,9 +96,9 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
     if (!keys.length) return 'project patch';
     return keys.map((k) => {
       const v = patch[k];
-      const short = typeof v === 'string' && v.length > 42 ? `${v.slice(0, 42)}ΓÇª` : JSON.stringify(v)?.slice(0, 42);
-      return `${k} ΓåÆ ${short}`;
-    }).join(' ┬╖ ');
+      const short = typeof v === 'string' && v.length > 42 ? `${v.slice(0, 42)}…` : JSON.stringify(v)?.slice(0, 42);
+      return `${k} → ${short}`;
+    }).join(' · ');
   };
 
   if (!open) {
@@ -180,11 +180,11 @@ export default function CopilotPanel({ jobId, clipIndex, applyEdit }) {
             {!applied ? (
               <button className="nc-btn-primary" style={{ width: '100%', marginTop: 10, fontSize: 13 }} disabled={applying} onClick={applyPatch}>
                 {applying ? <Loader2 size={14} style={{ animation: 'nc-spin 1s linear infinite' }} /> : <Check size={14} />}
-                {applying ? 'ApplyingΓÇª' : 'Apply to project'}
+                {applying ? 'Applying…' : 'Apply to project'}
               </button>
             ) : (
               <div style={{ marginTop: 10, fontSize: 12.5, color: 'var(--nc-green)', display: 'flex', alignItems: 'center', gap: 6 }}>
-                <Check size={14} /> Applied ΓÇö re-export from the editor to render it.
+                <Check size={14} /> Applied — re-export from the editor to render it.
               </div>
             )}
           </div>

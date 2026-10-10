@@ -908,10 +908,17 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     setUploading(true);
     try {
       const { file: rel } = ctl ? await ctl.uploadAudio(file) : await uploadAudio(jobId, file);
-      mutate((pp) => { pp.audio = [{ file: rel, volume: 1.0, offset: 0.0 }]; }, 'music');
+      // Await the music mutation before reporting success: a rejected save
+      // must not claim the audio was attached. (Controlled mutate returns
+      // the queue's save promise; standalone mutate is synchronous.)
+      await mutate((pp) => { pp.audio = [{ file: rel, volume: 1.0, offset: 0.0 }]; }, 'music');
       pushToast?.('success', 'Music attached — mixed at export');
     } catch (e) {
-      pushToast?.('error', 'Upload failed: ' + ((e && e.message) || e).slice(0, 140));
+      // Session cancellation is expected, not a failure: the upload belonged
+      // to a previous clip/session, so stay silent instead of alarming.
+      if (e?.code !== 'QUEUE_CANCELLED') {
+        pushToast?.('error', 'Upload failed: ' + ((e && e.message) || e).slice(0, 140));
+      }
     } finally {
       setUploading(false);
     }
