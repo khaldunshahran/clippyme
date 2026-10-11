@@ -8,17 +8,49 @@
  *
  * Contracts covered:
  *  1. single-clip identity + version-checked Apply (typed finishing via the
- *     existing controller authority; expectedVersion concurrency guard).
+ *     selected controller authority; expectedVersion concurrency guard in
+ *     the standalone path).
  *  2. default-OFF honesty: legacy renderer named as the unchanged default.
  *  8. delayed async responses can never replace another selection's
  *     preview (stale selection -> 'stale' state, no commit).
+ *  5. preview and export share one compiled composition identity.
+ *
+ * Review 01 additions (promoted coordinator probes, adapted to the
+ * controller-prop API):
+ *  R1. Apply routes through the selected workspace controller
+ *      (controller.applyEdit), never direct saves; legacy export drains via
+ *      controller.exportProject(). Without a controller the explicit
+ *      standalone direct-API path is kept.
+ *  R2. Lifetime gates: lifetimeKey captured at async start, re-checked
+ *      after every await (switch/close/reselect/session-reset drops the
+ *      continuation); isLive is false when activeSelectionKey is null, so
+ *      a cleared selection cannot authorize an old card to save.
+ *  R3. Preview auth: authed POST mints a short-lived preview token; the
+ *      iframe src carries ?token= (never a Supabase JWT). The composition
+ *      is driven through the validated postMessage protocol ({hf:1,...}),
+ *      never contentWindow.__hf / document. Play actually starts playback
+ *      (timeupdate confirms); the iframe aspect comes from the manifest's
+ *      render width/height.
+ *  R4. Export binds to the acknowledged preview: startRender sends
+ *      { compile_id, expected_version }; unapplied template/param edits
+ *      invalidate the preview and require re-preview before render.
+ *  R5. Cancel honesty: cancelRender awaits the cancel API, polls the render
+ *      status once, and displays the backend-acknowledged terminal state.
  *
  * Load-bearing mutations (run manually, each must fail, then re-run green):
- *  M1: HyperframesCard drops the isLive guard in commit (stale commit)
- *  M2: apply drops expectedVersion (stale apply)
- *  M3: HyperframesMsg stops mapping scope -> jobId/index (identity loss)
+ *  M1: apply ignores the controller prop (direct saveClipProject) ->
+ *      'Apply must use the selected workspace controller' fails.
+ *  M2: lifetime check removed after the getClipProject await ->
+ *      'switching selection during a project fetch prevents the subsequent
+ *      save' fails.
+ *  M3: startRender drops compile_id -> 'export must send the exact preview
+ *      composition identity' fails.
+ *  M4: iframe src built without the preview token -> 'preview fetches an
+ *      authed token and puts it in the iframe src' fails.
+ *  M5: isLive allows null activeSelectionKey -> 'clearing selection cannot
+ *      authorize an old card to save' fails.
  */
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 // This repo's JSX transform uses the classic runtime (React.createElement);
 // the components don't import React themselves, and the react-module mock
 // below spreads the real module, so expose it as the React global.
@@ -32,7 +64,8 @@ const hfApi = vi.hoisted(() => ({
   renderHyperframes: vi.fn(),
   hyperframesRenderStatus: vi.fn(),
   cancelHyperframesRender: vi.fn(),
-  hyperframesCompositionUrl: vi.fn((j, c) => `/api/hyperframes/composition/${j}/${c}/index.html`),
+  getHyperframesPreviewToken: vi.fn(),
+  hyperframesCompositionUrl: vi.fn((j, c, t) => `/api/hyperframes/composition/${j}/${c}/index.html${t ? `?token=${t}` : ''}`),
 }));
 const realApi = vi.hoisted(() => ({
   getClipProject: vi.fn(),
@@ -114,8 +147,15 @@ beforeEach(() => {
   hooks.index = 0;
   vi.clearAllMocks();
   hfApi.getHyperframesCapability.mockResolvedValue({ available: true, reason: null, templates: TEMPLATES });
+  hfApi.getHyperframesPreviewToken.mockResolvedValue({ token: 'tok-123', expires_in: 300 });
   realApi.getClipProject.mockResolvedValue({ project: { version: 1 }, version: 1 });
   realApi.saveClipProject.mockResolvedValue({ version: 2, project: {} });
+});
+
+afterEach(() => {
+  // The postMessage tests stub a window; restore the module-top React stub.
+  vi.unstubAllGlobals();
+  vi.stubGlobal('React', React);
 });
 
 describe('HyperframesCard capability states', () => {
@@ -239,6 +279,31 @@ describe('ChatThread /hyperframes wiring', () => {
     expect(hfApi.getHyperframesCapability).toHaveBeenCalledWith();
     expect(findByTestId(cardTree, 'hyperframes-card')).toBeTruthy();
   });
+
+  it('threads the controller and lifetimeKey to the matching card only (R1)', async () => {
+    const controller = { applyEdit: vi.fn() };
+    const thread = {
+      id: 't1',
+      messages: [
+        { id: 'm1', role: 'ai', kind: 'hyperframes', data: { command: '/hyperframes', scope: { threadId: 't1', jobId: 'j9', clipIndex: 2 } } },
+        { id: 'm2', role: 'ai', kind: 'hyperframes', data: { command: '/hyperframes', scope: { threadId: 't1', jobId: 'j7', clipIndex: 0 } } },
+      ],
+    };
+    const renderThread = () => {
+      hooks.index = 0;
+      return ChatThread({ thread, activeSelectionKey: 'j9:2', controller, controllerKey: 'j9:2', lifetimeKey: 'life-9' });
+    };
+    const tree = renderThread();
+    const msgs = walk(tree).filter((n) => n.type && n.type.name === 'HyperframesMsg');
+    expect(msgs).toHaveLength(2);
+    const cardEls = msgs.map((m) => m.type(m.props));
+    // The card for the currently selected clip gets the shared controller.
+    expect(cardEls[0].props.controller).toBe(controller);
+    expect(cardEls[0].props.lifetimeKey).toBe('life-9');
+    // A card for any other clip must NOT receive it (wrong project).
+    expect(cardEls[1].props.controller).toBeNull();
+    expect(cardEls[1].props.lifetimeKey).toBe('life-9');
+  });
 });
 
 describe('HyperframesCard preview/export identity (contract 5)', () => {
@@ -246,6 +311,7 @@ describe('HyperframesCard preview/export identity (contract 5)', () => {
     project_version: 2,
     template: { id: 'clean-captions', version: 1 },
     renderer: { engine: '0.8.145' },
+    render: { width: 608, height: 1080, fps: 30 },
     duration: 10.0,
   };
   async function toPreview() {
@@ -275,9 +341,9 @@ describe('HyperframesCard preview/export identity (contract 5)', () => {
     const previewTree = hfPreviewEl.type(hfPreviewEl.props);
     const iframe = findByTestId(previewTree, 'hf-preview-iframe');
     expect(iframe).toBeTruthy();
-    expect(iframe.props.src).toBe('/api/hyperframes/composition/j1/abcdef0123456789/index.html');
+    expect(iframe.props.src).toBe('/api/hyperframes/composition/j1/abcdef0123456789/index.html?token=tok-123');
     expect(iframe.props.sandbox).toMatch(/allow-scripts/);
-    // no vendored player element: the player cannot drive the __hf protocol
+    // no vendored player element: the player cannot drive the seek protocol
     expect(walk(tree).filter((n) => n.type === 'hyperframes-player')).toEqual([]);
     const id = findByTestId(tree, 'hf-preview-identity');
     expect(textOf(id)).toMatch(/digest-abc-1/); // 12-char digest prefix
@@ -301,5 +367,342 @@ describe('HyperframesCard preview/export identity (contract 5)', () => {
     const tree1 = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
     expect(textOf(tree1)).toMatch(/Rendering/);
     expect(textOf(tree1)).not.toMatch(/queued/);
+  });
+});
+
+describe('review-01 R1/R2: single project authority + lifetime gates', () => {
+  it('Apply must use the selected workspace controller, never direct saves', async () => {
+    const controller = { applyEdit: vi.fn().mockResolvedValue({ version: 2 }) };
+    const props = { data: data('j1', 0), activeSelectionKey: 'j1:0', controller };
+    card(props); await flush();
+    await findByTestId(card(props), 'hf-apply').props.onClick();
+    await flush();
+    expect(controller.applyEdit).toHaveBeenCalledTimes(1);
+    expect(realApi.saveClipProject).not.toHaveBeenCalled();
+    const tree = card(props);
+    expect(textOf(tree)).toMatch(/Applied to project version 2/);
+  });
+
+  it('switching selection during a project fetch prevents the subsequent save', async () => {
+    let resolveGet;
+    realApi.getClipProject.mockReturnValue(new Promise((r) => { resolveGet = r; }));
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0' };
+    card(p); await flush();
+    const pending = findByTestId(card(p), 'hf-apply').props.onClick();
+    card({ ...p, activeSelectionKey: 'j2:0' });
+    resolveGet({ project: { version: 1 }, version: 1 }); await pending;
+    expect(realApi.saveClipProject).not.toHaveBeenCalled();
+  });
+
+  it('clearing selection cannot authorize an old card to save', async () => {
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0' };
+    card(p); await flush();
+    const tree = card({ ...p, activeSelectionKey: null });
+    const button = findByTestId(tree, 'hf-apply');
+    expect(button).toBeTruthy();
+    expect(button.props.disabled).toBe(true);
+    if (button && !button.props.disabled) await button.props.onClick();
+    expect(realApi.saveClipProject).not.toHaveBeenCalled();
+  });
+
+  it('a lifetimeKey change during a project fetch drops the continuation', async () => {
+    let resolveGet;
+    realApi.getClipProject.mockReturnValue(new Promise((r) => { resolveGet = r; }));
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0', lifetimeKey: 'life-1' };
+    card(p); await flush();
+    const pending = findByTestId(card(p), 'hf-apply').props.onClick();
+    // session reset / reselection bumps the lifetime key mid-flight
+    card({ ...p, lifetimeKey: 'life-2' });
+    resolveGet({ project: { version: 1 }, version: 1 });
+    await pending;
+    expect(realApi.saveClipProject).not.toHaveBeenCalled();
+  });
+
+  it('a controller save interrupted after dispatch stays honest and never retries', async () => {
+    const err = Object.assign(
+      new Error('interrupted: apply (save request issued; confirmation cancelled)'),
+      { code: 'SAVE_INTERRUPTED' },
+    );
+    const controller = { applyEdit: vi.fn().mockRejectedValue(err) };
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0', controller };
+    card(p); await flush();
+    await findByTestId(card(p), 'hf-apply').props.onClick();
+    await flush();
+    const tree = card(p);
+    expect(controller.applyEdit).toHaveBeenCalledTimes(1);
+    expect(realApi.saveClipProject).not.toHaveBeenCalled();
+    expect(textOf(tree)).toMatch(/already been sent|interrupted/i);
+    expect(textOf(tree)).not.toMatch(/Applied to project version/);
+  });
+
+  it('legacy export drains through the controller, never direct compose', async () => {
+    const controller = {
+      applyEdit: vi.fn().mockResolvedValue({ version: 2 }),
+      exportProject: vi.fn().mockResolvedValue({ composed_url: '/legacy/x.mp4', identity: { version: 3 } }),
+    };
+    hfApi.compileHyperframes.mockResolvedValue({ compile_id: 'c1', preview_identity: 'd', manifest: { duration: 5 } });
+    hfApi.renderHyperframes.mockResolvedValue({ render_id: 'r', state: 'failed', error: 'worker blew up' });
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0', controller };
+    card(p); await flush();
+    let tree = card(p);
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    tree = card(p);
+    await findByTestId(tree, 'hf-preview').props.onClick();
+    await flush();
+    tree = card(p);
+    await findByTestId(tree, 'hf-render').props.onClick();
+    await flush();
+    tree = card(p);
+    expect(findByTestId(tree, 'hf-legacy')).toBeTruthy();
+    await findByTestId(tree, 'hf-legacy').props.onClick();
+    await flush();
+    tree = card(p);
+    expect(controller.exportProject).toHaveBeenCalledTimes(1);
+    expect(realApi.composeProject).not.toHaveBeenCalled();
+    expect(realApi.getClipProject).not.toHaveBeenCalled();
+    expect(textOf(tree)).toMatch(/accepted legacy renderer/);
+    expect(findByTestId(tree, 'hf-legacy-output')).toBeTruthy();
+  });
+});
+
+describe('review-01 R3: preview auth + postMessage + aspect + playback', () => {
+  const MANIFEST = {
+    project_version: 2,
+    template: { id: 'clean-captions', version: 1 },
+    renderer: { engine: '0.8.145' },
+    render: { width: 608, height: 1080, fps: 30 },
+    duration: 10.0,
+  };
+  async function toPreview() {
+    hfApi.compileHyperframes.mockResolvedValue({
+      compile_id: 'abcdef0123456789',
+      preview_identity: 'digest-abc-123',
+      manifest: MANIFEST,
+    });
+    card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await flush();
+    let tree = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    tree = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await findByTestId(tree, 'hf-preview').props.onClick();
+    await flush();
+    return card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+  }
+  // Drive the nested HfPreview with a stubbed window (message bridge) and
+  // a fake contentWindow carrying ONLY postMessage: no __hf, no document,
+  // the cross-origin reality. HfPreview hook order: frameRef(0), t(1),
+  // ready(2), playing(3), playReqRef(4).
+  function drivePreview(hfPreviewEl) {
+    const listeners = {};
+    vi.stubGlobal('window', {
+      addEventListener: vi.fn((type, fn) => { listeners[type] = fn; }),
+      removeEventListener: vi.fn(),
+    });
+    const postMessage = vi.fn();
+    // Fresh hook slots: the card's slots are occupied (index 0 is the card's
+    // state string), so the nested component gets its own array.
+    hooks.values = [];
+    hooks.index = 0;
+    hfPreviewEl.type(hfPreviewEl.props);
+    hooks.values[0].current = { contentWindow: { postMessage } };
+    const rerender = () => { hooks.index = 0; return hfPreviewEl.type(hfPreviewEl.props); };
+    return { listeners, postMessage, rerender };
+  }
+
+  it('preview fetches an authed token and puts it in the iframe src (never a JWT)', async () => {
+    const tree = await toPreview();
+    expect(hfApi.getHyperframesPreviewToken).toHaveBeenCalledTimes(1);
+    expect(hfApi.getHyperframesPreviewToken).toHaveBeenCalledWith('j1', 'abcdef0123456789');
+    const hfPreviewEl = walk(tree).find((n) => n.type && n.type.name === 'HfPreview');
+    hooks.index = 0;
+    const previewTree = hfPreviewEl.type(hfPreviewEl.props);
+    const iframe = findByTestId(previewTree, 'hf-preview-iframe');
+    expect(iframe.props.src).toBe('/api/hyperframes/composition/j1/abcdef0123456789/index.html?token=tok-123');
+    expect(iframe.props.src).not.toMatch(/eyJ/); // no Supabase JWT in the URL
+  });
+
+  it('a missing preview token fails honestly instead of loading unauthenticated', async () => {
+    hfApi.getHyperframesPreviewToken.mockResolvedValue({});
+    hfApi.compileHyperframes.mockResolvedValue({
+      compile_id: 'c9', preview_identity: 'd', manifest: { duration: 5 },
+    });
+    card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await flush();
+    let tree = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    tree = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await findByTestId(tree, 'hf-preview').props.onClick();
+    await flush();
+    tree = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    expect(textOf(tree)).toMatch(/Preview failed/);
+    expect(findByTestId(tree, 'hf-preview-frame')).toBeNull();
+  });
+
+  it('sizes the preview iframe from the manifest render dimensions', async () => {
+    const tree = await toPreview();
+    const hfPreviewEl = walk(tree).find((n) => n.type && n.type.name === 'HfPreview');
+    hooks.index = 0;
+    const previewTree = hfPreviewEl.type(hfPreviewEl.props);
+    const iframe = findByTestId(previewTree, 'hf-preview-iframe');
+    expect(iframe.props.style.aspectRatio).toBe('608/1080');
+  });
+
+  it('drives the composition through the postMessage protocol, never contentWindow.__hf', async () => {
+    const tree = await toPreview();
+    const hfPreviewEl = walk(tree).find((n) => n.type && n.type.name === 'HfPreview');
+    const { listeners, postMessage, rerender } = drivePreview(hfPreviewEl);
+    expect(listeners.message).toBeTruthy();
+    // The composition announces readiness; junk messages are ignored.
+    listeners.message({ data: { nope: true } });
+    listeners.message({ data: { hf: 1, type: 'ready' } });
+    await flush();
+    expect(hooks.values[2]).toBe(true); // ready
+    // Play ACTUALLY starts playback via the protocol (targetOrigin '*').
+    const playBtn = findByTestId(rerender(), 'hf-preview-play');
+    expect(playBtn).toBeTruthy();
+    await playBtn.props.onClick();
+    expect(postMessage).toHaveBeenCalledWith({ hf: 1, type: 'play' }, '*');
+    // Playing state is confirmed by the composition's timeupdate messages.
+    listeners.message({ data: { hf: 1, type: 'timeupdate', t: 3.25 } });
+    expect(hooks.values[1]).toBe(3.25);
+    const pauseBtn = findByTestId(rerender(), 'hf-preview-play');
+    expect(textOf(pauseBtn)).toMatch(/Pause/);
+    await pauseBtn.props.onClick();
+    expect(postMessage).toHaveBeenCalledWith({ hf: 1, type: 'pause' }, '*');
+    // Scrub sends pause + seek through the protocol.
+    const scrub = findByTestId(rerender(), 'hf-preview-scrub');
+    scrub.props.onChange({ target: { value: '2.5' } });
+    expect(postMessage).toHaveBeenCalledWith({ hf: 1, type: 'seek', t: 2.5 }, '*');
+    // Every cross-origin post uses '*' (sandboxed opaque origin); the fake
+    // contentWindow never had __hf/document and nothing threw.
+    expect(postMessage.mock.calls.length).toBeGreaterThan(0);
+    expect(postMessage.mock.calls.every((c) => c[1] === '*')).toBe(true);
+    expect('__hf' in (hooks.values[0].current || {})).toBe(false);
+  });
+});
+
+describe('review-01 R4: export bound to the acknowledged preview', () => {
+  const MANIFEST = { project_version: 2, duration: 5 };
+  it('export must send the exact preview composition identity', async () => {
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0' };
+    hfApi.compileHyperframes.mockResolvedValue({ compile_id: 'abcdef0123456789', preview_identity: 'same', manifest: { duration: 5, project_version: 2 } });
+    hfApi.renderHyperframes.mockResolvedValue({ render_id: 'r', state: 'rendered', output_url: '/out' });
+    card(p); await flush();
+    await findByTestId(card(p), 'hf-apply').props.onClick();
+    await flush();
+    const applied = card(p);
+    findByTestId(applied, 'hf-template').props.onChange({ target: { value: 'emphasized-word' } });
+    await findByTestId(card(p), 'hf-preview').props.onClick();
+    await flush();
+    await findByTestId(card(p), 'hf-render').props.onClick();
+    await flush();
+    expect(hfApi.renderHyperframes).toHaveBeenCalledWith('j1', 0, expect.objectContaining({ compile_id: 'abcdef0123456789' }));
+    const body = hfApi.renderHyperframes.mock.calls[0][2];
+    expect(body.expected_version).toBe(2);
+  });
+
+  it('changing the template after preview invalidates it and requires re-preview', async () => {
+    hfApi.compileHyperframes
+      .mockResolvedValueOnce({ compile_id: 'compile-aaa', preview_identity: 'd1', manifest: MANIFEST })
+      .mockResolvedValueOnce({ compile_id: 'compile-bbb', preview_identity: 'd2', manifest: MANIFEST });
+    hfApi.renderHyperframes.mockResolvedValue({ render_id: 'r2', state: 'rendered', output_url: '/o2' });
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0' };
+    card(p); await flush();
+    let tree = card(p);
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    tree = card(p);
+    await findByTestId(tree, 'hf-preview').props.onClick();
+    await flush();
+    tree = card(p);
+    expect(findByTestId(tree, 'hf-render')).toBeTruthy();
+    // Unapplied edit AFTER the preview was acknowledged: the old compile
+    // must not be renderable anymore.
+    findByTestId(tree, 'hf-template').props.onChange({ target: { value: 'emphasized-word' } });
+    tree = card(p);
+    expect(findByTestId(tree, 'hf-render')).toBeNull();
+    expect(findByTestId(tree, 'hf-preview')).toBeTruthy();
+    expect(textOf(tree)).not.toMatch(/compile-aaa/);
+    // Re-preview compiles the NEW selection; render binds to the new id.
+    await findByTestId(tree, 'hf-preview').props.onClick();
+    await flush();
+    tree = card(p);
+    expect(hfApi.compileHyperframes).toHaveBeenLastCalledWith(
+      'j1', 0, expect.objectContaining({ template_id: 'emphasized-word' }));
+    await findByTestId(tree, 'hf-render').props.onClick();
+    await flush();
+    expect(hfApi.renderHyperframes).toHaveBeenCalledWith(
+      'j1', 0, expect.objectContaining({ compile_id: 'compile-bbb' }));
+  });
+});
+
+describe('review-01 R5: cancel reflects the backend-acknowledged state', () => {
+  const MANIFEST = { project_version: 2, duration: 5 };
+  // House pattern: the harness useEffect ignores deps and re-runs on every
+  // card() call, scheduling a stale 'proposal' reset. So (like toPreview)
+  // this helper ends with the preview tree and the tests click hf-render on
+  // that same tree with no card() in between; assertions after a card()
+  // read the tree synchronously.
+  async function toPreviewTree() {
+    hfApi.compileHyperframes.mockResolvedValue({ compile_id: 'abcdef0123456789', preview_identity: 'd', manifest: MANIFEST });
+    hfApi.renderHyperframes.mockResolvedValue({ render_id: 'rid-9', state: 'rendering' });
+    card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await flush();
+    let tree = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    tree = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    await findByTestId(tree, 'hf-preview').props.onClick();
+    await flush();
+    return card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+  }
+  async function toRendering() {
+    const previewTree = await toPreviewTree();
+    await findByTestId(previewTree, 'hf-render').props.onClick();
+    await flush();
+    return card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+  }
+
+  it('cancel shows rendered when the backend already rendered', async () => {
+    const tree = await toRendering();
+    expect(findByTestId(tree, 'hf-cancel')).toBeTruthy();
+    hfApi.cancelHyperframesRender.mockResolvedValue({ ok: true });
+    hfApi.hyperframesRenderStatus.mockResolvedValue({ state: 'rendered', output_url: '/exports/r9.mp4' });
+    await findByTestId(tree, 'hf-cancel').props.onClick();
+    await flush();
+    const after = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    const t = textOf(after);
+    expect(hfApi.cancelHyperframesRender).toHaveBeenCalledWith('rid-9');
+    expect(hfApi.hyperframesRenderStatus).toHaveBeenCalledWith('rid-9');
+    expect(t).toMatch(/Export rendered/);
+    expect(findByTestId(after, 'hf-output')).toBeTruthy();
+    expect(t).not.toMatch(/nothing was published/);
+  });
+
+  it('cancel shows cancelled when the backend acknowledges cancellation', async () => {
+    const tree = await toRendering();
+    hfApi.cancelHyperframesRender.mockResolvedValue({ ok: true });
+    hfApi.hyperframesRenderStatus.mockResolvedValue({ state: 'cancelled' });
+    await findByTestId(tree, 'hf-cancel').props.onClick();
+    await flush();
+    const after = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    expect(textOf(after)).toMatch(/Render cancelled/);
+    expect(textOf(after)).not.toMatch(/Export rendered/);
+  });
+
+  it('a failed cancel stays honest instead of claiming cancelled', async () => {
+    const tree = await toRendering();
+    hfApi.cancelHyperframesRender.mockRejectedValue(new Error('worker unreachable'));
+    await findByTestId(tree, 'hf-cancel').props.onClick();
+    await flush();
+    const after = card({ data: data('j1', 0), activeSelectionKey: 'j1:0' });
+    const t = textOf(after);
+    expect(t).toMatch(/Cancel failed/);
+    expect(t).not.toMatch(/nothing was published/);
+    expect(t).not.toMatch(/Render cancelled/); // never claims cancelled: the cancel did not go through
+    expect(hfApi.cancelHyperframesRender).toHaveBeenCalledWith('rid-9');
   });
 });

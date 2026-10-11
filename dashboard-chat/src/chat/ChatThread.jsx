@@ -214,23 +214,36 @@ function ProposalMsg({ data, onApply, onDiscard }) {
  * contract 8 is enforced via activeSelectionKey: delayed async responses
  * can never replace another selection's preview.
  */
-function HyperframesMsg({ data, activeSelectionKey }) {
+function HyperframesMsg({ data, activeSelectionKey, controller, controllerKey, lifetimeKey }) {
   const d = data || {};
   const scope = d.scope || {};
+  const jobId = scope.jobId ?? null;
+  const index = Number.isInteger(scope.clipIndex) ? scope.clipIndex : null;
+  const msgKey = jobId != null && index != null ? `${jobId}:${index}` : null;
+  // The shared workspace controller belongs to the app's current selection
+  // (controllerKey). A card scoped to any other clip must NOT route through
+  // it: it would mutate the wrong clip's project. Gate here AND in the card
+  // via isLive, so a stale card can never apply to another selection.
+  const routedController =
+    controller && controllerKey != null && msgKey != null && controllerKey === msgKey
+      ? controller
+      : null;
   return (
     <HyperframesCard
       data={{
         command: d.command || '/hyperframes',
-        jobId: scope.jobId ?? null,
-        index: Number.isInteger(scope.clipIndex) ? scope.clipIndex : null,
-        scope: scope.jobId != null && Number.isInteger(scope.clipIndex) ? 'single' : 'global',
+        jobId,
+        index,
+        scope: msgKey ? 'single' : 'global',
       }}
       activeSelectionKey={activeSelectionKey}
+      controller={routedController}
+      lifetimeKey={lifetimeKey}
     />
   );
 }
 
-export default function ChatThread({ thread, activeSelectionKey, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue, onApplyProposal, onDiscardProposal }) {
+export default function ChatThread({ thread, activeSelectionKey, controller = null, controllerKey = null, lifetimeKey = null, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue, onApplyProposal, onDiscardProposal }) {
   const bottomRef = useRef(null);
   const msgs = thread?.messages || [];
 
@@ -302,7 +315,7 @@ export default function ChatThread({ thread, activeSelectionKey, onOpenClip, onE
                 </div>
               );
             case 'hyperframes':
-              return <div key={m.id}><HyperframesMsg data={m.data} activeSelectionKey={activeSelectionKey} /></div>;
+              return <div key={m.id}><HyperframesMsg data={m.data} activeSelectionKey={activeSelectionKey} controller={controller} controllerKey={controllerKey} lifetimeKey={lifetimeKey} /></div>;
             case 'notice':
               return (
                 <div key={m.id} className="nc-anim-fade-up" style={{ display: 'flex', gap: 8, alignItems: 'flex-start', maxWidth: 640 }}>

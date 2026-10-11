@@ -210,8 +210,9 @@ def test_caption_text_is_escaped(fake_base, tmp_path):
     compiled = _compile(p, str(tmp_path))
     html = open(compiled.html_path, encoding="utf-8").read()
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
-    # the only <script> tags are the reviewed ones (data block + seek impl)
-    assert html.count("<script") == 2
+    # the only <script> tags are the reviewed ones (data block + seek impl +
+    # preview postMessage bridge)
+    assert html.count("<script") == 3
     assert "<script>alert(1)</script>" not in html
 
 
@@ -258,3 +259,96 @@ def test_framing_trajectory_fails_clearly(tmp_path):
     p.framing = SimpleNamespace()  # non-None marker: trajectory present
     with pytest.raises(CleanBaseUnavailable, match="framing trajectory"):
         asyncio.run(resolve_clean_base(p, str(tmp_path), 0))
+
+# --- review-01 group 5: clean base + music honesty ----------------------------------
+
+def test_reframed_base_lineage_refused(tmp_path):
+    # Any reframed_base lineage (no framing field) is an honest refusal.
+    # The old code silently rematerialized the static segment crop, quietly
+    # discarding accepted Task05 lineage framing (tracked/split/screencast
+    # pixels).
+    import asyncio
+    from types import SimpleNamespace
+    from clippyme.finishing.cleanbase import (
+        CleanBaseUnavailable, resolve_clean_base)
+    p = _project()
+    p.reframed_base = SimpleNamespace(base_ref="clip_final.mp4")
+    with pytest.raises(CleanBaseUnavailable, match="reframed_base"):
+        asyncio.run(resolve_clean_base(p, str(tmp_path), 0))
+
+
+def test_lineage_base_not_silently_replaced_by_static_crop(tmp_path):
+    # Landmark regression: the accepted (lineage) base deliberately differs
+    # from the static segment crop — the pilot must not render a quiet
+    # substitution of the static crop for the accepted base.
+    import asyncio
+    from clippyme.finishing.cleanbase import (
+        CleanBaseUnavailable, resolve_clean_base)
+    p = _project()
+    p.reframed_base = {
+        "base_ref": "clip_final.mp4",
+        "segments": [{"id": "seg0",
+                      "crop": {"x": 40, "y": 80, "w": 400, "h": 711}}],
+    }
+    with pytest.raises(CleanBaseUnavailable, match="legacy render path"):
+        asyncio.run(resolve_clean_base(p, str(tmp_path), 0))
+
+
+def test_configured_music_refused(fake_base, tmp_path):
+    # A project with configured music fails clearly: the pilot renders
+    # source audio only and would silently drop the music mix.
+    from clippyme.finishing.cleanbase import CleanBaseUnavailable
+    p = _project(audio=[{"file": "music/song.mp3"}])
+    with pytest.raises(CleanBaseUnavailable, match="configured music"):
+        _compile(p, str(tmp_path))
+
+
+def test_source_audio_project_unchanged(fake_base, tmp_path):
+    # music=None (source-audio) projects are unaffected by the music gate.
+    p = _project()
+    compiled = _compile(p, str(tmp_path))
+    assert os.path.isfile(compiled.html_path)
+
+
+def test_source_audio_preserved_in_clean_base(tmp_path, monkeypatch):
+    # The materialized clean base keeps source audio for music=None projects.
+    import asyncio
+    import shutil
+    import subprocess
+    from clippyme.domain import project_render as pr
+    from clippyme.finishing.cleanbase import resolve_clean_base
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        pytest.skip("ffmpeg/ffprobe not on PATH")
+    src = tmp_path / "timeline.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc=size=608x1080:rate=30:duration=2",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest", str(src)],
+        check=True)
+
+    async def _fake_timeline(project, job_dir, clip_index):
+        return (str(src), 2.0)
+
+    monkeypatch.setattr(pr, "_materialize_timeline", _fake_timeline)
+    p = _project()  # default audio: [AudioTrack()] -> file=None (no music)
+    base = asyncio.run(resolve_clean_base(p, str(tmp_path), 0))
+    assert base["has_audio"] is True
+    assert pr.probe_media(base["path"])["has_audio"] is True
+
+
+def test_preview_bridge_postmessage_protocol(fake_base, tmp_path):
+    # The generated composition carries the shape-validated postMessage
+    # bridge (contract 2 backend); the worker engine's __hf object is kept.
+    p = _project()
+    compiled = _compile(p, str(tmp_path))
+    html = open(compiled.html_path, encoding="utf-8").read()
+    assert "window.__hf = {" in html  # engine object untouched
+    assert "postMessage" in html
+    assert "{ hf: 1, type: 'ready' }" in html
+    assert "type: 'timeupdate'" in html
+    assert "__hf.seek" in html
+    assert "video.play()" in html
+    assert "video.pause()" in html
+    assert "m.hf !== 1" in html  # shape validation

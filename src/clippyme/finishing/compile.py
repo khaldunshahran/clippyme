@@ -29,7 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from . import templates
-from .cleanbase import CleanBaseError, resolve_clean_base
+from .cleanbase import CleanBaseError, CleanBaseUnavailable, resolve_clean_base
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,25 @@ def _escape(text: str) -> str:
     return html.escape(text, quote=True)
 
 
+def _configured_music_file(project) -> str | None:
+    """Return the configured music file, or None for source-audio projects.
+
+    ``AudioTrack.file`` is the "music file" field (null = no music); a
+    legacy ``music`` attribute is honored too. Any non-empty value means the
+    accepted pipeline would mix music the pilot cannot reproduce.
+    """
+    legacy = getattr(project, "music", None)
+    if legacy:
+        f = legacy if isinstance(legacy, str) else getattr(legacy, "file", None)
+        if f and str(f).strip():
+            return str(f)
+    for track in getattr(project, "audio", None) or []:
+        f = getattr(track, "file", None)
+        if f and str(f).strip():
+            return str(f)
+    return None
+
+
 def _group_phrases(mapped_words: list[dict]) -> list[dict]:
     """Deterministically group word cues into phrase cues for display.
 
@@ -212,6 +231,62 @@ def _font_face_css(fonts: list[dict]) -> str:
             "@font-face { font-family:'%s'; src:url('%s'); font-display:block; }" % (
                 f["family"], f["file"]))
     return "\n".join(lines)
+
+
+# Task 18 review-01: preview postMessage bridge (contract 2 backend).
+# The composition listens for {hf:1, type:'seek'|'play'|'pause', t?} and
+# drives its own window.__hf.seek / the base <video> element (play() with
+# audio, pause()). It posts {hf:1, type:'ready'} to the parent once __hf is
+# installed and {hf:1, type:'timeupdate', t} during playback. Incoming
+# messages are shape-validated; no secrets cross this bridge (numeric t
+# only). The worker engine keeps using window.__hf directly (untouched).
+_BRIDGE_JS = """
+(function () {
+  var video = document.getElementById('hf-base');
+  var D = 0;
+  try { D = JSON.parse(document.getElementById('hf-data').textContent).duration; } catch (e) { D = 0; }
+  function post(msg) {
+    try { window.parent.postMessage(msg, '*'); } catch (e) {}
+  }
+  var tries = 0;
+  (function waitReady() {
+    if (window.__hf && typeof window.__hf.seek === 'function') {
+      post({ hf: 1, type: 'ready' });
+      return;
+    }
+    if (++tries < 200) { setTimeout(waitReady, 50); }
+  })();
+  function validT(v) {
+    return typeof v === 'number' && isFinite(v) && v >= 0;
+  }
+  window.addEventListener('message', function (ev) {
+    var m = ev.data;
+    if (!m || typeof m !== 'object' || m.hf !== 1) { return; }
+    var t = validT(m.t) ? m.t : null;
+    if (m.type === 'seek') {
+      if (t === null) { return; }
+      var ct = (D > 0) ? Math.min(Math.max(t, 0), D) : Math.max(t, 0);
+      if (window.__hf && typeof window.__hf.seek === 'function') { window.__hf.seek(ct); }
+      if (video) { try { video.currentTime = ct; } catch (e) {} }
+    } else if (m.type === 'play') {
+      if (video) {
+        try { video.muted = false; } catch (e) {}
+        try {
+          var pr = video.play();
+          if (pr && typeof pr.catch === 'function') { pr.catch(function () {}); }
+        } catch (e) {}
+      }
+    } else if (m.type === 'pause') {
+      if (video) { try { video.pause(); } catch (e) {} }
+    }
+  });
+  if (video) {
+    video.addEventListener('timeupdate', function () {
+      post({ hf: 1, type: 'timeupdate', t: video.currentTime });
+    });
+  }
+})();
+"""
 
 
 def _build_html(*, spec, params: FinishingParams, width: int, height: int,
@@ -291,10 +366,13 @@ def _build_html(*, spec, params: FinishingParams, width: int, height: int,
 <script>
 %s
 </script>
+<script>
+%s
+</script>
 </body>
 </html>
 """ % (_font_face_css(fonts), css, width, height, duration,
-       caps_html, hook_html, data_json, spec.seek_js)
+       caps_html, hook_html, data_json, spec.seek_js, _BRIDGE_JS)
 
 
 async def compile_hyperframes_composition(
@@ -315,7 +393,10 @@ async def compile_hyperframes_composition(
       the hyperframes renderer,
     - known template + bounded typed params,
     - acknowledged_version matches project.version (stale -> reject),
-    - verified clean base available (framing trajectories fail clearly),
+    - no configured music (the pilot renders source audio only; configured
+      music fails clearly instead of being silently dropped),
+    - verified clean base available (framing trajectories and reframed_base
+      lineage fail clearly),
     - local immutable fonts present (sha256 recorded),
     - composition duration matches the materialized base clock.
     """
@@ -336,6 +417,16 @@ async def compile_hyperframes_composition(
         raise CompileError(
             f"stale project version: acknowledged {acknowledged_version}, "
             f"project is v{project.version}")
+
+    # 3b. Configured music: the pilot renders the source-audio base only and
+    # would silently drop a configured music track (the accepted pipeline
+    # mixes project.audio music in _mix_music). Fail clearly instead.
+    music_file = _configured_music_file(project)
+    if music_file:
+        raise CleanBaseUnavailable(
+            f"project has configured music ({music_file}); the Hyperframes "
+            "pilot renders source audio only — use the legacy render path"
+        )
 
     # 4. Verified clean base (contract 3).
     base = await resolve_clean_base(project, job_dir, clip_index)

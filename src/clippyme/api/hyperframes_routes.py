@@ -10,9 +10,15 @@ Endpoints (all authed, job-ownership checked, job-relative paths only):
     into a deterministic composition. Returns the preview URL (served from
     the same authed composition endpoint the export renders) and the
     preview/export identity digest.
+- POST /api/hyperframes/preview-token/{job_id}/{compile_id}
+    Mint a short-lived HMAC preview token (single-compile scope, ~15 min)
+    so a browser <iframe> can load the composition without the apiFetch
+    Bearer <redacted> Authed via get_current_user, job ownership checked.
 - GET  /api/hyperframes/composition/{job_id}/{compile_id}/{asset}
     Serve the compiled composition and its allowlisted local assets
     (index.html, base.mp4, template fonts). Traversal/symlink-safe.
+    Accepts ?token= (a valid preview token) instead of get_current_user;
+    the Bearer <redacted> is unchanged when no token is given.
 - POST /api/hyperframes/render/{job_id}/{clip_index}
     Consume the frozen accepted project snapshot through the current
     compose route/version contract and dispatch ONE bounded local worker
@@ -32,6 +38,7 @@ error and the accepted compose path stays the way to render.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import mimetypes
@@ -41,7 +48,7 @@ import shutil
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -230,6 +237,108 @@ def _read_record(job_dir: str, render_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Atomic publication (review-01 group 4)
+# ---------------------------------------------------------------------------
+
+class PublishValidationError(Exception):
+    """A staged output file failed media validation."""
+
+
+class PublishSkipped(Exception):
+    """The render left the 'rendering' state (e.g. cancelled) before publish:
+    output is deliberately NOT installed. The record already carries an
+    honest note; this is not an error."""
+
+
+def _validate_staged_output(path: str, *, width: int, height: int) -> None:
+    """Probe a staged output file before it may replace the final export.
+
+    Raises PublishValidationError unless the file has a video stream, a
+    positive duration, and the manifest's render dimensions.
+    """
+    from clippyme.domain import project_render as pr
+    probe = pr.probe_media(path)
+    if probe.get("has_video") is not True:
+        raise PublishValidationError(
+            f"staged output has no video stream: {os.path.basename(path)}")
+    dur = probe.get("duration")
+    if not (isinstance(dur, (int, float)) and dur > 0):
+        raise PublishValidationError(
+            f"staged output has non-positive duration: {dur!r}")
+    if probe.get("width") != int(width) or probe.get("height") != int(height):
+        raise PublishValidationError(
+            f"staged output dims {probe.get('width')}x{probe.get('height')} "
+            f"!= render {width}x{height}")
+
+
+def _stage_and_install(src_path: str, final_path: str, *,
+                       width: int, height: int) -> None:
+    """Atomically install src_path as final_path.
+
+    Stages into a destination-local unique temp file (same directory, so the
+    final os.replace is atomic), validates the staged file, then replaces.
+    On ANY failure the previous final_path is left untouched and only our
+    own temp file is removed.
+    """
+    dest_dir = os.path.dirname(os.path.abspath(final_path))
+    tmp = os.path.join(
+        dest_dir,
+        os.path.basename(final_path) + f".part-{uuid.uuid4().hex[:8]}")
+    try:
+        shutil.copy2(src_path, tmp)
+        _validate_staged_output(tmp, width=width, height=height)
+        os.replace(tmp, final_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+async def _publish_worker_output(*, job_dir: str, render_id: str,
+                                 src_path: str, cache_key: str,
+                                 output_path: str, width: int, height: int) -> None:
+    """Publish a finished worker render: install into the cache, then
+    atomically install the versioned output file.
+
+    Re-checks the terminal state FIRST: a render that is no longer
+    "rendering" (e.g. cancelled while the worker finished) is NEVER
+    installed — the record keeps its terminal state with an honest note.
+    Raises PublishSkipped in that case, other exceptions on publish failure.
+    """
+    from clippyme.finishing import cache as _cache
+    rec = _read_record(job_dir, render_id) or {}
+    if rec.get("state") != "rendering":
+        note = (f"worker finished but the record left 'rendering' "
+                f"(state={rec.get('state')!r}); output not published")
+        rec["publish_note"] = note
+        _write_record(job_dir, render_id, rec)
+        raise PublishSkipped(note)
+    _cache.store(job_dir, cache_key, src_path)
+    await asyncio.to_thread(_stage_and_install, src_path, output_path,
+                            width=width, height=height)
+
+
+async def _route_current_user(request: Request) -> AuthUser:
+    """Resolve the current user for the composition asset route.
+
+    Honors the FastAPI dependency override used by the test harness; in
+    production this is exactly get_current_user(request). Separated out
+    because the route must skip session auth entirely when a valid preview
+    token is presented (a Depends would raise 401 before the route body
+    runs); the Bearer <redacted> is otherwise unchanged.
+    """
+    override = request.app.dependency_overrides.get(get_current_user)
+    if override is not None:
+        result = override()
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    return get_current_user(request)
+
+
+# ---------------------------------------------------------------------------
 # Capability
 # ---------------------------------------------------------------------------
 
@@ -294,6 +403,10 @@ async def hyperframes_compile(job_id: str, clip_index: int,
         )
     except _c.FinishingDisabled as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except _c.CleanBaseError as exc:
+        # Honest refusal (framing trajectory, reframed_base lineage,
+        # configured music): the pilot cannot render this project.
+        raise HTTPException(status_code=400, detail=str(exc))
     except _c.CompileError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001 - never leak internals
@@ -330,12 +443,63 @@ async def hyperframes_compile(job_id: str, clip_index: int,
     }
 
 
+@router.post("/api/hyperframes/preview-token/{job_id}/{compile_id}")
+async def hyperframes_preview_token(job_id: str, compile_id: str,
+                                    request: Request,
+                                    user: AuthUser = Depends(get_current_user)):
+    """Mint a short-lived, single-compile preview token for the composition.
+
+    Lets a browser <iframe> load the authed composition assets without
+    attaching the apiFetch Bearer <redacted> The token is HMAC-signed with
+    the app's existing shared secret (never a Supabase JWT), scoped to this
+    job+compile, ~15 min expiry. Authed via get_current_user; job ownership
+    checked like every other endpoint.
+    """
+    enforce_rate_limit(request, "hyperframes_preview_token",
+                       capacity=20, refill_per_sec=20 / 60)
+    job_dir = _guard_job(job_id, user)
+    if not _compile_id_ok(compile_id):
+        raise HTTPException(status_code=400, detail="Invalid compile ID")
+    crec = os.path.join(_hf_dir(job_id), "compiles", compile_id + ".json")
+    if not os.path.isfile(crec):
+        raise HTTPException(status_code=404, detail="Unknown compile ID")
+    from clippyme.finishing import preview_tokens as _pt
+    token, expires_in = _pt.mint_preview_token(job_id, compile_id)
+    return {"token": token, "expires_in": expires_in}
+
+
 @router.get("/api/hyperframes/composition/{job_id}/{compile_id}/{asset}")
 async def hyperframes_composition_asset(
         job_id: str, compile_id: str, asset: str, request: Request,
-        user: AuthUser = Depends(get_current_user)):
-    """Serve the compiled composition + allowlisted local assets (sandboxed)."""
-    job_dir = _guard_job(job_id, user)
+        token: str | None = Query(default=None, max_length=2048)):
+    """Serve the compiled composition + allowlisted local assets (sandboxed).
+
+    Two auth modes (ownership never weakened):
+    - ?token=: a valid HMAC preview token (minted authed above) scoped to
+      this job+compile — served WITHOUT get_current_user so browser iframe
+      navigation works. Bad/expired/mis-scoped tokens -> 401; unknown
+      compile -> 404.
+    - no token: the existing Bearer <redacted> (unchanged).
+    """
+    from clippyme.finishing import preview_tokens as _pt
+    if token:
+        try:
+            _pt.verify_preview_token(token, job_id=job_id,
+                                     compile_id=compile_id)
+        except _pt.PreviewTokenError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        if not is_valid_job_id(job_id):
+            raise HTTPException(status_code=400, detail="Invalid job ID")
+        job_dir = _job_dir(job_id)
+        if not os.path.isdir(job_dir):
+            raise HTTPException(status_code=404, detail="Job not found on disk")
+        crec = os.path.join(job_dir, _HF_DIRNAME, "compiles",
+                            compile_id + ".json")
+        if not os.path.isfile(crec):
+            raise HTTPException(status_code=404, detail="Unknown compile ID")
+    else:
+        user = await _route_current_user(request)
+        job_dir = _guard_job(job_id, user)
     path = _resolve_hf_asset(job_dir, compile_id, asset)
     media_type, _ = mimetypes.guess_type(path)
     if asset.endswith(".html"):
@@ -400,6 +564,23 @@ async def hyperframes_render(job_id: str, clip_index: int,
             raise HTTPException(
                 status_code=409,
                 detail="Compile was built from a different project version")
+        # Snapshot binding (review-01 group 3): passing compile_id must not
+        # bypass snapshot validation. The compile must be for the CURRENT
+        # saved project — same version AND same digest, recomputed with the
+        # compiler's digest function. A newer save or any project change
+        # after the preview makes the preview stale: re-preview to export.
+        project, latest = _load_project_at_version(job_dir, clip_index, None)
+        rec_version = int(rec.get("project_version", -1))
+        if rec_version != latest:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Preview is stale: compiled from project v{rec_version}, "
+                       f"but the project is now v{latest}. Re-preview to export.")
+        if rec.get("project_digest") != _c.project_digest(project):
+            raise HTTPException(
+                status_code=409,
+                detail="Preview is stale: the project changed after this "
+                       "preview was compiled. Re-preview to export.")
         comp_dir = os.path.join(_hf_dir(job_id), compile_id)
         manifest_path = os.path.join(comp_dir, "manifest.json")
         if not os.path.isfile(manifest_path):
@@ -437,6 +618,10 @@ async def hyperframes_render(job_id: str, clip_index: int,
             )
         except _c.FinishingDisabled as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        except _c.CleanBaseError as exc:
+            # Honest refusal (framing trajectory, reframed_base lineage,
+            # configured music): the pilot cannot render this project.
+            raise HTTPException(status_code=400, detail=str(exc))
         except _c.CompileError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception:  # noqa: BLE001
@@ -471,7 +656,29 @@ async def hyperframes_render(job_id: str, clip_index: int,
     now = time.time()
 
     if cached:
-        shutil.copy2(cached, output_path)
+        # Atomic publish: stage into a destination-local temp file, validate
+        # the staged media, then replace. A failed publish never leaves a
+        # partial file behind and the previous complete export is preserved.
+        try:
+            _stage_and_install(cached, output_path,
+                               width=manifest["render"]["width"],
+                               height=manifest["render"]["height"])
+        except Exception as exc:  # noqa: BLE001 - honest failure, keep old output
+            record = {
+                "render_id": render_id, "job_id": job_id,
+                "clip_index": clip_index,
+                "project_version": project_version, "compile_id": compile_id,
+                "preview_identity": preview_identity,
+                "template_id": template_id,
+                "state": "failed", "cache_hit": True,
+                "output_file": output_name,
+                "output_url": f"/videos/{job_id}/{output_name}",
+                "created_at": now, "finished_at": time.time(),
+                "error": f"publish failed: {exc}; previous output preserved",
+                "metrics": {"cache": "hit", "cache_key": key},
+            }
+            _write_record(job_dir, render_id, record)
+            raise HTTPException(status_code=500, detail=record["error"])
         record = {
             "render_id": render_id, "job_id": job_id, "clip_index": clip_index,
             "project_version": project_version, "compile_id": compile_id,
@@ -549,20 +756,28 @@ async def hyperframes_render(job_id: str, clip_index: int,
                        error=f"worker error: {exc}")
             _write_record(job_dir, render_id, rec)
             return
-        # Atomic publish: cache first, then the versioned output name.
-        # A concurrent cancel wins over a late publish: never install output
-        # for a render that is no longer "rendering".
+        # Atomic publish: install into the cache, then stage + validate +
+        # atomically replace the versioned output name. A concurrent cancel
+        # wins over a late publish: never install output for a render that
+        # is no longer "rendering" (the record keeps its terminal state with
+        # an honest note).
         try:
-            rec_now = _read_record(job_dir, render_id) or {}
-            if rec_now.get("state") != "rendering":
-                return
-            _cache.store(job_dir, key, worker_out)
-            shutil.copy2(worker_out, output_path)
-        except OSError as exc:
+            await _publish_worker_output(
+                job_dir=job_dir, render_id=render_id, src_path=worker_out,
+                cache_key=key, output_path=output_path,
+                width=manifest["render"]["width"],
+                height=manifest["render"]["height"])
+        except PublishSkipped:
+            # Terminal-state race: the record already carries the honest
+            # note and keeps its state (e.g. cancelled). Nothing to do.
+            return
+        except Exception as exc:  # noqa: BLE001
+            rec = _read_record(job_dir, render_id) or {}
             rec.update(state="failed", finished_at=time.time(),
                        error=f"publish failed: {exc}")
             _write_record(job_dir, render_id, rec)
             return
+        rec = _read_record(job_dir, render_id) or {}
         rec.update(state="rendered", finished_at=time.time(),
                    metrics=result.metrics)
         _write_record(job_dir, render_id, rec)
@@ -619,6 +834,7 @@ async def hyperframes_render_status(render_id: str, request: Request,
         "cache_hit": rec.get("cache_hit", False),
         "output_url": rec.get("output_url"),
         "error": rec.get("error"),
+        "note": rec.get("publish_note"),
         "metrics": rec.get("metrics", {}),
     }
 

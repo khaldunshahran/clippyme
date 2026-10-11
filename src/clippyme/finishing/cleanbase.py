@@ -7,7 +7,9 @@ Audit result (recorded 2026-10-10, see RESULT.md):
 - ``project.reframed_base`` lineage points at the pipeline's ``clip_final``,
   which is the fully composed clip — captions/hooks may be baked in and the
   lineage record carries no graphics-free provenance. It is therefore NOT
-  reused as a Hyperframes base.
+  reused as a Hyperframes base; any project carrying reframed_base lineage
+  is refused clearly (review-01 group 5) instead of silently falling back to
+  the static segment crop, which would discard accepted Task05 framing.
 - The accepted ``_materialize_timeline`` path (project_render) produces the
   cut/cropped/concatenated timeline with audio and NO graphics layers — it is
   the pre-compose footage by construction, so it is a verified clean base.
@@ -77,14 +79,17 @@ async def resolve_clean_base(project, job_dir: str, clip_index: int) -> dict:
 
     # Lineage audit: reframed_base points at clip_final (post-graphics), and
     # the lineage record has no graphics-free provenance marker, so it is
-    # never reused here — even when check_lineage_eligible passes for the
-    # accepted renderer.
+    # never reused here. Task05 lineage can carry tracked/split/screencast
+    # pixels that differ from the static segment crop — silently
+    # materializing the static crop would discard accepted framing, so a
+    # project carrying lineage without a framing field is an honest refusal
+    # (pilot limitation), not a silent downgrade.
     lineage = getattr(project, "reframed_base", None)
     if lineage is not None:
-        logger.info(
-            "hyperframes clean-base: lineage base %r present but not verifiably "
-            "graphics-free (clip_final provenance); materializing clean timeline",
-            getattr(lineage, "base_ref", "?"),
+        raise CleanBaseUnavailable(
+            "project carries reframed_base lineage (Task05 accepted framing) "
+            "with no verified graphics-free provenance; the Hyperframes "
+            "pilot cannot safely replay it — use the legacy render path"
         )
 
     # Verified clean: the accepted pre-compose timeline materialization.
@@ -136,4 +141,7 @@ async def resolve_clean_base(project, job_dir: str, clip_index: int) -> dict:
         "width": int(bw),
         "height": int(bh),
         "fps": float(bfps),
+        # Informational: source-audio projects must keep their audio in the
+        # pilot base (configured music is refused upstream in the compiler).
+        "has_audio": probe.get("has_audio") is True,
     }

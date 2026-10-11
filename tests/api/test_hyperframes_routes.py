@@ -276,3 +276,372 @@ def test_worker_busy_surfaces_as_failed_state(tmp_path, monkeypatch):
     r = client.get(f"/api/hyperframes/render/{render_id}")
     assert r.json()["state"] == "failed"
     assert "busy" in r.json()["error"]
+
+
+# --- preview tokens (review-01 group 2 backend) ------------------------------------
+
+import asyncio as _asyncio
+import shutil as _shutil
+import subprocess as _subprocess
+from pathlib import Path as _Path
+
+
+def _ffmpeg_available():
+    return bool(_shutil.which("ffmpeg") and _shutil.which("ffprobe"))
+
+
+def _tiny_mp4(path, w=608, h=1080, fps=30, dur=1.0):
+    if not _ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not on PATH")
+    _subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", f"testsrc=size={w}x{h}:rate={fps}:duration={dur}",
+         "-f", "lavfi", "-i", f"sine=frequency=440:duration={dur}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest", str(path)],
+        check=True)
+    return str(path)
+
+
+def _valid_compile_record(hr, job_dir, jid, cid, *,
+                          width=608, height=1080, fps=30):
+    """Write a compile record + manifest matching the CURRENT saved project
+    (real digest via the compiler's digest function), like the compile
+    endpoint would."""
+    from clippyme.finishing import compile as _c
+    project, version = hr._load_project_at_version(job_dir, 0, None)
+    comp = os.path.join(job_dir, ".hf", cid)
+    os.makedirs(comp, exist_ok=True)
+    manifest = {
+        "project_digest": _c.project_digest(project),
+        "template": {"id": "clean-captions", "version": 1},
+        "params": {"caption_size": "medium", "caption_position": "lower-third"},
+        "base": {"sha256": "a" * 64},
+        "fonts": [],
+        "renderer": {"engine": "0.8.145"},
+        "render": {"width": width, "height": height, "fps": fps},
+        "duration": 5.0,
+        "frames": 150,
+    }
+    with open(os.path.join(comp, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+    crec_dir = os.path.join(job_dir, ".hf", "compiles")
+    os.makedirs(crec_dir, exist_ok=True)
+    rec = {"compile_id": cid, "job_id": jid, "clip_index": 0,
+           "project_version": version,
+           "project_digest": manifest["project_digest"],
+           "preview_identity": "digest-" + cid[:8],
+           "template": manifest["template"],
+           "created_at": 0.0}
+    with open(os.path.join(crec_dir, cid + ".json"), "w") as f:
+        json.dump(rec, f)
+    return rec, manifest
+
+
+def _write_token_compile(hr, out, jid, cid):
+    job_dir = _write_job(out, jid, _project())
+    _valid_compile_record(hr, job_dir, jid, cid)
+    with open(os.path.join(job_dir, ".hf", cid, "index.html"), "w") as f:
+        f.write("<html>preview</html>")
+    return job_dir
+
+
+def _mint_token(client, jid, cid):
+    r = client.post(f"/api/hyperframes/preview-token/{jid}/{cid}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expires_in"] == 900
+    assert isinstance(body["token"], str) and "." in body["token"]
+    return body["token"]
+
+
+def test_preview_token_mint_and_asset_access(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    _write_token_compile(hr, out, jid, cid)
+    token = _mint_token(client, jid, cid)
+    # The token works with NO session auth at all (overrides cleared).
+    client.app.dependency_overrides.clear()
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/{cid}/index.html?token={token}")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("text/html")
+
+
+def test_preview_token_bad_signature_rejected(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    _write_token_compile(hr, out, jid, cid)
+    token = _mint_token(client, jid, cid)
+    bad = token[:-2] + ("AA" if not token.endswith("AA") else "BB")
+    client.app.dependency_overrides.clear()
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/{cid}/index.html?token={bad}")
+    assert r.status_code == 401
+
+
+def test_preview_token_expired_rejected(tmp_path, monkeypatch):
+    from clippyme.finishing import preview_tokens as _pt
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    _write_token_compile(hr, out, jid, cid)
+    token, _ = _pt.mint_preview_token(jid, cid, ttl_sec=-5)
+    client.app.dependency_overrides.clear()
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/{cid}/index.html?token={token}")
+    assert r.status_code == 401
+    assert "expired" in r.json()["detail"]
+
+
+def test_preview_token_wrong_scope_rejected(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    _write_token_compile(hr, out, jid, cid)
+    token = _mint_token(client, jid, cid)
+    client.app.dependency_overrides.clear()
+    # Token scoped to jid, used on another job's path.
+    other = _job_id()
+    _write_job(out, other, _project())
+    r = client.get(
+        f"/api/hyperframes/composition/{other}/{cid}/index.html?token={token}")
+    assert r.status_code == 401
+    # Token scoped to cid, used on another compile's path.
+    cid2 = "1234567890abcdef"
+    _valid_compile_record(hr, os.path.join(out, jid), jid, cid2)
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/{cid2}/index.html?token={token}")
+    assert r.status_code == 401
+
+
+def test_preview_token_unknown_compile_rejected(tmp_path, monkeypatch):
+    from clippyme.finishing import preview_tokens as _pt
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    _write_job(out, jid, _project())
+    token, _ = _pt.mint_preview_token(jid, "ffffffffffffffff")
+    client.app.dependency_overrides.clear()
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/ffffffffffffffff/index.html"
+        f"?token={token}")
+    assert r.status_code == 404
+
+
+def test_preview_token_mint_requires_auth(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    _write_token_compile(hr, out, jid, cid)
+    client.app.dependency_overrides.clear()
+    monkeypatch.setenv("AUTH_DISABLED_DEV", "0")
+    r = client.post(f"/api/hyperframes/preview-token/{jid}/{cid}")
+    assert r.status_code == 401
+
+
+def test_preview_token_respects_asset_allowlist(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    job_dir = _write_token_compile(hr, out, jid, cid)
+    with open(os.path.join(job_dir, ".hf", cid, "manifest.json"), "w") as f:
+        f.write("{}")
+    token = _mint_token(client, jid, cid)
+    client.app.dependency_overrides.clear()
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/{cid}/manifest.json?token={token}")
+    assert r.status_code == 404
+
+
+# --- compile/export snapshot binding (review-01 group 3 backend) --------------------
+
+def test_render_rejects_stale_compile_after_new_save(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())  # v2
+    cid = "abcdef0123456789"
+    _valid_compile_record(hr, job_dir, jid, cid)
+    # A newer save lands after the preview was compiled...
+    p3 = _project()
+    p3["version"] = 3
+    _write_job(out, jid, p3)
+    r = client.post(f"/api/hyperframes/render/{jid}/0",
+                    json={"compile_id": cid})
+    assert r.status_code == 409
+    assert "stale" in r.json()["detail"].lower()
+    assert "re-preview" in r.json()["detail"].lower()
+
+
+def test_render_rejects_compile_digest_mismatch(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())
+    cid = "abcdef0123456789"
+    rec, _ = _valid_compile_record(hr, job_dir, jid, cid)
+    # Same version, but the record digest no longer matches the saved project.
+    rec["project_digest"] = "0" * 64
+    with open(os.path.join(job_dir, ".hf", "compiles", cid + ".json"),
+              "w") as f:
+        json.dump(rec, f)
+    r = client.post(f"/api/hyperframes/render/{jid}/0",
+                    json={"compile_id": cid})
+    assert r.status_code == 409
+    assert "stale" in r.json()["detail"].lower()
+
+
+def test_render_accepts_current_compile_cache_hit(tmp_path, monkeypatch):
+    from clippyme.finishing import cache as _cache
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())
+    cid = "abcdef0123456789"
+    _, manifest = _valid_compile_record(hr, job_dir, jid, cid)
+    w, h = manifest["render"]["width"], manifest["render"]["height"]
+    cached = _tiny_mp4(tmp_path / "cached.mp4", w=w, h=h)
+    monkeypatch.setattr(_cache, "lookup", lambda *a: cached)
+    r = client.post(f"/api/hyperframes/render/{jid}/0",
+                    json={"compile_id": cid})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "rendered" and body["cache_hit"] is True
+    final = os.path.join(job_dir, body["output_url"].rsplit("/", 1)[-1])
+    assert os.path.isfile(final)
+    from clippyme.domain import project_render as _pr
+    probe = _pr.probe_media(final)
+    assert probe["has_video"] is True
+    assert probe["width"] == w and probe["height"] == h
+    assert list(_Path(job_dir).glob("*.part-*")) == []
+
+
+# --- atomic publication (review-01 group 4) -----------------------------------------
+
+def test_cache_hit_publish_failure_preserves_previous_output(tmp_path,
+                                                            monkeypatch):
+    """Promoted coordinator-review01-backend.py regression — now with a VALID
+    compile record (real digest) so the corruption path is actually reached:
+    an injected copy failure must not replace a previous complete export
+    with partial bytes, must clean up its own temp file, and must fail
+    honestly with a failed record."""
+    from clippyme.finishing import cache as _cache
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())
+    cid = "abcdef0123456789"
+    _valid_compile_record(hr, job_dir, jid, cid)
+    final = os.path.join(job_dir, hr._output_name(0, 2, "clean-captions"))
+    _Path(final).write_bytes(b"previous-complete-export")
+    cached = tmp_path / "cache.mp4"
+    cached.write_bytes(b"new-complete-export")
+    monkeypatch.setattr(_cache, "lookup", lambda *a: str(cached))
+
+    def interrupted_copy(src, dst, *a, **kw):
+        _Path(dst).write_bytes(b"partial-new-export")
+        raise OSError("injected disk write failure")
+
+    monkeypatch.setattr(hr.shutil, "copy2", interrupted_copy)
+    r = client.post(f"/api/hyperframes/render/{jid}/0",
+                    json={"compile_id": cid})
+    assert r.status_code == 500
+    assert "previous output preserved" in r.json()["detail"]
+    assert _Path(final).read_bytes() == b"previous-complete-export"
+    assert list(_Path(job_dir).glob("*.part-*")) == []
+    recs = list((_Path(job_dir) / ".hf" / "renders").glob("*.json"))
+    assert len(recs) == 1
+    rec = json.loads(recs[0].read_text())
+    assert rec["state"] == "failed"
+    assert "publish failed" in rec["error"]
+
+
+def test_stage_and_install_rejects_bad_media(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    final = tmp_path / "final.mp4"
+    final.write_bytes(b"previous-complete-export")
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"not-a-video")
+    with pytest.raises(hr.PublishValidationError, match="no video stream"):
+        hr._stage_and_install(str(src), str(final), width=608, height=1080)
+    assert final.read_bytes() == b"previous-complete-export"
+    assert list(tmp_path.glob("*.part-*")) == []
+
+
+def test_stage_and_install_copy_failure_cleans_up(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    final = tmp_path / "final.mp4"
+    final.write_bytes(b"previous-complete-export")
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"new-bytes")
+
+    def interrupted_copy(s, d, *a, **kw):
+        _Path(d).write_bytes(b"partial")
+        raise OSError("injected disk write failure")
+
+    monkeypatch.setattr(hr.shutil, "copy2", interrupted_copy)
+    with pytest.raises(OSError, match="injected disk write failure"):
+        hr._stage_and_install(str(src), str(final), width=608, height=1080)
+    assert final.read_bytes() == b"previous-complete-export"
+    assert list(tmp_path.glob("*.part-*")) == []
+
+
+def test_stage_and_install_success(tmp_path, monkeypatch):
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    final = tmp_path / "final.mp4"
+    final.write_bytes(b"previous-complete-export")
+    src = _tiny_mp4(tmp_path / "src.mp4", w=608, h=1080)
+    hr._stage_and_install(src, str(final), width=608, height=1080)
+    from clippyme.domain import project_render as _pr
+    probe = _pr.probe_media(str(final))
+    assert probe["has_video"] is True
+    assert probe["width"] == 608 and probe["height"] == 1080
+    assert list(tmp_path.glob("*.part-*")) == []
+
+
+def test_publish_worker_output_installs_when_rendering(tmp_path, monkeypatch):
+    """The fresh-worker publish path: cache install + atomic output install."""
+    from clippyme.finishing import cache as _cache
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())
+    render_id = f"{jid}_{'ab12cd34ef56ab78'}"
+    hr._write_record(job_dir, render_id, {
+        "render_id": render_id, "job_id": jid, "clip_index": 0,
+        "project_version": 2, "state": "rendering"})
+    output_path = os.path.join(job_dir, "hf_clip_0_v2_clean-captions.mp4")
+    src = _tiny_mp4(tmp_path / "worker-out.mp4", w=608, h=1080)
+    _asyncio.run(hr._publish_worker_output(
+        job_dir=job_dir, render_id=render_id, src_path=src,
+        cache_key="k" * 64, output_path=output_path,
+        width=608, height=1080))
+    assert os.path.isfile(output_path)
+    assert _cache.lookup(job_dir, "k" * 64) is not None
+    assert list(_Path(job_dir).glob("*.part-*")) == []
+
+
+def test_publish_worker_output_cancel_race_never_installs(tmp_path,
+                                                         monkeypatch):
+    """A cancelled-then-completed worker never installs output; the record
+    stays cancelled with an honest note (surfaced by the status endpoint)."""
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())
+    render_id = f"{jid}_{'ab12cd34ef56ab78'}"
+    hr._write_record(job_dir, render_id, {
+        "render_id": render_id, "job_id": jid, "clip_index": 0,
+        "project_version": 2, "state": "cancelled",
+        "error": "cancel requested", "finished_at": 0.0})
+    output_path = os.path.join(job_dir, "hf_clip_0_v2_clean-captions.mp4")
+    src = tmp_path / "worker-out.mp4"
+    src.write_bytes(b"worker-bytes")
+    with pytest.raises(hr.PublishSkipped):
+        _asyncio.run(hr._publish_worker_output(
+            job_dir=job_dir, render_id=render_id, src_path=str(src),
+            cache_key="k" * 64, output_path=output_path,
+            width=608, height=1080))
+    assert not os.path.exists(output_path)
+    rec = hr._read_record(job_dir, render_id)
+    assert rec["state"] == "cancelled"
+    assert "not published" in rec["publish_note"]
+    r = client.get(f"/api/hyperframes/render/{render_id}")
+    assert r.json()["state"] == "cancelled"
+    assert "not published" in (r.json()["note"] or "")

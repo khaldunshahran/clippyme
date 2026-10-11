@@ -73,6 +73,22 @@ function AppShell() {
     workspaceRef.current = { controller: ws.controller };
   }, [workspaceRef, ws.controller]);
 
+  // Task 18 review 01: lifetime identity for the Hyperframes card. The card
+  // captures it at every async start and drops any continuation whose key no
+  // longer matches. The epoch moves whenever the workspace controller
+  // instance is replaced (selection switch / close / reselection -- including
+  // same-ID reselection, which always yields a fresh controller) or the
+  // session resets (ws.resetKey). Render-phase ref compare: no re-render is
+  // triggered; the epoch only moves when the controller identity changes.
+  const hfEpochRef = useRef(0);
+  const hfLastControllerRef = useRef(ws.controller);
+  if (hfLastControllerRef.current !== ws.controller) {
+    hfLastControllerRef.current = ws.controller;
+    hfEpochRef.current += 1;
+  }
+  const activeSelectionKey = selectedClip ? `${selectedClip.jobId}:${selectedClip.clipIndex}` : null;
+  const hfLifetimeKey = `${ws.resetKey}:${hfEpochRef.current}`;
+
   const ensureThread = useCallback(() => {
     if (activeId) return activeId;
     return createThread();
@@ -225,7 +241,10 @@ function AppShell() {
             ) : (
               <ChatThread
                 thread={active}
-                activeSelectionKey={selectedClip ? `${selectedClip.jobId}:${selectedClip.clipIndex}` : null}
+                activeSelectionKey={activeSelectionKey}
+                controller={ws.controller}
+                controllerKey={activeSelectionKey}
+                lifetimeKey={hfLifetimeKey}
                 onOpenClip={(i) => openClip(activeId, i)}
                 onEditClip={(i) => handleSelectClip(activeId, i)}
                 onScheduleClip={(i) => openSchedule(activeId, i)}
