@@ -257,50 +257,84 @@
   /* Horizontal overflow is contained here, so inner controls must wrap or
    * scroll in an intentional tool strip — never rely on being clipped. */
   overflow-x: hidden;
+  /* The editor is the container the grid/header respond to (review-02):
+   * its width is what remains AFTER the transcript rail is deducted, so
+   * a two-column editor layout is only chosen when the editor itself —
+   * not the outer panel — can actually fit preview + inspector. */
+  container-type: inline-size;
+  container-name: nugget-editor;
 }
 
-/* Narrow workspace panel: stack the transcript above the editor (mirrors
- * the small-viewport behavior), so the 300px rail never squeezes the
- * editor into an unusable sliver. Keyed to the panel, not the viewport. */
+/* Narrow workspace panel: stack the transcript BELOW the editor as an
+ * explicit tool view (mirrors the small-viewport behavior), so the 300px
+ * rail never squeezes the editor into an unusable sliver and its seek
+ * player never sits above the workspace identity/primary preview.
+ * Keyed to the panel, not the viewport. */
 @container nugget-workspace (max-width: 560px) {
   .nc-ws-body {
     flex-direction: column;
+    overflow-y: auto;
+  }
+  .nc-ws-editor {
+    order: 1;
+    /* Size to content: a shrunk flex box (min-height: 0 in the base
+     * rule) would let the tall editor grid paint OVER the transcript
+     * tool view that follows in the column. */
+    flex: 0 0 auto;
+    overflow: visible;
   }
   .nc-ws-transcript {
+    order: 2;
     width: 100%;
     border-right: none;
-    border-bottom: 1px solid var(--line-1, rgba(140, 130, 110, 0.25));
+    border-top: 1px solid var(--line-1, rgba(140, 130, 110, 0.25));
     max-height: 38vh;
     flex-shrink: 0;
   }
-  .nc-ws-editor {
-    overflow: visible;
+  .nc-ws-transcript .tp-video-wrap {
+    max-width: 300px;
+    margin-left: auto;
+    margin-right: auto;
+    width: calc(100% - 20px);
   }
 }
 
-/* Narrow workspace: transcript stacks above the editor. */
+/* Narrow workspace: the editor (identity + primary preview) comes first;
+ * the transcript stacks BELOW it as an explicit tool view. */
 @media (max-width: 900px) {
   .nc-ws-body {
     flex-direction: column;
     overflow-y: auto;
   }
+  .nc-ws-editor {
+    order: 1;
+    overflow: visible;
+    /* Size to content (see the container block): the transcript tool
+     * view follows in the column and must never be painted over by
+     * the editor's overflowing grid. */
+    flex: 0 0 auto;
+  }
   .nc-ws-transcript {
+    order: 2;
     width: 100%;
     border-right: none;
-    border-bottom: 1px solid var(--line-1, rgba(140, 130, 110, 0.25));
+    border-top: 1px solid var(--line-1, rgba(140, 130, 110, 0.25));
     max-height: 46vh;
     flex-shrink: 0;
   }
-  .nc-ws-editor {
-    overflow: visible;
-    flex: 1 1 auto;
+  .nc-ws-transcript .tp-video-wrap {
+    max-width: 300px;
+    margin-left: auto;
+    margin-right: auto;
+    width: calc(100% - 20px);
   }
 }
 
 /* ------------------------------------------------------------------
  * Nested clip editor: responsive grid + preview labels.
- * The grid collapses to one column when the workspace panel is narrow
- * (container query) or the viewport is small (standalone fallback).
+ * The grid collapses to one column when the EDITOR is narrow (container
+ * query on .nc-ws-editor — the width remaining after the transcript
+ * rail, review-02) or the viewport is small (standalone fallback).
  * ------------------------------------------------------------------ */
 
 .nc-ce-grid {
@@ -310,7 +344,7 @@
   grid-template-columns: minmax(0, 1fr);
 }
 
-@container nugget-workspace (min-width: 720px) {
+@container nugget-editor (min-width: 720px) {
   .nc-ce-grid {
     grid-template-columns: minmax(0, 1.12fr) minmax(300px, 0.88fr);
   }

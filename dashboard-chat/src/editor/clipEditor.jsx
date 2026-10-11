@@ -5,18 +5,20 @@
 // The server renders final pixels on Export (POST /api/compose {project}).
 // Undo = load an earlier version into the draft, then save/export.
 //
-// Preview honesty: the <video> plays the master/composed clip (source-slice
-// timeline, 1:1 with project source coords); captions/hooks render as DOM
-// overlays synced to the playhead. Export is the pixel-exact check. When the
-// player shows an exported render (exact or historical), the DOM overlays
-// stay off — the file already contains that version's graphics.
+// Preview honesty: in draft mode the <video> plays the clip's raw source
+// file (source-slice timeline, 1:1 with project source coords — see
+// draftPreviewSource); captions/hooks render as DOM overlays synced to
+// the playhead. Export is the pixel-exact check. When the player shows
+// an exported render (exact or historical) or the composed-file
+// fallback, the DOM overlays stay off and playback runs on the file's
+// own timebase — the file already contains that version's graphics.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon, Btn } from './primitives';
 import { SUBTITLE_PRESETS } from './data';
 import {
   getClipProject, saveClipProject, composeProject, backfillClipProjects,
-  listClipProjectVersions, editClipAI, safeResolveUrl, clipPreviewSrc,
+  listClipProjectVersions, editClipAI, safeResolveUrl,
   uploadAudio,
 } from '../api/realApi';
 
@@ -176,6 +178,27 @@ function wordAt(words, edits, t) {
     }
   }
   return null;
+}
+
+// The genuine draft input for the preview player (review-02). The
+// editor's timeline is written in SOURCE coordinates and its caption /
+// hook graphics are drawn as DOM overlays, so the draft player must play
+// the clip's raw source file (clip.video_url — the same file
+// clipVideoSrc returns). It must NOT silently play
+// clip.composed_video_url: that file is a rendered artifact whose
+// graphics are already burned in, and clipPreviewSrc prefers it — using
+// it as the "draft" would stack new DOM graphics over burned ones and
+// mislabel a rendered timeline as the source. Only when a clip has no
+// raw source at all do we fall back to the composed file, flagged
+// `composed: true` so the UI presents it honestly (no DOM overlays, no
+// draft segment looping, no source-coordinate split from its playhead)
+// instead of claiming it is clean source footage.
+export function draftPreviewSource(clip) {
+  const raw = clip && clip.video_url ? safeResolveUrl(clip.video_url) : '';
+  if (raw) return { src: raw, composed: false };
+  const composed = clip && clip.composed_video_url ? safeResolveUrl(clip.composed_video_url) : '';
+  if (composed) return { src: composed, composed: true };
+  return { src: '', composed: false };
 }
 
 function validateDraft(p) {
@@ -703,22 +726,30 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const [aiBusy, setAiBusy] = useState(false);
   const [aiMsg, setAiMsg] = useState('');
   // UI-01: what the preview player is showing, bound to the actual
-  // artifact + project identity (review-01):
-  // - 'draft' = the genuine draft input (source footage) + DOM overlays
-  //   drawn from the current draft project (approximate preview);
-  // - 'render' = an exported file. It is only the EXACT render while
-  //   `version` still equals the acknowledged project version AND the
-  //   ownership (clip session key + controller identity) still matches.
-  //   Any authoritative save path (manual, chat/transcript, bulk,
-  //   undo/redo, restore/reset, clip/controller switch) bumps the version
-  //   or moves ownership and invalidates it. A render whose version no
-  //   longer matches is presented honestly as a historical render, without
-  //   the current draft's DOM overlays or timeline assertions (its pixels
-  //   already contain that version's graphics).
+  // artifact + project identity (review-01, review-02):
+  // - 'draft' = the genuine draft input (the clip's raw source file —
+  //   see draftPreviewSource) + DOM overlays drawn from the current
+  //   draft project (approximate preview);
+  // - 'render' = an exported file. It is only the EXACT current render
+  //   while its version still equals the server-ACKNOWLEDGED version
+  //   (ackVersion), the draft carries no unsaved divergence (dirty),
+  //   the recorded content identity still matches, AND the ownership
+  //   (clip session key + controller identity) still matches. Any
+  //   authoritative save path (manual, chat/transcript, bulk, undo/redo,
+  //   restore/reset, clip/controller switch) moves one of those and
+  //   invalidates exactness. A render that no longer qualifies is
+  //   presented honestly as a historical render, without the current
+  //   draft's DOM overlays (its pixels already contain that version's
+  //   graphics), and its playback runs on its own timebase.
   // Any current-draft edit returns the player to the genuine draft input:
   // the previous exported file is never the draft source, and draft
   // overlays must never draw on top of exported pixels.
-  const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null, key: null, ctl: null });
+  const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null, key: null, ctl: null, contentKey: null });
+  // True while the player's "draft" input is actually the composed file
+  // (the clip has no raw source — see draftPreviewSource). That file is
+  // a rendered artifact: no DOM overlays, no draft segment loop, and its
+  // playhead cannot authorize a source-coordinate split.
+  const [draftComposed, setDraftComposed] = useState(false);
   const videoRef = useRef(null);
 
   // Task 16 authority mode: controlled (via the project controller) or
@@ -735,11 +766,12 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
               if (res && res.composed_url) {
                 const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
                 setVideoSrc(safeResolveUrl(res.composed_url) + bust);
+                setDraftComposed(false);
                 setPlayhead(0);
                 // The player now shows the exact exported file — owned by
                 // this clip session; any later authoritative save or
                 // ownership move invalidates it (see previewBadge below).
-                setPreviewKind({ kind: 'render', version: res.version ?? null, key: `${jobId}:${clipIndex}`, ctl: controller });
+                setPreviewKind({ kind: 'render', version: res.version ?? null, key: `${jobId}:${clipIndex}`, ctl: controller, contentKey: res?.identity?.idempotency_key ?? null });
               }
               pushToast?.(
                 res && res.deduped
@@ -772,6 +804,15 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // job/clip ids are unchanged.
   const previewSessionKey = `${jobId}:${clipIndex}`;
 
+  // Point the player at the genuine draft input (see
+  // draftPreviewSource) and record whether that input is the
+  // composed-file fallback.
+  const applyDraftSrc = () => {
+    const d = draftPreviewSource(clip);
+    setVideoSrc(d.src);
+    setDraftComposed(d.composed);
+  };
+
   const refreshVersions = useCallback(async () => {
     if (ctl) { await ctl.refreshVersions(); return; }
     setVersionsLoadingLocal(true);
@@ -801,7 +842,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
         if (!alive) return;
         setProjectLocal(proj);
         setSavedVersionLocal(proj.version);
-        setVideoSrc(clipPreviewSrc(clip, null));
+        applyDraftSrc();
         setStatusLocal('ready');
         refreshVersions();
       } catch (e) {
@@ -819,10 +860,18 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // the clip (the controller swaps it to the exact render on export).
   // Clears stale preview ownership across selection/reset: a new clip
   // session always starts on the genuine draft input.
+  const seededSessionRef = useRef(null);
   useEffect(() => {
     if (mode !== 'controlled') return;
-    setVideoSrc(clipPreviewSrc(clip, null));
-    setPreviewKind({ kind: 'draft', version: null, key: `${jobId}:${clipIndex}`, ctl: controller });
+    // Seed once per clip session (session key + controller identity):
+    // re-renders of the same session must never clobber an active
+    // render preview or a draft the user already navigated to.
+    const seedKey = `${jobId}:${clipIndex}`;
+    const prevSeed = seededSessionRef.current;
+    if (prevSeed && prevSeed.key === seedKey && prevSeed.ctl === controller) return;
+    seededSessionRef.current = { key: seedKey, ctl: controller };
+    applyDraftSrc();
+    setPreviewKind({ kind: 'draft', version: null, key: seedKey, ctl: controller, contentKey: null });
     // clip is a stable prop from the results list; intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, jobId, clipIndex, controller]);
@@ -842,10 +891,10 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     // the previous exported file is not the draft source, and the draft's
     // DOM overlays must never draw on top of exported pixels.
     if (previewKind.kind === 'render') {
-      setVideoSrc(clipPreviewSrc(clip, null));
+      applyDraftSrc();
       setPlayhead(0);
     }
-    setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
+    setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller, contentKey: null });
     if (ctl) return ctl.mutate(label, fn);
     setProjectLocal((prev) => {
       if (!prev) return prev;
@@ -867,12 +916,26 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const hook = ((project && project.overlays) || []).find((o) => o.type === 'hook');
   const activeWord = useMemo(() => wordAt(words, edits, playhead), [words, edits, playhead]);
 
+  // Preview ownership, derived before the playback handlers that bind
+  // to it: a shown render (exact or historical) belongs to this clip
+  // session + controller, and the composed-file fallback counts as an
+  // artifact too. Artifact playback runs on the file's own timebase
+  // (review-02): the draft segment loop, draft overlays and
+  // source-coordinate split authorization do not apply to it.
+  const renderOwned = previewKind.kind === 'render'
+    && previewKind.key === previewSessionKey
+    && previewKind.ctl === controller;
+  const artifactPlayback = renderOwned || draftComposed;
+
   // --- preview playback ------------------------------------------------
   const onTimeUpdate = () => {
     const v = videoRef.current;
     if (!v) return;
     const t = v.currentTime;
     setPlayhead(t);
+    // Never loop a rendered artifact through the current draft's
+    // segment bounds — its timeline is not the draft's source timeline.
+    if (artifactPlayback) return;
     const s = segs[selSeg];
     if (loopSeg && s && !v.paused && t >= s.end) v.currentTime = s.start;
   };
@@ -888,6 +951,13 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     if (s) { s.start = start; s.end = end; }
   }, 'trim segment');
   const onSplit = () => {
+    // A rendered file's playhead sits in the artifact's own timebase,
+    // not in draft source coordinates: it cannot authorize a
+    // source-coordinate split (review-02).
+    if (artifactPlayback) {
+      pushToast?.('warn', 'The preview is showing a rendered file — return to the draft preview to split at the playhead.');
+      return;
+    }
     const s = segs[selSeg];
     if (!s) return;
     if (!(playhead > s.start + 0.2 && playhead < s.end - 0.2)) {
@@ -1090,11 +1160,12 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       setSavedVersionLocal(res.version);
       const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
       setVideoSrc(safeResolveUrl(res.composed_url) + bust);
+      setDraftComposed(false);
       setPlayhead(0);
       // The player now shows the exact exported file — owned by this clip
       // session; any later authoritative save or ownership move invalidates
       // it (see previewBadge below).
-      setPreviewKind({ kind: 'render', version: res.version ?? null, key: previewSessionKey, ctl: controller });
+      setPreviewKind({ kind: 'render', version: res.version ?? null, key: previewSessionKey, ctl: controller, contentKey: toRender?.idempotency_key ?? null });
       await refreshVersions();
       pushToast?.('success', res.deduped
         ? `v${res.version} unchanged — reused the existing render`
@@ -1116,8 +1187,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
         await ctl.loadVersion(v);
         // The restored draft is not the previously rendered file: back to
         // the genuine draft input.
-        setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
-        setVideoSrc(clipPreviewSrc(clip, null));
+        setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller, contentKey: null });
+        applyDraftSrc();
         setPlayhead(0);
       } catch (e) {
         pushToast?.('Load failed: ' + ((e && e.message) || e).slice(0, 120));
@@ -1133,8 +1204,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       setDirtyLocal(true);
       // The restored draft is not the previously rendered file: back to
       // the genuine draft input.
-      setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
-      setVideoSrc(clipPreviewSrc(clip, null));
+      setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller, contentKey: null });
+      applyDraftSrc();
       setPlayhead(0);
       pushToast?.('info', `Loaded v${v} into the draft — save or export to keep it`);
     } catch (e) {
@@ -1145,11 +1216,12 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const onPreviewVersion = (v) => {
     if (!v.output_url) return;
     setVideoSrc(safeResolveUrl(v.output_url) + `?v=${Date.now()}`);
+    setDraftComposed(false);
     setPlayhead(0);
     // Previewing that version's exported file. When it is not the current
     // acknowledged version it is presented as a historical render (badge
     // below) — never with the current draft's DOM overlays.
-    setPreviewKind({ kind: 'render', version: v.version ?? null, key: previewSessionKey, ctl: controller });
+    setPreviewKind({ kind: 'render', version: v.version ?? null, key: previewSessionKey, ctl: controller, contentKey: null });
   };
 
   const onResetAi = async () => {
@@ -1159,8 +1231,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
         await ctl.resetToAiCut();
         // The reset draft is not the previously rendered file: back to the
         // genuine draft input.
-        setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
-        setVideoSrc(clipPreviewSrc(clip, null));
+        setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller, contentKey: null });
+        applyDraftSrc();
         setPlayhead(0);
       } catch (e) {
         pushToast?.('Reset failed: ' + ((e && e.message) || e).slice(0, 120));
@@ -1180,8 +1252,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       setDirtyLocal(true);
       // The reset draft is not the previously rendered file: back to the
       // genuine draft input.
-      setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
-      setVideoSrc(clipPreviewSrc(clip, null));
+      setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller, contentKey: null });
+      applyDraftSrc();
       setPlayhead(0);
       pushToast?.('info', `Reset to the AI cut (v${proj.version}) — save or export to keep it`);
     } catch (e) {
@@ -1256,27 +1328,35 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
             cls: 'nc-ce-badge-draft',
           }
         : { label: 'Saved', cls: 'nc-ce-badge-render' };
-  // Preview identity (review-01): the render badge is only exact while the
-  // previewed version still equals the acknowledged project version AND
-  // the preview ownership (clip session + controller identity) matches.
-  // Any authoritative save path (manual, chat/transcript, bulk, undo/redo,
-  // restore/reset) or clip/controller switch invalidates it. A render whose
-  // version no longer matches is labeled historical — its pixels already
-  // contain that version's graphics, so the current draft's DOM overlays
-  // stay off and the timeline makes no assertions about it.
-  const renderOwned = previewKind.kind === 'render'
-    && previewKind.key === previewSessionKey
-    && previewKind.ctl === controller;
-  const renderMatchesDraft = renderOwned && previewKind.version != null && previewKind.version === savedVersion;
-  const previewBadge = renderMatchesDraft
+  // Exact-current classification (review-02): a render is the EXACT
+  // current artifact only while its version is the server-ACKNOWLEDGED
+  // version (ackVersion — NOT the draft's content version, which a
+  // restore can roll back while the server sits newer), the draft
+  // carries no unsaved divergence (dirty), and — when both are known —
+  // the content identity (idempotency key) still matches the
+  // acknowledged project. Anything else is a historical render:
+  // viewable, but never "exact". Ownership (renderOwned) was derived
+  // with the playback handlers above.
+  const renderMatchesAck = renderOwned
+    && previewKind.version != null
+    && previewKind.version === ackVersion
+    && !dirty
+    && (previewKind.contentKey == null
+      || project?.idempotency_key == null
+      || previewKind.contentKey === project.idempotency_key);
+  const previewBadge = renderMatchesAck
     ? { label: `Exact v${previewKind.version} render`, cls: 'nc-ce-badge-render' }
     : renderOwned
       ? { label: `Historical v${previewKind.version ?? '?'} render`, cls: 'nc-ce-badge-pending' }
-      : { label: 'Draft preview', cls: 'nc-ce-badge-draft' };
+      : draftComposed
+        ? { label: 'Composed file — burned-in graphics', cls: 'nc-ce-badge-pending' }
+        : { label: 'Draft preview', cls: 'nc-ce-badge-draft' };
   // The playhead is always driven by the <video> element's own time
   // (onTimeUpdate) — the rendered artifact's own timebase, never an
-  // assumed draft mapping.
-  const showDraftOverlays = !renderOwned;
+  // assumed draft mapping. Draft DOM overlays draw only over the
+  // genuine draft input, never over an artifact (render or composed
+  // fallback) whose graphics are already burned in.
+  const showDraftOverlays = !artifactPlayback;
 
   return (
     <main className={`container fade-in${mode === 'standalone' ? ' nc-ce-standalone' : ''}`} style={{ maxWidth: 1400, paddingBottom: 48 }}>
@@ -1364,6 +1444,14 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
           </div>
 
           <div style={{ maxWidth: 560, margin: '14px auto 0' }}>
+            {artifactPlayback && (
+              <div style={{ fontSize: 12, color: 'var(--ink-dim, #666)', background: 'rgba(51,46,38,.06)',
+                border: '1px dashed rgba(51,46,38,.25)', borderRadius: 8, padding: '6px 10px', marginBottom: 6 }}>
+                The player is showing a rendered file on its own timeline. The draft
+                timeline below describes the current draft only — segment looping and
+                playhead splits apply to the draft preview, not to this file.
+              </div>
+            )}
             <Timeline
               duration={duration}
               segments={segs}
@@ -1376,7 +1464,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
             />
             <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5,
               color: 'var(--ink-dim, #666)', marginTop: 8, cursor: 'pointer' }}>
-              <input type="checkbox" checked={loopSeg} onChange={(e) => setLoopSeg(e.target.checked)} />
+              <input type="checkbox" checked={loopSeg} disabled={artifactPlayback} onChange={(e) => setLoopSeg(e.target.checked)} />
               Loop the selected segment in preview
             </label>
           </div>

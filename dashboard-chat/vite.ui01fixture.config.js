@@ -11,6 +11,13 @@
  *
  * Build:  node node_modules/vite/bin/vite.js build --config vite.ui01fixture.config.js
  * Output: /tmp/ui01-fixture-dist (NOT dashboard-chat/dist).
+ *
+ * The config also emits ui01-fixture-dev.html (development-React entry,
+ * src/ui01-fixture/dev-main.jsx). Build that bundle with
+ * `--mode development` into a separate outDir so React's development
+ * build — and therefore real StrictMode double-effect behavior — is
+ * what the dev checks measure (review-02):
+ *   node node_modules/vite/bin/vite.js build --config vite.ui01fixture.config.js --mode development --outDir /tmp/ui01-fixture-dist-dev
  */
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
@@ -57,6 +64,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         fixture: path.join(here, 'ui01-fixture.html'),
+        fixturedev: path.join(here, 'ui01-fixture-dev.html'),
         frame390: path.join(here, 'frame-390.html'),
       },
     },

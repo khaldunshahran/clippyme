@@ -80,7 +80,10 @@ export async function composeProject(jobId, clipIndex, project) {
   __calls.compose += 1;
   return {
     version: project.version,
-    composed_url: `/fixture-render-v${project.version}.mp4`,
+    // Relative on purpose: the fixture is served from file://, where a
+    // leading slash would escape the dist folder and the (real, playable)
+    // synthetic media would never load.
+    composed_url: `fixture-render-v${project.version}.mp4`,
     deduped: false,
   };
 }
@@ -93,7 +96,7 @@ export async function listClipProjectVersions() {
     versions: [
       { version: 1, origin: 'auto', created_at: '2026-10-11T10:00:00', output_url: null },
       { version: 2, origin: 'user', created_at: '2026-10-11T11:00:00', output_url: null },
-      { version: 3, origin: 'user', created_at: '2026-10-11T12:00:00', output_url: '/fixture-render-v3.mp4' },
+      { version: 3, origin: 'user', created_at: '2026-10-11T12:00:00', output_url: 'fixture-render-v3.mp4' },
     ],
   };
 }
@@ -112,5 +115,27 @@ export async function bulkUndo() { return { ok: true }; }
 export const newBulkIdempotencyKey = () => `fixture-bulk-${Date.now()}`;
 
 export const safeResolveUrl = (u) => u;
-export const clipPreviewSrc = () => 'fixture-draft.mp4';
-export const clipVideoSrc = () => 'fixture-draft.mp4';
+// The src helpers mirror the PRODUCTION selection policy in
+// api/realApi.js verbatim (review-02): clipVideoSrc is the raw
+// video_url; clipPreviewSrc prefers an applied previewUrl, then the
+// COMPOSED file, then the raw source. The editor's draft player must
+// therefore NOT use clipPreviewSrc — draftPreviewSource (clipEditor)
+// picks the raw source. An earlier stub returned 'fixture-draft.mp4'
+// for both helpers, which hid exactly that integration issue.
+export function clipVideoSrc(clip, bust) {
+  const full = safeResolveUrl(clip?.video_url || '');
+  return bust ? `${full}${full.includes('?') ? '&' : '?'}v=${bust}` : full;
+}
+export function clipPreviewSrc(clip, state) {
+  if (state?.previewUrl) {
+    const full = safeResolveUrl(state.previewUrl);
+    const b = state.previewBust;
+    return b ? `${full}${full.includes('?') ? '&' : '?'}v=${b}` : full;
+  }
+  if (clip?.composed_video_url) {
+    const full = safeResolveUrl(clip.composed_video_url);
+    const b = state?.reframeBust;
+    return b ? `${full}${full.includes('?') ? '&' : '?'}v=${b}` : full;
+  }
+  return clipVideoSrc(clip, state?.reframeBust);
+}

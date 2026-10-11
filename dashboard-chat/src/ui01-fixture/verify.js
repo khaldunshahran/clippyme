@@ -61,6 +61,24 @@ function overlaps(a, b) {
   return !(r1.right <= r2.left || r2.right <= r1.left || r1.bottom <= r2.top || r2.bottom <= r1.top);
 }
 
+function luminance(rgb) {
+  const m = String(rgb).match(/[\d.]+/g);
+  if (!m || m.length < 3) return null;
+  const [r, g, b] = m.slice(0, 3).map((v) => {
+    const c = parseFloat(v) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function contrastRatio(fg, bg) {
+  const l1 = luminance(fg);
+  const l2 = luminance(bg);
+  if (l1 == null || l2 == null) return 0;
+  const [hi, lo] = l1 >= l2 ? [l1, l2] : [l2, l1];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
 const buttonByText = (text, scope = document) =>
   $$('button', scope).find((b) => (b.textContent || '').trim().includes(text)) || null;
 
@@ -74,13 +92,36 @@ export function runVerify(variant) {
 
   const narrow = window.innerWidth <= 900;
   const selected = variant.sel !== '0';
+  // View state: the narrow Chat/Editor toggle hides one column by design
+  // (CSS display:none; React stays mounted). Editor checks only apply
+  // when the editor column is the visible one; chat checks only when
+  // the chat column is visible (not toggled away, not collapsed).
+  const mview = ($('.nc-workspace-row')?.getAttribute('data-mview')) || 'chat';
+  const editorVisible = !narrow || mview === 'editor';
+  const chatCollapsedVariant = variant.actions.includes('hideChat') && !narrow;
+  const chatVisible = (!narrow || mview === 'chat') && !chatCollapsedVariant;
 
   // Page-level: no horizontal overflow (the old failure mode).
   check('page: no horizontal overflow',
     document.documentElement.scrollWidth <= window.innerWidth + 1,
     `sw=${document.documentElement.scrollWidth} iw=${window.innerWidth}`);
 
+  // Production-faithful theme (review-02): the fixture imports the real
+  // index.css — the same import production src/main.jsx makes. These
+  // computed styles prove the production theme actually applied; an
+  // unstyled shell (white background, browser-default serif/buttons)
+  // fails them, so screenshots from this shell can speak for production
+  // theme, dimensions and contrast.
+  const bodyBg = getComputedStyle(document.body).backgroundColor;
+  check('theme: production global CSS applied (dark chat background)',
+    bodyBg === 'rgb(10, 10, 11)', bodyBg);
+  const bodyFont = getComputedStyle(document.body).fontFamily || '';
+  check('theme: production font stack applied (not browser-default serif)',
+    bodyFont.includes('Segoe UI') && !/^\s*"?Times/.test(bodyFont),
+    bodyFont.slice(0, 60));
+
   if (selected) {
+  if (editorVisible) {
     // Header identity group.
     const title = $('.nc-ce-title');
     check('header: clip title visible', visible(title) && inViewport(title));
@@ -97,7 +138,7 @@ export function runVerify(variant) {
 
     // Header action strip: every action reachable and keyboard-focusable.
     const actions = ['Transcript', 'Ask Nugget to edit', 'Reset to AI cut', 'Save draft', 'Export'];
-    if (!narrow) actions.splice(2, 0, 'Hide chat');
+    if (!narrow) actions.splice(2, 0, chatCollapsedVariant ? 'Show chat' : 'Hide chat');
     const strip = $('.nc-ce-actions');
     for (const name of actions) {
       const btn = name === 'Ask Nugget to edit'
@@ -166,11 +207,43 @@ export function runVerify(variant) {
     const video = $('.nc-ce-grid video');
     check('primary preview player present', !!video);
 
-    // Mobile view: the narrow toggle hides one column by design (CSS
-    // display:none, React stays mounted). Chat-column checks only apply
-    // when the chat column is the visible one.
-    const mview = ($('.nc-workspace-row')?.getAttribute('data-mview')) || 'chat';
-    const chatVisible = !narrow || mview === 'chat';
+    // Editor content-area sizing (review-02): the grid/header respond
+    // to the .nc-ws-editor width — what remains AFTER the transcript
+    // rail — so the primary player must keep a usable width and the
+    // grid shape must follow the EDITOR width, not the outer panel's.
+    // (The panel-based query once qualified a two-column layout while
+    // the player was squeezed to ~116px beside the 300px rail.)
+    const editorEl = $('.nc-ws-editor');
+    const gridEl = $('.nc-ce-grid');
+    if (editorEl && gridEl && video) {
+      const ew = editorEl.clientWidth;
+      const vw = video.getBoundingClientRect().width;
+      check('editor: primary preview keeps a usable width',
+        vw >= 240, `video=${Math.round(vw)} editor=${ew}`);
+      const kids = gridEl.children;
+      if (kids.length >= 2) {
+        const r0 = kids[0].getBoundingClientRect();
+        const r1 = kids[1].getBoundingClientRect();
+        const sideBySide = r1.left > r0.left + 50 && Math.abs(r1.top - r0.top) < 60;
+        if (ew >= 740) {
+          check('editor: two-column grid when the EDITOR itself fits it',
+            sideBySide, `editor=${ew}`);
+        } else if (ew <= 700) {
+          check('editor: single column when the EDITOR cannot fit two columns',
+            !sideBySide, `editor=${ew}`);
+        }
+      }
+    }
+  } else {
+    // Narrow chat view: the editor column is hidden by the Chat/Editor
+    // toggle (CSS display:none) — React and controller state stay
+    // mounted, which the mobile driver test proves separately.
+    check('mobile chat view: editor column hidden by the toggle (React stays mounted)',
+      !!$('.nc-workspace-panel') && !visible($('.nc-workspace-panel')));
+    check('mobile chat view: chat column visible', visible($('.nc-chat-col')));
+  }
+
+    // (mview / editorVisible / chatVisible were computed at the top.)
 
     // Transcript rail state (lives in the editor panel). Defaults closed
     // below 1200px viewport; the fixture opens it explicitly via the
@@ -179,6 +252,36 @@ export function runVerify(variant) {
       check('transcript: closed on request', !$('.nc-ws-transcript'));
     } else if (variant.actions.includes('openTranscript') && (!narrow || mview === 'editor')) {
       check('transcript: rail visible when open', visible($('.nc-ws-transcript')));
+      // Stacked layouts (review-02): the transcript is a tool view
+      // BELOW the editor — its top must start at or below the editor
+      // grid's bottom (a shrunk editor box once let the grid paint
+      // over the rail; element rects alone would not show that, the
+      // grid's painted bottom would).
+      const bodyEl = $('.nc-ws-body');
+      const gridEl2 = $('.nc-ce-grid');
+      const railEl = $('.nc-ws-transcript');
+      if (bodyEl && gridEl2 && railEl && getComputedStyle(bodyEl).flexDirection === 'column') {
+        const gb = gridEl2.getBoundingClientRect().bottom;
+        const rt = railEl.getBoundingClientRect().top;
+        check('stacked: transcript tool view below the editor content (no paint overlap)',
+          rt >= gb - 2, `railTop=${Math.round(rt)} gridBottom=${Math.round(gb)}`);
+      }
+      // Readable transcript text on the production theme (review-02):
+      // word ink vs its EFFECTIVE background — the active word carries
+      // its own highlight background (white ink on the highlight), so
+      // the surface behind a word is its own background when it has
+      // one, else the rail surface.
+      const tpw = $('.nc-ws-transcript .tp-w');
+      const tpSurface = $('.nc-ws-transcript .tp');
+      if (tpw && tpSurface) {
+        const wordCs = getComputedStyle(tpw);
+        const wordBg = wordCs.backgroundColor || '';
+        const alpha = parseFloat((wordBg.match(/[\d.]+/g) || [])[3] ?? '1');
+        const effBg = alpha > 0 ? wordBg : getComputedStyle(tpSurface).backgroundColor;
+        const ratio = contrastRatio(wordCs.color, effBg);
+        check('theme: transcript words readable on their effective background (contrast >= 3)',
+          ratio >= 3, `ratio=${ratio.toFixed(2)} bg=${effBg}`);
+      }
     }
 
     // Chat column state.

@@ -19,6 +19,11 @@
  */
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+// Production-faithful shell (review-02): the REAL global chat CSS/theme
+// (index.css — the same import production src/main.jsx makes). Without
+// it the chat column rendered unstyled (white, serif, default buttons)
+// and the screenshots could not establish production theme/contrast.
+import '../index.css';
 import { AppShell } from '../App.jsx';
 import { runDriver } from './driver.js';
 import { runVerify } from './verify.js';

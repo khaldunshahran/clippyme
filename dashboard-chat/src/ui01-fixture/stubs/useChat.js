@@ -16,8 +16,27 @@ function makeThreads() {
       phase: 'idle',
       messages: [{ id: 'm1', role: 'user', text: 'Fixture: make the hook punchier' }],
       clips: [
-        { index: 0, title: 'Fixture clip one', raw: null },
-        { index: 1, title: 'Fixture clip two', raw: null },
+        // Clip one carries BOTH a raw source and a composed artifact
+        // (review-02): the draft player must select the raw source
+        // (video_url), never the composed/burned file.
+        {
+          index: 0,
+          title: 'Fixture clip one',
+          raw: {
+            video_title_for_youtube_short: 'Fixture clip one',
+            video_url: 'fixture-source.mp4',
+            composed_video_url: 'fixture-composed-v3.mp4',
+          },
+        },
+        {
+          index: 1,
+          title: 'Fixture clip two',
+          raw: {
+            video_title_for_youtube_short: 'Fixture clip two',
+            video_url: 'fixture-source-2.mp4',
+            composed_video_url: null,
+          },
+        },
       ],
       settings: {},
       validation: null,

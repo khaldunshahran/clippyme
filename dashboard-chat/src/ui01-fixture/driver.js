@@ -8,10 +8,14 @@
  * into #ui01-test-results and the document title is set to
  * UI01-TEST-DONE when the sequence finishes.
  *
- * ?ui01test=1      desktop-width lifecycle (1440): mount, export/preview
- *                  identity, controller-only save, deferred save, restore
- *                  ack/draft, historical render, Ask-Nugget, clip switch,
- *                  unmount/remount.
+ * ?ui01test=1      desktop-width lifecycle (1440): mount, draft-source
+ *                  selection, export/preview identity, rendered-artifact
+ *                  timebase on real playable media, controller-only save,
+ *                  deferred save, restore ack/draft, historical render,
+ *                  Ask-Nugget, clip switch, unmount/remount.
+ *                  Media: the fixture dist must contain the synthetic
+ *                  playable mp4s (see README — generated with ffmpeg
+ *                  into the dist folder after the vite build).
  * ?ui01test=mobile narrow-width (390): Chat/Editor tab switching preserves
  *                  mounted composer text + controller identity; real focus.
  */
@@ -80,6 +84,14 @@ async function runDesktop(rec, poll, stats) {
   // Draft overlays are drawn from the current draft project (positive control).
   rec('mount: draft hook/caption overlays render in draft preview',
     $$('[data-ui01="hook-overlay"],[data-ui01="caption-overlay"]').length >= 1);
+  // The fixture clip carries BOTH video_url and composed_video_url
+  // (review-02): the draft player must select the raw source — the
+  // production clipPreviewSrc policy would have picked the composed
+  // (burned) file here.
+  const mountSrc = $('.nc-ce-grid video')?.getAttribute('src') || '';
+  rec('mount: draft player selects the raw source (video_url), not the composed file',
+    mountSrc.includes('fixture-source.mp4') && !mountSrc.includes('composed'),
+    mountSrc);
 
   // 2 — controller identity: exactly one per selection.
   rec('mount: exactly one controller created for the selection',
@@ -97,6 +109,35 @@ async function runDesktop(rec, poll, stats) {
   rec('export: player src is the exported artifact', videoSrc.includes('fixture-render-v3.mp4'), videoSrc);
   rec('export: draft overlays suppressed on the render',
     $$('[data-ui01="hook-overlay"],[data-ui01="caption-overlay"]').length === 0);
+
+  // 3.5 — rendered playback timebase (review-02): the exported file is
+  // a real playable mp4 and must play on the artifact's OWN timeline —
+  // the draft segment loop must never rewind it. Two probes:
+  //  (i) play-through: play from 0 and confirm the playhead advances
+  //      steadily past 2s;
+  //  (ii) seek: re-initialize the media element with load() first —
+  //      headless Chrome can leave a React-remounted element (the
+  //      export swaps the player via key={videoSrc}) in a state where
+  //      seeks resolve to 0 until load() is called; that is a harness
+  //      quirk of the synthetic setup, not app behavior (the app seeks
+  //      only through user controls). After load(), seek to 2s and
+  //      confirm the playhead lands and advances from there.
+  const renderVideo = $('.nc-ce-grid video');
+  await poll(() => renderVideo.readyState >= 2, { label: 'render media loaded' });
+  rec('render playback: artifact media is playable (readyState)',
+    renderVideo.readyState >= 2, `readyState=${renderVideo.readyState}`);
+  await renderVideo.play();
+  await poll(() => renderVideo.currentTime >= 2.3, { label: 'render play-through past 2.3s' });
+  rec('render playback: playhead advances on the artifact timebase (no draft loop)',
+    renderVideo.currentTime >= 2.3 && !renderVideo.paused,
+    `t=${renderVideo.currentTime.toFixed(2)} paused=${renderVideo.paused}`);
+  renderVideo.pause();
+  renderVideo.load();
+  await poll(() => renderVideo.readyState >= 2, { label: 'render media reloaded' });
+  renderVideo.currentTime = 2;
+  await poll(() => renderVideo.currentTime >= 1.9, { label: 'render seeked to 2s' });
+  rec('render playback: seek lands on the artifact timeline (after load() re-init)',
+    renderVideo.currentTime >= 1.9, `t=${renderVideo.currentTime.toFixed(2)}`);
 
   // 4 — controller-only saved edit (chat/transcript path, NOT the nested
   // mutate): the exact-render badge must invalidate.
@@ -166,6 +207,37 @@ async function runDesktop(rec, poll, stats) {
     $$('[data-ui01="hook-overlay"],[data-ui01="caption-overlay"]').length === 0);
   rec('watch render: player src is that version\u2019s artifact',
     ($('.nc-ce-grid video')?.getAttribute('src') || '').includes('fixture-render-v3.mp4'));
+
+  // 8.5 — historical-render timebase under a short draft segment
+  // (review-02): shorten the CURRENT draft to segment [0,1) through the
+  // controller (a chat-side edit). The player still shows the v3 render;
+  // with loop selected-segment on, a draft-bound handler would rewind
+  // the artifact to 0 as soon as it plays past 1s.
+  await c0.applyEdit('shorten draft segment', (p) => {
+    p.segments = [{ ...p.segments[0], start: 0, end: 1 }];
+    return p;
+  });
+  await poll(() => badgeText('Acknowledged project version') === 'v6', { label: 'ack badge v6' });
+  rec('historical: badge stays Historical v3 after the draft edit',
+    badgeText('What the preview player is showing') === 'Historical v3 render',
+    badgeText('What the preview player is showing'));
+  const histVideo = $('.nc-ce-grid video');
+  await poll(() => histVideo.readyState >= 2, { label: 'historical media loaded' });
+  // Play-through is the load-bearing probe here: with the draft loop
+  // wrongly applied, the playhead could never pass the [0,1) segment
+  // end — it would rewind to 0 at t>=1 for as long as it plays.
+  await histVideo.play();
+  await poll(() => histVideo.currentTime >= 1.9, { label: 'historical play-through past 1.9s' });
+  rec('historical playback: not rewound by the current draft segment [0,1) loop',
+    histVideo.currentTime >= 1.9 && !histVideo.paused,
+    `t=${histVideo.currentTime.toFixed(2)} paused=${histVideo.paused}`);
+  histVideo.pause();
+  histVideo.load();
+  await poll(() => histVideo.readyState >= 2, { label: 'historical media reloaded' });
+  histVideo.currentTime = 2;
+  await poll(() => histVideo.currentTime >= 1.9, { label: 'historical seeked to 2s' });
+  rec('historical playback: seek lands on the artifact timeline (after load() re-init)',
+    histVideo.currentTime >= 1.9, `t=${histVideo.currentTime.toFixed(2)}`);
 
   // 9 — clip switch: old controller disposed, preview ownership cleared.
   const before = stats();

@@ -3195,11 +3195,14 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
  *
  * The header is split into an identity group (Back, title, badges) and an
  * action group (Transcript, Ask Nugget, chat toggle, Reset, Save, Export).
- * It adapts to the WORKSPACE PANEL width (container query), not the
- * viewport: the panel can be much narrower than the viewport when the chat
- * rail and transcript rail consume width (that is what squeezed titles to
- * "F.." and clipped the AI-cut tab). Standalone mounts (no workspace
- * container) fall back to viewport queries explicitly.
+ * It adapts to the EDITOR width (container query on .nc-ws-editor), not
+ * the viewport and not the outer workspace panel: the editor can be much
+ * narrower than both when the chat rail and transcript rail consume
+ * width (measuring the panel qualified wide layouts while the editor
+ * itself was a sliver — that is what squeezed titles to "F..", clipped
+ * the AI-cut tab, and shrank the primary player next to the rail).
+ * Standalone mounts (no editor container) fall back to viewport queries
+ * explicitly.
  *
  * Narrow panels keep the identity row and wrap the actions onto
  * their own rows inside the panel, so every control stays fully
@@ -3237,7 +3240,7 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
   flex-wrap: wrap;
   min-width: 0;
 }
-@container nugget-workspace (max-width: 700px) {
+@container nugget-editor (max-width: 700px) {
   .nc-ce-head {
     flex-direction: column;
     align-items: stretch;
