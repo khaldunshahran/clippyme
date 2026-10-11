@@ -82,6 +82,11 @@ function loadValidSelection() {
 // alive. These are the non-terminal proposal states.
 const PROPOSAL_OPEN = (s) => s === 'thinking' || s === 'ready';
 
+// Task 19: a bulk card is actionable only while its lifetime is alive.
+// The card keeps its own state machine; the message only seeds it, so an
+// 'idle' seed left behind by a reload is never actionable either.
+const BULK_OPEN = (s) => ['idle', 'preparing', 'proposal', 'applying'].includes(s);
+
 // A proposal whose lifetime cannot be established is never left actionable:
 // it stays in history as 'stale' instead of 'thinking'/'ready'.
 // Conversation history is retained; the payload is not actionable.
@@ -90,6 +95,10 @@ function staleOpenProposals(thread, reason) {
   let changed = false;
   const messages = thread.messages.map((m) => {
     if (m && m.kind === 'proposal' && PROPOSAL_OPEN(m.data?.state)) {
+      changed = true;
+      return { ...m, data: { ...(m.data || {}), state: 'stale', staleReason: reason } };
+    }
+    if (m && m.kind === 'bulk' && BULK_OPEN(m.data?.state)) {
       changed = true;
       return { ...m, data: { ...(m.data || {}), state: 'stale', staleReason: reason } };
     }
@@ -552,6 +561,46 @@ export function useChat() {
   }, [updateMsg]);
 
 
+  // ---------------- bulk editing (Task 19) ----------------
+  // A bulk-scope message opens the version-aware bulk editing card.
+  // Routing alone never mutates: the card freezes the proposal (exact job,
+  // ordered clip IDs, acknowledged base versions) and only an explicit
+  // Apply saves, per clip, under optimistic concurrency.
+  const runBulkChat = useCallback((thread, text) => {
+    const threadId = thread.id;
+    if (!thread.jobId) {
+      pushMsg(threadId, {
+        role: 'ai', kind: 'notice',
+        text: 'Bulk editing needs a finished clip job first — paste a link and let the clips finish, then ask again.',
+      });
+      return;
+    }
+    pushMsg(threadId, {
+      role: 'ai', kind: 'bulk',
+      data: {
+        state: 'idle', jobId: thread.jobId, threadId,
+        scope: { mode: 'all' }, text,
+      },
+    });
+  }, [pushMsg]);
+
+  // Grid multi-select entry point: an explicit set of clips to bulk-edit.
+  const startBulkEdit = useCallback((threadId, clipIndices) => {
+    const thread = threads.find((t) => t.id === threadId);
+    if (!thread?.jobId) return;
+    const indices = [...new Set(
+      (clipIndices || []).filter((n) => Number.isInteger(n) && n >= 0)
+    )].sort((a, b) => a - b);
+    if (!indices.length) return;
+    pushMsg(threadId, {
+      role: 'ai', kind: 'bulk',
+      data: {
+        state: 'idle', jobId: thread.jobId, threadId,
+        scope: { mode: 'selected', clipIndices: indices }, text: '',
+      },
+    });
+  }, [threads, pushMsg]);
+
   // ---------------- send / steer ----------------
   const sendMessage = useCallback(async (text) => {
     let threadId = activeId;
@@ -606,12 +655,9 @@ export function useChat() {
       return;
     }
 
-    // (c) Bulk scope: honest feedback, never mutate multiple clips.
-    if (route.type === 'bulk-unsupported') {
-      pushMsg(threadId, {
-        role: 'ai', kind: 'notice',
-        text: 'I can only edit one clip at a time right now, so I left all clips untouched. Select a single clip and describe the change — I\'ll propose the edit for that clip before anything is saved.',
-      });
+    // (c) Bulk scope: open the version-aware bulk editing card.
+    if (route.type === 'bulk') {
+      runBulkChat(thread, clean);
       return;
     }
 
@@ -647,7 +693,7 @@ export function useChat() {
     }
 
     // (none) validating / caption-pick / settings / error: stay silent, as before.
-  }, [activeId, threads, selectedClip, createThread, pushMsg, patchThread, runValidation, stopPoll, clearSelection, runChatEdit]);
+  }, [activeId, threads, selectedClip, createThread, pushMsg, patchThread, runValidation, stopPoll, clearSelection, runChatEdit, runBulkChat]);
 
   // Resume polling for threads that were mid-clip when the app loaded.
   useEffect(() => {
@@ -687,6 +733,7 @@ export function useChat() {
     createThread, selectThread, deleteThread,
     sendMessage, applyProposal, discardProposal,
     confirmSettings, proceedToSettings, patchThread,
+    startBulkEdit,
     DEFAULT_SETTINGS,
   };
 }

@@ -71,6 +71,14 @@ const realApi = vi.hoisted(() => ({
   getClipProject: vi.fn(),
   saveClipProject: vi.fn(),
   composeProject: vi.fn(),
+  // Task 19: ChatThread now also renders BulkEditCard, which imports the
+  // bulk named exports from this same module. Present but unused here.
+  bulkPrepare: vi.fn(),
+  bulkApply: vi.fn(),
+  bulkRetry: vi.fn(),
+  bulkUndo: vi.fn(),
+  bulkStatus: vi.fn(),
+  newBulkIdempotencyKey: vi.fn(() => 'test-key-hf'),
 }));
 
 vi.mock('react', async (original) => {

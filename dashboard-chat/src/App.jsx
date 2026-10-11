@@ -49,10 +49,26 @@ function AppShell() {
     createThread, selectThread, deleteThread,
     sendMessage, applyProposal, discardProposal,
     confirmSettings, proceedToSettings, patchThread,
+    startBulkEdit,
     DEFAULT_SETTINGS,
   } = chat;
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Task 19: grid multi-select for bulk editing. Selection state lives
+  // here (the grid is stateless); "Bulk edit" pushes a bulk card message
+  // on the active thread and closes the grid.
+  const [bulkSelectMode, setBulkSelectMode] = useState(false);
+  const [bulkSelected, setBulkSelected] = useState([]);
+  const toggleBulkSelect = useCallback((index) => {
+    setBulkSelected((sel) => (sel.includes(index) ? sel.filter((i) => i !== index) : [...sel, index]));
+  }, []);
+  const handleBulkEdit = useCallback((indices) => {
+    if (!activeId || !indices.length) return;
+    startBulkEdit(activeId, indices);
+    setGridOpen(false);
+    setBulkSelectMode(false);
+    setBulkSelected([]);
+  }, [activeId, startBulkEdit, setGridOpen]);
   const [schedTarget, setSchedTarget] = useState(null); // { threadId, jobId, index } — schedule dialog open
   const [schedWhen, setSchedWhen] = useState('');
   const [schedBusy, setSchedBusy] = useState(false);
@@ -318,10 +334,16 @@ function AppShell() {
         <ClipGrid
           clips={active.clips}
           title={active.title}
-          onClose={() => setGridOpen(false)}
+          onClose={() => { setGridOpen(false); setBulkSelectMode(false); setBulkSelected([]); }}
           onOpenClip={(i) => { setGridOpen(false); openClip(activeId, i); }}
           onEditClip={(i) => { setGridOpen(false); handleSelectClip(activeId, i); }}
           onScheduleClip={(i) => openSchedule(activeId, i)}
+          selectionMode={bulkSelectMode}
+          selectedIndices={bulkSelected}
+          onToggleSelectionMode={() => { setBulkSelectMode((v) => !v); setBulkSelected([]); }}
+          onToggleSelect={toggleBulkSelect}
+          onSelectAll={() => setBulkSelected(active.clips.map((c) => c.index))}
+          onBulkEdit={handleBulkEdit}
         />
       )}
 

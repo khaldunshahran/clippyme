@@ -110,11 +110,11 @@ describe('review-02 gate 1: every/each scope is multi-clip only', () => {
     'Update each of these clips with the new style',
     'Every one of the clips needs a hook',
     'These selected clips should all be yellow',
-  ])('multi-clip request routes bulk-unsupported: %s', (text) => {
-    expect(routeChatMessage(text, SEL_CTX).type).toBe('bulk-unsupported');
+  ])('multi-clip request routes bulk (Task 19 card): %s', (text) => {
+    expect(routeChatMessage(text, SEL_CTX).type).toBe('bulk');
   });
 
-  it('a genuine every-clip request through sendMessage makes zero provider calls', async () => {
+  it('a genuine every-clip request through sendMessage opens a bulk card with zero provider calls', async () => {
     const { c } = await fixture();
     let chat = seed();
     chat.workspaceRef.current = { controller: c };
@@ -122,6 +122,10 @@ describe('review-02 gate 1: every/each scope is multi-clip only', () => {
     expect(api.editAiPatch).not.toHaveBeenCalled();
     chat = render();
     expect(proposal(chat)).toBeUndefined();
+    const bulk = chat.threads[0].messages.find((m) => m.kind === 'bulk');
+    expect(bulk).toBeTruthy();
+    expect(bulk.data.scope).toEqual({ mode: 'all' });
+    expect(bulk.data.jobId).toBe('j');
   });
 
   it('an in-clip every-word edit through sendMessage reaches the AI edit route', async () => {

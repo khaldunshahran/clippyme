@@ -212,6 +212,74 @@ export async function batchApplyProjects(jobId, clipIndices, patch) {
   return res.json();
 }
 
+
+// Task 19 — version-aware bulk editing operations. Thin wrappers over the
+// FastAPI /api/project/{jobId}/bulk/* endpoints. All errors throw with
+// status so the card can render them honestly.
+//
+// prepare: freeze a proposal (scope + intent + base versions + per-clip
+//   plan). Never saves.
+// apply: apply a prepared operation (idempotent; crash-resumable).
+// retry: retry eligible unresolved items under the original version guards.
+// undo: undo applied clips without overwriting later edits.
+// status: reconcile — the ledger's recorded truth after an interrupt.
+async function _bulkCall(jobId, path, { method = 'GET', body } = {}) {
+  const res = await apiFetch(getApiUrl(`/api/project/${jobId}/bulk${path}`), {
+    method,
+    ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.detail || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res.json();
+}
+
+export function bulkPrepare(jobId, { scope, intent, idempotencyKey }) {
+  return _bulkCall(jobId, '/prepare', {
+    method: 'POST',
+    body: { scope, intent, idempotency_key: idempotencyKey },
+  });
+}
+
+export function bulkApply(jobId, operationId, idempotencyKey) {
+  return _bulkCall(jobId, '/apply', {
+    method: 'POST',
+    body: { operation_id: operationId, idempotency_key: idempotencyKey },
+  });
+}
+
+export function bulkRetry(jobId, operationId, idempotencyKey) {
+  return _bulkCall(jobId, `/${operationId}/retry`, {
+    method: 'POST',
+    body: { idempotency_key: idempotencyKey },
+  });
+}
+
+export function bulkUndo(jobId, operationId, idempotencyKey) {
+  return _bulkCall(jobId, `/${operationId}/undo`, {
+    method: 'POST',
+    body: { idempotency_key: idempotencyKey },
+  });
+}
+
+export function bulkStatus(jobId, operationId) {
+  return _bulkCall(jobId, `/${operationId}`);
+}
+
+// Mint a client-side idempotency key for one bulk proposal. The key binds
+// to the exact operation payload server-side; re-preparing the same key
+// with a different payload is rejected, so a fresh key means a fresh
+// proposal.
+export function newBulkIdempotencyKey() {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  } catch { /* fall through */ }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 // List recorded project versions (newest last).
 // Returns { versions: [{version, origin, created_at, project_file, output_file, output_url}], latest }.
 export async function listClipProjectVersions(jobId, index) {

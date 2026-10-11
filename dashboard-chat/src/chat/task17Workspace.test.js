@@ -171,7 +171,7 @@ describe('messageRouter — the real dispatcher', () => {
     expect(routeChatMessage('/hyperframesx', { phase: 'idle' }).type).toBe('idle-hint');
   });
 
-  it('routes bulk scope to bulk-unsupported (never mutates)', () => {
+  it('routes bulk scope to bulk (routing alone never mutates)', () => {
     for (const t of [
       'make all clips punchier',
       'apply this to every clip please',
@@ -179,8 +179,8 @@ describe('messageRouter — the real dispatcher', () => {
       'each clip needs louder captions',
       'these selected clips are too dark',
     ]) {
-      expect(routeChatMessage(t, { phase: 'done', selection: SEL() }).type).toBe('bulk-unsupported');
-      expect(routeChatMessage(t, { phase: 'done' }).type).toBe('bulk-unsupported');
+      expect(routeChatMessage(t, { phase: 'done', selection: SEL() }).type).toBe('bulk');
+      expect(routeChatMessage(t, { phase: 'done' }).type).toBe('bulk');
     }
     // "all" without a clip scope is not bulk
     expect(routeChatMessage('make it all punchier', { phase: 'done', selection: SEL() }).type).toBe('edit');
@@ -530,14 +530,15 @@ describe('useChat host wiring — the real sendMessage', () => {
     expect(apiMocks.editAiPatch).not.toHaveBeenCalled();
   });
 
-  it('bulk scope gets honest feedback with zero provider calls', async () => {
+  it('bulk scope opens a bulk card with zero provider calls (nothing saved until Apply)', async () => {
     const { threadId } = setupDoneThread();
     let chat = renderChat();
     await chat.sendMessage('make all clips punchier');
     chat = renderChat();
     const m = lastAi(chat, threadId);
-    expect(m.kind).toBe('notice');
-    expect(m.text).toMatch(/one clip at a time/i);
+    expect(m.kind).toBe('bulk');
+    expect(m.data.scope).toEqual({ mode: 'all' });
+    expect(m.data.jobId).toBe('job1');
     expect(apiMocks.editAiPatch).not.toHaveBeenCalled();
   });
 
@@ -911,7 +912,7 @@ describe('review-01: bulk scope is explicit multi-clip intent only', () => {
     }
   });
 
-  it('explicit multi-clip intent stays bulk-unsupported', () => {
+  it('explicit multi-clip intent routes bulk (Task 19)', () => {
     for (const t of [
       'make all clips punchier',
       'apply this to every clip please',
@@ -920,11 +921,11 @@ describe('review-01: bulk scope is explicit multi-clip intent only', () => {
       'edit every single clip',
       'bulk brighten my clips',
     ]) {
-      expect(routeChatMessage(t, CTX).type).toBe('bulk-unsupported');
+      expect(routeChatMessage(t, CTX).type).toBe('bulk');
     }
   });
 
-  it('bulk-unsupported via the host makes zero provider calls and zero saves', async () => {
+  it('bulk via the host makes zero provider calls and zero saves until Apply', async () => {
     const render = () => { hooks.index = 0; return useChat(); };
     let chat = render();
     const threadId = chat.createThread();
@@ -941,6 +942,8 @@ describe('review-01: bulk scope is explicit multi-clip intent only', () => {
     expect(f.saves).toHaveLength(0);
     chat = render();
     const msgs = chat.threads.find((t) => t.id === threadId).messages;
-    expect(msgs[msgs.length - 1].kind).toBe('notice');
+    const last = msgs[msgs.length - 1];
+    expect(last.kind).toBe('bulk');
+    expect(last.data.scope).toEqual({ mode: 'all' });
   });
 });

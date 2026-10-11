@@ -11,7 +11,9 @@
  *  (b) /hyperframes command                            -> 'hyperframes'
  *  (c) explicit multi-clip scope ("all clips", "every clip",
  *      "each of these clips", "these selected clips", "bulk")
- *                                                      -> 'bulk-unsupported' (never mutates)
+ *                                                      -> 'bulk' (Task 19:
+ *      opens the version-aware bulk editing card; routing alone never
+ *      mutates -- the proposal is frozen and applied explicitly)
  *  (d) explicit clip selection                         -> 'edit'
  *      (even when the text contains a URL — embedded links stay edits;
  *       starting a new source needs the explicit New-source action or a
@@ -64,10 +66,12 @@ export function routeChatMessage(text, ctx = {}) {
   if (HYPERFRAMES_RE.test(clean)) {
     return { type: 'hyperframes' };
   }
-  // (c) Explicit multi-clip scope is honestly unsupported — never mutate
-  // several clips. Singular in-clip wording never reaches this branch.
+  // (c) Explicit multi-clip scope -> the Task 19 bulk editing flow.
+  // Routing alone never mutates: the card freezes the proposal (scope +
+  // base versions) and only an explicit Apply saves. Singular in-clip
+  // wording never reaches this branch.
   if (BULK_WORD_RE.test(clean) || BULK_SCOPE_RE.test(clean) || BULK_EVERY_RE.test(clean)) {
-    return { type: 'bulk-unsupported' };
+    return { type: 'bulk' };
   }
   // (d) Explicit selection: an ordinary edit, even with an embedded link.
   if (hasSelection(selection)) {

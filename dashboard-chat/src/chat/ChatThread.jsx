@@ -4,6 +4,7 @@ import { ProgressBody } from './ProgressPill.jsx';
 import ClipRow from './ClipRow.jsx';
 import CaptionCarousel from './CaptionCarousel.jsx';
 import HyperframesCard from './HyperframesCard.jsx';
+import BulkEditCard from './BulkEditCard.jsx';
 
 /**
  * Single card for a validated link. It MORPHS in place through the job
@@ -243,6 +244,33 @@ function HyperframesMsg({ data, activeSelectionKey, controller, controllerKey, l
   );
 }
 
+/**
+ * Task 19 -- the bulk editing card. The message carries the frozen scope
+ * seed {jobId, threadId, scope:{mode, clipIndices?}, text}; the card itself
+ * freezes the proposal (base versions + per-clip plan) server-side. The
+ * workspace controller is passed for drain-before-prepare / reload-after
+ * -apply of an in-scope active clip only -- the card never saves through
+ * anything else, and unapplied proposals die with the selection lifetime.
+ */
+function BulkMsg({ data, thread, controller, lifetimeKey }) {
+  const d = data || {};
+  return (
+    <BulkEditCard
+      data={{
+        jobId: d.jobId ?? thread?.jobId ?? null,
+        threadId: d.threadId ?? thread?.id ?? null,
+        scope: d.scope || { mode: 'all' },
+        text: d.text || '',
+      }}
+      clips={thread?.clips || []}
+      activeThreadId={thread?.id ?? null}
+      activeJobId={thread?.jobId ?? null}
+      controller={controller}
+      lifetimeKey={lifetimeKey}
+    />
+  );
+}
+
 export default function ChatThread({ thread, activeSelectionKey, controller = null, controllerKey = null, lifetimeKey = null, onOpenClip, onEditClip, onScheduleClip, onViewAll, onCaptionSelect, onCaptionContinue, onApplyProposal, onDiscardProposal }) {
   const bottomRef = useRef(null);
   const msgs = thread?.messages || [];
@@ -316,6 +344,8 @@ export default function ChatThread({ thread, activeSelectionKey, controller = nu
               );
             case 'hyperframes':
               return <div key={m.id}><HyperframesMsg data={m.data} activeSelectionKey={activeSelectionKey} controller={controller} controllerKey={controllerKey} lifetimeKey={lifetimeKey} /></div>;
+            case 'bulk':
+              return <div key={m.id}><BulkMsg data={m.data} thread={thread} controller={controller} lifetimeKey={lifetimeKey} /></div>;
             case 'notice':
               return (
                 <div key={m.id} className="nc-anim-fade-up" style={{ display: 'flex', gap: 8, alignItems: 'flex-start', maxWidth: 640 }}>

@@ -2126,6 +2126,222 @@ async def batch_apply_projects(job_id: str, request: Request,
     return {"results": results}
 
 
+
+# ---------------------------------------------------------------------------
+# Task 19: version-aware bulk editing operations
+# ---------------------------------------------------------------------------
+# A bulk operation proposes one shared caption/hook style change across
+# several clips, freezes scope + base versions, applies per clip under the
+# existing optimistic-concurrency contract (save_project_version -- the ONE
+# save authority, shared with PUT /api/project/{job}/{clip} and the legacy
+# POST .../batch-apply), and records everything in a versioned idempotent
+# operation ledger (domain/bulk_edit.py). The legacy batch-apply endpoint
+# above is unchanged.
+#
+# Endpoints:
+#   POST /api/project/{job_id}/bulk/prepare            freeze a proposal
+#   POST /api/project/{job_id}/bulk/apply               apply (idempotent)
+#   POST /api/project/{job_id}/bulk/{operation_id}/retry  retry unresolved
+#   POST /api/project/{job_id}/bulk/{operation_id}/undo   undo applied clips
+#   GET  /api/project/{job_id}/bulk/{operation_id}       reconcile / status
+
+
+def _bulk_guards(request: Request, job_id: str, user: AuthUser) -> str:
+    """Shared gates for the bulk endpoints; returns the job dir."""
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "bulk_edit", capacity=10, refill_per_sec=10 / 60)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    _verify_job_ownership(job_id, user)
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job_dir
+
+
+def _bulk_idempotency_key(body: dict) -> str:
+    key = body.get("idempotency_key")
+    if key is None:
+        return str(uuid.uuid4())
+    if not isinstance(key, str) or not key.strip() or len(key) > 128:
+        raise HTTPException(
+            status_code=400,
+            detail="idempotency_key must be a non-empty string (max 128 chars)")
+    return key.strip()
+
+
+def _public_operation(op: dict) -> dict:
+    """Ledger record minus internal bulk (base snapshots stay server-side).
+
+    Items are returned as a clip-ordered list; the ledger itself keeps the
+    index-keyed dict.
+    """
+    import copy
+    pub = copy.deepcopy(op)
+    items = pub.get("items", {})
+    ordered = sorted(items.values(), key=lambda i: i.get("clip_index", 0))
+    for item in ordered:
+        item.pop("base_snapshot", None)
+    pub["items"] = ordered
+    return pub
+
+
+def _load_bulk_operation(job_dir: str, job_id: str, operation_id: str,
+                         idempotency_key: str | None = None) -> dict:
+    from clippyme.domain.bulk_edit import get_operation
+    if not isinstance(operation_id, str) or not operation_id:
+        raise HTTPException(status_code=400, detail="Invalid operation ID")
+    op = get_operation(job_dir, operation_id)
+    if op is None:
+        raise HTTPException(status_code=404, detail="Bulk operation not found")
+    if op.get("job_id") != job_id:
+        raise HTTPException(
+            status_code=400, detail="Operation belongs to a different job")
+    if idempotency_key is not None and op.get("idempotency_key") != idempotency_key:
+        raise HTTPException(
+            status_code=409,
+            detail="idempotency key does not match this operation")
+    return op
+
+
+@app.post("/api/project/{job_id}/bulk/prepare")
+async def bulk_prepare(job_id: str, request: Request,
+                       user: AuthUser = Depends(get_current_user)):
+    """Freeze a bulk-edit proposal: scope, intent, base versions, per-clip plan.
+
+    Body: {"scope": {"mode": "selected"|"all", "clip_indices": [...]},
+           "intent": {"op": ..., "params": {...}, "on_override": ...},
+           "idempotency_key": "..." (optional)}.
+    Idempotent on (idempotency_key, exact payload): a replay returns the
+    existing operation; the same key with a different payload is rejected
+    (409). Never saves -- the returned proposal must be applied explicitly.
+    """
+    job_dir = _bulk_guards(request, job_id, user)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    from clippyme.domain.bulk_edit import create_operation
+    try:
+        op = await asyncio.to_thread(
+            create_operation,
+            job_dir=job_dir, job_id=job_id,
+            scope=body.get("scope") or {},
+            intent=body.get("intent") or {},
+            idempotency_key=_bulk_idempotency_key(body),
+        )
+    except KeyError as exc:
+        # Idempotency-key reuse with a different payload.
+        raise HTTPException(status_code=409, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _public_operation(op)
+
+
+@app.post("/api/project/{job_id}/bulk/apply")
+async def bulk_apply(job_id: str, request: Request,
+                     user: AuthUser = Depends(get_current_user)):
+    """Apply a prepared bulk operation (idempotent, crash-resumable).
+
+    Body: {"operation_id": "...", "idempotency_key": "..."}. Each clip is
+    saved with its frozen expected version through the single save
+    authority; per-clip outcomes (applied/conflict/failed/unsupported/
+    pending/preserved/unchanged/excluded) are recorded in the ledger after
+    every step. Replaying the same key+payload returns the recorded outcome
+    and never mints duplicate versions. An interrupted request must be
+    reconciled via GET .../bulk/{operation_id} -- the response alone never
+    proves what landed.
+    """
+    job_dir = _bulk_guards(request, job_id, user)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    operation_id = body.get("operation_id")
+    key = _bulk_idempotency_key(body)
+    _load_bulk_operation(job_dir, job_id, operation_id, key)
+    from clippyme.domain.bulk_edit import apply_operation
+    try:
+        op = await asyncio.to_thread(
+            apply_operation, job_dir=job_dir, operation_id=operation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _public_operation(op)
+
+
+@app.post("/api/project/{job_id}/bulk/{operation_id}/retry")
+async def bulk_retry(job_id: str, operation_id: str, request: Request,
+                     user: AuthUser = Depends(get_current_user)):
+    """Retry eligible unresolved items under the ORIGINAL version guards.
+
+    Eligible: failed / pending. Applied, conflict, unsupported, preserved,
+    unchanged and excluded items are never retouched; a retryable item whose
+    clip moved past the frozen base version becomes a conflict, never a
+    silent rebase.
+    """
+    job_dir = _bulk_guards(request, job_id, user)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    key = _bulk_idempotency_key(body if isinstance(body, dict) else {})
+    _load_bulk_operation(job_dir, job_id, operation_id, key)
+    from clippyme.domain.bulk_edit import retry_operation
+    try:
+        op = await asyncio.to_thread(
+            retry_operation, job_dir=job_dir, operation_id=operation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _public_operation(op)
+
+
+@app.post("/api/project/{job_id}/bulk/{operation_id}/undo")
+async def bulk_undo(job_id: str, operation_id: str, request: Request,
+                    user: AuthUser = Depends(get_current_user)):
+    """Undo successfully applied clips without overwriting later edits.
+
+    Only clips whose current version still equals the operation's
+    acknowledged result version are restored (via the versioned save path,
+    as a new acknowledged revision). Later edits surface as explicit undo
+    conflicts. Repeated undo is idempotent.
+    """
+    job_dir = _bulk_guards(request, job_id, user)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    key = _bulk_idempotency_key(body if isinstance(body, dict) else {})
+    _load_bulk_operation(job_dir, job_id, operation_id, key)
+    from clippyme.domain.bulk_edit import undo_operation
+    try:
+        op = await asyncio.to_thread(
+            undo_operation, job_dir=job_dir, operation_id=operation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _public_operation(op)
+
+
+@app.get("/api/project/{job_id}/bulk/{operation_id}")
+async def bulk_status(job_id: str, operation_id: str, request: Request,
+                      user: AuthUser = Depends(get_current_user)):
+    """Reconcile a bulk operation: the ledger's recorded truth.
+
+    After an interrupted apply/retry/undo request, this -- not the client's
+    missing response -- says what landed. Persisted independently of any
+    frontend lifetime.
+    """
+    job_dir = _bulk_guards(request, job_id, user)
+    op = _load_bulk_operation(job_dir, job_id, operation_id)
+    return _public_operation(op)
+
+
+
 def _find_backfill_source(job_dir: str, clip_filename: str | None):
     """Locate the source slice for backfill.
 
