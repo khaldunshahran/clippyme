@@ -3191,14 +3191,32 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
 }
 
 
-/* UI-01: responsive workspace header — the single clip header stacks
-   cleanly on narrow screens instead of squeezing the title to "F.." or
-   clipping action buttons. Desktop keeps the horizontal wrap layout. */
+/* UI-01: responsive workspace header — the single clip header.
+ *
+ * The header is split into an identity group (Back, title, badges) and an
+ * action group (Transcript, Ask Nugget, chat toggle, Reset, Save, Export).
+ * It adapts to the WORKSPACE PANEL width (container query), not the
+ * viewport: the panel can be much narrower than the viewport when the chat
+ * rail and transcript rail consume width (that is what squeezed titles to
+ * "F.." and clipped the AI-cut tab). Standalone mounts (no workspace
+ * container) fall back to viewport queries explicitly.
+ *
+ * Narrow panels keep the identity row and move the actions into a
+ * horizontally scrollable labeled tool strip — compact, keyboard
+ * reachable, and never a very tall one-control-per-row stack. */
 .nc-ce-head {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 18px 0;
+  flex-wrap: wrap;
+}
+.nc-ce-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 340px;
   flex-wrap: wrap;
 }
 .nc-ce-title-wrap {
@@ -3212,20 +3230,78 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-@media (max-width: 640px) {
+.nc-ce-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+@container nugget-workspace (max-width: 700px) {
   .nc-ce-head {
     flex-direction: column;
     align-items: stretch;
     gap: 8px;
     padding: 12px 0;
   }
-  .nc-ce-title-wrap {
-    flex: none;
-    width: 100%;
+  .nc-ce-identity {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  .nc-ce-identity .nc-ce-title-wrap {
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .nc-ce-title {
-    white-space: normal;
-    overflow: visible;
     font-size: 18px;
+  }
+  .nc-ce-actions {
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-width: thin;
+  }
+  .nc-ce-actions > * {
+    flex-shrink: 0;
+  }
+}
+@media (max-width: 700px) {
+  .nc-ce-standalone .nc-ce-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 12px 0;
+  }
+  .nc-ce-standalone .nc-ce-identity {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  .nc-ce-standalone .nc-ce-identity .nc-ce-title-wrap {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .nc-ce-standalone .nc-ce-title {
+    font-size: 18px;
+  }
+  .nc-ce-standalone .nc-ce-actions {
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-width: thin;
+  }
+  .nc-ce-standalone .nc-ce-actions > * {
+    flex-shrink: 0;
   }
 }

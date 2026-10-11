@@ -254,7 +254,28 @@
   min-height: 0;
   position: relative;
   overflow-y: auto;
+  /* Horizontal overflow is contained here, so inner controls must wrap or
+   * scroll in an intentional tool strip — never rely on being clipped. */
   overflow-x: hidden;
+}
+
+/* Narrow workspace panel: stack the transcript above the editor (mirrors
+ * the small-viewport behavior), so the 300px rail never squeezes the
+ * editor into an unusable sliver. Keyed to the panel, not the viewport. */
+@container nugget-workspace (max-width: 560px) {
+  .nc-ws-body {
+    flex-direction: column;
+  }
+  .nc-ws-transcript {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--line-1, rgba(140, 130, 110, 0.25));
+    max-height: 38vh;
+    flex-shrink: 0;
+  }
+  .nc-ws-editor {
+    overflow: visible;
+  }
 }
 
 /* Narrow workspace: transcript stacks above the editor. */
@@ -295,8 +316,13 @@
   }
 }
 
+/* Standalone fallback (explicit): the workspace panel's container query
+ * governs hosted mode; without the container, fall back to the viewport.
+ * The viewport rule must NOT apply to hosted mode — at wide viewports the
+ * panel itself can be narrow (chat rail + transcript rail consume width)
+ * and forcing two columns there clips controls. */
 @media (min-width: 1100px) {
-  .nc-ce-grid {
+  .nc-ce-standalone .nc-ce-grid {
     grid-template-columns: minmax(0, 1.12fr) minmax(330px, 0.88fr);
   }
 }
@@ -353,4 +379,28 @@
 /* Single workspace header extras live on clay buttons; keep them quiet. */
 .nc-ws-header-extra {
   display: contents;
+}
+
+/* The desktop chat-rail toggle is ineffective below 900px (the Chat/Editor
+ * toggle governs visibility there) — hide it instead of showing a dead
+ * control on mobile widths. */
+@media (max-width: 900px) {
+  .nc-ws-chat-toggle {
+    display: none;
+  }
+}
+
+/* Editor panel tabs: an intentional wrapping tool strip — every tab stays
+ * visible/reachable instead of being clipped by .nc-ws-editor's
+ * overflow-x: hidden. */
+.nc-ce-tabs {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+/* Selected-clip identity beside the composer: wrap instead of crowding at
+ * narrow chat-rail widths. */
+.nc-selection-bar {
+  flex-wrap: wrap;
+  row-gap: 6px;
 }

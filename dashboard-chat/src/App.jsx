@@ -186,7 +186,9 @@ export function AppShell() {
   // The selected clip's display data (selection is always bound to its thread).
   const selThread = selectedClip ? threads.find((t) => t.id === selectedClip.threadId) : null;
   const selClip = selThread?.clips?.[selectedClip?.clipIndex] || null;
-  const selVersion = ws.snap?.project?.version ?? null;
+  // Acknowledged version (review-01): the server-acknowledged version, not
+  // the draft content version (they differ after a restore/reset).
+  const selVersion = ws.snap?.ackVersion ?? ws.snap?.project?.version ?? null;
 
   const handleNewSource = useCallback(() => {
     clearSelection();
@@ -200,6 +202,10 @@ export function AppShell() {
   // composer (no second provider invocation, no proposal bypass).
   const handleAskNugget = useCallback(() => {
     setMobileView('chat');
+    // Restore a collapsed desktop chat rail first: the composer is
+    // display:none while collapsed and cannot take focus. The focus call
+    // stays deferred so it runs after the layout commits.
+    setChatCollapsed(false);
     setTimeout(() => composerRef.current?.focus(), 0);
   }, []);
 

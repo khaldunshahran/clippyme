@@ -142,6 +142,7 @@ export default function EditorView({
         <Btn
           variant="ghost"
           size="sm"
+          className="nc-ws-chat-toggle"
           onClick={onToggleChat}
           aria-pressed={chatCollapsed}
           title={chatCollapsed ? 'Show the chat column' : 'Hide the chat column to focus the editor'}

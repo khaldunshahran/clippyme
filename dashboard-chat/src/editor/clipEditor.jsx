@@ -7,7 +7,9 @@
 //
 // Preview honesty: the <video> plays the master/composed clip (source-slice
 // timeline, 1:1 with project source coords); captions/hooks render as DOM
-// overlays synced to the playhead. Export is the pixel-exact check.
+// overlays synced to the playhead. Export is the pixel-exact check. When the
+// player shows an exported render (exact or historical), the DOM overlays
+// stay off — the file already contains that version's graphics.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon, Btn } from './primitives';
@@ -700,12 +702,23 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const [aiText, setAiText] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
   const [aiMsg, setAiMsg] = useState('');
-  // UI-01: what the preview player is showing. 'draft' = source footage +
-  // DOM overlays from the current draft project (approximate preview);
-  // 'render' = the exact exported file for that version. Any project edit
-  // returns it to 'draft' — the preview is only the exact render until the
-  // next change.
-  const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null });
+  // UI-01: what the preview player is showing, bound to the actual
+  // artifact + project identity (review-01):
+  // - 'draft' = the genuine draft input (source footage) + DOM overlays
+  //   drawn from the current draft project (approximate preview);
+  // - 'render' = an exported file. It is only the EXACT render while
+  //   `version` still equals the acknowledged project version AND the
+  //   ownership (clip session key + controller identity) still matches.
+  //   Any authoritative save path (manual, chat/transcript, bulk,
+  //   undo/redo, restore/reset, clip/controller switch) bumps the version
+  //   or moves ownership and invalidates it. A render whose version no
+  //   longer matches is presented honestly as a historical render, without
+  //   the current draft's DOM overlays or timeline assertions (its pixels
+  //   already contain that version's graphics).
+  // Any current-draft edit returns the player to the genuine draft input:
+  // the previous exported file is never the draft source, and draft
+  // overlays must never draw on top of exported pixels.
+  const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null, key: null, ctl: null });
   const videoRef = useRef(null);
 
   // Task 16 authority mode: controlled (via the project controller) or
@@ -723,8 +736,10 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
                 const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
                 setVideoSrc(safeResolveUrl(res.composed_url) + bust);
                 setPlayhead(0);
-                // The player now shows the exact exported file.
-                setPreviewKind({ kind: 'render', version: res.version ?? null });
+                // The player now shows the exact exported file — owned by
+                // this clip session; any later authoritative save or
+                // ownership move invalidates it (see previewBadge below).
+                setPreviewKind({ kind: 'render', version: res.version ?? null, key: `${jobId}:${clipIndex}`, ctl: controller });
               }
               pushToast?.(
                 res && res.deduped
@@ -750,6 +765,12 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const exporting = mode === 'controlled' ? ctlSnap.exporting : exportingLocal;
 
   const title = (clip && (clip.video_title_for_youtube_short || clip.title)) || `Clip ${clipIndex + 1}`;
+
+  // Preview ownership: the clip session this previewKind belongs to. The
+  // controller identity is part of it, so a same-clip reselection (fresh
+  // controller) or a session reset clears stale ownership even when the
+  // job/clip ids are unchanged.
+  const previewSessionKey = `${jobId}:${clipIndex}`;
 
   const refreshVersions = useCallback(async () => {
     if (ctl) { await ctl.refreshVersions(); return; }
@@ -796,12 +817,15 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
 
   // Controlled mode: the controller owns the project; seed the preview from
   // the clip (the controller swaps it to the exact render on export).
+  // Clears stale preview ownership across selection/reset: a new clip
+  // session always starts on the genuine draft input.
   useEffect(() => {
     if (mode !== 'controlled') return;
     setVideoSrc(clipPreviewSrc(clip, null));
+    setPreviewKind({ kind: 'draft', version: null, key: `${jobId}:${clipIndex}`, ctl: controller });
     // clip is a stable prop from the results list; intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, jobId, clipIndex]);
+  }, [mode, jobId, clipIndex, controller]);
 
   // Keep the selected segment in range when segments change.
   useEffect(() => {
@@ -813,8 +837,15 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // NEW render, never a dedup hit). Controlled: forward to the project
   // controller's queue (which stamps origin/idempotency itself).
   const mutate = useCallback((fn, label = 'edit') => {
-    // Any project edit invalidates the "exact render" preview state.
-    setPreviewKind({ kind: 'draft', version: null });
+    // Any current-draft edit invalidates the render preview state. When the
+    // player is showing a render, return it to the genuine draft input —
+    // the previous exported file is not the draft source, and the draft's
+    // DOM overlays must never draw on top of exported pixels.
+    if (previewKind.kind === 'render') {
+      setVideoSrc(clipPreviewSrc(clip, null));
+      setPlayhead(0);
+    }
+    setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
     if (ctl) return ctl.mutate(label, fn);
     setProjectLocal((prev) => {
       if (!prev) return prev;
@@ -825,7 +856,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       return next;
     });
     setDirtyLocal(true);
-  }, [ctl]);
+  }, [ctl, previewKind.kind, previewSessionKey, controller, clip]);
 
   const duration = (project && project.source && project.source.duration) || 0;
   const segs = (project && project.segments) || [];
@@ -1060,8 +1091,10 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
       setVideoSrc(safeResolveUrl(res.composed_url) + bust);
       setPlayhead(0);
-      // The player now shows the exact exported file.
-      setPreviewKind({ kind: 'render', version: res.version ?? null });
+      // The player now shows the exact exported file — owned by this clip
+      // session; any later authoritative save or ownership move invalidates
+      // it (see previewBadge below).
+      setPreviewKind({ kind: 'render', version: res.version ?? null, key: previewSessionKey, ctl: controller });
       await refreshVersions();
       pushToast?.('success', res.deduped
         ? `v${res.version} unchanged — reused the existing render`
@@ -1081,6 +1114,11 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       // always acknowledged state); keeps the restored key, marks dirty.
       try {
         await ctl.loadVersion(v);
+        // The restored draft is not the previously rendered file: back to
+        // the genuine draft input.
+        setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
+        setVideoSrc(clipPreviewSrc(clip, null));
+        setPlayhead(0);
       } catch (e) {
         pushToast?.('Load failed: ' + ((e && e.message) || e).slice(0, 120));
       }
@@ -1093,6 +1131,11 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       setSavedVersionLocal(proj.version);
       setSelSeg(0);
       setDirtyLocal(true);
+      // The restored draft is not the previously rendered file: back to
+      // the genuine draft input.
+      setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
+      setVideoSrc(clipPreviewSrc(clip, null));
+      setPlayhead(0);
       pushToast?.('info', `Loaded v${v} into the draft — save or export to keep it`);
     } catch (e) {
       pushToast?.('error', 'Load failed: ' + ((e && e.message) || e).slice(0, 120));
@@ -1103,8 +1146,10 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     if (!v.output_url) return;
     setVideoSrc(safeResolveUrl(v.output_url) + `?v=${Date.now()}`);
     setPlayhead(0);
-    // Previewing that version's exact exported file.
-    setPreviewKind({ kind: 'render', version: v.version ?? null });
+    // Previewing that version's exported file. When it is not the current
+    // acknowledged version it is presented as a historical render (badge
+    // below) — never with the current draft's DOM overlays.
+    setPreviewKind({ kind: 'render', version: v.version ?? null, key: previewSessionKey, ctl: controller });
   };
 
   const onResetAi = async () => {
@@ -1112,6 +1157,11 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       // Controlled: through the controller (earliest AI cut, keeps its key).
       try {
         await ctl.resetToAiCut();
+        // The reset draft is not the previously rendered file: back to the
+        // genuine draft input.
+        setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
+        setVideoSrc(clipPreviewSrc(clip, null));
+        setPlayhead(0);
       } catch (e) {
         pushToast?.('Reset failed: ' + ((e && e.message) || e).slice(0, 120));
       }
@@ -1128,6 +1178,11 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       setSavedVersionLocal(proj.version);
       setSelSeg(0);
       setDirtyLocal(true);
+      // The reset draft is not the previously rendered file: back to the
+      // genuine draft input.
+      setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller });
+      setVideoSrc(clipPreviewSrc(clip, null));
+      setPlayhead(0);
       pushToast?.('info', `Reset to the AI cut (v${proj.version}) — save or export to keep it`);
     } catch (e) {
       pushToast?.('error', 'Reset failed: ' + ((e && e.message) || e).slice(0, 120));
@@ -1178,49 +1233,90 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
 
   // UI-01 workspace header status: the actual pending/saved state plus
   // what the preview player is showing (draft vs exact exported render).
+  //
+  // Acknowledged version (review-01): the REAL server-acknowledged version
+  // (controller ackVersion), never the draft content version. After a
+  // restore/reset the draft may hold historical content (e.g. v1) while the
+  // server sits at the acknowledged version (e.g. v7) — the badge names
+  // the acknowledged version, and the save-state badge distinguishes the
+  // restored draft separately.
+  const ackVersion = mode === 'controlled'
+    ? (ctlSnap.ackVersion ?? savedVersion ?? project?.version ?? null)
+    : (savedVersion ?? project?.version ?? null);
+  const draftVersion = project?.version ?? null;
   const saveState = exporting
     ? { label: 'Exporting…', cls: 'nc-ce-badge-pending' }
     : saving
       ? { label: 'Saving…', cls: 'nc-ce-badge-pending' }
       : dirty
-        ? { label: 'Unsaved changes', cls: 'nc-ce-badge-draft' }
+        ? {
+            label: draftVersion != null && draftVersion !== ackVersion
+              ? `Unsaved changes · draft v${draftVersion}`
+              : 'Unsaved changes',
+            cls: 'nc-ce-badge-draft',
+          }
         : { label: 'Saved', cls: 'nc-ce-badge-render' };
-  const previewBadge = previewKind.kind === 'render'
-    ? { label: `Exact v${previewKind.version ?? savedVersion ?? project.version} render`, cls: 'nc-ce-badge-render' }
-    : { label: 'Draft preview', cls: 'nc-ce-badge-draft' };
+  // Preview identity (review-01): the render badge is only exact while the
+  // previewed version still equals the acknowledged project version AND
+  // the preview ownership (clip session + controller identity) matches.
+  // Any authoritative save path (manual, chat/transcript, bulk, undo/redo,
+  // restore/reset) or clip/controller switch invalidates it. A render whose
+  // version no longer matches is labeled historical — its pixels already
+  // contain that version's graphics, so the current draft's DOM overlays
+  // stay off and the timeline makes no assertions about it.
+  const renderOwned = previewKind.kind === 'render'
+    && previewKind.key === previewSessionKey
+    && previewKind.ctl === controller;
+  const renderMatchesDraft = renderOwned && previewKind.version != null && previewKind.version === savedVersion;
+  const previewBadge = renderMatchesDraft
+    ? { label: `Exact v${previewKind.version} render`, cls: 'nc-ce-badge-render' }
+    : renderOwned
+      ? { label: `Historical v${previewKind.version ?? '?'} render`, cls: 'nc-ce-badge-pending' }
+      : { label: 'Draft preview', cls: 'nc-ce-badge-draft' };
+  // The playhead is always driven by the <video> element's own time
+  // (onTimeUpdate) — the rendered artifact's own timebase, never an
+  // assumed draft mapping.
+  const showDraftOverlays = !renderOwned;
 
   return (
-    <main className="container fade-in" style={{ maxWidth: 1400, paddingBottom: 48 }}>
+    <main className={`container fade-in${mode === 'standalone' ? ' nc-ce-standalone' : ''}`} style={{ maxWidth: 1400, paddingBottom: 48 }}>
       {/* Single workspace header: clip identity, acknowledged version,
           actual pending/saved state, draft-vs-exact preview distinction,
-          and the existing export action. */}
+          and the existing export action. Identity and actions are separate
+          groups so narrow workspace panels can keep the identity row and
+          move the actions into a scrollable labeled tool strip (see
+          workspace.css) instead of clipping them. */}
       <div className="nc-ce-head">
-        <Btn variant="ghost" size="sm" icon="arrow-left" onClick={onBackClick}>Back</Btn>
-        <div className="nc-ce-title-wrap">
-          <div className="eyebrow">Clip editor</div>
-          <h2 className="nc-ce-title" title={title}>
-            {title}
-          </h2>
+        <div className="nc-ce-identity">
+          <Btn variant="ghost" size="sm" icon="arrow-left" onClick={onBackClick}>Back</Btn>
+          <div className="nc-ce-title-wrap">
+            <div className="eyebrow">Clip editor</div>
+            <h2 className="nc-ce-title" title={title}>
+              {title}
+            </h2>
+          </div>
+          <span className="nc-ce-badge nc-ce-badge-pending" title="Acknowledged project version">
+            {'v' + (ackVersion ?? '')}
+          </span>
+          <span className={`nc-ce-badge ${saveState.cls}`} title="Project save state">
+            {saveState.label}
+          </span>
+          <span className={`nc-ce-badge ${previewBadge.cls}`} title="What the preview player is showing">
+            {previewBadge.label}
+          </span>
         </div>
-        <span className="nc-ce-badge nc-ce-badge-pending" title="Acknowledged project version">
-          v{savedVersion ?? project.version}
-        </span>
-        <span className={`nc-ce-badge ${saveState.cls}`} title="Project save state">
-          {saveState.label}
-        </span>
-        <span className={`nc-ce-badge ${previewBadge.cls}`} title="What the preview player is showing">
-          {previewBadge.label}
-        </span>
-        {headerExtra}
-        <Btn variant="ghost" size="sm" icon="refresh-cw" onClick={onResetAi} title="Reload the AI-generated cut">
-          Reset to AI cut
-        </Btn>
-        <Btn variant="ghost" size="sm" icon="check" loading={saving} disabled={!dirty || saving} onClick={onSave}>
-          {saving ? 'Saving…' : 'Save draft'}
-        </Btn>
-        <Btn variant="primary" size="sm" icon="download" loading={exporting} disabled={exporting} onClick={onExport}>
-          {exporting ? 'Exporting…' : 'Export'}
-        </Btn>
+        <div className="nc-ce-actions" role="toolbar" aria-label="Editor actions" tabIndex={0}>
+          {headerExtra}
+          <Btn variant="ghost" size="sm" icon="refresh-cw" onClick={onResetAi} title="Reload the AI-generated cut">
+            Reset to AI cut
+          </Btn>
+          <Btn variant="ghost" size="sm" icon="check" loading={saving} disabled={!dirty || saving} onClick={onSave}>
+            {saving ? 'Saving…' : 'Save draft'}
+          </Btn>
+          <Btn variant="primary" size="sm" icon="download" loading={exporting} disabled={exporting} onClick={onExport}>
+            {exporting ? 'Exporting…' : 'Export'}
+          </Btn>
+        </div>
       </div>
 
       {/* UI-01: responsive grid (collapses to one column in a narrow
@@ -1245,18 +1341,19 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
               onTimeUpdate={onTimeUpdate}
               style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', zIndex: 0 }}
             />
-            {/* hook overlay */}
-            {hookVisible && (
-              <div style={{ position: 'absolute', top: '4%', left: '6%', right: '6%', zIndex: 2,
+            {/* hook overlay — draft preview only; a shown render already
+                contains that version's graphics. */}
+            {showDraftOverlays && hookVisible && (
+              <div data-ui01="hook-overlay" style={{ position: 'absolute', top: '4%', left: '6%', right: '6%', zIndex: 2,
                 textAlign: 'center', color: '#fff', pointerEvents: 'none',
                 fontFamily: "Anton, Impact, 'Arial Black', sans-serif", fontSize: 24, lineHeight: 1.15,
                 textShadow: '-1.5px -1.5px 0 #000,1.5px -1.5px 0 #000,-1.5px 1.5px 0 #000,1.5px 1.5px 0 #000' }}>
                 {hook.text}
               </div>
             )}
-            {/* caption overlay */}
-            {activeWord && (
-              <div style={{ position: 'absolute', zIndex: 2, pointerEvents: 'none', textAlign: 'center',
+            {/* caption overlay — draft preview only (see above). */}
+            {showDraftOverlays && activeWord && (
+              <div data-ui01="caption-overlay" style={{ position: 'absolute', zIndex: 2, pointerEvents: 'none', textAlign: 'center',
                 ...(CAP_POS_STYLE[caps.position] || CAP_POS_STYLE.bottom) }}>
                 <span style={{ ...capStyle, fontSize: 26, fontWeight: 800, padding: '2px 10px',
                   borderRadius: 6, display: 'inline-block', lineHeight: 1.25 }}>
@@ -1287,8 +1384,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
 
         {/* right: inspector + versions */}
         <div>
-          <div style={{ display: 'flex', gap: 4, marginBottom: 14, borderBottom: '1px solid rgba(51,46,38,.12)',
-            paddingBottom: 8 }} role="tablist">
+          <div className="nc-ce-tabs" style={{ display: 'flex', gap: 4, marginBottom: 14, borderBottom: '1px solid rgba(51,46,38,.12)',
+            paddingBottom: 8 }} role="tablist" aria-label="Editor panels">
             {PANELS.map((t) => (
               <button key={t.id} type="button" role="tab" aria-selected={panel === t.id}
                 onClick={() => setPanel(t.id)}

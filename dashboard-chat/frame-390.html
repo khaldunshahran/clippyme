@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <!--
+    UI-01 offline fixture — true-390px frame.
+    Headless Chrome enforces a 500px minimum window width, so 390px CSS
+    layout is verified through this 390px iframe (same technique as the
+    UI-01 submission). The iframe runs the real fixture; its query string
+    is forwarded verbatim. For ?ui01test= runs the inner JSON results are
+    mirrored into this document for --dump-dom.
+  -->
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>UI-01 390px frame</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: #141414; }
+      iframe { width: 390px; height: 844px; border: 0; display: block; background: #fff; }
+    </style>
+  </head>
+  <body>
+    <iframe id="f" title="390px viewport"></iframe>
+    <script>
+      document.getElementById('f').src = './ui01-fixture.html' + window.location.search;
+      // Mirror the inner scripted-test results outward for --dump-dom.
+      var tries = 0;
+      var t = setInterval(function () {
+        tries++;
+        try {
+          var d = document.getElementById('f').contentDocument;
+          var pre = d && d.querySelector('#ui01-test-results');
+          if (pre && pre.textContent) {
+            var out = document.createElement('pre');
+            out.id = 'ui01-test-results';
+            out.textContent = pre.textContent;
+            document.body.appendChild(out);
+            document.title = d.title;
+            clearInterval(t);
+          }
+        } catch (e) { /* iframe not readable yet */ }
+        if (tries > 300) clearInterval(t);
+      }, 100);
+    </script>
+  </body>
+</html>
