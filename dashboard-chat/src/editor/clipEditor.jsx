@@ -205,9 +205,19 @@ function wordAt(words, edits, t) {
 // through the backend media route (/videos/{job}/{file}) is the
 // reframed result file — job_results.py builds every clip.video_url
 // that way. Missing source identity does not turn it into raw footage:
-// resolveDraftInput classifies route-served picks as 'result'. Only a
-// clip-level reference that is NOT a backend result URL keeps the
-// legacy 'draft' treatment.
+// resolveDraftInput classifies route-served picks as 'result'.
+//
+// NOTE (review-05): the route is not the only delivered shape.
+// job_results.py sets clip.video_url to the remote (r2) URL when one
+// exists and to the local /videos path otherwise — every backend
+// video_url is an ABSOLUTE URL or a media-route path, i.e. a rendered
+// result either way. A cloud URL without source identity is still a
+// result, not proof of raw footage: resolveDraftInput classifies
+// absolute picks as 'result' too. Only a scheme-less relative
+// clip-level reference — a shape the result pipeline never emits —
+// keeps the legacy 'draft' treatment. Filenames and hostnames are
+// not provenance; only the recorded project.source.file (or another
+// independently authoritative raw record) authorizes a raw input.
 export function draftPreviewSource(clip) {
   const raw = clip && clip.video_url ? safeResolveUrl(clip.video_url) : '';
   if (raw) return { src: raw, composed: false };
@@ -247,14 +257,27 @@ export function isBackendMediaUrl(src) {
   return typeof src === 'string' && /(^|\/)videos\//.test(src);
 }
 
+// True when a URL is absolute: it carries a scheme (http:, https:,
+// blob:, data:, ...) or is protocol-relative (//host/...). Backend
+// results are always delivered in this shape or the media-route
+// shape (see the review-05 note above draftPreviewSource), so an
+// absolute clip-level pick is a delivered result file, never — by
+// itself — evidence of raw footage.
+export function isAbsoluteMediaUrl(src) {
+  return typeof src === 'string'
+    && (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(src) || src.startsWith('//'));
+}
+
 // Draft input selection, in authority order:
 //  - 'source':   the project's recorded raw slice resolved through the
 //                media route — the genuine draft input. Draft graphics,
 //                segment looping and source-coordinate tools apply.
 //  - 'draft':    legacy compatibility for projects that record no
 //                source file (they predate source recording) AND whose
-//                clip-level pick is not a backend result URL: the
-//                clip-level draftPreviewSource pick (video_url).
+//                clip-level pick is a scheme-less relative reference
+//                — the one pick shape the result pipeline never
+//                emits: the clip-level draftPreviewSource pick
+//                (video_url).
 //  - 'composed': the composed artifact (burned-in graphics) is the
 //                only/best available file — an artifact, never
 //                presented as clean footage.
@@ -262,14 +285,23 @@ export function isBackendMediaUrl(src) {
 //                shows — either because a recorded source file was
 //                unsafe/unresolvable, or because NO source identity
 //                is recorded (missing/empty/non-string source.file)
-//                and the pick is a backend media-route URL (review-04:
-//                missing source identity never mints clean-draft
-//                provenance — a project's age does not prove rawness).
-//                Labeled a result, with draft graphics and
-//                source-coordinate operations suppressed. Rawness is
-//                never inferred from the mere absence of
-//                composed_video_url.
+//                and the pick is a delivered result: a backend
+//                media-route URL (review-04) or ANY absolute URL
+//                (review-05 — job_results.py returns the remote r2
+//                URL for the same rendered clip, so a cloud URL
+//                without source identity is a result too; missing
+//                source identity never mints clean-draft provenance
+//                — a project's age does not prove rawness). Labeled
+//                a result, with draft graphics and source-coordinate
+//                operations suppressed. Rawness is never inferred
+//                from the mere absence of composed_video_url, and
+//                never from a filename or hostname.
 //  - 'none':     no usable media at all.
+// A deferred seek counts as landed only when the element's actual
+// position matches the requested target within this explicit small
+// tolerance (review-05). See consumePendingSeek.
+export const SEEK_LANDING_TOLERANCE_S = 0.25;
+
 export function resolveDraftInput(clip, project, jobId) {
   const recorded = project && project.source && typeof project.source.file === 'string'
     ? project.source.file.trim()
@@ -284,7 +316,7 @@ export function resolveDraftInput(clip, project, jobId) {
   const d = draftPreviewSource(clip);
   if (!d.src) return { src: '', kind: 'none' };
   if (d.composed) return { src: d.src, kind: 'composed' };
-  if (isBackendMediaUrl(d.src)) return { src: d.src, kind: 'result' };
+  if (isBackendMediaUrl(d.src) || isAbsoluteMediaUrl(d.src)) return { src: d.src, kind: 'result' };
   return { src: d.src, kind: 'draft' };
 }
 
@@ -834,8 +866,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null, key: null, ctl: null, contentKey: null });
   // What the draft input actually is (see resolveDraftInput): 'source'
   // (the project's recorded raw slice — the genuine draft input),
-  // 'draft' (legacy no-source-recorded pick that is not a backend
-  // result URL), 'composed' / 'result'
+  // 'draft' (legacy no-source-recorded scheme-less relative pick),
+  // 'composed' / 'result'
   // (rendered files shown honestly as artifacts: no DOM overlays, no
   // draft segment loop, no source-coordinate split/seek from their
   // playheads), or 'none'.
@@ -1122,8 +1154,13 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // Consumption also requires a VERIFIED landing: a currentTime
   // write issued at loadedmetadata (readyState 1, target beyond the
   // buffered range) can be silently discarded by the element, so the
-  // write is read back — if it did not stick, the seek stays queued
-  // and the canplay handlers retry it once the media can accept it.
+  // write is read back and compared against the requested target —
+  // landed means |actual - target| <= SEEK_LANDING_TOLERANCE_S
+  // (review-05). Any positive position is NOT success: an element
+  // parked at an old position, or one that clamped the write
+  // elsewhere outside the tolerance, has not landed, and the seek
+  // stays queued for the canplay retries. The target 0 is verified
+  // exactly the same way.
   const consumePendingSeek = () => {
     const pending = pendingSeekRef.current;
     if (!pending) return;
@@ -1133,13 +1170,13 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     const v = videoRef.current;
     if (!v) return;
     try { v.currentTime = pending.t; } catch { /* ignore */ }
-    if (pending.t > 0 && !(v.currentTime > 0)) {
-      // Not landed yet: retry on canplay, but bound the attempts —
-      // on a transport that cannot seek at all (no range support)
-      // the write will never stick, and re-writing on every media
-      // event would spin. After the canplay retries the seek is
-      // dropped WITHOUT moving the playhead: the element stays the
-      // honest position.
+    if (Math.abs(v.currentTime - pending.t) > SEEK_LANDING_TOLERANCE_S) {
+      // Not landed: retry on canplay, but bound the attempts — on a
+      // transport that cannot seek at all (no range support) the
+      // write will never stick, and re-writing on every media event
+      // would spin. After the canplay retries the seek is dropped
+      // WITHOUT moving the playhead or claiming the target landed:
+      // the element stays the honest position.
       pending.tries = (pending.tries || 0) + 1;
       if (pending.tries < 3) return;
       pendingSeekRef.current = null;

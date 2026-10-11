@@ -301,11 +301,18 @@ describe('UI-01 review-04 — missing source identity (unit)', () => {
     expect(resolveDraftInput({}, legacy, 'j1')).toEqual({ src: '', kind: 'none' });
   });
 
-  it('a non-route legacy clip reference keeps the legacy draft treatment', () => {
+  it('only a scheme-less legacy clip reference keeps the legacy draft treatment', () => {
+    // 'draft' survives ONLY for a scheme-less relative reference — a
+    // shape the result pipeline never emits (job_results.py returns
+    // the remote r2 URL or the /videos path for every rendered
+    // clip). "Non-route" alone never proved rawness: a remote cloud
+    // URL without source identity is a delivered result (review-05).
     expect(resolveDraftInput({ video_url: 'raw.mp4' }, legacy, 'j1'))
       .toEqual({ src: 'raw.mp4', kind: 'draft' });
     expect(resolveDraftInput({ video_url: 'raw.mp4', composed_video_url: 'comp.mp4' }, legacy, 'j1'))
       .toEqual({ src: 'raw.mp4', kind: 'draft' });
+    expect(resolveDraftInput({ video_url: 'https://media.example.net/job/example_clip_1.mp4' }, legacy, 'j1'))
+      .toEqual({ src: 'https://media.example.net/job/example_clip_1.mp4', kind: 'result' });
   });
 
   it('a recorded source still wins; an unsafe recorded source still falls back to result', () => {
