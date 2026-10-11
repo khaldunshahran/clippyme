@@ -750,3 +750,72 @@ def test_composition_font_served_with_cors_for_opaque_origin(tmp_path,
         f"?token={token}")
     assert r.status_code == 200
     assert r.headers.get("access-control-allow-origin") == "*"
+def test_publish_worker_output_cancel_during_cleanup_returns_rendered(tmp_path,
+                                                                      monkeypatch):
+    """Review-03: the terminal 'rendered' state is committed BEFORE the
+    cancellable backup cleanup. A cancel landing in cleanup invokes the
+    actual cancel route, which must see the terminal record and report
+    'rendered' instead of flipping a committed export to 'cancelled'."""
+    import threading
+    from starlette.requests import Request
+    from clippyme.api.auth import get_current_user
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())
+    render_id = f"{jid}_{'abcdef0123456789'}"
+    hr._write_record(job_dir, render_id, {
+        "render_id": render_id, "job_id": jid, "clip_index": 0,
+        "project_version": 2, "state": "rendering"})
+    output_path = os.path.join(job_dir, "hf_clip_0_v2_clean-captions.mp4")
+    with open(output_path, "wb") as f:
+        f.write(b"previous")
+    src = tmp_path / "worker-out.mp4"
+    src.write_bytes(b"new-bytes")
+    from clippyme.finishing import cache as _cache_mod
+    monkeypatch.setattr(_cache_mod, "store", lambda *a, **k: None)
+    # Bypass media validation: the probe src is not a real video.
+    monkeypatch.setattr(
+        hr, "_stage_and_install",
+        lambda s_path, d_path, **kw: _Path(d_path).write_bytes(_Path(s_path).read_bytes()))
+
+    started = threading.Event()
+    release = threading.Event()
+    real_remove = os.remove
+
+    def blocking_remove(path):
+        if ".prev-" in str(path):
+            started.set()
+            assert release.wait(timeout=10)
+        return real_remove(path)
+
+    monkeypatch.setattr(hr.os, "remove", blocking_remove)
+
+    async def run():
+        task = _asyncio.create_task(hr._publish_worker_output(
+            job_dir=job_dir, render_id=render_id, src_path=str(src),
+            cache_key="k" * 64, output_path=output_path,
+            width=608, height=1080))
+        hr._RENDER_TASKS[render_id] = task
+        try:
+            assert await _asyncio.to_thread(started.wait, 10)
+            # Commit gate passed: the terminal state is already on disk
+            # BEFORE the cancellable cleanup await.
+            assert hr._read_record(job_dir, render_id)["state"] == "rendered"
+            # The actual cancel route, landing now, sees the terminal
+            # record and reports honestly instead of overwriting it.
+            request = Request({"type": "http", "app": client.app})
+            user = client.app.dependency_overrides[get_current_user]()
+            response = await hr.hyperframes_render_cancel(
+                render_id, request, user)
+            assert response["state"] == "rendered"
+            release.set()
+            await task
+            rec = hr._read_record(job_dir, render_id)
+            assert rec["state"] == "rendered"
+            with open(output_path, "rb") as f:
+                assert f.read() == b"new-bytes"
+        finally:
+            release.set()
+            hr._RENDER_TASKS.pop(render_id, None)
+
+    _asyncio.run(run())

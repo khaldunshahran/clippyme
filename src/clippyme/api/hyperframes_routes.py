@@ -347,8 +347,12 @@ async def _publish_worker_output(*, job_dir: str, render_id: str,
     snapshotted BEFORE the staging/install thread, and the record is
     re-read AFTER the thread settles. If the render left 'rendering' in the
     meantime (cancel during copy/validation), the prior export is restored
-    and PublishSkipped is raised — cancellation wins and the cancelled
-    record stays truthful about the bytes on disk. A staging/install
+    and PublishSkipped is raised. When the commit gate passes, the terminal
+    'rendered' state is recorded BEFORE the cancellable backup cleanup, so
+    a cancel landing in cleanup sees a terminal record and reports honestly
+    instead of overwriting a committed export with 'cancelled'. When
+    cancellation wins instead (during staging), the cancelled record stays
+    truthful about the bytes on disk. A staging/install
     failure propagates normally (atomic _stage_and_install leaves the prior
     output untouched). The early state check below is only a fast path; the
     commit gate after settle is the actual decision point.
@@ -418,12 +422,29 @@ async def _publish_worker_output(*, job_dir: str, render_id: str,
         if cancelled:
             raise asyncio.CancelledError()
         raise PublishSkipped(note)
-    # Commit stands: the backup is no longer needed.
+    # Commit stands: record the terminal state BEFORE any cancellable
+    # cleanup. The staging thread already installed the new output
+    # atomically; once 'rendered' is recorded, a cancel landing in cleanup
+    # sees a terminal record and reports honestly instead of overwriting a
+    # committed export with 'cancelled'. There is no await between the
+    # commit gate above and this write, so the cancel route cannot
+    # interleave between the decision and its recording.
+    rec2["state"] = "rendered"
+    rec2["finished_at"] = time.time()
+    _write_record(job_dir, render_id, rec2)
+    # Backup cleanup is best-effort and must not change the terminal
+    # decision: shield it so a late cancel cannot turn a committed render
+    # into a cancelled task. The backup is ours alone (unique .prev- name).
     if backup_path:
         try:
-            await asyncio.to_thread(os.remove, backup_path)
+            await asyncio.shield(asyncio.to_thread(os.remove, backup_path))
         except OSError:
             pass
+        except asyncio.CancelledError:
+            # Terminal state already committed above; the orphaned backup is
+            # harmless. Re-raise so a genuinely cancelled task still reports
+            # cancellation instead of swallowing it.
+            raise
 
 
 async def _route_current_user(request: Request) -> AuthUser:

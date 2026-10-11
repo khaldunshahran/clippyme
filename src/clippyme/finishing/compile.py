@@ -292,7 +292,7 @@ _BRIDGE_JS = """
     try { if (ev.source !== window.parent) { return; } } catch (e) { return; }
     var m = ev.data;
     if (!m || typeof m !== 'object' || m.hf !== 1) { return; }
-    if (IID && m.hfiid && m.hfiid !== IID) { return; }
+    if (IID && m.hfiid !== IID) { return; }
     var t = validT(m.t) ? m.t : null;
     if (m.type === 'seek') {
       if (t === null) { return; }

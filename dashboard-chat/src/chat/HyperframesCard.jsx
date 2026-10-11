@@ -86,7 +86,9 @@ function HfPreview({ src, hfiid, duration, renderWidth, renderHeight }) {
   const post = (msg) => {
     const w = frameRef.current && frameRef.current.contentWindow;
     if (!w || typeof w.postMessage !== 'function') return false;
-    w.postMessage({ hf: 1, ...msg }, '*');
+    // Per-instance binding (review-03): parent commands carry this
+    // preview's IID so the composition can require an exact match.
+    w.postMessage({ hf: 1, hfiid, ...msg }, '*');
     return true;
   };
 
@@ -121,8 +123,11 @@ function HfPreview({ src, hfiid, duration, renderWidth, renderHeight }) {
       const owned = frameRef.current && frameRef.current.contentWindow;
       if (!owned || event.source !== owned) return;
       // Per-instance binding: a stale/reloaded frame carries a different
-      // hfiid (messages without one are still accepted for harness compat).
-      if (hfiid && d.hfiid && d.hfiid !== hfiid) return;
+      // Per-instance binding (review-03): when this preview has an IID,
+      // the incoming message must carry the exact same IID. A missing or
+      // wrong IID is rejected -- WindowProxy/source identity alone cannot
+      // distinguish stale/reloaded documents in the same iframe.
+      if (hfiid && d.hfiid !== hfiid) return;
       if (d.type === 'ready') {
         setReady(true);
         seekTo(0);
@@ -366,17 +371,15 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
     }
   };
 
-  // Unapplied template/param edits invalidate the acknowledged preview:
-  // export must never render a compile_id from a different selection.
-  // Review-02: a change after Apply with NO acknowledged preview yet
-  // returns to 'proposal' — changed settings must be re-applied /
-  // acknowledged before they can be previewed or exported. A change after
-  // an acknowledged preview keeps the applied settings ('applied') and
-  // allows re-preview of the variant; the preview itself is invalidated.
+  // Unapplied template/param edits always return the card to 'proposal'
+  // (review-03): EVERY changed finishing setting requires another
+  // acknowledged Apply before it can be previewed or exported -- including
+  // after an existing preview. An acknowledged preview never authorizes
+  // later edits; preview/export always bind to the acknowledged snapshot.
   const invalidatePreview = () => {
     setPreview(null);
     setRender(null);
-    setState((s) => (s === 'preview' ? 'applied' : 'proposal'));
+    setState('proposal');
   };
   const onTemplateChange = (e) => { setTemplateId(e.target.value); invalidatePreview(); };
   const onParamChange = (p) => (e) => { setParams((prev) => ({ ...prev, [p]: e.target.value })); invalidatePreview(); };

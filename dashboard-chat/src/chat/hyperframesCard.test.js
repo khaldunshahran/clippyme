@@ -561,26 +561,29 @@ describe('review-01 R3: preview auth + postMessage + aspect + playback', () => {
     // the harness provides the owned window as the source.
     const owned = hooks.values[0].current.contentWindow;
     // The composition announces readiness; junk messages are ignored.
+    // (review-03) the harness speaks the exact instance ID of this preview.
+    const hfiid = hfPreviewEl.props.hfiid;
+    expect(hfiid).toMatch(/^hf-/);
     listeners.message({ source: owned, data: { nope: true } });
-    listeners.message({ source: owned, data: { hf: 1, type: 'ready' } });
+    listeners.message({ source: owned, data: { hf: 1, hfiid, type: 'ready' } });
     await flush();
     expect(hooks.values[2]).toBe(true); // ready
     // Play ACTUALLY starts playback via the protocol (targetOrigin '*').
     const playBtn = findByTestId(rerender(), 'hf-preview-play');
     expect(playBtn).toBeTruthy();
     await playBtn.props.onClick();
-    expect(postMessage).toHaveBeenCalledWith({ hf: 1, type: 'play' }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ hf: 1, hfiid, type: 'play' }, '*');
     // Playing state is confirmed by the composition's timeupdate messages.
-    listeners.message({ source: owned, data: { hf: 1, type: 'timeupdate', t: 3.25 } });
+    listeners.message({ source: owned, data: { hf: 1, hfiid, type: 'timeupdate', t: 3.25 } });
     expect(hooks.values[1]).toBe(3.25);
     const pauseBtn = findByTestId(rerender(), 'hf-preview-play');
     expect(textOf(pauseBtn)).toMatch(/Pause/);
     await pauseBtn.props.onClick();
-    expect(postMessage).toHaveBeenCalledWith({ hf: 1, type: 'pause' }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ hf: 1, hfiid, type: 'pause' }, '*');
     // Scrub sends pause + seek through the protocol.
     const scrub = findByTestId(rerender(), 'hf-preview-scrub');
     scrub.props.onChange({ target: { value: '2.5' } });
-    expect(postMessage).toHaveBeenCalledWith({ hf: 1, type: 'seek', t: 2.5 }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ hf: 1, hfiid, type: 'seek', t: 2.5 }, '*');
     // Every cross-origin post uses '*' (sandboxed opaque origin); the fake
     // contentWindow never had __hf/document and nothing threw.
     expect(postMessage.mock.calls.length).toBeGreaterThan(0);
@@ -613,7 +616,7 @@ describe('review-01 R4: export bound to the acknowledged preview', () => {
     expect(body.expected_version).toBe(2);
   });
 
-  it('changing the template after preview invalidates it and requires re-preview', async () => {
+  it('changing the template after preview requires another acknowledged Apply (review-03)', async () => {
     hfApi.compileHyperframes
       .mockResolvedValueOnce({ compile_id: 'compile-aaa', preview_identity: 'd1', manifest: MANIFEST })
       .mockResolvedValueOnce({ compile_id: 'compile-bbb', preview_identity: 'd2', manifest: MANIFEST });
@@ -628,23 +631,57 @@ describe('review-01 R4: export bound to the acknowledged preview', () => {
     await flush();
     tree = card(p);
     expect(findByTestId(tree, 'hf-render')).toBeTruthy();
-    // Unapplied edit AFTER the preview was acknowledged: the old compile
-    // must not be renderable anymore.
+    // Changed setting AFTER an acknowledged preview: the card returns to
+    // 'proposal' -- the old compile is gone and cannot be rendered, and the
+    // new settings cannot be previewed without another acknowledged Apply.
     findByTestId(tree, 'hf-template').props.onChange({ target: { value: 'emphasized-word' } });
     tree = card(p);
     expect(findByTestId(tree, 'hf-render')).toBeNull();
-    expect(findByTestId(tree, 'hf-preview')).toBeTruthy();
+    expect(findByTestId(tree, 'hf-preview')).toBeNull();
+    expect(findByTestId(tree, 'hf-apply')).toBeTruthy();
     expect(textOf(tree)).not.toMatch(/compile-aaa/);
-    // Re-preview compiles the NEW selection; render binds to the new id.
+    expect(hfApi.compileHyperframes).toHaveBeenCalledTimes(1);
+    // Re-Apply acknowledges the NEW settings (assert the saved template).
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    const savedProject = realApi.saveClipProject.mock.calls[realApi.saveClipProject.mock.calls.length - 1][2];
+    expect(savedProject.finishing.template).toBe('emphasized-word');
+    // Preview/export now bind the new acknowledged snapshot.
+    tree = card(p);
     await findByTestId(tree, 'hf-preview').props.onClick();
     await flush();
     tree = card(p);
-    expect(hfApi.compileHyperframes).toHaveBeenLastCalledWith(
-      'j1', 0, expect.objectContaining({ template_id: 'emphasized-word' }));
+    expect(hfApi.compileHyperframes).toHaveBeenCalledTimes(2);
     await findByTestId(tree, 'hf-render').props.onClick();
     await flush();
     expect(hfApi.renderHyperframes).toHaveBeenCalledWith(
       'j1', 0, expect.objectContaining({ compile_id: 'compile-bbb' }));
+  });
+
+  it('changing a parameter after preview also requires another acknowledged Apply (review-03)', async () => {
+    hfApi.compileHyperframes.mockResolvedValue({ compile_id: 'compile-aaa', preview_identity: 'd1', manifest: MANIFEST });
+    const p = { data: data('j1', 0), activeSelectionKey: 'j1:0' };
+    card(p); await flush();
+    let tree = card(p);
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    tree = card(p);
+    await findByTestId(tree, 'hf-preview').props.onClick();
+    await flush();
+    tree = card(p);
+    expect(findByTestId(tree, 'hf-render')).toBeTruthy();
+    // Parameter (not template) change after the acknowledged preview.
+    findByTestId(tree, 'hf-caption_size').props.onChange({ target: { value: 'large' } });
+    tree = card(p);
+    expect(findByTestId(tree, 'hf-render')).toBeNull();
+    expect(findByTestId(tree, 'hf-preview')).toBeNull();
+    expect(findByTestId(tree, 'hf-apply')).toBeTruthy();
+    expect(hfApi.compileHyperframes).toHaveBeenCalledTimes(1);
+    // Re-Apply acknowledges the new parameter value.
+    await findByTestId(tree, 'hf-apply').props.onClick();
+    await flush();
+    const savedProject = realApi.saveClipProject.mock.calls[realApi.saveClipProject.mock.calls.length - 1][2];
+    expect(savedProject.finishing.caption_size).toBe('large');
   });
 });
 
@@ -752,22 +789,56 @@ describe('coordinator review02 remaining production contracts', () => {
       hooks.index=0;
       const updated=element.type(element.props);
       expect(findByTestId(updated,'hf-preview-play')).toBeNull();
-      // Owned window: accepted, play button appears. (load-bearing: the
-      // source check must not reject the real iframe.)
-      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,type:'ready'}});
+      // Owned window + correct IID: accepted, play button appears.
+      // (load-bearing: the source check must not reject the real iframe,
+      // and the IID check must not reject the real composition.)
+      const hfiid = element.props.hfiid;
+      expect(hfiid).toMatch(/^hf-/);
+      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,hfiid,type:'ready'}});
       await flush();
       hooks.index=0;
       const updated2=element.type(element.props);
       expect(findByTestId(updated2,'hf-preview-play')).not.toBeNull();
+      // Missing IID: rejected even from the owned window (review-03).
+      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,type:'timeupdate',t:5}});
+      await flush();
+      expect(hooks.values[1]).toBe(0);
       // Stale instance id: a message from the owned window but with a
       // different hfiid must not drive this preview.
+      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,hfiid:'hf-stale',type:'timeupdate',t:5}});
+      await flush();
+      // t stays 0 (the missing/stale timeupdates were ignored).
+      expect(hooks.values[1]).toBe(0);
+      // Correct IID: accepted, playback clock advances.
+      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,hfiid,type:'timeupdate',t:2.5}});
+      await flush();
+      expect(hooks.values[1]).toBe(2.5);
+    } finally { vi.unstubAllGlobals(); vi.stubGlobal('React',React); }
+  });
+
+  it('parent seek/play/pause commands carry the preview instance ID (review-03)', async () => {
+    const {tree}=await previewCard();
+    const element=walk(tree).find(n=>n.type?.name==='HfPreview');
+    hooks.values=[]; hooks.index=0;
+    const listeners=[];
+    vi.stubGlobal('window',{addEventListener:(name,fn)=>{if(name==='message') listeners.push(fn);},removeEventListener:()=>{}});
+    try {
+      element.type(element.props);
+      const ownedWindow={postMessage:vi.fn()};
+      hooks.values[0].current={contentWindow:ownedWindow};
       const hfiid = element.props.hfiid;
       expect(hfiid).toMatch(/^hf-/);
-      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,hfiid:'hf-stale',type:'timeupdate',t:1}});
+      // ready with the correct IID, then drive a seek through the UI.
+      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,hfiid,type:'ready'}});
       await flush();
-      // t stays 0 (the stale timeupdate was ignored).
-      expect(hooks.values[1]).toBe(0);
-    } finally { vi.unstubAllGlobals(); vi.stubGlobal('React',React); }
+      hooks.index=0;
+      const updated=element.type(element.props);
+      const scrub=findByTestId(updated,'hf-preview-scrub');
+      scrub.props.onChange({target:{value:'3.25'}});
+      // The parent command carries {hf:1, hfiid, type:'seek', t}.
+      expect(ownedWindow.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({hf:1,hfiid,type:'seek',t:3.25}), '*');
+    } finally { vi.unstubAllGlobals(); vi.stubGlobal('React', React); }
   });
 });
 
