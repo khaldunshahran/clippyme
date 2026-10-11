@@ -657,12 +657,12 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast }) {
 
   const duration = (project && project.source && project.source.duration) || 0;
   const segs = (project && project.segments) || [];
-  const seg = segs[selSeg];
-  const caps = (project && project.captions) || {};
-  const words = caps.words || [];
-  const edits = caps.edits || {};
+  const caps = project?.captions || {};
   const hook = ((project && project.overlays) || []).find((o) => o.type === 'hook');
-  const activeWord = useMemo(() => wordAt(words, edits, playhead), [words, edits, playhead]);
+  const activeWord = useMemo(
+    () => wordAt(project?.captions?.words || [], project?.captions?.edits || {}, playhead),
+    [project?.captions?.words, project?.captions?.edits, playhead],
+  );
 
   // --- preview playback ------------------------------------------------
   const onTimeUpdate = () => {
