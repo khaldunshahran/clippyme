@@ -260,7 +260,9 @@ def test_is_safe_output_dir_casing():
         # different directory, which the containment guard must reject.
         same_root = os.path.normcase(changed) == os.path.normcase(original)
         assert _is_safe_output_dir(changed) is same_root
-    assert _is_safe_output_dir(r"C:\Windows\System32") is False
+    assert _is_safe_output_dir(os.path.abspath(os.sep)) is False
+    if os.name == 'nt':
+        assert _is_safe_output_dir(r"C:\Windows\System32") is False
 
 
 def test_downloader_api_rejects_ssrf_url():
