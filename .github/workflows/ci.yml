@@ -37,6 +37,13 @@ jobs:
           pip install -e ".[host-tests]"
           pip install pytest pytest-cov pytest-timeout pip-audit ruff bandit
 
+      - name: Install media tools for actual export regressions
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          ffmpeg -version
+          ffprobe -version
+
       - name: Lint (ruff — bug-class rules)
         run: ruff check src/clippyme tests --select E9,F63,F7,F82
 

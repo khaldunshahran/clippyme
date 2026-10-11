@@ -254,8 +254,12 @@ def test_download_youtube_video_propagates_microservice_error_detail(monkeypatch
 def test_is_safe_output_dir_casing():
     from clippyme.services.downloader_api import _is_safe_output_dir
     assert _is_safe_output_dir("output/test") is True
-    assert _is_safe_output_dir(os.path.abspath("output/test").upper()) is True
-    assert _is_safe_output_dir(os.path.abspath("output/test").lower()) is True
+    original = os.path.abspath("output/test")
+    for changed in (original.upper(), original.lower()):
+        # Windows normalizes casing; POSIX treats a changed root as a
+        # different directory, which the containment guard must reject.
+        same_root = os.path.normcase(changed) == os.path.normcase(original)
+        assert _is_safe_output_dir(changed) is same_root
     assert _is_safe_output_dir(r"C:\Windows\System32") is False
 
 
