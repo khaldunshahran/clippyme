@@ -1,4 +1,4 @@
-# UI-01 offline fixture (review-01 evidence, updated for review-02 and review-03)
+# UI-01 offline fixture (review-01 evidence, updated for review-02, review-03 and review-04)
 
 Renders the **real** `AppShell` (real React root, real hooks, real
 `useWorkspaceController` → real `createProjectController` + real serialized
@@ -117,19 +117,36 @@ foreach ($d in @('C:\tmp\ui01-fixture-dist','C:\tmp\ui01-fixture-dist-dev')) {
    contracts (source-timeline seek isolation; authoritative
    project-source resolution with traversal validation and honest
    fallbacks) are pinned in `src/chat/ui01Review03.test.js` and the
-   coordinator probe `src/chat/coordinatorUi01Review03.test.js`.
+   coordinator probe `src/chat/coordinatorUi01Review03.test.js`. The
+   review-04 fallback contracts (a deferred source seek is bound to
+   its exact input + preview session and invalidated on load failure;
+   missing source identity classifies a backend media-route
+   `video_url` as the reframed result, never a clean draft) are
+   pinned in `src/chat/ui01Review04.test.js` and the coordinator
+   probe `src/chat/coordinatorUi01Review04.test.js`.
 
-## Run transport (review-02)
+## Run transport (review-02, server corrected in review-04)
 
 All browser runs serve the dist folders from a **throwaway localhost
-server** (`python -m http.server 8931 --bind 127.0.0.1 --directory
-C:/tmp/ui01-fixture-dist`, started for the run and stopped after it).
-Reason: under `--virtual-time-budget`, media data over `file://`
-stalls at HAVE_METADATA (the file loader is not virtualized), so the
+server** (started for the run and stopped after it): `node
+src/ui01-fixture/serve-dist.mjs 8931 C:/tmp/ui01-fixture-dist` (and
+port 8932 for the dev dist). Reason for HTTP at all: under
+`--virtual-time-budget`, media data over `file://` stalls at
+HAVE_METADATA (the file loader is not virtualized), so the
 playable-media timebase checks can never observe playback; over
 127.0.0.1 HTTP the same budget fast-forwards the loads and the media
 reaches HAVE_FUTURE_DATA. Nothing else about the fixture changes —
 all references are relative.
+
+The review-02 recipe used `python -m http.server`; that server
+speaks HTTP/1.0 and sends no `Accept-Ranges`, and current Chrome
+then reports the 30s source media as `seekable [0,0]` — every
+`currentTime` write is silently dropped, so the driver's real-media
+seek checks (the deferred source seek above all) cannot land no
+matter what the app does. `serve-dist.mjs` is a dependency-free
+Node static server with Range support (the production backend's
+media route serves ranges too); over it the same file reports
+`seekable [0,30]` and seeks land immediately.
 
 ## Screenshot one variant (headless Chrome, throwaway profile)
 

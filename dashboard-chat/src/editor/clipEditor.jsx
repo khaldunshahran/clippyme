@@ -200,6 +200,14 @@ function wordAt(words, edits, t) {
 // Whenever the loaded project records a source file, resolveDraftInput
 // uses THAT; this helper only preserves compatibility for old projects
 // that predate source recording.
+//
+// NOTE (review-04): even for those old projects, a video_url served
+// through the backend media route (/videos/{job}/{file}) is the
+// reframed result file — job_results.py builds every clip.video_url
+// that way. Missing source identity does not turn it into raw footage:
+// resolveDraftInput classifies route-served picks as 'result'. Only a
+// clip-level reference that is NOT a backend result URL keeps the
+// legacy 'draft' treatment.
 export function draftPreviewSource(clip) {
   const raw = clip && clip.video_url ? safeResolveUrl(clip.video_url) : '';
   if (raw) return { src: raw, composed: false };
@@ -230,22 +238,37 @@ export function projectSourceFileUrl(project, jobId) {
   return safeResolveUrl(`/videos/${jobId}/${file}`);
 }
 
+// True when a URL is served through the backend /videos media route.
+// Every clip file on that route is a pipeline OUTPUT — the reframed
+// result (clip.video_url) or the composed render — never the raw
+// source slice (route access to source_* leaves is deliberately
+// refused by the backend mount).
+export function isBackendMediaUrl(src) {
+  return typeof src === 'string' && /(^|\/)videos\//.test(src);
+}
+
 // Draft input selection, in authority order:
 //  - 'source':   the project's recorded raw slice resolved through the
 //                media route — the genuine draft input. Draft graphics,
 //                segment looping and source-coordinate tools apply.
 //  - 'draft':    legacy compatibility for projects that record no
-//                source file (they predate source recording): the
+//                source file (they predate source recording) AND whose
+//                clip-level pick is not a backend result URL: the
 //                clip-level draftPreviewSource pick (video_url).
 //  - 'composed': the composed artifact (burned-in graphics) is the
 //                only/best available file — an artifact, never
 //                presented as clean footage.
-//  - 'result':   a source file WAS recorded but is unsafe or
-//                unresolvable, so the player falls back to the
-//                reframed result file (clip.video_url) — labeled a
-//                result, with draft graphics and source-coordinate
-//                operations suppressed. Rawness is never inferred
-//                from the mere absence of composed_video_url.
+//  - 'result':   the reframed result file (clip.video_url) is what
+//                shows — either because a recorded source file was
+//                unsafe/unresolvable, or because NO source identity
+//                is recorded (missing/empty/non-string source.file)
+//                and the pick is a backend media-route URL (review-04:
+//                missing source identity never mints clean-draft
+//                provenance — a project's age does not prove rawness).
+//                Labeled a result, with draft graphics and
+//                source-coordinate operations suppressed. Rawness is
+//                never inferred from the mere absence of
+//                composed_video_url.
 //  - 'none':     no usable media at all.
 export function resolveDraftInput(clip, project, jobId) {
   const recorded = project && project.source && typeof project.source.file === 'string'
@@ -260,7 +283,9 @@ export function resolveDraftInput(clip, project, jobId) {
   }
   const d = draftPreviewSource(clip);
   if (!d.src) return { src: '', kind: 'none' };
-  return { src: d.src, kind: d.composed ? 'composed' : 'draft' };
+  if (d.composed) return { src: d.src, kind: 'composed' };
+  if (isBackendMediaUrl(d.src)) return { src: d.src, kind: 'result' };
+  return { src: d.src, kind: 'draft' };
 }
 
 function validateDraft(p) {
@@ -809,7 +834,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null, key: null, ctl: null, contentKey: null });
   // What the draft input actually is (see resolveDraftInput): 'source'
   // (the project's recorded raw slice — the genuine draft input),
-  // 'draft' (legacy no-source-recorded pick), 'composed' / 'result'
+  // 'draft' (legacy no-source-recorded pick that is not a backend
+  // result URL), 'composed' / 'result'
   // (rendered files shown honestly as artifacts: no DOM overlays, no
   // draft segment loop, no source-coordinate split/seek from their
   // playheads), or 'none'.
@@ -822,9 +848,14 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // tracked separately from the draft/source playhead, so an artifact
   // can never move the source timeline's playhead or vice versa.
   const [artifactPlayhead, setArtifactPlayhead] = useState(0);
-  // A source-coordinate seek requested while an artifact was showing:
-  // applied to the DRAFT input once its media loads, never written
-  // into the artifact element (see onSeek/onLoadedMetadata).
+  // A source-coordinate seek requested while an artifact was showing,
+  // bound to the exact draft input it was queued for (review-04):
+  // { t, src, key, ctl } — the resolved draft-input URL plus the
+  // preview session/controller ownership at queue time. Only metadata
+  // for THAT input in THAT session may consume it (onLoadedMetadata);
+  // a failed load invalidates it (onVideoError), and a fallback
+  // artifact, an export or a new session must never consume an older
+  // source seek. It is never written into the artifact element.
   const pendingSeekRef = useRef(null);
   const videoRef = useRef(null);
 
@@ -898,6 +929,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     setVideoSrc(d.src);
     setDraftKind(d.kind);
     if (d.kind === 'source') setSourceUnavailable(false);
+    return d;
   };
 
   const refreshVersions = useCallback(async () => {
@@ -1040,8 +1072,9 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // Return the player to the draft input (used by edits and by
   // source-timeline gestures while an artifact is showing).
   const showDraftPreview = () => {
-    applyDraftSrc();
+    const d = applyDraftSrc();
     setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller, contentKey: null });
+    return d;
   };
 
   const onSeek = (t) => {
@@ -1056,8 +1089,16 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       // footage (composed/result fallback), there is no draft input
       // to return to: source seeking stays disabled while it shows.
       if (renderOwned && (draftKind === 'source' || draftKind === 'draft')) {
-        showDraftPreview();
-        pendingSeekRef.current = t;
+        const d = showDraftPreview();
+        // Bind the deferred seek to the exact input + session it was
+        // queued for (review-04) — see pendingSeekRef above.
+        pendingSeekRef.current = {
+          t,
+          src: d ? d.src : '',
+          key: previewSessionKey,
+          ctl: controller,
+          tries: 0,
+        };
       }
       return;
     }
@@ -1066,14 +1107,50 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     setPlayhead(t);
   };
 
-  const onLoadedMetadata = () => {
-    if (pendingSeekRef.current == null) return;
-    const t = pendingSeekRef.current;
-    pendingSeekRef.current = null;
+  // Consume the deferred source seek (review-03/04). Only the exact
+  // input + session the seek was queued for may consume it: a
+  // fallback artifact (a different src after a failed source load),
+  // an export (a render is now showing) or a newer preview session
+  // must never inherit an older source seek. A non-matching event
+  // must not DESTROY the seek either — a superseded artifact element
+  // can deliver a late loadedmetadata (from an earlier load()) after
+  // the gesture already returned the player to the draft, and the
+  // draft element's own metadata still has to land the seek. The
+  // seek is invalidated explicitly when its own load fails
+  // (onVideoError), never by unrelated media events.
+  //
+  // Consumption also requires a VERIFIED landing: a currentTime
+  // write issued at loadedmetadata (readyState 1, target beyond the
+  // buffered range) can be silently discarded by the element, so the
+  // write is read back — if it did not stick, the seek stays queued
+  // and the canplay handlers retry it once the media can accept it.
+  const consumePendingSeek = () => {
+    const pending = pendingSeekRef.current;
+    if (!pending) return;
+    if (pending.key !== previewSessionKey || pending.ctl !== controller) return;
+    if (previewKind.kind !== 'draft') return;
+    if (!pending.src || pending.src !== videoSrc) return;
     const v = videoRef.current;
-    if (v) { try { v.currentTime = t; } catch { /* ignore */ } }
-    setPlayhead(t);
+    if (!v) return;
+    try { v.currentTime = pending.t; } catch { /* ignore */ }
+    if (pending.t > 0 && !(v.currentTime > 0)) {
+      // Not landed yet: retry on canplay, but bound the attempts —
+      // on a transport that cannot seek at all (no range support)
+      // the write will never stick, and re-writing on every media
+      // event would spin. After the canplay retries the seek is
+      // dropped WITHOUT moving the playhead: the element stays the
+      // honest position.
+      pending.tries = (pending.tries || 0) + 1;
+      if (pending.tries < 3) return;
+      pendingSeekRef.current = null;
+      return;
+    }
+    pendingSeekRef.current = null;
+    setPlayhead(pending.t);
   };
+
+  const onLoadedMetadata = () => { consumePendingSeek(); };
+  const onCanPlay = () => { consumePendingSeek(); };
 
   const onVideoError = () => {
     // The authoritative source was selected, but the media route
@@ -1082,6 +1159,10 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     // artifact state instead of leaving a dead player or pretending
     // the fallback is clean draft footage.
     if (previewKind.kind !== 'draft' || draftKind !== 'source') return;
+    // The queued source seek dies with the failed load (review-04):
+    // the fallback artifact that replaces the source must never
+    // consume it when its own metadata arrives.
+    pendingSeekRef.current = null;
     const d = draftPreviewSource(clip);
     setSourceUnavailable(true);
     if (d.src) {
@@ -1571,6 +1652,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
               preload="auto"
               onTimeUpdate={onTimeUpdate}
               onLoadedMetadata={onLoadedMetadata}
+              onCanPlay={onCanPlay}
+              onCanPlayThrough={onCanPlay}
               onError={onVideoError}
               style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', zIndex: 0 }}
             />
