@@ -230,11 +230,16 @@ export default function BulkEditCard({
           clearBulkOpRef(jobId, threadId);
           setState('idle');
         } else {
+          restoreDoneRef.current = true; // recovery now belongs to explicit Reconcile
           setError(
             'Could not confirm the saved operation (network/server error). ' +
-            'The reference is kept -- reload or reconcile to try again.'
+            'The reference is kept -- reconcile to try again.'
           );
-          setState('idle');
+          // Keep the only known identity actionable without exposing a new
+          // Prepare that could overwrite its recovery reference.
+          setOperation({ operation_id: ref.operation_id, status: 'unconfirmed', items: [] });
+          setInterrupted(true);
+          setState('results');
         }
       }
     })();
@@ -376,8 +381,13 @@ export default function BulkEditCard({
       const op = await api.bulkStatus(jobId, operation.operation_id);
       if (!genAlive(gen) || !ledgerAlive() || !lifetimeAlive(tok)) return;
       setOperation(op);
-      setInterrupted(false);
-      setState('results');
+      setInterrupted(op.status === 'applying');
+      if (op.status === 'proposed') {
+        preparedTokRef.current = tok;
+        setState('proposal');
+      } else {
+        setState('results');
+      }
       await reconcileController(op, tok, ctl);
     } catch (e) {
       if (genAlive(gen)) setError(`Reconcile failed: ${e?.message || 'unknown error'}`);

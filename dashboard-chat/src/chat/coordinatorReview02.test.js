@@ -562,10 +562,33 @@ it('review02: transient status failure retains the durable operation reference',
 });
 async function flush(){for(let i=0;i<8;i++) await Promise.resolve();}
 
+it('review02: transient restore offers same-operation reconciliation instead of duplicate prepare', async () => {
+  const { key, store } = reviewStorage();
+  bulkApi.bulkStatus.mockRejectedValueOnce(new Error('network interrupted'));
+  try {
+    render(baseProps()); await flush();
+    let tree = render(baseProps());
+    expect(store[key]).toBeTruthy();
+    expect(findByTestId(tree, 'bulk-prepare')).toBeNull();
+    expect(findByTestId(tree, 'bulk-reconcile')).toBeTruthy();
+    bulkApi.bulkStatus.mockResolvedValue(preparedOp([plannedItem(0)]));
+    await click(tree, 'bulk-reconcile');
+    tree = render(baseProps());
+    expect(findByTestId(tree, 'bulk-apply')).toBeTruthy();
+    bulkApi.bulkApply.mockResolvedValue(preparedOp([
+      { ...plannedItem(0), outcome: 'applied', result_version: 3 },
+    ]));
+    await click(tree, 'bulk-apply');
+    expect(bulkApi.bulkStatus.mock.calls).toEqual([['job1', 'op1'], ['job1', 'op1']]);
+    expect(bulkApi.bulkApply).toHaveBeenCalledWith('job1', 'op1', 'test-key-1');
+    expect(bulkApi.bulkPrepare).not.toHaveBeenCalled();
+  } finally { delete globalThis.localStorage; }
+});
+
 it('review02: delayed first-generation restore response stays ignored after replay', async () => {
   // Durable control for generation-scoped effect ownership: setup ->
   // cleanup -> setup, then the STALE first-generation response resolves
-  // before the live one. Only the live generation may become a proposal.
+  // after the live one. It must never overwrite the acknowledged proposal.
   reviewStorage(); // op1/test-key-1 in storage
   const deferreds = [];
   bulkApi.bulkStatus.mockImplementation(() => new Promise((r) => { deferreds.push(r); }));
@@ -580,8 +603,9 @@ it('review02: delayed first-generation restore response stays ignored after repl
     expect(deferreds.length).toBe(2);
     const stale = preparedOp([plannedItem(0)]);
     stale.operation_id = 'op-stale';
-    deferreds[0](stale); // delayed first-generation response
     deferreds[1](preparedOp([plannedItem(0)])); // live generation response
+    await flush();
+    deferreds[0](stale); // stale response arrives last
     await flush();
     const tree = render(p);
     // The stale response never became state; the live one is an actionable proposal.
