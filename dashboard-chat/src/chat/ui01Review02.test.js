@@ -233,13 +233,21 @@ describe('review-02: draft source selection', () => {
     expect(draftPreviewSource(null)).toEqual({ src: '', composed: false });
   });
 
-  it('mounted editor: draft player src is the raw source when both URLs exist', () => {
-    const controller = mockController();
+  it('mounted editor: draft player src is the recorded project source when both URLs exist', () => {
+    // Review-06: a genuine draft fixture records its actual
+    // source.file — the recorded project source is the draft input.
+    // clip.video_url alone (any shape) never classifies as clean
+    // draft footage without it.
+    const project = {
+      ...makeProject(3),
+      source: { file: 'source_raw.mp4', duration: 30, width: 1920, height: 1080 },
+    };
+    const controller = mockController({ project });
     const clip = { title: 'Clip 1', video_url: 'raw.mp4', composed_video_url: 'comp.mp4' };
     renderDirect(controller, clip);
     const tree = renderDirect(controller, clip);
     const video = findAll(tree, (e) => e.type === 'video')[0];
-    expect(video.props.src).toBe('raw.mp4');
+    expect(video.props.src).toBe('/videos/j1/source_raw.mp4');
     expect(textOf(previewBadge(tree))).toBe('Draft preview');
   });
 

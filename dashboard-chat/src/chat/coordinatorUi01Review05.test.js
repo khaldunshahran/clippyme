@@ -301,11 +301,15 @@ describe('UI-01 review-04 — missing source identity (unit)', () => {
     expect(resolveDraftInput({}, legacy, 'j1')).toEqual({ src: '', kind: 'none' });
   });
 
-  it('a non-route legacy clip reference keeps the legacy draft treatment', () => {
+  it('a relative legacy clip reference is a delivered result too (review-06)', () => {
+    // Review-06 removed the relative-shape exception: without a
+    // recorded source.file, 'raw.mp4' is a delivered result, never
+    // clean draft footage. Genuine draft fixtures record their
+    // actual source.file (see ui01Review06.test.js).
     expect(resolveDraftInput({ video_url: 'raw.mp4' }, legacy, 'j1'))
-      .toEqual({ src: 'raw.mp4', kind: 'draft' });
+      .toEqual({ src: 'raw.mp4', kind: 'result' });
     expect(resolveDraftInput({ video_url: 'raw.mp4', composed_video_url: 'comp.mp4' }, legacy, 'j1'))
-      .toEqual({ src: 'raw.mp4', kind: 'draft' });
+      .toEqual({ src: 'raw.mp4', kind: 'result' });
   });
 
   it('a recorded source still wins; an unsafe recorded source still falls back to result', () => {

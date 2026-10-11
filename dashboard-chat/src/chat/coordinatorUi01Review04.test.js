@@ -311,15 +311,18 @@ describe('UI-01 review-03 — authoritative source resolution (unit)', () => {
     expect(resolveDraftInput({}, evil, 'j1')).toEqual({ src: '', kind: 'none' });
   });
 
-  it('resolveDraftInput: no recorded source keeps the legacy clip-level selection', () => {
+  it('resolveDraftInput: no recorded source classifies every pick shape honestly (review-06)', () => {
+    // Review-06: the relative-shape exception is removed — without a
+    // recorded source.file, a relative pick is a delivered result,
+    // never clean draft footage (see ui01Review06.test.js).
     const legacy = { source: { duration: 30, width: 1920, height: 1080 } };
     expect(resolveDraftInput({ video_url: 'raw.mp4', composed_video_url: 'comp.mp4' }, legacy, 'j1'))
-      .toEqual({ src: 'raw.mp4', kind: 'draft' });
+      .toEqual({ src: 'raw.mp4', kind: 'result' });
     expect(resolveDraftInput({ composed_video_url: 'comp.mp4' }, legacy, 'j1'))
       .toEqual({ src: 'comp.mp4', kind: 'composed' });
     expect(resolveDraftInput({}, legacy, 'j1')).toEqual({ src: '', kind: 'none' });
     expect(resolveDraftInput({ video_url: 'raw.mp4' }, null, 'j1'))
-      .toEqual({ src: 'raw.mp4', kind: 'draft' });
+      .toEqual({ src: 'raw.mp4', kind: 'result' });
   });
 });
 

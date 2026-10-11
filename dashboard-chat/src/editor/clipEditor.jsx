@@ -213,11 +213,17 @@ function wordAt(words, edits, t) {
 // video_url is an ABSOLUTE URL or a media-route path, i.e. a rendered
 // result either way. A cloud URL without source identity is still a
 // result, not proof of raw footage: resolveDraftInput classifies
-// absolute picks as 'result' too. Only a scheme-less relative
-// clip-level reference — a shape the result pipeline never emits —
-// keeps the legacy 'draft' treatment. Filenames and hostnames are
-// not provenance; only the recorded project.source.file (or another
-// independently authoritative raw record) authorizes a raw input.
+// absolute picks as 'result' too.
+//
+// NOTE (review-06): the scheme-less relative exception that
+// review-05 retained is removed as well. A URL shape today's
+// pipeline does not emit still does not establish rawness for a
+// legacy caller: with no recorded source identity, EVERY clip-level
+// pick — media-route, absolute, or relative ('example_clip_1.mp4',
+// '/example_clip_1.mp4') — classifies 'result'. Filenames and
+// hostnames are not provenance; only the recorded
+// project.source.file (or another independently authoritative raw
+// record) authorizes a raw input.
 export function draftPreviewSource(clip) {
   const raw = clip && clip.video_url ? safeResolveUrl(clip.video_url) : '';
   if (raw) return { src: raw, composed: false };
@@ -272,12 +278,6 @@ export function isAbsoluteMediaUrl(src) {
 //  - 'source':   the project's recorded raw slice resolved through the
 //                media route — the genuine draft input. Draft graphics,
 //                segment looping and source-coordinate tools apply.
-//  - 'draft':    legacy compatibility for projects that record no
-//                source file (they predate source recording) AND whose
-//                clip-level pick is a scheme-less relative reference
-//                — the one pick shape the result pipeline never
-//                emits: the clip-level draftPreviewSource pick
-//                (video_url).
 //  - 'composed': the composed artifact (burned-in graphics) is the
 //                only/best available file — an artifact, never
 //                presented as clean footage.
@@ -285,11 +285,15 @@ export function isAbsoluteMediaUrl(src) {
 //                shows — either because a recorded source file was
 //                unsafe/unresolvable, or because NO source identity
 //                is recorded (missing/empty/non-string source.file)
-//                and the pick is a delivered result: a backend
-//                media-route URL (review-04) or ANY absolute URL
-//                (review-05 — job_results.py returns the remote r2
-//                URL for the same rendered clip, so a cloud URL
-//                without source identity is a result too; missing
+//                and the pick is a delivered result of ANY shape: a
+//                backend media-route URL (review-04), ANY absolute
+//                URL (review-05 — job_results.py returns the remote
+//                r2 URL for the same rendered clip, so a cloud URL
+//                without source identity is a result too), or a
+//                scheme-less relative reference (review-06 — the
+//                former relative-shape exception is removed: a URL
+//                shape today's pipeline does not emit still cannot
+//                prove rawness for a legacy caller); missing
 //                source identity never mints clean-draft provenance
 //                — a project's age does not prove rawness). Labeled
 //                a result, with draft graphics and source-coordinate
@@ -316,8 +320,11 @@ export function resolveDraftInput(clip, project, jobId) {
   const d = draftPreviewSource(clip);
   if (!d.src) return { src: '', kind: 'none' };
   if (d.composed) return { src: d.src, kind: 'composed' };
-  if (isBackendMediaUrl(d.src) || isAbsoluteMediaUrl(d.src)) return { src: d.src, kind: 'result' };
-  return { src: d.src, kind: 'draft' };
+  // No recorded source identity: every remaining pick is a delivered
+  // result, whatever its shape — media-route (review-04), absolute
+  // (review-05), or scheme-less relative (review-06). It stays
+  // playable as an honest artifact; it is never clean draft footage.
+  return { src: d.src, kind: 'result' };
 }
 
 function validateDraft(p) {
@@ -866,11 +873,11 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null, key: null, ctl: null, contentKey: null });
   // What the draft input actually is (see resolveDraftInput): 'source'
   // (the project's recorded raw slice — the genuine draft input),
-  // 'draft' (legacy no-source-recorded scheme-less relative pick),
   // 'composed' / 'result'
   // (rendered files shown honestly as artifacts: no DOM overlays, no
   // draft segment loop, no source-coordinate split/seek from their
-  // playheads), or 'none'.
+  // playheads), or 'none'. Without a recorded source.file there is no
+  // clean-draft classification at all (review-06).
   const [draftKind, setDraftKind] = useState('draft');
   // True when the authoritative source was selected but could not be
   // loaded through the media route, and the player fell back to a

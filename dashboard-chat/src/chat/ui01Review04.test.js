@@ -13,8 +13,9 @@
 // preserved.
 //
 // Contract 2 — missing source identity must not invent clean-draft
-// provenance. resolveDraftInput returns kind='draft' only for legacy
-// clip-level references that are NOT backend result URLs. A
+// provenance. (Review-06 removed the last relative-shape exception
+// this contract originally retained: without a recorded source.file,
+// NO pick shape classifies 'draft' — see ui01Review06.test.js.) A
 // clip.video_url served through the /videos media route is the
 // pipeline's reframed RESULT file (domain/job_results.py), however
 // old the project is: missing/empty/non-string project.source.file
@@ -301,16 +302,17 @@ describe('UI-01 review-04 — missing source identity (unit)', () => {
     expect(resolveDraftInput({}, legacy, 'j1')).toEqual({ src: '', kind: 'none' });
   });
 
-  it('only a scheme-less legacy clip reference keeps the legacy draft treatment', () => {
-    // 'draft' survives ONLY for a scheme-less relative reference — a
-    // shape the result pipeline never emits (job_results.py returns
-    // the remote r2 URL or the /videos path for every rendered
-    // clip). "Non-route" alone never proved rawness: a remote cloud
-    // URL without source identity is a delivered result (review-05).
+  it('no pick shape mints clean-draft provenance without recorded source identity (review-06)', () => {
+    // Review-05 established that "non-route" alone never proved
+    // rawness (a remote cloud URL without source identity is a
+    // delivered result); review-06 removed the remaining
+    // relative-shape exception: a scheme-less relative reference —
+    // a shape today's pipeline never emits — still cannot prove
+    // rawness for a legacy caller, so it classifies 'result' too.
     expect(resolveDraftInput({ video_url: 'raw.mp4' }, legacy, 'j1'))
-      .toEqual({ src: 'raw.mp4', kind: 'draft' });
+      .toEqual({ src: 'raw.mp4', kind: 'result' });
     expect(resolveDraftInput({ video_url: 'raw.mp4', composed_video_url: 'comp.mp4' }, legacy, 'j1'))
-      .toEqual({ src: 'raw.mp4', kind: 'draft' });
+      .toEqual({ src: 'raw.mp4', kind: 'result' });
     expect(resolveDraftInput({ video_url: 'https://media.example.net/job/example_clip_1.mp4' }, legacy, 'j1'))
       .toEqual({ src: 'https://media.example.net/job/example_clip_1.mp4', kind: 'result' });
   });
