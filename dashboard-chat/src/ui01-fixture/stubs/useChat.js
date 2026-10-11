@@ -1,7 +1,7 @@
 /**
  * UI-01 offline fixture — stubbed useChat.
  *
- * Provides a small static thread with two clips and a selectable clip.
+ * Provides a small static thread with three clips and a selectable clip.
  * The REAL AppShell, Sidebar, ChatThread/WelcomeView, SelectionBar and
  * Composer all render against this. No network, no production data.
  */
@@ -16,15 +16,17 @@ function makeThreads() {
       phase: 'idle',
       messages: [{ id: 'm1', role: 'user', text: 'Fixture: make the hook punchier' }],
       clips: [
-        // Clip one carries BOTH a raw source and a composed artifact
-        // (review-02): the draft player must select the raw source
-        // (video_url), never the composed/burned file.
+        // Clip one is production-shaped (review-03): video_url is the
+        // pipeline's REFRAMED RESULT file and composed_video_url a
+        // rendered artifact — neither is the raw source. The draft
+        // player must select the project's recorded source slice
+        // (project.source.file, served at videos/j1/ in the dist).
         {
           index: 0,
           title: 'Fixture clip one',
           raw: {
             video_title_for_youtube_short: 'Fixture clip one',
-            video_url: 'fixture-source.mp4',
+            video_url: 'fixture-result-v3.mp4',
             composed_video_url: 'fixture-composed-v3.mp4',
           },
         },
@@ -35,6 +37,19 @@ function makeThreads() {
             video_title_for_youtube_short: 'Fixture clip two',
             video_url: 'fixture-source-2.mp4',
             composed_video_url: null,
+          },
+        },
+        // Clip three (review-03): no result file, only the composed
+        // artifact, and its project records no source file (legacy
+        // shape) — the player must present the composed file honestly
+        // and keep source seeking disabled while it shows.
+        {
+          index: 2,
+          title: 'Fixture clip three',
+          raw: {
+            video_title_for_youtube_short: 'Fixture clip three',
+            video_url: null,
+            composed_video_url: 'fixture-composed-v3.mp4',
           },
         },
       ],

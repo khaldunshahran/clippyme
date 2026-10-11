@@ -8,11 +8,14 @@
  * into #ui01-test-results and the document title is set to
  * UI01-TEST-DONE when the sequence finishes.
  *
- * ?ui01test=1      desktop-width lifecycle (1440): mount, draft-source
- *                  selection, export/preview identity, rendered-artifact
- *                  timebase on real playable media, controller-only save,
- *                  deferred save, restore ack/draft, historical render,
- *                  Ask-Nugget, clip switch, unmount/remount.
+ * ?ui01test=1      desktop-width lifecycle (1440): mount, authoritative
+ *                  source-slice selection (review-03), export/preview
+ *                  identity, rendered-artifact timebase on real playable
+ *                  media, source-timeline seek isolation on real media
+ *                  (pointer + keyboard + composed state, review-03),
+ *                  controller-only save, deferred save, restore
+ *                  ack/draft, historical render, Ask-Nugget, clip
+ *                  switch, unmount/remount.
  *                  Media: the fixture dist must contain the synthetic
  *                  playable mp4s (see README — generated with ffmpeg
  *                  into the dist folder after the vite build).
@@ -84,13 +87,14 @@ async function runDesktop(rec, poll, stats) {
   // Draft overlays are drawn from the current draft project (positive control).
   rec('mount: draft hook/caption overlays render in draft preview',
     $$('[data-ui01="hook-overlay"],[data-ui01="caption-overlay"]').length >= 1);
-  // The fixture clip carries BOTH video_url and composed_video_url
-  // (review-02): the draft player must select the raw source — the
-  // production clipPreviewSrc policy would have picked the composed
-  // (burned) file here.
+  // The fixture clip is production-shaped (review-03): video_url is
+  // the reframed RESULT file and a composed artifact also exists. The
+  // draft player must select the authoritative project source slice
+  // (project.source.file through the media route) — never either
+  // rendered file.
   const mountSrc = $('.nc-ce-grid video')?.getAttribute('src') || '';
-  rec('mount: draft player selects the raw source (video_url), not the composed file',
-    mountSrc.includes('fixture-source.mp4') && !mountSrc.includes('composed'),
+  rec('mount: draft player selects the project source slice, not the result/composed files',
+    mountSrc.includes('videos/j1/source_fixture_clip_1.mp4') && !mountSrc.includes('fixture-result') && !mountSrc.includes('composed'),
     mountSrc);
 
   // 2 — controller identity: exactly one per selection.
@@ -238,6 +242,116 @@ async function runDesktop(rec, poll, stats) {
   await poll(() => histVideo.currentTime >= 1.9, { label: 'historical seeked to 2s' });
   rec('historical playback: seek lands on the artifact timeline (after load() re-init)',
     histVideo.currentTime >= 1.9, `t=${histVideo.currentTime.toFixed(2)}`);
+
+  // 8.6 — source-timeline seek isolation + authoritative source on
+  // real playable media (review-03). The draft becomes nonzero and
+  // multi-segment ([10,14) + [18,24) on the 30s source; the Timeline
+  // maps clicks over the SOURCE duration, 30s). The player still
+  // shows the v3 render.
+  //  (i) pointer: a source-timeline click at t=20 must NOT move the
+  //      artifact element; it returns the player to the draft input
+  //      (the project source slice) and the deferred seek lands on
+  //      the DRAFT element once its media loads;
+  //  (ii) keyboard: the same via ArrowRight on the focused scrubber
+  //      (previewing the render reset the draft playhead to 0 — the
+  //      pre-existing onPreviewVersion behavior — so the arrow seek
+  //      targets t=1 on the draft, never the artifact);
+  //  (iii) composed state: on clip three (no usable source) the
+  //      timeline seek is disabled outright.
+  // Landing assertions re-query the live video element on every poll:
+  // the return-to-draft swaps the element (key={videoSrc}), and a
+  // captured reference can go stale across re-renders.
+  await c0.applyEdit('multi-segment draft', (p) => {
+    const crop = p.segments[0].crop;
+    p.segments = [
+      { id: 'seg0', start: 10, end: 14, crop },
+      { id: 'seg1', start: 18, end: 24, crop },
+    ];
+    return p;
+  });
+  await poll(() => badgeText('Acknowledged project version') === 'v7', { label: 'ack badge v7' });
+  rec('seek isolation: badge stays Historical v3 with the multi-segment draft',
+    badgeText('What the preview player is showing') === 'Historical v3 render',
+    badgeText('What the preview player is showing'));
+  const clickTimelineAt = (sourceT, span) => {
+    const scrub = $('[aria-label="Timeline scrubber"]');
+    const r = scrub.getBoundingClientRect();
+    scrub.dispatchEvent(new MouseEvent('click', {
+      bubbles: true, clientX: r.left + r.width * (sourceT / span),
+    }));
+  };
+  const parkArtifact = async (label) => {
+    const v = $('.nc-ce-grid video');
+    v.load();
+    await poll(() => v.readyState >= 2, { label });
+    v.currentTime = 2;
+    await poll(() => v.currentTime >= 1.9, { label: `${label} parked at 2s` });
+    v.pause();
+    return v;
+  };
+  // (i) pointer seek at source t=20.
+  const artPointer = await parkArtifact('artifact media (pointer case)');
+  clickTimelineAt(20, 30);
+  await sleep(400);
+  rec('seek isolation (pointer): artifact element not moved by the source-coordinate click',
+    artPointer.currentTime >= 1.9 && artPointer.currentTime < 2.6,
+    `artifact t=${artPointer.currentTime.toFixed(2)}`);
+  await poll(() => badgeText('What the preview player is showing') === 'Draft preview',
+    { label: 'returned to Draft preview (pointer)' });
+  rec('seek isolation (pointer): player returned to the draft input',
+    ($('.nc-ce-grid video')?.getAttribute('src') || '').includes('videos/j1/source_fixture_clip_1.mp4'),
+    $('.nc-ce-grid video')?.getAttribute('src') || '');
+  await poll(() => ($('.nc-ce-grid video')?.currentTime ?? 0) >= 19.5,
+    { label: 'draft seek landed at ~20s' });
+  rec('seek isolation (pointer): deferred seek lands on the draft source element',
+    ($('.nc-ce-grid video')?.currentTime ?? 0) >= 19.5,
+    `draft t=${($('.nc-ce-grid video')?.currentTime ?? 0).toFixed(2)}`);
+  $('.nc-ce-grid video')?.pause();
+  // (ii) keyboard seek: preview the render again, park it, ArrowRight.
+  // Previewing reset the draft playhead to 0, so the arrow seek
+  // targets t=1 — on the DRAFT element after the return, while the
+  // artifact stays parked at 2s.
+  buttonByText('Watch render').click();
+  await poll(() => badgeText('What the preview player is showing') === 'Historical v3 render',
+    { label: 'Historical v3 render badge (keyboard case)' });
+  const artKeys = await parkArtifact('artifact media (keyboard case)');
+  const scrubEl = $('[aria-label="Timeline scrubber"]');
+  scrubEl.focus();
+  scrubEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  await sleep(400);
+  rec('seek isolation (keyboard): artifact element not moved by the arrow-key seek',
+    artKeys.currentTime >= 1.9 && artKeys.currentTime < 2.6,
+    `artifact t=${artKeys.currentTime.toFixed(2)}`);
+  await poll(() => badgeText('What the preview player is showing') === 'Draft preview',
+    { label: 'returned to Draft preview (keyboard)' });
+  await poll(() => {
+    const t = $('.nc-ce-grid video')?.currentTime ?? 0;
+    return t >= 0.9 && t < 1.6;
+  }, { label: 'draft keyboard seek landed at ~1s' });
+  rec('seek isolation (keyboard): deferred seek lands on the draft source element',
+    ($('.nc-ce-grid video')?.currentTime ?? 0) >= 0.9,
+    `draft t=${($('.nc-ce-grid video')?.currentTime ?? 0).toFixed(2)}`);
+  $('.nc-ce-grid video')?.pause();
+  // (iii) composed fallback state: source seeking disabled.
+  window.__ui01Chat.selectClip('t1', 2);
+  await poll(() => ($('.nc-ce-title')?.textContent || '').includes('Fixture clip three'),
+    { label: 'clip three title' });
+  await poll(() => badgeText('What the preview player is showing') === 'Composed file — burned-in graphics',
+    { label: 'composed badge (clip three)' });
+  rec('composed state: clip three presents the composed file honestly', true);
+  const compVideo = $('.nc-ce-grid video');
+  compVideo.load();
+  await poll(() => compVideo.readyState >= 2, { label: 'composed media loaded' });
+  compVideo.currentTime = 1;
+  await poll(() => compVideo.currentTime >= 0.9, { label: 'composed parked at 1s' });
+  compVideo.pause();
+  clickTimelineAt(20, 30);
+  await sleep(400);
+  rec('composed state: source-timeline click does not move the composed artifact',
+    compVideo.currentTime >= 0.9 && compVideo.currentTime < 1.5,
+    `composed t=${compVideo.currentTime.toFixed(2)}`);
+  rec('composed state: badge unchanged after the seek attempt',
+    badgeText('What the preview player is showing') === 'Composed file — burned-in graphics');
 
   // 9 — clip switch: old controller disposed, preview ownership cleared.
   const before = stats();

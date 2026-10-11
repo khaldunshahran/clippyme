@@ -1,4 +1,4 @@
-# UI-01 offline fixture (review-01 evidence, updated for review-02)
+# UI-01 offline fixture (review-01 evidence, updated for review-02 and review-03)
 
 Renders the **real** `AppShell` (real React root, real hooks, real
 `useWorkspaceController` → real `createProjectController` + real serialized
@@ -16,8 +16,10 @@ modules are aliased to offline stubs by the throwaway
   development-React entry for StrictMode evidence; `?ui01dev=1` runs
   its checks. See "Test kinds" below.
 - `driver.js` — scripted browser tests (`?ui01test=1` desktop lifecycle
-  incl. draft-source selection and rendered/historical playback on
-  real playable media, `?ui01test=mobile` narrow-viewport tab switching)
+  incl. authoritative source-slice selection, rendered/historical
+  playback on real playable media, and source-timeline seek isolation
+  on real media — pointer + keyboard + composed state (review-03);
+  `?ui01test=mobile` narrow-viewport tab switching)
 - `verify.js` — screenshot-mode control verification (bounding boxes,
   keyboard focus, non-overlapping identity, production theme, editor
   content-area width, transcript contrast) rendered into the badge
@@ -36,21 +38,45 @@ modules are aliased to offline stubs by the throwaway
 
 ```
 node node_modules/vite/bin/vite.js build --config vite.ui01fixture.config.js
+$env:NODE_ENV = 'development'
 node node_modules/vite/bin/vite.js build --config vite.ui01fixture.config.js --mode development --outDir C:/tmp/ui01-fixture-dist-dev
+Remove-Item Env:NODE_ENV
 ```
+
+The development bundle needs BOTH `--mode development` AND
+`NODE_ENV=development` in the build process environment: `vite build`
+otherwise replaces `process.env.NODE_ENV` with `"production"` and the
+bundle silently contains production React (StrictMode never
+double-invokes — the dev checks then time out with setups=1, which is
+exactly how a fake dev bundle is detected).
 
 Output goes to `/tmp/ui01-fixture-dist` (production-mode bundle) and
 `/tmp/ui01-fixture-dist-dev` (development-React bundle) — never
 `dashboard-chat/dist`.
 
-## Synthetic media (review-02)
+## Synthetic media (review-02, extended for review-03)
 
-The stub backend references small playable mp4s by relative name
-(`fixture-source.mp4`, `fixture-source-2.mp4`,
-`fixture-composed-v3.mp4`, `fixture-render-v3.mp4`). They are generated
+The fixture references small playable mp4s. They are generated
 artifacts — never committed — produced with the installed ffmpeg into
-BOTH dist folders after building (6s, 360x640, test pattern + tone;
-composed/render use a distinct pattern):
+BOTH dist folders after building:
+
+- `fixture-source.mp4`, `fixture-source-2.mp4` — 6s, 360x640, testsrc2
+  (fixture-source-2 is still the transcript seek-aid file for clip two;
+  fixture-source is retained from review-02, no longer a draft input).
+- `fixture-composed-v3.mp4`, `fixture-render-v3.mp4` — 6s, 360x640,
+  smptebars (rendered artifacts).
+- `fixture-result-v3.mp4` — 6s, 360x640, testsrc (review-03): clip
+  one's `video_url`, i.e. the pipeline's already-reframed RESULT file
+  — visually distinct from the source and never a draft input.
+- `videos/j1/source_fixture_clip_1.mp4` — 30s, 640x360 LANDSCAPE,
+  testsrc2 (review-03): the authoritative project source slice,
+  served under the production media-route shape
+  `/videos/{job_id}/{file}` so source t=20 is genuinely playable and
+  seekable in the seek-isolation driver steps. (The real backend's
+  static mount refuses `source_*` leaves — an availability fact the
+  app handles with the honest artifact fallback; the fixture's
+  throwaway localhost server simply serves the dist folder, so the
+  route shape is exercised end-to-end here.)
 
 ```
 foreach ($d in @('C:\tmp\ui01-fixture-dist','C:\tmp\ui01-fixture-dist-dev')) {
@@ -58,6 +84,9 @@ foreach ($d in @('C:\tmp\ui01-fixture-dist','C:\tmp\ui01-fixture-dist-dev')) {
   ffmpeg -y -v error -f lavfi -i testsrc2=size=360x640:rate=30:duration=6 -f lavfi -i sine=frequency=550:duration=6 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -movflags +faststart "$d\fixture-source-2.mp4"
   ffmpeg -y -v error -f lavfi -i smptebars=size=360x640:rate=30:duration=6 -f lavfi -i sine=frequency=660:duration=6 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -movflags +faststart "$d\fixture-composed-v3.mp4"
   ffmpeg -y -v error -f lavfi -i smptebars=size=360x640:rate=30:duration=6 -f lavfi -i sine=frequency=770:duration=6 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -movflags +faststart "$d\fixture-render-v3.mp4"
+  ffmpeg -y -v error -f lavfi -i testsrc=size=360x640:rate=30:duration=6 -f lavfi -i sine=frequency=880:duration=6 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -movflags +faststart "$d\fixture-result-v3.mp4"
+  New-Item -ItemType Directory -Force "$d\videos\j1" | Out-Null
+  ffmpeg -y -v error -f lavfi -i testsrc2=size=640x360:rate=30:duration=30 -f lavfi -i sine=frequency=440:duration=30 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -movflags +faststart "$d\videos\j1\source_fixture_clip_1.mp4"
 }
 ```
 
@@ -84,7 +113,11 @@ foreach ($d in @('C:\tmp\ui01-fixture-dist','C:\tmp\ui01-fixture-dist-dev')) {
    contracts; it does not mount React and does not claim to. The
    review-02 identity/timebase/source contracts are pinned in
    `src/chat/ui01Review02.test.js` and the coordinator probe
-   `src/chat/coordinatorUi01Review02.test.js`.
+   `src/chat/coordinatorUi01Review02.test.js`. The review-03
+   contracts (source-timeline seek isolation; authoritative
+   project-source resolution with traversal validation and honest
+   fallbacks) are pinned in `src/chat/ui01Review03.test.js` and the
+   coordinator probe `src/chat/coordinatorUi01Review03.test.js`.
 
 ## Run transport (review-02)
 

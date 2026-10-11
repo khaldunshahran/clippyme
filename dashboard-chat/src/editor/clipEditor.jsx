@@ -5,13 +5,15 @@
 // The server renders final pixels on Export (POST /api/compose {project}).
 // Undo = load an earlier version into the draft, then save/export.
 //
-// Preview honesty: in draft mode the <video> plays the clip's raw source
-// file (source-slice timeline, 1:1 with project source coords — see
-// draftPreviewSource); captions/hooks render as DOM overlays synced to
-// the playhead. Export is the pixel-exact check. When the player shows
-// an exported render (exact or historical) or the composed-file
-// fallback, the DOM overlays stay off and playback runs on the file's
-// own timebase — the file already contains that version's graphics.
+// Preview honesty: in draft mode the <video> plays the authoritative
+// project source slice (project.source.file, resolved through the
+// existing media route — see resolveDraftInput; source-slice timeline,
+// 1:1 with project source coords); captions/hooks render as DOM
+// overlays synced to the playhead. Export is the pixel-exact check.
+// When the player shows an exported render (exact or historical) or a
+// rendered-file fallback (composed/result), the DOM overlays stay off
+// and playback runs on the file's own timebase — the file already
+// contains that version's graphics.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon, Btn } from './primitives';
@@ -180,25 +182,85 @@ function wordAt(words, edits, t) {
   return null;
 }
 
-// The genuine draft input for the preview player (review-02). The
-// editor's timeline is written in SOURCE coordinates and its caption /
-// hook graphics are drawn as DOM overlays, so the draft player must play
-// the clip's raw source file (clip.video_url — the same file
-// clipVideoSrc returns). It must NOT silently play
-// clip.composed_video_url: that file is a rendered artifact whose
-// graphics are already burned in, and clipPreviewSrc prefers it — using
-// it as the "draft" would stack new DOM graphics over burned ones and
-// mislabel a rendered timeline as the source. Only when a clip has no
-// raw source at all do we fall back to the composed file, flagged
-// `composed: true` so the UI presents it honestly (no DOM overlays, no
-// draft segment looping, no source-coordinate split from its playhead)
-// instead of claiming it is clean source footage.
+// Legacy clip-level fallback selection (review-02), used ONLY for
+// projects that record no authoritative source (see resolveDraftInput):
+// prefer the clip's video_url over the composed file, because
+// clipPreviewSrc prefers composed_video_url — a rendered artifact whose
+// graphics are already burned in — and the draft player must never
+// silently stack new DOM graphics over burned ones. A composed-only
+// clip falls back to the composed file, flagged `composed: true` so
+// the UI presents it honestly (no DOM overlays, no draft segment
+// looping, no source-coordinate split from its playhead) instead of
+// claiming it is clean source footage.
+//
+// NOTE (review-03): clip.video_url is NOT the raw source — the backend
+// sets it to the pipeline's reframed result file
+// (process_video_to_vertical output, published as the clip final),
+// while the raw slice is recorded separately as project.source.file.
+// Whenever the loaded project records a source file, resolveDraftInput
+// uses THAT; this helper only preserves compatibility for old projects
+// that predate source recording.
 export function draftPreviewSource(clip) {
   const raw = clip && clip.video_url ? safeResolveUrl(clip.video_url) : '';
   if (raw) return { src: raw, composed: false };
   const composed = clip && clip.composed_video_url ? safeResolveUrl(clip.composed_video_url) : '';
   if (composed) return { src: composed, composed: true };
   return { src: '', composed: false };
+}
+
+// The authoritative draft input (review-03). The loaded project's
+// source.file is the raw slice basename recorded by the pipeline
+// (pipeline/project_emit.py: "16:9 source slice on disk, e.g.
+// source_<clip>.mp4"), with source dimensions and source-coordinate
+// segment/crop values — it is the only input whose geometry matches
+// the editor's timeline. Resolve it through the EXISTING media route
+// (the same /videos/{job_id}/{file} route + safeResolveUrl rules that
+// serve every other clip file); no new API is invented and no
+// arbitrary path is accepted: the recorded name must be a plain media
+// basename — no separators, no traversal, no scheme, no dotfiles.
+export function projectSourceFileUrl(project, jobId) {
+  const file = project && project.source && typeof project.source.file === 'string'
+    ? project.source.file.trim()
+    : '';
+  if (!file) return '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(file)) return '';
+  if (file.includes('..')) return '';
+  if (!/\.(mp4|mov|webm|mkv|m4v)$/i.test(file)) return '';
+  if (typeof jobId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(jobId)) return '';
+  return safeResolveUrl(`/videos/${jobId}/${file}`);
+}
+
+// Draft input selection, in authority order:
+//  - 'source':   the project's recorded raw slice resolved through the
+//                media route — the genuine draft input. Draft graphics,
+//                segment looping and source-coordinate tools apply.
+//  - 'draft':    legacy compatibility for projects that record no
+//                source file (they predate source recording): the
+//                clip-level draftPreviewSource pick (video_url).
+//  - 'composed': the composed artifact (burned-in graphics) is the
+//                only/best available file — an artifact, never
+//                presented as clean footage.
+//  - 'result':   a source file WAS recorded but is unsafe or
+//                unresolvable, so the player falls back to the
+//                reframed result file (clip.video_url) — labeled a
+//                result, with draft graphics and source-coordinate
+//                operations suppressed. Rawness is never inferred
+//                from the mere absence of composed_video_url.
+//  - 'none':     no usable media at all.
+export function resolveDraftInput(clip, project, jobId) {
+  const recorded = project && project.source && typeof project.source.file === 'string'
+    ? project.source.file.trim()
+    : '';
+  if (recorded) {
+    const url = projectSourceFileUrl(project, jobId);
+    if (url) return { src: url, kind: 'source' };
+    const d = draftPreviewSource(clip);
+    if (!d.src) return { src: '', kind: 'none' };
+    return { src: d.src, kind: d.composed ? 'composed' : 'result' };
+  }
+  const d = draftPreviewSource(clip);
+  if (!d.src) return { src: '', kind: 'none' };
+  return { src: d.src, kind: d.composed ? 'composed' : 'draft' };
 }
 
 function validateDraft(p) {
@@ -727,9 +789,9 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const [aiMsg, setAiMsg] = useState('');
   // UI-01: what the preview player is showing, bound to the actual
   // artifact + project identity (review-01, review-02):
-  // - 'draft' = the genuine draft input (the clip's raw source file —
-  //   see draftPreviewSource) + DOM overlays drawn from the current
-  //   draft project (approximate preview);
+  // - 'draft' = the genuine draft input (the authoritative project
+  //   source slice — see resolveDraftInput) + DOM overlays drawn from
+  //   the current draft project (approximate preview);
   // - 'render' = an exported file. It is only the EXACT current render
   //   while its version still equals the server-ACKNOWLEDGED version
   //   (ackVersion), the draft carries no unsaved divergence (dirty),
@@ -745,11 +807,25 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // the previous exported file is never the draft source, and draft
   // overlays must never draw on top of exported pixels.
   const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null, key: null, ctl: null, contentKey: null });
-  // True while the player's "draft" input is actually the composed file
-  // (the clip has no raw source — see draftPreviewSource). That file is
-  // a rendered artifact: no DOM overlays, no draft segment loop, and its
-  // playhead cannot authorize a source-coordinate split.
-  const [draftComposed, setDraftComposed] = useState(false);
+  // What the draft input actually is (see resolveDraftInput): 'source'
+  // (the project's recorded raw slice — the genuine draft input),
+  // 'draft' (legacy no-source-recorded pick), 'composed' / 'result'
+  // (rendered files shown honestly as artifacts: no DOM overlays, no
+  // draft segment loop, no source-coordinate split/seek from their
+  // playheads), or 'none'.
+  const [draftKind, setDraftKind] = useState('draft');
+  // True when the authoritative source was selected but could not be
+  // loaded through the media route, and the player fell back to a
+  // rendered file (see onVideoError).
+  const [sourceUnavailable, setSourceUnavailable] = useState(false);
+  // The artifact's OWN playhead (review-03): rendered playback time is
+  // tracked separately from the draft/source playhead, so an artifact
+  // can never move the source timeline's playhead or vice versa.
+  const [artifactPlayhead, setArtifactPlayhead] = useState(0);
+  // A source-coordinate seek requested while an artifact was showing:
+  // applied to the DRAFT input once its media loads, never written
+  // into the artifact element (see onSeek/onLoadedMetadata).
+  const pendingSeekRef = useRef(null);
   const videoRef = useRef(null);
 
   // Task 16 authority mode: controlled (via the project controller) or
@@ -766,7 +842,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
               if (res && res.composed_url) {
                 const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
                 setVideoSrc(safeResolveUrl(res.composed_url) + bust);
-                setDraftComposed(false);
+                setArtifactPlayhead(0);
                 setPlayhead(0);
                 // The player now shows the exact exported file — owned by
                 // this clip session; any later authoritative save or
@@ -804,13 +880,24 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // job/clip ids are unchanged.
   const previewSessionKey = `${jobId}:${clipIndex}`;
 
-  // Point the player at the genuine draft input (see
-  // draftPreviewSource) and record whether that input is the
-  // composed-file fallback.
-  const applyDraftSrc = () => {
-    const d = draftPreviewSource(clip);
+  // Point the player at the draft input selected by resolveDraftInput:
+  // the authoritative project source (project.source.file through the
+  // media route) whenever the loaded project records one; the legacy
+  // clip-level pick only for projects that predate source recording.
+  // An explicit project override wins (standalone load); controlled
+  // mode reads the controller's freshest snapshot; standalone mode
+  // uses this render's project (every caller is re-created per render
+  // or carries project in its dependency list, so it is never stale).
+  const applyDraftSrc = (projOverride) => {
+    const proj = projOverride !== undefined
+      ? projOverride
+      : mode === 'controlled'
+        ? (controller ? (controller.getState() || {}).project : null)
+        : project;
+    const d = resolveDraftInput(clip, proj, jobId);
     setVideoSrc(d.src);
-    setDraftComposed(d.composed);
+    setDraftKind(d.kind);
+    if (d.kind === 'source') setSourceUnavailable(false);
   };
 
   const refreshVersions = useCallback(async () => {
@@ -842,7 +929,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
         if (!alive) return;
         setProjectLocal(proj);
         setSavedVersionLocal(proj.version);
-        applyDraftSrc();
+        applyDraftSrc(proj);
         setStatusLocal('ready');
         refreshVersions();
       } catch (e) {
@@ -866,15 +953,21 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     // Seed once per clip session (session key + controller identity):
     // re-renders of the same session must never clobber an active
     // render preview or a draft the user already navigated to.
+    // One exception: the authoritative draft input depends on the
+    // loaded project (its recorded source file), so if the first seed
+    // ran before the project arrived, re-seed exactly once when it
+    // lands — still during the initial draft state, before any export
+    // could have happened (export requires the project).
     const seedKey = `${jobId}:${clipIndex}`;
     const prevSeed = seededSessionRef.current;
-    if (prevSeed && prevSeed.key === seedKey && prevSeed.ctl === controller) return;
-    seededSessionRef.current = { key: seedKey, ctl: controller };
+    if (prevSeed && prevSeed.key === seedKey && prevSeed.ctl === controller
+      && (prevSeed.projectLoaded || !project)) return;
+    seededSessionRef.current = { key: seedKey, ctl: controller, projectLoaded: !!project };
     applyDraftSrc();
     setPreviewKind({ kind: 'draft', version: null, key: seedKey, ctl: controller, contentKey: null });
     // clip is a stable prop from the results list; intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, jobId, clipIndex, controller]);
+  }, [mode, jobId, clipIndex, controller, project]);
 
   // Keep the selected segment in range when segments change.
   useEffect(() => {
@@ -925,24 +1018,80 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const renderOwned = previewKind.kind === 'render'
     && previewKind.key === previewSessionKey
     && previewKind.ctl === controller;
-  const artifactPlayback = renderOwned || draftComposed;
+  const artifactPlayback = renderOwned
+    || draftKind === 'composed'
+    || draftKind === 'result';
 
   // --- preview playback ------------------------------------------------
   const onTimeUpdate = () => {
     const v = videoRef.current;
     if (!v) return;
     const t = v.currentTime;
+    // Separate playheads (review-03): a rendered file's playback time
+    // is tracked on the artifact's own playhead only — it never moves
+    // the draft/source playhead, and the draft's segment loop never
+    // rewinds it. Its timeline is not the draft's source timeline.
+    if (artifactPlayback) { setArtifactPlayhead(t); return; }
     setPlayhead(t);
-    // Never loop a rendered artifact through the current draft's
-    // segment bounds — its timeline is not the draft's source timeline.
-    if (artifactPlayback) return;
     const s = segs[selSeg];
     if (loopSeg && s && !v.paused && t >= s.end) v.currentTime = s.start;
   };
+
+  // Return the player to the draft input (used by edits and by
+  // source-timeline gestures while an artifact is showing).
+  const showDraftPreview = () => {
+    applyDraftSrc();
+    setPreviewKind({ kind: 'draft', version: null, key: previewSessionKey, ctl: controller, contentKey: null });
+  };
+
   const onSeek = (t) => {
+    if (artifactPlayback) {
+      // Source coordinates must never be written into a rendered
+      // file's playback element (review-03): a source-timeline gesture
+      // (Timeline pointer click or arrow keys, both routed here)
+      // explicitly returns the player to the genuine draft input
+      // first, and the seek is applied to the DRAFT once its media
+      // loads (pendingSeekRef / onLoadedMetadata) — the artifact
+      // element is never touched. When the artifact is the only
+      // footage (composed/result fallback), there is no draft input
+      // to return to: source seeking stays disabled while it shows.
+      if (renderOwned && (draftKind === 'source' || draftKind === 'draft')) {
+        showDraftPreview();
+        pendingSeekRef.current = t;
+      }
+      return;
+    }
     const v = videoRef.current;
     if (v) { try { v.currentTime = t; } catch { /* ignore */ } }
     setPlayhead(t);
+  };
+
+  const onLoadedMetadata = () => {
+    if (pendingSeekRef.current == null) return;
+    const t = pendingSeekRef.current;
+    pendingSeekRef.current = null;
+    const v = videoRef.current;
+    if (v) { try { v.currentTime = t; } catch { /* ignore */ } }
+    setPlayhead(t);
+  };
+
+  const onVideoError = () => {
+    // The authoritative source was selected, but the media route
+    // could not serve it (the static mount refuses source_* leaves,
+    // and a purged slice is simply gone): fall back to the honest
+    // artifact state instead of leaving a dead player or pretending
+    // the fallback is clean draft footage.
+    if (previewKind.kind !== 'draft' || draftKind !== 'source') return;
+    const d = draftPreviewSource(clip);
+    setSourceUnavailable(true);
+    if (d.src) {
+      setVideoSrc(d.src);
+      setDraftKind(d.composed ? 'composed' : 'result');
+    } else {
+      setVideoSrc('');
+      setDraftKind('none');
+    }
+    pushToast?.('warn', 'The raw source file could not be loaded for preview — showing the rendered result instead. Draft graphics and source-coordinate tools are disabled for it.');
   };
 
   // --- trim -------------------------------------------------------------
@@ -1160,7 +1309,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       setSavedVersionLocal(res.version);
       const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
       setVideoSrc(safeResolveUrl(res.composed_url) + bust);
-      setDraftComposed(false);
+      setArtifactPlayhead(0);
       setPlayhead(0);
       // The player now shows the exact exported file — owned by this clip
       // session; any later authoritative save or ownership move invalidates
@@ -1216,7 +1365,7 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const onPreviewVersion = (v) => {
     if (!v.output_url) return;
     setVideoSrc(safeResolveUrl(v.output_url) + `?v=${Date.now()}`);
-    setDraftComposed(false);
+    setArtifactPlayhead(0);
     setPlayhead(0);
     // Previewing that version's exported file. When it is not the current
     // acknowledged version it is presented as a historical render (badge
@@ -1348,9 +1497,11 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     ? { label: `Exact v${previewKind.version} render`, cls: 'nc-ce-badge-render' }
     : renderOwned
       ? { label: `Historical v${previewKind.version ?? '?'} render`, cls: 'nc-ce-badge-pending' }
-      : draftComposed
+      : draftKind === 'composed'
         ? { label: 'Composed file — burned-in graphics', cls: 'nc-ce-badge-pending' }
-        : { label: 'Draft preview', cls: 'nc-ce-badge-draft' };
+        : draftKind === 'result'
+          ? { label: 'Result file — not the raw source', cls: 'nc-ce-badge-pending' }
+          : { label: 'Draft preview', cls: 'nc-ce-badge-draft' };
   // The playhead is always driven by the <video> element's own time
   // (onTimeUpdate) — the rendered artifact's own timebase, never an
   // assumed draft mapping. Draft DOM overlays draw only over the
@@ -1419,6 +1570,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
               playsInline
               preload="auto"
               onTimeUpdate={onTimeUpdate}
+              onLoadedMetadata={onLoadedMetadata}
+              onError={onVideoError}
               style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', zIndex: 0 }}
             />
             {/* hook overlay — draft preview only; a shown render already
@@ -1447,9 +1600,16 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
             {artifactPlayback && (
               <div style={{ fontSize: 12, color: 'var(--ink-dim, #666)', background: 'rgba(51,46,38,.06)',
                 border: '1px dashed rgba(51,46,38,.25)', borderRadius: 8, padding: '6px 10px', marginBottom: 6 }}>
-                The player is showing a rendered file on its own timeline. The draft
-                timeline below describes the current draft only — segment looping and
-                playhead splits apply to the draft preview, not to this file.
+                The player is showing a rendered file on its own timeline
+                {artifactPlayhead > 0 ? ` (file time ${fmtT(artifactPlayhead)})` : ''}. The draft
+                timeline below describes the current draft only — segment looping,
+                playhead splits and source-coordinate seeks apply to the draft preview,
+                not to this file. Using the timeline returns to the draft input first.
+                {sourceUnavailable && (
+                  <> The project&apos;s raw source file could not be loaded through the
+                  media route, so this rendered result is shown instead — it is not
+                  the raw source footage.</>
+                )}
               </div>
             )}
             <Timeline

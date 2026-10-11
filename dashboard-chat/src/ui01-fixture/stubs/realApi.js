@@ -8,12 +8,21 @@
  */
 const clone = (p) => JSON.parse(JSON.stringify(p));
 
-function makeProject(version) {
+function makeProject(version, { legacySource = false } = {}) {
   return {
     origin: version === 1 ? 'auto' : 'user',
     version,
     idempotency_key: `fixture-key-v${version}`,
-    source: { duration: 30, width: 1080, height: 1920 },
+    // Production-shaped source (review-03): the pipeline records the
+    // raw slice basename (source_<clip>.mp4) with LANDSCAPE source
+    // dimensions — the draft player must resolve THIS through the
+    // /videos/{job_id}/{file} media route, never clip.video_url (which
+    // production sets to the reframed result file). The legacySource
+    // variant (clip index 2) omits `file`, modeling projects that
+    // predate source recording.
+    source: legacySource
+      ? { duration: 30, width: 1920, height: 1080 }
+      : { file: 'source_fixture_clip_1.mp4', duration: 30, width: 1920, height: 1080 },
     segments: [{ id: 'seg0', start: 0, end: 30, crop: { x: 236, y: 0, w: 608, h: 1080 } }],
     captions: {
       style: 'classic_white',
@@ -38,10 +47,13 @@ const stores = new Map();
 function storeFor(jobId, clipIndex) {
   const k = `${jobId}:${clipIndex}`;
   if (!stores.has(k)) {
-    const latest = makeProject(3);
+    // Clip index 2 models an old project that records no source file
+    // (review-03 legacy compatibility shape).
+    const mk = (v) => makeProject(v, { legacySource: clipIndex === 2 });
+    const latest = mk(3);
     stores.set(k, {
       latest,
-      history: { 1: makeProject(1), 2: makeProject(2), 3: clone(latest) },
+      history: { 1: mk(1), 2: mk(2), 3: clone(latest) },
       nextVersion: 3,
     });
   }
@@ -116,12 +128,16 @@ export const newBulkIdempotencyKey = () => `fixture-bulk-${Date.now()}`;
 
 export const safeResolveUrl = (u) => u;
 // The src helpers mirror the PRODUCTION selection policy in
-// api/realApi.js verbatim (review-02): clipVideoSrc is the raw
+// api/realApi.js verbatim (review-02): clipVideoSrc is the clip's
 // video_url; clipPreviewSrc prefers an applied previewUrl, then the
-// COMPOSED file, then the raw source. The editor's draft player must
-// therefore NOT use clipPreviewSrc — draftPreviewSource (clipEditor)
-// picks the raw source. An earlier stub returned 'fixture-draft.mp4'
-// for both helpers, which hid exactly that integration issue.
+// COMPOSED file, then video_url. Production sets video_url to the
+// reframed RESULT file (review-03), so neither helper names the raw
+// source: the editor's draft player resolves the authoritative
+// project.source.file through the media route instead
+// (resolveDraftInput in clipEditor), and only projects that record no
+// source file fall back to the clip-level pick (draftPreviewSource).
+// An earlier stub returned 'fixture-draft.mp4' for both helpers,
+// which hid exactly that integration issue.
 export function clipVideoSrc(clip, bust) {
   const full = safeResolveUrl(clip?.video_url || '');
   return bust ? `${full}${full.includes('?') ? '&' : '?'}v=${bust}` : full;
