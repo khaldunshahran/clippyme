@@ -208,6 +208,16 @@ def detect_split_scenes(video_path, scenes, strategies=None, samples=None):
 
     return found
 
+
+def maybe_promote_split(video_path, scenes, strategies, metadata):
+    """Automatic split remains an explicit opt-in; manual split is independent."""
+    if os.environ.get('SPLIT_LAYOUT', '0').strip().lower() not in ('1', 'true', 'yes'):
+        return
+    found = detect_split_scenes(video_path, scenes, strategies=strategies)
+    for index, entry in found.items():
+        strategies[index] = 'SPLIT'
+        metadata[index] = entry
+
 def create_split_frame(frame, out_w, out_h, left_centre, right_centre, left_dim=None, right_dim=None):
     import cv2
     import numpy as np

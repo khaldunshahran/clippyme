@@ -90,6 +90,15 @@ def _stub_heavy_modules(monkeypatch):
     for name in ["_get_face_detection", "_get_face_mesh", "_get_yolo_model"]:
         setattr(fake, name, lambda *a, **k: None)
     monkeypatch.setitem(sys.modules, "clippyme.pipeline.reframe_detect", fake)
+    import clippyme.pipeline as pipeline_package
+    monkeypatch.setattr(pipeline_package, 'reframe_detect', fake, raising=False)
+    # reframe re-exports detector functions. A prior test may already have
+    # imported it; inject the same raw detector into that actual lookup too.
+    from clippyme.pipeline import reframe as rf
+    for name in ('detect_face_candidates', 'detect_person_yolo',
+                 'detect_action_candidates', 'compute_mouth_aspect_ratio',
+                 '_get_face_detection', '_get_face_mesh', '_get_yolo_model'):
+        monkeypatch.setattr(rf, name, getattr(fake, name))
 
 
 def _inject_raw_provider(monkeypatch):

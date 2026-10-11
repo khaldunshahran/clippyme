@@ -1223,6 +1223,8 @@ def _render_global_smooth(input_video, ffmpeg_process, cameraman, speaker_tracke
         plan_config_digest(turn_cfg.config_digest(), action_cfg,
                            turn_on=turn_aware)
         if action_aware else turn_cfg.config_digest())
+    from clippyme.pipeline.mediapipe_tasks_compat import bind_model_identity
+    plan_config_digest_value = bind_model_identity(plan_config_digest_value)
     plan = None
     plan_reused = False
     # The plan's crops are built for the ACTUAL render aspect — a sidecar is
@@ -1672,13 +1674,8 @@ def process_video_to_vertical(input_video, final_output_video, reframe_mode='aut
         scene_strategies = analyze_scenes_strategy(input_video, scenes)
 
         print("\n   🔍 Step 3.1: Checking for SPLIT upgrades in WIDE scenes...")
-        from clippyme.pipeline.layouts.split_layout import detect_split_scenes
-        # detect_split_scenes uses the strategies list to only analyze WIDE scenes
-        split_metadata_detected = detect_split_scenes(input_video, scenes, strategies=scene_strategies)
-        for idx in split_metadata_detected:
-            scene_strategies[idx] = 'SPLIT'
-            split_metadata[idx] = split_metadata_detected[idx]
-            print(f"      -> Upgraded scene {idx} to SPLIT")
+        from clippyme.pipeline.layouts.split_layout import maybe_promote_split
+        maybe_promote_split(input_video, scenes, scene_strategies, split_metadata)
             
         print("\n   🔍 Step 3.2: Checking for SCREENCAST upgrades in GENERAL scenes...")
         from clippyme.pipeline.layouts.screencast_layout import maybe_promote_screencast

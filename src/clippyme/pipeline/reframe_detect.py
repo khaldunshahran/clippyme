@@ -10,6 +10,7 @@ import mediapipe as mp
 from ultralytics import YOLO
 
 from clippyme.pipeline.hardware import DEVICE
+from clippyme.pipeline.mediapipe_tasks_compat import create_tasks_adapter
 
 _yolo_model = None
 
@@ -35,6 +36,8 @@ def _get_face_detection():
     global _face_detection
     if _face_detection is None and mp_face_detection is not None:
         _face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+    elif _face_detection is None:
+        _face_detection = create_tasks_adapter(mp)
     return _face_detection
 
 
@@ -49,6 +52,8 @@ def _get_face_mesh():
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+    elif _face_mesh is None:
+        _face_mesh = create_tasks_adapter(mp, landmarks=True)
     return _face_mesh
 
 # MediaPipe FaceMesh mouth landmark indices (inner lips + corners). Defined here

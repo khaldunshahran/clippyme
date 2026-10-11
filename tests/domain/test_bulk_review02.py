@@ -97,7 +97,7 @@ def _barrier_run(monkeypatch, job_dir, oid, first_fn, prepare_second,
 
 
 def _prepare2(job_dir):
-    return _prepare_op(j, "second", 1)
+    return _prepare_op(job_dir, "second", 1)
 
 
 def test_apply_final_status_write_cannot_erase_concurrent_proposal(

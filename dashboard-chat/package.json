@@ -11,14 +11,14 @@
     "@vitejs/plugin-react": "^4.7.0",
     "tailwindcss": "^4.2.2",
     "vite": "^6.4.3",
-    "vitest": "^3.2.4"
+    "vitest": "4.1.11"
   },
   "name": "nugget-chat",
   "private": true,
   "scripts": {
     "build": "vite build",
-    "dev": "vite --port 5176 --strictPort",
-    "preview": "vite preview --port 5176 --strictPort",
+    "dev": "vite --port 5175 --strictPort",
+    "preview": "vite preview --port 5175 --strictPort",
     "test": "vitest run"
   },
   "type": "module",

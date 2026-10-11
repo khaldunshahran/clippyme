@@ -1595,7 +1595,7 @@ def plan_from_dict(d: dict) -> FramingPlan:
             if not (start_frame <= t["first_frame"]
                     <= t["last_frame"] <= end_frame):
                 raise ValueError(f"malformed-plan: {ctx} track "
-                                 f"'{t["id"]}' frames outside its "
+                                 f"'{t['id']}' frames outside its "
                                  "scene")
         track_by_id = {t["id"]: t for t in tracks}
         for seg in segments:

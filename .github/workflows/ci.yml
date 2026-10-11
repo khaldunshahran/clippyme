@@ -68,7 +68,7 @@ jobs:
 
       - name: Dependency vulnerability scan (core pinned tree)
         run: >-
-          pip-audit -r requirements.lock --desc --disable-pip
+          pip-audit -r requirements.lock --desc --disable-pip --no-deps
           --ignore-vuln CVE-2025-3000
           --ignore-vuln CVE-2026-24049
           --ignore-vuln PYSEC-2026-1805
@@ -76,7 +76,7 @@ jobs:
           --ignore-vuln PYSEC-2026-3447
 
       - name: Dependency vulnerability scan (runtime tools)
-        run: pip-audit -r requirements-runtime-tools.txt --desc --disable-pip
+        run: pip-audit -r requirements-runtime-tools.txt --desc
 
       - name: Enforce backend test result
         if: steps.host_tests.outcome != 'success'
@@ -150,6 +150,29 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  chat-frontend:
+    name: Chat frontend (test + build + audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard-chat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: dashboard-chat/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Audit
+        run: npm audit --audit-level=high
 
   integration:
     name: Integration (Docker — reframe/pipeline)

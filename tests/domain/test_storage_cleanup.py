@@ -178,7 +178,9 @@ def test_all_clips_published_cleans_source_and_preserves_meta(temp_output_dir):
     assert os.path.exists(meta_file)
 
 
-def test_purge_partial_downloads_removes_flac_asr_dumps(temp_output_dir):
+def test_purge_partial_downloads_removes_flac_asr_dumps(temp_output_dir, monkeypatch):
+    # This fixture is an orphan; a hardcoded PID can belong to a real host process.
+    monkeypatch.setattr('clippyme.domain.job_artifacts._is_pid_alive', lambda pid: False)
     flac_asr = os.path.join(temp_output_dir, ".asr_1787037867_21724.flac")
     temp_flac = os.path.join(temp_output_dir, "temp_audio.flac")
     normal_flac = os.path.join(temp_output_dir, "music.flac")

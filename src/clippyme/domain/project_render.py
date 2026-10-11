@@ -319,7 +319,9 @@ def _build_timeline_filter(segments, render_w: int, render_h: int,
                            render_fps: int, has_audio: bool) -> tuple[str, list[str]]:
     """Build a single filtergraph: trim+crop+scale each segment, then join.
 
-    Cut boundaries use concat (byte-identical to the pre-3b graph). A
+    Cut boundaries use concat. Each segment is converted to the requested
+    FPS and bounded again: a retained VFR frame can carry a duration beyond
+    the original trim and otherwise extend the export past its audio. A
     boundary whose later segment has ``transition_in="fade"`` uses an
     xfade/acrossfade chain instead (~0.5s, clamped per boundary).
     """
@@ -334,10 +336,12 @@ def _build_timeline_filter(segments, render_w: int, render_h: int,
         v = (f"[0:v]trim=start={seg['start']:.3f}:end={seg['end']:.3f},"
              f"setpts=PTS-STARTPTS,"
              f"crop={w}:{h}:{x}:{y},"
-             f"scale={render_w}:{render_h}:flags=lanczos")
+             f"scale={render_w}:{render_h}:flags=lanczos,"
+             f"fps={render_fps},"
+             f"trim=duration={seg['end'] - seg['start']:.3f}")
         if use_fades:
             # xfade needs CFR + identical pix fmt/timebase on both inputs.
-            v += f",fps={render_fps},format=yuv420p,settb=AVTB"
+            v += ",format=yuv420p,settb=AVTB"
         filt.append(v + f"[v{i}]")
         if has_audio:
             a = (f"[0:a]atrim=start={seg['start']:.3f}:end={seg['end']:.3f},"
@@ -345,7 +349,7 @@ def _build_timeline_filter(segments, render_w: int, render_h: int,
             filt.append(a + f"[a{i}]")
 
     if not use_fades:
-        # Cut-only path: exactly the pre-3b filtergraph.
+        # Cut-only path: concatenate the independently bounded segments.
         vcat = "".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vcat]"
         # Original order: video parts, vcat, audio parts, acat.
         parts = [f for f in filt if "[v" in f and "[a" not in f]
