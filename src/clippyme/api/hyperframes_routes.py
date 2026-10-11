@@ -45,8 +45,11 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
+
+from urllib.parse import quote as _url_quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
@@ -129,6 +132,44 @@ def _compile_id_ok(compile_id: str) -> bool:
 
 def _render_id_ok(render_id: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-f-]{36}_[0-9a-f]{16}", render_id or ""))
+
+
+def _composition_asset_allowlist() -> set[str]:
+    """Closed allowlist of composition-dependent assets (Task 18 review-02).
+
+    index.html plus the compiler-staged video and template font files.
+    Shared by the asset resolver and the token injector so the two can
+    never disagree about which relative resources are authorized.
+    """
+    allowed = {"index.html", "base.mp4"}
+    from clippyme.finishing import templates as _t
+    for spec in _t.TEMPLATES.values():
+        allowed.add(spec.font_file)
+        if spec.hook_font_file:
+            allowed.add(spec.hook_font_file)
+    return allowed
+
+
+def _inject_preview_token(html: str, token: str) -> str:
+    """Rewrite allowlisted relative asset references to carry ?token=.
+
+    Relative resources do NOT inherit the navigation query, so without
+    this the token-granted index.html loads a base.mp4/font that 401s.
+    Only the closed allowlist above is rewritten (exact src=/url() shapes
+    the compiler emits); the scoped preview token is the same grant, not
+    a weakened one, and no JWT ever enters a URL.
+    """
+    q = "?token=" + _url_quote(token, safe="")
+    for name in sorted(_composition_asset_allowlist()):
+        if name == "index.html":
+            continue
+        tagged = name + q
+        html = html.replace(f'src="{name}"', f'src="{tagged}"')
+        html = html.replace(f"src='{name}'", f"src='{tagged}'")
+        html = html.replace(f'url("{name}")', f'url("{tagged}")')
+        html = html.replace(f"url('{name}')", f"url('{tagged}')")
+        html = html.replace(f"url({name})", f"url({tagged})")
+    return html
 
 
 def _resolve_hf_asset(job_dir: str, compile_id: str, asset: str) -> str:
@@ -302,10 +343,15 @@ async def _publish_worker_output(*, job_dir: str, render_id: str,
     """Publish a finished worker render: install into the cache, then
     atomically install the versioned output file.
 
-    Re-checks the terminal state FIRST: a render that is no longer
-    "rendering" (e.g. cancelled while the worker finished) is NEVER
-    installed — the record keeps its terminal state with an honest note.
-    Raises PublishSkipped in that case, other exceptions on publish failure.
+    Commit is coordinated with the terminal state: the prior export is
+    snapshotted BEFORE the staging/install thread, and the record is
+    re-read AFTER the thread settles. If the render left 'rendering' in the
+    meantime (cancel during copy/validation), the prior export is restored
+    and PublishSkipped is raised — cancellation wins and the cancelled
+    record stays truthful about the bytes on disk. A staging/install
+    failure propagates normally (atomic _stage_and_install leaves the prior
+    output untouched). The early state check below is only a fast path; the
+    commit gate after settle is the actual decision point.
     """
     from clippyme.finishing import cache as _cache
     rec = _read_record(job_dir, render_id) or {}
@@ -316,8 +362,68 @@ async def _publish_worker_output(*, job_dir: str, render_id: str,
         _write_record(job_dir, render_id, rec)
         raise PublishSkipped(note)
     _cache.store(job_dir, cache_key, src_path)
-    await asyncio.to_thread(_stage_and_install, src_path, output_path,
-                            width=width, height=height)
+    backup_path = None
+    if os.path.isfile(output_path):
+        backup_path = f"{output_path}.prev-{uuid.uuid4().hex[:8]}"
+        await asyncio.to_thread(shutil.copy2, output_path, backup_path)
+    settled = threading.Event()
+    box: dict = {}
+
+    def _run_stage() -> None:
+        try:
+            _stage_and_install(src_path, output_path,
+                               width=width, height=height)
+        except BaseException as exc:  # staging failure: propagate below
+            box["error"] = exc
+        finally:
+            settled.set()
+
+    cancelled = False
+    try:
+        await asyncio.to_thread(_run_stage)
+    except asyncio.CancelledError:
+        # The staging thread is NOT stopped by the task cancel; wait for it
+        # (shielded) before the commit gate so restore can never be followed
+        # by a late os.replace.
+        cancelled = True
+    if not settled.is_set():
+        await asyncio.shield(asyncio.to_thread(settled.wait))
+    if "error" in box:
+        if backup_path:
+            try:
+                await asyncio.to_thread(os.remove, backup_path)
+            except OSError:
+                pass
+        err = box["error"]
+        if cancelled:
+            raise asyncio.CancelledError() from err
+        raise err
+    # Commit gate: decide AFTER staging settled, on the CURRENT record.
+    rec2 = _read_record(job_dir, render_id) or {}
+    if cancelled or rec2.get("state") != "rendering":
+        if backup_path and os.path.isfile(backup_path):
+            await asyncio.to_thread(os.replace, backup_path, output_path)
+        elif backup_path is None and os.path.isfile(output_path):
+            # No prior export existed: never leave a fresh install behind a
+            # non-rendering record.
+            try:
+                await asyncio.to_thread(os.remove, output_path)
+            except OSError:
+                pass
+        note = (f"publish superseded: record left 'rendering' "
+                f"(state={rec2.get('state')!r}) during staging; prior "
+                f"output preserved")
+        rec2["publish_note"] = note
+        _write_record(job_dir, render_id, rec2)
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise PublishSkipped(note)
+    # Commit stands: the backup is no longer needed.
+    if backup_path:
+        try:
+            await asyncio.to_thread(os.remove, backup_path)
+        except OSError:
+            pass
 
 
 async def _route_current_user(request: Request) -> AuthUser:
@@ -478,8 +584,17 @@ async def hyperframes_composition_asset(
     - ?token=: a valid HMAC preview token (minted authed above) scoped to
       this job+compile — served WITHOUT get_current_user so browser iframe
       navigation works. Bad/expired/mis-scoped tokens -> 401; unknown
-      compile -> 404.
+      compile -> 404. When index.html is served under a valid token, its
+      allowlisted relative asset references (base.mp4, template fonts) are
+      rewritten to carry the SAME token, because relative resources do not
+      inherit the navigation query and would otherwise 401.
     - no token: the existing Bearer <redacted> (unchanged).
+
+    Fonts are served with Access-Control-Allow-Origin: * (token- or Bearer
+    <redacted>): the composition iframe is sandbox=allow-scripts, i.e. an
+    opaque origin, and fonts are CORS-checked resources that would stay
+    blocked without it. The grant remains the token/Bearer session, so the
+    wildcard does not weaken ownership.
     """
     from clippyme.finishing import preview_tokens as _pt
     if token:
@@ -506,9 +621,21 @@ async def hyperframes_composition_asset(
         media_type = "text/html"
     elif asset.endswith(".ttf"):
         media_type = "font/ttf"
+    headers = {}
+    if asset.endswith((".ttf", ".woff", ".woff2")) or token:
+        headers["Access-Control-Allow-Origin"] = "*"
+    # Token-granted index.html: authorize its allowlisted dependent assets
+    # with the same scoped grant (relative URLs carry no query).
+    if asset == "index.html" and token:
+        from fastapi.responses import Response
+        html = _inject_preview_token(
+            open(path, "r", encoding="utf-8").read(), token)
+        return Response(content=html, media_type="text/html",
+                        headers=headers)
     # No remote fetches from generated compositions: the composition dir only
     # ever contains compiler-staged local files (validated at resolve time).
-    return FileResponse(path, media_type=media_type or "application/octet-stream")
+    return FileResponse(path, media_type=media_type or "application/octet-stream",
+                        headers=headers)
 
 
 # ---------------------------------------------------------------------------

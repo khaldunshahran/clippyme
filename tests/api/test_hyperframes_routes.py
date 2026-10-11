@@ -12,6 +12,7 @@ standalone (auth dependency overridden):
 import json
 import os
 import uuid
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -645,3 +646,107 @@ def test_publish_worker_output_cancel_race_never_installs(tmp_path,
     r = client.get(f"/api/hyperframes/render/{render_id}")
     assert r.json()["state"] == "cancelled"
     assert "not published" in (r.json()["note"] or "")
+
+def test_publish_worker_output_cancel_during_staging_preserves_prior(tmp_path,
+                                                                     monkeypatch):
+    """Review-02: cancellation DURING staging/install must not replace the
+    prior export. The commit gate re-reads the record after the staging
+    thread settles; if cancelled, the prior bytes are restored."""
+    import threading
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    job_dir = _write_job(out, jid, _project())
+    render_id = f"{jid}_{'ab12cd34ef56ab78'}"
+    hr._write_record(job_dir, render_id, {
+        "render_id": render_id, "job_id": jid, "clip_index": 0,
+        "project_version": 2, "state": "rendering"})
+    output_path = os.path.join(job_dir, "hf_clip_0_v2_clean-captions.mp4")
+    with open(output_path, "wb") as f:
+        f.write(b"previous")
+    src = tmp_path / "worker-out.mp4"
+    src.write_bytes(b"new-bytes")
+    release = threading.Event()
+
+    def fake_stage_and_install(src_path, output_path, width, height):
+        # Simulate a slow staging: copy, then block until the test
+        # marks the record cancelled (as the cancel route would).
+        import shutil
+        shutil.copy2(src_path, output_path)
+        assert release.wait(timeout=10)
+        import os as _os
+        _os.replace(src_path, output_path)
+
+    monkeypatch.setattr(hr, "_stage_and_install", fake_stage_and_install)
+    from clippyme.finishing import cache as _cache_mod
+    monkeypatch.setattr(_cache_mod, "store", lambda *a, **k: None)
+
+    async def run():
+        task = _asyncio.create_task(hr._publish_worker_output(
+            job_dir=job_dir, render_id=render_id, src_path=str(src),
+            cache_key="k" * 64, output_path=output_path,
+            width=608, height=1080))
+        await _asyncio.sleep(0.2)  # let staging start and block
+        # Cancel route's durable write.
+        hr._write_record(job_dir, render_id, {
+            "render_id": render_id, "job_id": jid, "clip_index": 0,
+            "project_version": 2, "state": "cancelled",
+            "error": "cancel requested", "finished_at": 0.0})
+        release.set()
+        try:
+            await task
+            return "no-raise"
+        except hr.PublishSkipped:
+            return "skipped"
+    assert _asyncio.run(run()) == "skipped"
+    with open(output_path, "rb") as f:
+        assert f.read() == b"previous"
+    rec = hr._read_record(job_dir, render_id)
+    assert rec["state"] == "cancelled"
+
+
+def test_composition_html_injects_token_into_allowlisted_assets(tmp_path,
+                                                               monkeypatch):
+    """Review-02: index.html served with a valid token rewrites allowlisted
+    relative asset refs (base.mp4, fonts) to carry the same grant, because
+    relative resources do not inherit the navigation query."""
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    job_dir = _write_token_compile(hr, out, jid, cid)
+    comp = Path(job_dir) / ".hf" / cid
+    (comp / "index.html").write_text(
+        '<video src="base.mp4"></video>'
+        "<style>@font-face{src:url('Anton-Regular.ttf')}</style>",
+        encoding="utf-8")
+    (comp / "base.mp4").write_bytes(b"v")
+    (comp / "Anton-Regular.ttf").write_bytes(b"f")
+    token = _mint_token(client, jid, cid)
+    client.app.dependency_overrides.clear()
+    monkeypatch.setenv("AUTH_DISABLED_DEV", "0")
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/{cid}/index.html?token={token}")
+    assert r.status_code == 200
+    assert 'src="base.mp4?token=' in r.text
+    assert "url('Anton-Regular.ttf?token=" in r.text
+    # Non-allowlisted refs are never rewritten.
+    assert "evil.mp4?token=" not in r.text
+
+
+def test_composition_font_served_with_cors_for_opaque_origin(tmp_path,
+                                                            monkeypatch):
+    """Review-02: fonts served for the sandboxed (opaque-origin) iframe
+    carry Access-Control-Allow-Origin so they are not blocked."""
+    client, hr, out = _make_client(tmp_path, monkeypatch)
+    jid = _job_id()
+    cid = "abcdef0123456789"
+    job_dir = _write_token_compile(hr, out, jid, cid)
+    comp = Path(job_dir) / ".hf" / cid
+    (comp / "Anton-Regular.ttf").write_bytes(b"fake-font")
+    token = _mint_token(client, jid, cid)
+    client.app.dependency_overrides.clear()
+    monkeypatch.setenv("AUTH_DISABLED_DEV", "0")
+    r = client.get(
+        f"/api/hyperframes/composition/{jid}/{cid}/Anton-Regular.ttf"
+        f"?token={token}")
+    assert r.status_code == 200
+    assert r.headers.get("access-control-allow-origin") == "*"

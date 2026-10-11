@@ -442,6 +442,18 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
   }
 
   /**
+   * Drain pending saves through the queue without composing (review-02).
+   * Lets any in-flight/queued save finish and serialize before a caller
+   * (e.g. the Hyperframes export path) proceeds, so the export composes
+   * the acknowledged snapshot. Rejects if the controller was disposed.
+   */
+  function drain() {
+    const rejected = rejectIfDisposed('drain');
+    if (rejected) return rejected;
+    return queue.drain(() => undefined);
+  }
+
+  /**
    * Clip switch / unmount: invalidate in-flight work, drop listeners, and
    * reject every future operation. Terminal -- only load() restarts.
    */
@@ -466,6 +478,7 @@ export function createProjectController({ jobId, clipIndex, api, onToast }) {
     canRedo: queue.canRedo,
     saveDraft,
     exportProject,
+    drain,
     restoreVersion,
     resetToAiCut,
     listVersions,

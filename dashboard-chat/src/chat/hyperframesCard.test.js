@@ -341,13 +341,15 @@ describe('HyperframesCard preview/export identity (contract 5)', () => {
     const previewTree = hfPreviewEl.type(hfPreviewEl.props);
     const iframe = findByTestId(previewTree, 'hf-preview-iframe');
     expect(iframe).toBeTruthy();
-    expect(iframe.props.src).toBe('/api/hyperframes/composition/j1/abcdef0123456789/index.html?token=tok-123');
+    expect(iframe.props.src).toMatch(/^\/api\/hyperframes\/composition\/j1\/abcdef0123456789\/index\.html\?token=tok-123&hfiid=hf-[A-Za-z0-9-]+$/);
     expect(iframe.props.sandbox).toMatch(/allow-scripts/);
     // no vendored player element: the player cannot drive the seek protocol
     expect(walk(tree).filter((n) => n.type === 'hyperframes-player')).toEqual([]);
     const id = findByTestId(tree, 'hf-preview-identity');
     expect(textOf(id)).toMatch(/digest-abc-1/); // 12-char digest prefix
     expect(textOf(id)).toMatch(/clean-captions/);
+    // (review-02) the iframe URL carries the per-instance hfiid; the
+    // composition echoes it so a stale frame cannot cross-update.
   });
 
   it('template options show titles from the capability (not blank)', async () => {
@@ -519,7 +521,7 @@ describe('review-01 R3: preview auth + postMessage + aspect + playback', () => {
     hooks.index = 0;
     const previewTree = hfPreviewEl.type(hfPreviewEl.props);
     const iframe = findByTestId(previewTree, 'hf-preview-iframe');
-    expect(iframe.props.src).toBe('/api/hyperframes/composition/j1/abcdef0123456789/index.html?token=tok-123');
+    expect(iframe.props.src).toMatch(/^\/api\/hyperframes\/composition\/j1\/abcdef0123456789\/index\.html\?token=tok-123&hfiid=hf-[A-Za-z0-9-]+$/);
     expect(iframe.props.src).not.toMatch(/eyJ/); // no Supabase JWT in the URL
   });
 
@@ -555,9 +557,12 @@ describe('review-01 R3: preview auth + postMessage + aspect + playback', () => {
     const hfPreviewEl = walk(tree).find((n) => n.type && n.type.name === 'HfPreview');
     const { listeners, postMessage, rerender } = drivePreview(hfPreviewEl);
     expect(listeners.message).toBeTruthy();
+    // (review-02) messages are bound to event.source === the owned iframe;
+    // the harness provides the owned window as the source.
+    const owned = hooks.values[0].current.contentWindow;
     // The composition announces readiness; junk messages are ignored.
-    listeners.message({ data: { nope: true } });
-    listeners.message({ data: { hf: 1, type: 'ready' } });
+    listeners.message({ source: owned, data: { nope: true } });
+    listeners.message({ source: owned, data: { hf: 1, type: 'ready' } });
     await flush();
     expect(hooks.values[2]).toBe(true); // ready
     // Play ACTUALLY starts playback via the protocol (targetOrigin '*').
@@ -566,7 +571,7 @@ describe('review-01 R3: preview auth + postMessage + aspect + playback', () => {
     await playBtn.props.onClick();
     expect(postMessage).toHaveBeenCalledWith({ hf: 1, type: 'play' }, '*');
     // Playing state is confirmed by the composition's timeupdate messages.
-    listeners.message({ data: { hf: 1, type: 'timeupdate', t: 3.25 } });
+    listeners.message({ source: owned, data: { hf: 1, type: 'timeupdate', t: 3.25 } });
     expect(hooks.values[1]).toBe(3.25);
     const pauseBtn = findByTestId(rerender(), 'hf-preview-play');
     expect(textOf(pauseBtn)).toMatch(/Pause/);
@@ -595,6 +600,10 @@ describe('review-01 R4: export bound to the acknowledged preview', () => {
     await flush();
     const applied = card(p);
     findByTestId(applied, 'hf-template').props.onChange({ target: { value: 'emphasized-word' } });
+    // (review-02) a template change after Apply requires re-acknowledgment:
+    // the card returns to 'proposal'; re-Apply, then preview and render.
+    await findByTestId(card(p), 'hf-apply').props.onClick();
+    await flush();
     await findByTestId(card(p), 'hf-preview').props.onClick();
     await flush();
     await findByTestId(card(p), 'hf-render').props.onClick();
@@ -704,5 +713,73 @@ describe('review-01 R5: cancel reflects the backend-acknowledged state', () => {
     expect(t).not.toMatch(/nothing was published/);
     expect(t).not.toMatch(/Render cancelled/); // never claims cancelled: the cancel did not go through
     expect(hfApi.cancelHyperframesRender).toHaveBeenCalledWith('rid-9');
+  });
+});
+
+describe('coordinator review02 remaining production contracts', () => {
+  async function previewCard() {
+    const p={data:data('j1',0),activeSelectionKey:'j1:0'};
+    hfApi.compileHyperframes.mockResolvedValue({compile_id:'abcdef0123456789',preview_identity:'same',manifest:{duration:5,render:{width:90,height:160},project_version:2}});
+    card(p); await flush();
+    await findByTestId(card(p),'hf-apply').props.onClick();
+    await findByTestId(card(p),'hf-preview').props.onClick();
+    return {p,tree:card(p)};
+  }
+  it('keeps polling through rendering until the backend reaches rendered', async () => {
+    vi.useFakeTimers();
+    try {
+      const {p,tree}=await previewCard();
+      hfApi.renderHyperframes.mockResolvedValue({render_id:'r',state:'rendering'});
+      hfApi.hyperframesRenderStatus.mockResolvedValueOnce({state:'rendering'}).mockResolvedValueOnce({state:'rendered',output_url:'/final'});
+      await findByTestId(tree,'hf-render').props.onClick();
+      await vi.advanceTimersByTimeAsync(2200);
+      expect(hfApi.hyperframesRenderStatus).toHaveBeenCalledTimes(2);
+      expect(textOf(card(p))).toMatch(/Export rendered/);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+  it('ignores preview messages from a different iframe/window', async () => {
+    const {tree}=await previewCard();
+    const element=walk(tree).find(n=>n.type?.name==='HfPreview');
+    hooks.values=[]; hooks.index=0;
+    const listeners=[];
+    vi.stubGlobal('window',{addEventListener:(name,fn)=>{if(name==='message') listeners.push(fn);},removeEventListener:()=>{}});
+    try {
+      element.type(element.props);
+      const ownedWindow={postMessage:vi.fn()};
+      hooks.values[0].current={contentWindow:ownedWindow};
+      // Wrong window: ignored, play button never appears.
+      for(const fn of listeners) fn({source:{},origin:'null',data:{hf:1,type:'ready'}});
+      hooks.index=0;
+      const updated=element.type(element.props);
+      expect(findByTestId(updated,'hf-preview-play')).toBeNull();
+      // Owned window: accepted, play button appears. (load-bearing: the
+      // source check must not reject the real iframe.)
+      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,type:'ready'}});
+      await flush();
+      hooks.index=0;
+      const updated2=element.type(element.props);
+      expect(findByTestId(updated2,'hf-preview-play')).not.toBeNull();
+      // Stale instance id: a message from the owned window but with a
+      // different hfiid must not drive this preview.
+      const hfiid = element.props.hfiid;
+      expect(hfiid).toMatch(/^hf-/);
+      for(const fn of listeners) fn({source:ownedWindow,origin:'null',data:{hf:1,hfiid:'hf-stale',type:'timeupdate',t:1}});
+      await flush();
+      // t stays 0 (the stale timeupdate was ignored).
+      expect(hooks.values[1]).toBe(0);
+    } finally { vi.unstubAllGlobals(); vi.stubGlobal('React',React); }
+  });
+});
+
+describe('coordinator acknowledged finishing contract', () => {
+  it('cannot compile/export a changed template without acknowledging its save', async () => {
+    const p={data:data('j1',0),activeSelectionKey:'j1:0'};
+    card(p); await flush();
+    await findByTestId(card(p),'hf-apply').props.onClick();
+    const applied=card(p);
+    findByTestId(applied,'hf-template').props.onChange({target:{value:'emphasized-word'}});
+    const changed=card(p),preview=findByTestId(changed,'hf-preview');
+    if(preview && !preview.props.disabled) await preview.props.onClick();
+    expect(hfApi.compileHyperframes).not.toHaveBeenCalled();
   });
 });

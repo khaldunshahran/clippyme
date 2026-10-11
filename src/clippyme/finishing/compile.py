@@ -233,25 +233,54 @@ def _font_face_css(fonts: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# Task 18 review-01: preview postMessage bridge (contract 2 backend).
+# Task 18 review-02: preview postMessage bridge (contract 2 backend).
 # The composition listens for {hf:1, type:'seek'|'play'|'pause', t?} and
 # drives its own window.__hf.seek / the base <video> element (play() with
 # audio, pause()). It posts {hf:1, type:'ready'} to the parent once __hf is
 # installed and {hf:1, type:'timeupdate', t} during playback. Incoming
-# messages are shape-validated; no secrets cross this bridge (numeric t
+# messages are bound to ev.source === window.parent (shape-only checks
+# accept unrelated windows); every message echoes the per-instance hfiid
+# from the iframe URL so concurrently mounted previews cannot cross-update.
+# Graphics are driven CONTINUOUSLY from the actual media clock: __hf.seek
+# only positions graphics, so without this the video advances while
+# captions/hooks stay frozen. Incoming messages carry no secrets (numeric t
 # only). The worker engine keeps using window.__hf directly (untouched).
 _BRIDGE_JS = """
 (function () {
   var video = document.getElementById('hf-base');
   var D = 0;
   try { D = JSON.parse(document.getElementById('hf-data').textContent).duration; } catch (e) { D = 0; }
+  var IID = null;
+  try {
+    var mm = /[?&]hfiid=([A-Za-z0-9_-]{1,64})/.exec(location.search || '');
+    if (mm) { IID = mm[1]; }
+  } catch (e) {}
   function post(msg) {
     try { window.parent.postMessage(msg, '*'); } catch (e) {}
+  }
+  function baseMsg(type, extra) {
+    var msg = { hf: 1, type: type };
+    if (IID) { msg.hfiid = IID; }
+    if (extra) {
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) { msg[k] = extra[k]; }
+      }
+    }
+    return msg;
+  }
+  function syncGraphics() {
+    if (!video) { return; }
+    try {
+      if (window.__hf && typeof window.__hf.seek === 'function') {
+        window.__hf.seek(video.currentTime);
+      }
+    } catch (e) {}
   }
   var tries = 0;
   (function waitReady() {
     if (window.__hf && typeof window.__hf.seek === 'function') {
-      post({ hf: 1, type: 'ready' });
+      syncGraphics();
+      post(baseMsg('ready'));
       return;
     }
     if (++tries < 200) { setTimeout(waitReady, 50); }
@@ -260,14 +289,16 @@ _BRIDGE_JS = """
     return typeof v === 'number' && isFinite(v) && v >= 0;
   }
   window.addEventListener('message', function (ev) {
+    try { if (ev.source !== window.parent) { return; } } catch (e) { return; }
     var m = ev.data;
     if (!m || typeof m !== 'object' || m.hf !== 1) { return; }
+    if (IID && m.hfiid && m.hfiid !== IID) { return; }
     var t = validT(m.t) ? m.t : null;
     if (m.type === 'seek') {
       if (t === null) { return; }
       var ct = (D > 0) ? Math.min(Math.max(t, 0), D) : Math.max(t, 0);
-      if (window.__hf && typeof window.__hf.seek === 'function') { window.__hf.seek(ct); }
       if (video) { try { video.currentTime = ct; } catch (e) {} }
+      syncGraphics();
     } else if (m.type === 'play') {
       if (video) {
         try { video.muted = false; } catch (e) {}
@@ -278,12 +309,18 @@ _BRIDGE_JS = """
       }
     } else if (m.type === 'pause') {
       if (video) { try { video.pause(); } catch (e) {} }
+      syncGraphics();
     }
   });
   if (video) {
     video.addEventListener('timeupdate', function () {
-      post({ hf: 1, type: 'timeupdate', t: video.currentTime });
+      syncGraphics();
+      post(baseMsg('timeupdate', { t: video.currentTime }));
     });
+    video.addEventListener('seeked', syncGraphics);
+    video.addEventListener('play', syncGraphics);
+    video.addEventListener('pause', syncGraphics);
+    video.addEventListener('ended', syncGraphics);
   }
 })();
 """

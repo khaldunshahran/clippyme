@@ -73,7 +73,7 @@ function identityKey(jobId, index) {
 // must never be attempted. The base <video> inside the composition follows
 // the same seek/play/pause messages, so captions stay in sync by
 // construction. Marked as preview, never as the export reference.
-function HfPreview({ src, duration, renderWidth, renderHeight }) {
+function HfPreview({ src, hfiid, duration, renderWidth, renderHeight }) {
   const frameRef = useRef(null);
   const [t, setT] = useState(0);
   const [ready, setReady] = useState(false);
@@ -115,10 +115,20 @@ function HfPreview({ src, duration, renderWidth, renderHeight }) {
       const d = event && event.data;
       // Validate the shape on our side; ignore everything else.
       if (!d || typeof d !== 'object' || d.hf !== 1) return;
+      // Bind to the OWNED iframe only (review-02): shape-only checks accept
+      // messages from unrelated windows, and concurrently mounted previews
+      // could otherwise cross-update each other.
+      const owned = frameRef.current && frameRef.current.contentWindow;
+      if (!owned || event.source !== owned) return;
+      // Per-instance binding: a stale/reloaded frame carries a different
+      // hfiid (messages without one are still accepted for harness compat).
+      if (hfiid && d.hfiid && d.hfiid !== hfiid) return;
       if (d.type === 'ready') {
         setReady(true);
         seekTo(0);
       } else if (d.type === 'timeupdate' && Number.isFinite(d.t)) {
+        // Bounded values only: ignore out-of-range timestamps.
+        if (d.t < 0 || d.t > (duration || 0) + 1) return;
         setT(d.t);
         // The playing indicator is confirmed by actual composition
         // timeupdates, not just by our play request: if playback never
@@ -206,6 +216,40 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
   const [render, setRender] = useState(null); // { render_id, state, output_url, metrics, error }
   const [legacy, setLegacy] = useState(null); // { composed_url, version }
   const pollRef = useRef(null);
+  // Serializes status polls so requests never overlap (review-02). The
+  // chain is reset each time polling (re)starts.
+  const pollChainRef = useRef(Promise.resolve());
+
+  // Poll the render status until a terminal state. The interval is cleared
+  // ONLY on a terminal state, lifetime end, or status error — never after a
+  // successful in-progress poll (review-02: clearing after EVERY poll
+  // stopped polling on the first in-progress response).
+  const startPolling = (renderId, tok) => {
+    clearInterval(pollRef.current);
+    pollChainRef.current = Promise.resolve();
+    pollRef.current = setInterval(() => {
+      pollChainRef.current = pollChainRef.current.then(async () => {
+        try {
+          const st = await hyperframesRenderStatus(renderId);
+          if (!lifetimeAlive(tok)) { clearInterval(pollRef.current); return; }
+          const rs = st.state;
+          if (rs !== 'rendering') {
+            clearInterval(pollRef.current);
+            commit(tok, () => {
+              setRender({ render_id: renderId, state: rs, output_url: st.output_url, metrics: st.metrics, error: st.error });
+              setState(rs === 'rendered' ? 'rendered' : rs === 'cancelled' ? 'cancelled' : 'failed');
+              if (rs !== 'rendered' && rs !== 'cancelled') setError(st.error || 'Render failed');
+            });
+          } else {
+            commit(tok, () => setRender({ render_id: renderId, state: rs }));
+          }
+        } catch (e) {
+          clearInterval(pollRef.current);
+          commit(tok, () => { setRender({ render_id: renderId, state: 'failed', error: e.message }); setState('failed'); setError(e.message); });
+        }
+      });
+    }, 1000);
+  };
   const aliveRef = useRef(true);
   const [appliedVersion, setAppliedVersion] = useState(null);
 
@@ -324,10 +368,15 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
 
   // Unapplied template/param edits invalidate the acknowledged preview:
   // export must never render a compile_id from a different selection.
+  // Review-02: a change after Apply with NO acknowledged preview yet
+  // returns to 'proposal' — changed settings must be re-applied /
+  // acknowledged before they can be previewed or exported. A change after
+  // an acknowledged preview keeps the applied settings ('applied') and
+  // allows re-preview of the variant; the preview itself is invalidated.
   const invalidatePreview = () => {
     setPreview(null);
     setRender(null);
-    setState((s) => (s === 'preview' ? 'applied' : s));
+    setState((s) => (s === 'preview' ? 'applied' : 'proposal'));
   };
   const onTemplateChange = (e) => { setTemplateId(e.target.value); invalidatePreview(); };
   const onParamChange = (p) => (e) => { setParams((prev) => ({ ...prev, [p]: e.target.value })); invalidatePreview(); };
@@ -356,10 +405,15 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
       const token = tokenRes && tokenRes.token;
       if (!token) throw new Error('preview token missing from server response');
       commit(tok, () => {
+        // Per-instance binding (review-02): the preview iframe URL carries
+        // a unique hfiid that the composition echoes in its messages, so a
+        // stale/reloaded frame cannot update a concurrently mounted one.
+        const hfiid = `hf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
         setPreview({
           compile_id: res.compile_id,
           preview_identity: res.preview_identity, // manifest digest string
-          composition_url: hyperframesCompositionUrl(jobId, res.compile_id, token),
+          composition_url: `${hyperframesCompositionUrl(jobId, res.compile_id, token)}&hfiid=${encodeURIComponent(hfiid)}`,
+          hfiid,
           manifest: res.manifest || null,
         });
         setState('preview');
@@ -386,6 +440,14 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
     const version = appliedVersion;
     setState('rendering'); setError(null); setLegacy(null);
     try {
+      // Serialize through the single project authority (review-02): drain
+      // any pending saves so this export composes the acknowledged
+      // snapshot, not a stale one. compile_id forwarding alone is not
+      // queue integration.
+      if (controller && typeof controller.drain === 'function') {
+        await controller.drain();
+        if (!lifetimeAlive(tok)) return;
+      }
       const res = await renderHyperframes(jobId, index, { compile_id: compileId, expected_version: version });
       if (!lifetimeAlive(tok)) return;
       const initialState = res.state || 'rendering';
@@ -399,25 +461,7 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
         });
         return;
       }
-      clearInterval(pollRef.current);
-      pollRef.current = setInterval(async () => {
-        try {
-          const st = await hyperframesRenderStatus(res.render_id);
-          if (!lifetimeAlive(tok)) { clearInterval(pollRef.current); return; }
-          const rs = st.state;
-          clearInterval(pollRef.current);
-          if (rs !== 'rendering') {
-            setRender({ render_id: res.render_id, state: rs, output_url: st.output_url, metrics: st.metrics, error: st.error });
-            setState(rs === 'rendered' ? 'rendered' : rs === 'cancelled' ? 'cancelled' : 'failed');
-            if (rs !== 'rendered' && rs !== 'cancelled') setError(st.error || 'Render failed');
-          } else {
-            setRender({ render_id: res.render_id, state: rs });
-          }
-        } catch (e) {
-          clearInterval(pollRef.current);
-          commit(tok, () => { setRender({ render_id: res.render_id, state: 'failed', error: e.message }); setState('failed'); setError(e.message); });
-        }
-      }, 1000);
+      startPolling(res.render_id, tok);
     } catch (e) {
       commit(tok, () => { setState('preview'); setError(`Render failed: ${e.message}`); });
     }
@@ -454,9 +498,11 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
     } catch (e) {
       commit(tok, () => {
         // The cancel did not go through: the render may still be running or
-        // may already have finished. Keep the rendering state and say so —
-        // do not claim cancelled.
-        setError(`Cancel failed: ${e.message}. The render may still complete — check its status before rendering again.`);
+        // may already have finished. Restart polling so the card keeps an
+        // honest status path instead of stranding the user — do not claim
+        // cancelled.
+        setError(`Cancel failed: ${e.message}. The render may still complete — resuming status checks.`);
+        if (lifetimeAlive(tok)) startPolling(renderId, tok);
       });
     }
   };
@@ -566,6 +612,7 @@ export default function HyperframesCard({ data = {}, activeSelectionKey = null, 
         <div style={boxStyle}>
           <HfPreview
             src={preview.composition_url}
+            hfiid={preview.hfiid}
             duration={preview.manifest?.duration || 10}
             renderWidth={preview.manifest?.render?.width}
             renderHeight={preview.manifest?.render?.height}

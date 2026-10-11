@@ -346,9 +346,15 @@ def test_preview_bridge_postmessage_protocol(fake_base, tmp_path):
     html = open(compiled.html_path, encoding="utf-8").read()
     assert "window.__hf = {" in html  # engine object untouched
     assert "postMessage" in html
-    assert "{ hf: 1, type: 'ready' }" in html
-    assert "type: 'timeupdate'" in html
+    assert "baseMsg('ready')" in html  # ready announcement (review-02: via baseMsg with hfiid)
+    assert "baseMsg('timeupdate'" in html  # timeupdate (review-02: via baseMsg)
     assert "__hf.seek" in html
     assert "video.play()" in html
     assert "video.pause()" in html
     assert "m.hf !== 1" in html  # shape validation
+    # Review-02: graphics driven continuously from the media clock.
+    assert "syncGraphics()" in html
+    assert "video.currentTime" in html
+    # Review-02: per-instance binding + source validation.
+    assert "hfiid" in html
+    assert "ev.source !== window.parent" in html
