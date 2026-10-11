@@ -34,10 +34,15 @@ Design rules (TASK.md scope 1-7):
   records operation identity, frozen scope, typed intent identity,
   base/result versions and per-clip outcomes. It is written atomically
   (unique tmp + os.replace, strict finite JSON) after every per-clip step.
-  Whole read/modify/write transactions are serialized per job by an
-  in-process lock (the API serves these calls from one process; no
-  cross-process guarantee is claimed), so concurrent preparations neither
-  lose records nor mint duplicate operations. A crash between a project
+  EVERY whole-ledger read/modify/write transaction -- create, apply
+  initial/final, retry reset, undo init/final, per-item updates -- runs
+  inside the shared per-job serialization boundary, loading the ledger
+  fresh inside the lock and merging only its own operation's fields, so a
+  concurrent operation can neither be erased nor erase another (in-process
+  only; the API serves these calls from one process, no cross-process
+  guarantee is claimed). Lock order is always operation_lock -> job lock;
+  no ledger snapshot loaded outside the boundary is held across another
+  job transaction. A crash between a project
   save and the ledger write is recoverable: each applied clip's project
   carries a deterministic item idempotency key
   (``bulk:<operation_id>:<clip_index>``), and apply detects an already-landed
@@ -822,6 +827,29 @@ def job_ledger_lock(job_dir: str) -> threading.Lock:
         return _job_locks.setdefault(key, threading.Lock())
 
 
+def _transact_ledger(job_dir: str, mutate):
+    """Run one whole-ledger read/modify/write as a single job transaction.
+
+    The ledger is loaded fresh INSIDE the shared per-job serialization
+    boundary, the caller's ``mutate`` touches only its own operation's
+    fields on that fresh object, and the write lands before the lock
+    releases. A concurrent create/apply/retry/undo in the same job can
+    therefore neither be erased by this transaction nor erase it -- unique
+    tmp names alone cannot prevent that lost update. Callers must never
+    hold a ledger snapshot loaded outside this boundary across another
+    job transaction.
+
+    Lock order is always operation_lock (outer) -> job_ledger_lock
+    (inner); _record_item/_save_undo_state take only the job lock, so no
+    inversion (and no deadlock) is possible.
+    """
+    with job_ledger_lock(job_dir):
+        ledger = load_bulk_ledger(job_dir)
+        result = mutate(ledger)
+        save_bulk_ledger(job_dir, ledger)
+        return result
+
+
 # ---------------------------------------------------------------------------
 # Apply / retry / undo orchestration
 # ---------------------------------------------------------------------------
@@ -949,13 +977,18 @@ def apply_operation(*, job_dir: str, operation_id: str) -> dict:
     The ledger is rewritten after every item.
     """
     with operation_lock(operation_id):
-        ledger = load_bulk_ledger(job_dir)
-        op = ledger["operations"].get(operation_id)
-        if op is None:
-            raise KeyError(f"unknown bulk operation {operation_id}")
-        op["status"] = "applying"
-        op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        save_bulk_ledger(job_dir, ledger)
+        # Initial status write runs as one job transaction: the ledger is
+        # loaded fresh inside the shared boundary, so a proposal committed
+        # by a concurrent prepare cannot be erased by this write.
+        def _mark_applying(ledger):
+            op = ledger["operations"].get(operation_id)
+            if op is None:
+                raise KeyError(f"unknown bulk operation {operation_id}")
+            op["status"] = "applying"
+            op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            return op
+
+        op = _transact_ledger(job_dir, _mark_applying)
 
         intent_op = op["intent"]["op"]
         for ci_str, item in sorted(op["items"].items(),
@@ -1035,12 +1068,16 @@ def apply_operation(*, job_dir: str, operation_id: str) -> dict:
                     "error": str(exc)[:300],
                 })
 
-        ledger = load_bulk_ledger(job_dir)
-        op = ledger["operations"][operation_id]
-        op["status"] = _finalize_status(op)
-        op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        save_bulk_ledger(job_dir, ledger)
-        return op
+        # Final status write re-reads the ledger inside the job
+        # transaction: concurrent operations committed during the per-clip
+        # saves are merged, never clobbered.
+        def _finalize(ledger):
+            op = ledger["operations"][operation_id]
+            op["status"] = _finalize_status(op)
+            op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            return op
+
+        return _transact_ledger(job_dir, _finalize)
 
 
 def retry_operation(*, job_dir: str, operation_id: str) -> dict:
@@ -1052,19 +1089,24 @@ def retry_operation(*, job_dir: str, operation_id: str) -> dict:
     silent rebase.
     """
     with operation_lock(operation_id):
-        ledger = load_bulk_ledger(job_dir)
-        op = ledger["operations"].get(operation_id)
-        if op is None:
-            raise KeyError(f"unknown bulk operation {operation_id}")
+        # The reset decision reads the ledger fresh inside the shared job
+        # transaction boundary.
+        def _load_for_reset(ledger):
+            op = ledger["operations"].get(operation_id)
+            if op is None:
+                raise KeyError(f"unknown bulk operation {operation_id}")
+            return op
+
+        op = _transact_ledger(job_dir, _load_for_reset)
         eligible = [ci for ci, it in op["items"].items()
                     if it.get("outcome") in RETRYABLE_OUTCOMES]
         if not eligible:
             return op
-        # Reset eligible items to planned (keeping their frozen guards) and
-        # re-run the apply pass, which skips everything terminal.
-        for ci in eligible:
-            op["items"][ci]["outcome"] = OUTCOME_PLANNED
-            op["items"][ci]["error"] = None
+        # Compute the reset + re-plan in memory, then commit it as ONE job
+        # transaction below: the ledger is re-read fresh inside the
+        # boundary, so concurrent operations committed meanwhile are
+        # merged, never clobbered.
+        #
         # A pending hyperframes item carries no patch by design (the worker
         # was down at plan time), so its stored patch is never trusted.
         # Re-plan each eligible clip from the frozen intent under the
@@ -1072,28 +1114,46 @@ def retry_operation(*, job_dir: str, operation_id: str) -> dict:
         # changes, excluded, ...) are refreshed, the frozen
         # expected_version is kept, and nothing is saved unless the
         # rebuilt patch is non-empty and validated.
+        refresh = {}
+        worker_info = None
         if op["intent"]["op"] == OP_HYPERFRAMES_FINISHING:
             worker = _check_hyperframes_worker()
-            op["worker"] = {"available": bool(worker.get("available")),
-                            "reason": worker.get("reason", "")}
+            worker_info = {"available": bool(worker.get("available")),
+                           "reason": worker.get("reason", "")}
             for ci in eligible:
-                item = op["items"][ci]
                 path = get_project_path(job_dir, int(ci))
                 if not path:
-                    item["outcome"] = OUTCOME_FAILED
-                    item["error"] = "project file disappeared before retry"
+                    refresh[ci] = {
+                        "outcome": OUTCOME_FAILED,
+                        "error": "project file disappeared before retry",
+                    }
                     continue
                 plan = plan_bulk_operation(
                     job_dir=job_dir, clip_indices=[int(ci)],
                     intent=op["intent"], worker_available=worker)
                 fresh = plan["items"][0]
-                for field in ("outcome", "patch", "changes", "preserved",
-                              "adapted", "excluded", "summary"):
-                    item[field] = fresh[field]
-                item["error"] = None
-        op["status"] = "applying"
-        op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        save_bulk_ledger(job_dir, ledger)
+                refresh[ci] = {
+                    field: fresh[field]
+                    for field in ("outcome", "patch", "changes",
+                                  "preserved", "adapted", "excluded",
+                                  "summary")
+                }
+                refresh[ci]["error"] = None
+
+        def _mark_retrying(ledger):
+            target = ledger["operations"][operation_id]
+            for ci in eligible:
+                it = target["items"][ci]
+                it["outcome"] = OUTCOME_PLANNED
+                it["error"] = None
+                for field, value in refresh.get(ci, {}).items():
+                    it[field] = value
+            if worker_info is not None:
+                target["worker"] = worker_info
+            target["status"] = "applying"
+            target["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        _transact_ledger(job_dir, _mark_retrying)
     return apply_operation(job_dir=job_dir, operation_id=operation_id)
 
 
@@ -1107,14 +1167,19 @@ def undo_operation(*, job_dir: str, operation_id: str) -> dict:
     conflicts. Recorded undo outcomes make repeated undo idempotent.
     """
     with operation_lock(operation_id):
-        ledger = load_bulk_ledger(job_dir)
-        op = ledger["operations"].get(operation_id)
-        if op is None:
-            raise KeyError(f"unknown bulk operation {operation_id}")
-        undo = op.get("undo") or {"undone_at": None, "status": "pending",
-                                  "items": {}}
-        op["undo"] = undo
-        save_bulk_ledger(job_dir, ledger)
+        # The undo-init write runs as one job transaction: the ledger is
+        # loaded fresh inside the shared boundary, so a proposal committed
+        # by a concurrent prepare cannot be erased by this write.
+        def _init_undo(ledger):
+            op = ledger["operations"].get(operation_id)
+            if op is None:
+                raise KeyError(f"unknown bulk operation {operation_id}")
+            undo = op.get("undo") or {"undone_at": None, "status": "pending",
+                                      "items": {}}
+            op["undo"] = undo
+            return op, undo
+
+        op, undo = _transact_ledger(job_dir, _init_undo)
 
         for ci_str, item in sorted(op["items"].items(),
                                    key=lambda kv: int(kv[0])):
@@ -1190,24 +1255,30 @@ def undo_operation(*, job_dir: str, operation_id: str) -> dict:
                 }
             _save_undo_state(job_dir, operation_id, op)
 
-        ledger = load_bulk_ledger(job_dir)
-        op = ledger["operations"][operation_id]
-        undo = op["undo"]
-        outcomes = [r.get("outcome") for r in undo["items"].values()]
-        applied_items = [i for i in op["items"].values()
-                         if i.get("outcome") == OUTCOME_APPLIED]
-        if outcomes and all(o == "undone" for o in outcomes) and len(
-                outcomes) == len(applied_items):
-            undo["status"] = "undone"
-        elif any(o == "undone" for o in outcomes):
-            undo["status"] = "partially_undone"
-        elif outcomes:
-            undo["status"] = "undo_failed"
-        else:
-            undo["status"] = "nothing_to_undo"
-        undo["undone_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        save_bulk_ledger(job_dir, ledger)
-        return op
+        # Finalization re-reads the ledger inside the job transaction:
+        # concurrent operations committed during the per-clip undos are
+        # merged, never clobbered. The undo outcomes themselves were
+        # persisted per item via _save_undo_state, so the status is derived
+        # from the freshly loaded record.
+        def _finalize_undo(ledger):
+            op = ledger["operations"][operation_id]
+            undo = op["undo"]
+            outcomes = [r.get("outcome") for r in undo["items"].values()]
+            applied_items = [i for i in op["items"].values()
+                             if i.get("outcome") == OUTCOME_APPLIED]
+            if outcomes and all(o == "undone" for o in outcomes) and len(
+                    outcomes) == len(applied_items):
+                undo["status"] = "undone"
+            elif any(o == "undone" for o in outcomes):
+                undo["status"] = "partially_undone"
+            elif outcomes:
+                undo["status"] = "undo_failed"
+            else:
+                undo["status"] = "nothing_to_undo"
+            undo["undone_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            return op
+
+        return _transact_ledger(job_dir, _finalize_undo)
 
 
 def _save_undo_state(job_dir: str, operation_id: str, op: dict) -> None:

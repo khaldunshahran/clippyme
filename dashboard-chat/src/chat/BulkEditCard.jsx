@@ -146,37 +146,99 @@ export default function BulkEditCard({
     || !hasUnappliedProposal
     || lifetimeAlive(preparedTokRef.current);
 
-  const aliveRef = useRef(true);
   const inflightRef = useRef(false);
-  // Real lifecycle cleanup: a delayed response after unmount must not
-  // touch state. (The test harness runs effects immediately and ignores
-  // the returned cleanup, so the component stays usable under it.)
-  useEffect(() => () => { aliveRef.current = false; }, []);
+
+  // Generation-scoped effect ownership (StrictMode-safe). Every effect
+  // setup mints a fresh generation; cleanup invalidates only its own
+  // generation. A fresh setup is live; a prior generation's delayed
+  // responses stay ignored after a setup -> cleanup -> setup replay, and
+  // starting a new generation never reauthorizes an earlier in-flight
+  // response.
+  const aliveGenRef = useRef(0);
+  const deadGenRef = useRef(new Set());
+  const genAlive = (gen) => aliveGenRef.current === gen && !deadGenRef.current.has(gen);
+  // Real lifecycle cleanup: a delayed response after unmount (or after
+  // a StrictMode setup -> cleanup -> setup replay) must not touch state.
+  useEffect(() => {
+    aliveGenRef.current += 1;
+    const gen = aliveGenRef.current;
+    return () => { deadGenRef.current.add(gen); };
+  }, []);
 
   // Reload: a prepared-operation reference persisted for this job+thread
   // reconnects the card to its existing ledger instead of minting a new
   // idempotency key and a duplicate operation. Only the operation/key
   // reference is restored -- never project snapshots or grants.
-  const restoreRef = useRef(false);
+  //
+  // Replay-safe under StrictMode setup -> cleanup -> setup: the first
+  // setup's in-flight status fetch is cancelled by its cleanup (its
+  // generation is invalidated), and the replayed setup is allowed to
+  // reconnect -- a once-only flag set by the cancelled attempt never
+  // suppresses it. Completion is recorded only for an attempt that
+  // actually finished.
+  const restoreGenRef = useRef(0);
+  const restoreDeadRef = useRef(new Set());
+  const restoreDoneRef = useRef(false);
+  const restoreStartedRef = useRef(0);
+  const restoreGenAlive = (gen) =>
+    restoreGenRef.current === gen && !restoreDeadRef.current.has(gen);
   useEffect(() => {
-    if (restoreRef.current) return;
-    restoreRef.current = true;
+    restoreGenRef.current += 1;
+    const gen = restoreGenRef.current;
+    const cleanup = () => { restoreDeadRef.current.add(gen); };
+    if (restoreDoneRef.current) return cleanup;
+    // A live attempt is already in flight -- do not fire a duplicate.
+    if (restoreStartedRef.current && restoreGenAlive(restoreStartedRef.current)) {
+      return cleanup;
+    }
     const ref = readBulkOpRef(jobId, threadId);
-    if (!ref) return;
+    if (!ref) { restoreDoneRef.current = true; return cleanup; }
     keyRef.current = ref.idempotency_key;
+    restoreStartedRef.current = gen;
     setState('restoring');
     (async () => {
       try {
         const op = await api.bulkStatus(jobId, ref.operation_id);
-        if (!aliveRef.current) return;
+        if (!restoreGenAlive(gen)) return;
+        restoreDoneRef.current = true;
         setOperation(op);
         setInterrupted(false);
-        setState('results');
-      } catch {
-        clearBulkOpRef(jobId, threadId);
-        if (aliveRef.current) setState('idle');
+        if (op && op.status === 'proposed') {
+          // Restore the actual operation state: an acknowledged proposal
+          // the user can explicitly Apply against the SAME operation/key,
+          // with current session ownership. No automatic apply on refresh;
+          // the server still enforces the frozen version guards.
+          preparedTokRef.current = captureLifetime();
+          setState('proposal');
+        } else {
+          if (op && op.status === 'applying') {
+            // An apply was issued but its outcome is unknown -- reconcile.
+            setInterrupted(true);
+          }
+          setState('results');
+        }
+      } catch (e) {
+        if (!restoreGenAlive(gen)) return;
+        const status = e && e.status;
+        // Only an authoritative missing/invalid record retires the
+        // reference. Transient errors (network interruption, 5xx) keep it:
+        // the operation may still exist or be applied, so a later status
+        // check reconciles with the same ID/key -- never a duplicate
+        // prepare.
+        if (status === 404 || status === 410 || status === 400 || status === 422) {
+          restoreDoneRef.current = true;
+          clearBulkOpRef(jobId, threadId);
+          setState('idle');
+        } else {
+          setError(
+            'Could not confirm the saved operation (network/server error). ' +
+            'The reference is kept -- reload or reconcile to try again.'
+          );
+          setState('idle');
+        }
       }
     })();
+    return cleanup;
   }, []);
 
   const setParam = (k, v) => setParams((p) => ({ ...p, [k]: v }));
@@ -210,6 +272,7 @@ export default function BulkEditCard({
   };
 
   const prepare = async () => {
+    const gen = aliveGenRef.current;
     const tok = captureLifetime();
     preparedTokRef.current = tok;
     setState('preparing');
@@ -236,7 +299,7 @@ export default function BulkEditCard({
         intent,
         idempotencyKey: keyRef.current,
       });
-      if (!aliveRef.current || !lifetimeAlive(tok)) return;
+      if (!genAlive(gen) || !lifetimeAlive(tok)) return;
       setOperation(op);
       writeBulkOpRef(jobId, threadId, {
         operation_id: op.operation_id,
@@ -244,7 +307,7 @@ export default function BulkEditCard({
       });
       setState('proposal');
     } catch (e) {
-      if (!aliveRef.current) return;
+      if (!genAlive(gen)) return;
       if (!lifetimeAlive(tok)) return; // stale view via proposalLive
       setError(e?.message || 'Prepare failed.');
       setState('idle');
@@ -252,6 +315,7 @@ export default function BulkEditCard({
   };
 
   const apply = async () => {
+    const gen = aliveGenRef.current;
     if (!operation) return;
     // The proposal belongs to the generation captured at prepare start.
     // A handler captured from an older render (stale lifetime, job
@@ -268,12 +332,12 @@ export default function BulkEditCard({
       setInterrupted(false);
       try {
         const op = await api.bulkApply(jobId, operation.operation_id, keyRef.current);
-        if (!aliveRef.current || !lifetimeAlive(tok)) return;
+        if (!genAlive(gen) || !lifetimeAlive(tok)) return;
         setOperation(op);
         setState('results');
         await reconcileController(op, tok, controller);
       } catch (e) {
-        if (!aliveRef.current) return;
+        if (!genAlive(gen)) return;
         // Lifetime ended mid-apply: leave the open state; proposalLive
         // renders the stale view. (There is no literal 'stale' state -- it
         // matches no render branch by design.)
@@ -302,6 +366,7 @@ export default function BulkEditCard({
   };
 
   const reconcile = async () => {
+    const gen = aliveGenRef.current;
     if (!operation) return;
     const tok = captureLifetime();
     const ctl = controller;
@@ -309,19 +374,20 @@ export default function BulkEditCard({
     setError(null);
     try {
       const op = await api.bulkStatus(jobId, operation.operation_id);
-      if (!aliveRef.current || !ledgerAlive() || !lifetimeAlive(tok)) return;
+      if (!genAlive(gen) || !ledgerAlive() || !lifetimeAlive(tok)) return;
       setOperation(op);
       setInterrupted(false);
       setState('results');
       await reconcileController(op, tok, ctl);
     } catch (e) {
-      if (aliveRef.current) setError(`Reconcile failed: ${e?.message || 'unknown error'}`);
+      if (genAlive(gen)) setError(`Reconcile failed: ${e?.message || 'unknown error'}`);
     } finally {
-      if (aliveRef.current) setBusy(false);
+      if (genAlive(gen)) setBusy(false);
     }
   };
 
   const retry = async () => {
+    const gen = aliveGenRef.current;
     if (!operation || !ledgerAlive()) return;
     const tok = captureLifetime();
     const ctl = controller;
@@ -329,19 +395,20 @@ export default function BulkEditCard({
     setError(null);
     try {
       const op = await api.bulkRetry(jobId, operation.operation_id, keyRef.current);
-      if (!aliveRef.current || !ledgerAlive() || !lifetimeAlive(tok)) return;
+      if (!genAlive(gen) || !ledgerAlive() || !lifetimeAlive(tok)) return;
       setOperation(op);
       setInterrupted(false);
       setState('results');
       await reconcileController(op, tok, ctl);
     } catch (e) {
-      if (aliveRef.current) setError(`Retry failed: ${e?.message || 'unknown error'}`);
+      if (genAlive(gen)) setError(`Retry failed: ${e?.message || 'unknown error'}`);
     } finally {
-      if (aliveRef.current) setBusy(false);
+      if (genAlive(gen)) setBusy(false);
     }
   };
 
   const undo = async () => {
+    const gen = aliveGenRef.current;
     if (!operation || !ledgerAlive()) return;
     const tok = captureLifetime();
     const ctl = controller;
@@ -349,14 +416,14 @@ export default function BulkEditCard({
     setError(null);
     try {
       const op = await api.bulkUndo(jobId, operation.operation_id, keyRef.current);
-      if (!aliveRef.current || !ledgerAlive() || !lifetimeAlive(tok)) return;
+      if (!genAlive(gen) || !ledgerAlive() || !lifetimeAlive(tok)) return;
       setOperation(op);
       setState('results');
       await reconcileController(op, tok, ctl);
     } catch (e) {
-      if (aliveRef.current) setError(`Undo failed: ${e?.message || 'unknown error'}`);
+      if (genAlive(gen)) setError(`Undo failed: ${e?.message || 'unknown error'}`);
     } finally {
-      if (aliveRef.current) setBusy(false);
+      if (genAlive(gen)) setBusy(false);
     }
   };
 
