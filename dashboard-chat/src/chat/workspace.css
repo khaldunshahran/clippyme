@@ -1,39 +1,61 @@
-/* Task 17 — single-clip chat editing workspace layout.
+/* UI-01 — editor-first responsive selected-clip workspace.
  *
- * Desktop: the main area is a flex row — the chat column (thread +
- * selection bar + composer) beside a ~560px workspace panel holding the
- * editor. Below 900px a Chat/Editor toggle (rendered only on narrow
+ * With a clip selected (.has-selection on the row) the workspace panel is
+ * the primary flexible surface and the chat column becomes a bounded,
+ * collapsible secondary rail. Without a selection the chat takes the full
+ * width. Below 900px a Chat/Editor toggle (rendered only on narrow
  * screens) switches which column is visible; both stay mounted so the
- * toggle never loses composer or selection state.
+ * toggle never loses composer, selection or controller state.
+ *
+ * The workspace panel is a clay editing surface (editor theme tokens);
+ * the chat column keeps the dark conversation theme. One clean theme
+ * boundary instead of mixed surfaces.
  */
 
 .nc-workspace-row {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: row;
 }
 
 .nc-chat-col {
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
 
+/* Selected clip: chat becomes a bounded secondary rail. */
+.nc-workspace-row.has-selection .nc-chat-col {
+  flex: 0 0 380px;
+  border-right: 1px solid var(--nc-border);
+}
+
+/* Focusing the editor: the chat rail hides (desktop only — below 900px
+ * the Chat/Editor toggle governs visibility). */
+@media (min-width: 901px) {
+  .nc-workspace-row.chat-collapsed .nc-chat-col {
+    display: none;
+  }
+}
+
 .nc-workspace-panel {
-  width: 560px;
-  flex-shrink: 0;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  border-left: 1px solid var(--nc-border);
-  background: var(--nc-bg);
+  background: var(--bg, #dcd7cd);
   overflow: hidden;
+  /* Container for width-aware editor internals (grid collapse). */
+  container-type: inline-size;
+  container-name: nugget-workspace;
 }
 
-/* Selected-clip identity beside the composer. */
+/* Selected-clip identity beside the composer (chat side). */
 .nc-selection-bar {
   display: flex;
   align-items: center;
@@ -50,7 +72,6 @@
   height: 7px;
   border-radius: 50%;
   background: var(--nc-accent);
-  box-shadow: 0 0 8px var(--nc-accent);
   flex-shrink: 0;
 }
 
@@ -119,9 +140,9 @@
   .nc-mobile-toggle {
     display: flex;
   }
-  .nc-workspace-panel {
-    width: 100%;
-    border-left: none;
+  .nc-workspace-row.has-selection .nc-chat-col {
+    flex: 1 1 auto;
+    border-right: none;
   }
   .nc-workspace-row[data-mview='chat'] .nc-workspace-panel {
     display: none;
@@ -129,4 +150,207 @@
   .nc-workspace-row[data-mview='editor'] .nc-chat-col {
     display: none;
   }
+}
+
+/* ------------------------------------------------------------------
+ * Workspace internals (EditorView): transcript rail + editor.
+ * ------------------------------------------------------------------ */
+
+.nc-ws {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg, #dcd7cd);
+  color: var(--ink, #332e26);
+}
+
+.nc-ws-body {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  position: relative;
+}
+
+/* Transcript: collapsible tool rail, clay-themed to match the editor. */
+.nc-ws-transcript {
+  width: 300px;
+  flex-shrink: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--line-1, rgba(140, 130, 110, 0.25));
+  background: var(--surface, #eae5db);
+  overflow: hidden;
+}
+
+.nc-ws-transcript-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 4px;
+  flex-shrink: 0;
+}
+
+.nc-ws-transcript-title {
+  font-family: var(--font-display, 'Fredoka', sans-serif);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink, #332e26);
+  flex: 1;
+  min-width: 0;
+}
+
+/* Clay theme overrides for the transcript (dark defaults live in
+ * editor-timeline/transcript.css). Scoped — never leaks globally. */
+.nc-ws-transcript .tp {
+  background: var(--surface, #eae5db);
+  color: var(--ink, #332e26);
+}
+.nc-ws-transcript .tp-title { color: var(--ink-dim, #736b5b); }
+.nc-ws-transcript .tp-count { color: var(--ink-faint, #a39b8b); }
+.nc-ws-transcript .tp-w:hover { background: rgba(51, 46, 38, 0.07); }
+.nc-ws-transcript .tp-w.sel { background: rgba(187, 90, 60, 0.28); }
+.nc-ws-transcript .tp-w.active { background: var(--rust, #bb5a3c); color: #fff; }
+.nc-ws-transcript .tp-wedit {
+  color: var(--ink, #332e26);
+  background: var(--surface-deep, #cfc9bc);
+  border-color: var(--rust, #bb5a3c);
+}
+.nc-ws-transcript .tp-empty { color: var(--ink-faint, #a39b8b); }
+.nc-ws-transcript .tp-menu {
+  background: var(--surface, #eae5db);
+  border-color: var(--line-2, rgba(140, 130, 110, 0.4));
+  box-shadow: var(--clay-raised-md, 0 4px 18px rgba(0, 0, 0, 0.08));
+}
+.nc-ws-transcript .tp-menu-item { color: var(--ink, #332e26); }
+.nc-ws-transcript .tp-menu-item:hover:not(:disabled) { background: rgba(51, 46, 38, 0.06); }
+.nc-ws-transcript .tp-menu-item.danger { color: var(--rust-deep, #9b4126); }
+.nc-ws-transcript .tp-menu-hint { color: var(--ink-faint, #a39b8b); }
+.nc-ws-transcript .tp-video-wrap { border-color: var(--line-2, rgba(140, 130, 110, 0.4)); }
+/* The transcript's small video is a seek aid, not the main preview. */
+.nc-ws-transcript .tp-video-wrap::after {
+  content: 'Seek aid';
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 99px;
+  padding: 3px 8px;
+  pointer-events: none;
+}
+
+.nc-ws-editor {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Narrow workspace: transcript stacks above the editor. */
+@media (max-width: 900px) {
+  .nc-ws-body {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .nc-ws-transcript {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--line-1, rgba(140, 130, 110, 0.25));
+    max-height: 46vh;
+    flex-shrink: 0;
+  }
+  .nc-ws-editor {
+    overflow: visible;
+    flex: 1 1 auto;
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Nested clip editor: responsive grid + preview labels.
+ * The grid collapses to one column when the workspace panel is narrow
+ * (container query) or the viewport is small (standalone fallback).
+ * ------------------------------------------------------------------ */
+
+.nc-ce-grid {
+  display: grid;
+  gap: 24px;
+  align-items: start;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@container nugget-workspace (min-width: 720px) {
+  .nc-ce-grid {
+    grid-template-columns: minmax(0, 1.12fr) minmax(300px, 0.88fr);
+  }
+}
+
+@media (min-width: 1100px) {
+  .nc-ce-grid {
+    grid-template-columns: minmax(0, 1.12fr) minmax(330px, 0.88fr);
+  }
+}
+
+/* Tighter container padding inside the workspace panel. */
+.nc-ws-editor .container {
+  padding: 20px 20px 64px;
+}
+
+.nc-ce-preview-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 560px;
+  margin: 0 auto 8px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim, #736b5b);
+}
+
+.nc-ce-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  border-radius: 99px;
+  padding: 3px 10px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.nc-ce-badge-draft {
+  color: var(--gold-deep, #a57b33);
+  background: var(--warning-bg, rgba(201, 154, 68, 0.16));
+  border-color: rgba(201, 154, 68, 0.45);
+}
+
+.nc-ce-badge-render {
+  color: var(--sage-deep, #566349);
+  background: var(--success-bg, rgba(110, 127, 92, 0.16));
+  border-color: rgba(110, 127, 92, 0.45);
+}
+
+.nc-ce-badge-pending {
+  color: var(--ink-dim, #736b5b);
+  background: rgba(51, 46, 38, 0.06);
+  border-color: var(--line-2, rgba(140, 130, 110, 0.4));
+}
+
+/* Single workspace header extras live on clay buttons; keep them quiet. */
+.nc-ws-header-extra {
+  display: contents;
 }

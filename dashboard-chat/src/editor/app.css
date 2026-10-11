@@ -3190,3 +3190,42 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
   padding-top: 6px;
 }
 
+
+/* UI-01: responsive workspace header — the single clip header stacks
+   cleanly on narrow screens instead of squeezing the title to "F.." or
+   clipping action buttons. Desktop keeps the horizontal wrap layout. */
+.nc-ce-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 0;
+  flex-wrap: wrap;
+}
+.nc-ce-title-wrap {
+  min-width: 0;
+  flex: 1;
+}
+.nc-ce-title {
+  margin: 0;
+  font-size: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 640px) {
+  .nc-ce-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 12px 0;
+  }
+  .nc-ce-title-wrap {
+    flex: none;
+    width: 100%;
+  }
+  .nc-ce-title {
+    white-space: normal;
+    overflow: visible;
+    font-size: 18px;
+  }
+}

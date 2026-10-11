@@ -37,7 +37,8 @@ function DeployBadge() {
   );
 }
 
-function AppShell() {
+// Named export for UI-01 mounted host tests (default export unchanged).
+export function AppShell() {
   const chat = useChat();
   const {
     threads, active, activeId,
@@ -76,6 +77,9 @@ function AppShell() {
   // Narrow-screen (<900px) Chat/Editor toggle. Both columns stay mounted —
   // the toggle only flips CSS visibility, so composer/selection state is kept.
   const [mobileView, setMobileView] = useState('chat'); // 'chat' | 'editor'
+  // UI-01: desktop chat rail collapse — focus the editor. Below 900px the
+  // Chat/Editor toggle governs visibility instead (see workspace.css).
+  const [chatCollapsed, setChatCollapsed] = useState(false);
   const composerRef = useRef(null);
 
   // Task 17 — one shared project authority for the selected clip. The
@@ -191,6 +195,14 @@ function AppShell() {
     setTimeout(() => composerRef.current?.focus(), 0);
   }, [clearSelection]);
 
+  // UI-01: the workspace's contextual "Ask Nugget to edit" action. Main
+  // chat is the primary AI entry point — this only focuses the existing
+  // composer (no second provider invocation, no proposal bypass).
+  const handleAskNugget = useCallback(() => {
+    setMobileView('chat');
+    setTimeout(() => composerRef.current?.focus(), 0);
+  }, []);
+
   return (
     <div style={{ display: 'flex', height: '100%', background: 'var(--nc-bg)', color: 'var(--nc-text)', overflow: 'hidden' }}>
       <Sidebar
@@ -249,7 +261,10 @@ function AppShell() {
           </div>
         )}
 
-        <div className="nc-workspace-row" data-mview={mobileView}>
+        <div
+          className={`nc-workspace-row${selectedClip && selClip ? ' has-selection' : ''}${chatCollapsed ? ' chat-collapsed' : ''}`}
+          data-mview={mobileView}
+        >
           {/* chat column */}
           <section className="nc-chat-col" aria-label="Chat">
             {showWelcome ? (
@@ -309,6 +324,9 @@ function AppShell() {
                 clipIndex={selectedClip.clipIndex}
                 clip={selClip}
                 onBack={clearSelection}
+                onAskNugget={handleAskNugget}
+                chatCollapsed={chatCollapsed}
+                onToggleChat={() => setChatCollapsed((v) => !v)}
               />
             </aside>
           )}

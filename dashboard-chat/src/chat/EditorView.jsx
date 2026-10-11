@@ -1,8 +1,8 @@
-import { useEffect, useMemo } from 'react';
-import { ArrowLeft } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 import '../editor/tokens.css';
 import '../editor/app.css';
 import { ClipEditorView } from '../editor/clipEditor.jsx';
+import { Btn } from '../editor/primitives.jsx';
 import CopilotPanel from './CopilotPanel.jsx';
 import TranscriptPanel from '../editor-timeline/TranscriptPanel.jsx';
 import { useWorkspaceController } from './useWorkspaceController.js';
@@ -11,9 +11,17 @@ import { clipVideoSrc } from '../api/realApi.js';
 /**
  * Deep editor, slice 1: transcript-first editing.
  *
- * Left column: TranscriptPanel (word-level transcript, click-to-seek,
- * inline word edit, split & trim, remove caption & video). Main area: the
- * nested clip editor.
+ * UI-01: the workspace is editor-first. The transcript is a collapsible
+ * tool rail (not a fixed 300px column); the nested clip editor owns the
+ * single workspace header (clip identity, acknowledged version,
+ * pending/saved state, export action). The old EditorView header (Back +
+ * "Editing — title" + version) was redundant with it and is removed.
+ *
+ * In hosted mode (controller prop provided by the app) the floating AI
+ * copilot is replaced by a contextual "Ask Nugget to edit" action that
+ * focuses the main chat composer — main chat is the primary AI entry
+ * point. Standalone/back-compat mounts (no controller prop) keep the
+ * floating copilot.
  *
  * Task 16: ONE authoritative project controller per clip owns the project,
  * its acknowledged version, and the single serialized edit queue
@@ -23,7 +31,7 @@ import { clipVideoSrc } from '../api/realApi.js';
  * nested ClipEditorView runs in controlled mode and never keeps its own
  * copy.
  *
- * Task 17: the editor renders INLINE in the workspace side panel (no more
+ * Task 17: the editor renders INLINE in the workspace panel (no more
  * fixed full-screen overlay) and receives the shared project authority as
  * props {controller, snap, resetKey, toast} from the host's
  * useWorkspaceController — the SAME controller main-chat proposals,
@@ -40,6 +48,11 @@ export default function EditorView({
   snap: snapProp = null,
   resetKey: resetKeyProp = 0,
   toast: toastProp = null,
+  // UI-01 hosted integration. onAskNugget focuses the main chat composer;
+  // chatCollapsed/onToggleChat hide the chat rail to focus the editor.
+  onAskNugget = null,
+  chatCollapsed = false,
+  onToggleChat = null,
 }) {
   const internal = useWorkspaceController({ jobId, clipIndex, disabled: !!controllerProp });
   const controller = controllerProp || internal.controller;
@@ -47,13 +60,17 @@ export default function EditorView({
   const resetKey = controllerProp ? resetKeyProp : internal.resetKey;
   const toast = controllerProp ? toastProp : internal.toast;
 
+  // UI-01: transcript is a collapsible rail. Open by default on wide
+  // screens; the header toggle (and keyboard) controls it everywhere.
+  const [transcriptOpen, setTranscriptOpen] = useState(
+    () => (typeof window === 'undefined' ? true : window.innerWidth >= 1200)
+  );
+
   // Global undo/redo with the inline-editor guard (condition 6):
   // never fire when focus is inside an input/textarea/select/contenteditable.
   useEffect(() => {
     if (!controller) return undefined;
     const onKey = (e) => {
-      const mod = e.ctrlKey || e.metaKey;
-      if (!mod || e.key.toLowerCase() !== 'z') return;
       const t = e.target;
       if (
         t &&
@@ -64,6 +81,8 @@ export default function EditorView({
       ) {
         return;
       }
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod || e.key.toLowerCase() !== 'z') return;
       e.preventDefault();
       if (e.shiftKey) {
         controller.redo().catch(() => {});
@@ -74,6 +93,10 @@ export default function EditorView({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [controller]);
+
+  // Hosted = the app provided the shared project authority. Standalone =
+  // back-compat mode (own controller, floating copilot kept).
+  const hosted = !!controllerProp;
 
   const project = snap?.project ?? null;
   const loadError = snap?.loadError || '';
@@ -88,51 +111,75 @@ export default function EditorView({
 
   if (!controller) return null;
 
+  // Workspace header extras: transcript rail toggle, contextual AI entry
+  // (hosted only — focuses the main chat composer), chat rail toggle.
+  const headerExtra = (
+    <>
+      <Btn
+        variant="ghost"
+        size="sm"
+        icon="captions"
+        onClick={() => setTranscriptOpen((v) => !v)}
+        aria-pressed={transcriptOpen}
+        aria-controls="nc-transcript-panel"
+        title={transcriptOpen ? 'Hide the transcript rail' : 'Show the transcript rail'}
+      >
+        Transcript
+      </Btn>
+      {hosted && onAskNugget && (
+        <Btn
+          variant="ghost"
+          size="sm"
+          icon="sparkles"
+          onClick={onAskNugget}
+          title="Focus the chat composer to ask Nugget for an edit"
+          aria-label="Ask Nugget to edit — focuses the chat composer"
+        >
+          Ask Nugget to edit
+        </Btn>
+      )}
+      {onToggleChat && (
+        <Btn
+          variant="ghost"
+          size="sm"
+          onClick={onToggleChat}
+          aria-pressed={chatCollapsed}
+          title={chatCollapsed ? 'Show the chat column' : 'Hide the chat column to focus the editor'}
+        >
+          {chatCollapsed ? 'Show chat' : 'Hide chat'}
+        </Btn>
+      )}
+    </>
+  );
+
   return (
-    <div
-      className="nc-anim-fade-in"
-      style={{
-        flex: 1, minHeight: 0, background: 'var(--nc-bg)',
-        display: 'flex', flexDirection: 'column',
-      }}
-    >
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px',
-        borderBottom: '1px solid var(--nc-border)', background: 'var(--nc-bg-soft)',
-        flexShrink: 0,
-      }}>
-        <button className="nc-icon-btn" onClick={onBack} aria-label="Back to chat">
-          <ArrowLeft size={17} />
-        </button>
-        <div style={{ fontSize: 14, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          Editing — {clip?.title || `Clip ${clipIndex + 1}`}
-        </div>
-        <div style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--nc-text-faint)' }}>
-          {project ? `v${project.version}` : ''}
-        </div>
-      </div>
+    <div className="nc-anim-fade-in nc-ws">
+      <div className="nc-ws-body">
+        {/* Transcript tool rail: collapsible; the transcript seek path
+            (click-to-seek, word edit, split & trim) is unchanged. */}
+        {transcriptOpen && (
+          <div className="nc-ws-transcript" id="nc-transcript-panel">
+            {loadError ? (
+              <div style={{ padding: 16, fontSize: 13, color: 'var(--rust-deep, #9b4126)' }}>
+                {loadError}
+              </div>
+            ) : (
+              <TranscriptPanel
+                key={resetKey}
+                project={project}
+                videoSrc={videoSrc}
+                applyEdit={controller.applyEdit}
+                pushToast={internal.pushToast}
+                disabled={!project}
+              />
+            )}
+          </div>
+        )}
 
-      <div style={{ flex: 1, minHeight: 0, display: 'flex', position: 'relative' }}>
-        {/* Slice-1 transcript column */}
-        <div style={{ width: 300, flexShrink: 0, borderRight: '1px solid var(--nc-border)', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-          {loadError ? (
-            <div style={{ padding: 16, fontSize: 13, color: 'var(--nc-red)' }}>
-              {loadError}
-            </div>
-          ) : (
-            <TranscriptPanel
-              key={resetKey}
-              project={project}
-              videoSrc={videoSrc}
-              applyEdit={controller.applyEdit}
-              pushToast={internal.pushToast}
-              disabled={!project}
-            />
-          )}
-        </div>
-
-        {/* Nested deep editor: controlled by the project controller above. */}
-        <div className="nc-editor-scope" style={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'auto' }}>
+        {/* Nested deep editor: controlled by the project controller above.
+            Its header is the single workspace header (identity, version,
+            pending/saved state, export). */}
+        <div className="nc-editor-scope nc-ws-editor">
           <ClipEditorView
             jobId={jobId}
             clipIndex={clipIndex}
@@ -140,16 +187,19 @@ export default function EditorView({
             onBack={onBack}
             pushToast={internal.pushToast}
             controller={controller}
+            headerExtra={headerExtra}
           />
-          {/* Condition 4: copilot edits route through the same queue.
-              Keyed by clip identity + session: a clip switch or session
-              reset remounts the panel, dropping any stale AI result. */}
-          <CopilotPanel
-            key={`${jobId}:${clipIndex}:${resetKey}`}
-            jobId={jobId}
-            clipIndex={clipIndex}
-            applyEdit={controller.applyEdit}
-          />
+          {/* Standalone/back-compat only: the floating copilot is kept.
+              Hosted mode uses "Ask Nugget to edit" (main chat composer)
+              instead — main chat is the primary AI entry point. */}
+          {!hosted && (
+            <CopilotPanel
+              key={`${jobId}:${clipIndex}:${resetKey}`}
+              jobId={jobId}
+              clipIndex={clipIndex}
+              applyEdit={controller.applyEdit}
+            />
+          )}
         </div>
       </div>
 

@@ -681,7 +681,7 @@ function VersionsPanel({ versions, currentVersion, onLoad, onPreviewVersion, loa
 
 // ---------------------------------------------------------- main editor view
 
-export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, controller = null, standalone = false }) {
+export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, controller = null, standalone = false, headerExtra = null }) {
   const [statusLocal, setStatusLocal] = useState('loading'); // loading | ready | error
   const [loadErrorLocal, setLoadErrorLocal] = useState('');
   const [projectLocal, setProjectLocal] = useState(null);
@@ -700,6 +700,12 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   const [aiText, setAiText] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
   const [aiMsg, setAiMsg] = useState('');
+  // UI-01: what the preview player is showing. 'draft' = source footage +
+  // DOM overlays from the current draft project (approximate preview);
+  // 'render' = the exact exported file for that version. Any project edit
+  // returns it to 'draft' — the preview is only the exact render until the
+  // next change.
+  const [previewKind, setPreviewKind] = useState({ kind: 'draft', version: null });
   const videoRef = useRef(null);
 
   // Task 16 authority mode: controlled (via the project controller) or
@@ -717,6 +723,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
                 const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
                 setVideoSrc(safeResolveUrl(res.composed_url) + bust);
                 setPlayhead(0);
+                // The player now shows the exact exported file.
+                setPreviewKind({ kind: 'render', version: res.version ?? null });
               }
               pushToast?.(
                 res && res.deduped
@@ -805,6 +813,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
   // NEW render, never a dedup hit). Controlled: forward to the project
   // controller's queue (which stamps origin/idempotency itself).
   const mutate = useCallback((fn, label = 'edit') => {
+    // Any project edit invalidates the "exact render" preview state.
+    setPreviewKind({ kind: 'draft', version: null });
     if (ctl) return ctl.mutate(label, fn);
     setProjectLocal((prev) => {
       if (!prev) return prev;
@@ -1050,6 +1060,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
       const bust = `${res.composed_url.includes('?') ? '&' : '?'}v=${Date.now()}`;
       setVideoSrc(safeResolveUrl(res.composed_url) + bust);
       setPlayhead(0);
+      // The player now shows the exact exported file.
+      setPreviewKind({ kind: 'render', version: res.version ?? null });
       await refreshVersions();
       pushToast?.('success', res.deduped
         ? `v${res.version} unchanged — reused the existing render`
@@ -1091,6 +1103,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     if (!v.output_url) return;
     setVideoSrc(safeResolveUrl(v.output_url) + `?v=${Date.now()}`);
     setPlayhead(0);
+    // Previewing that version's exact exported file.
+    setPreviewKind({ kind: 'render', version: v.version ?? null });
   };
 
   const onResetAi = async () => {
@@ -1162,23 +1176,42 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
     { id: 'ai', label: 'AI cut', icon: 'wand-sparkles' },
   ];
 
+  // UI-01 workspace header status: the actual pending/saved state plus
+  // what the preview player is showing (draft vs exact exported render).
+  const saveState = exporting
+    ? { label: 'Exporting…', cls: 'nc-ce-badge-pending' }
+    : saving
+      ? { label: 'Saving…', cls: 'nc-ce-badge-pending' }
+      : dirty
+        ? { label: 'Unsaved changes', cls: 'nc-ce-badge-draft' }
+        : { label: 'Saved', cls: 'nc-ce-badge-render' };
+  const previewBadge = previewKind.kind === 'render'
+    ? { label: `Exact v${previewKind.version ?? savedVersion ?? project.version} render`, cls: 'nc-ce-badge-render' }
+    : { label: 'Draft preview', cls: 'nc-ce-badge-draft' };
+
   return (
     <main className="container fade-in" style={{ maxWidth: 1400, paddingBottom: 48 }}>
-      {/* header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '18px 0', flexWrap: 'wrap' }}>
+      {/* Single workspace header: clip identity, acknowledged version,
+          actual pending/saved state, draft-vs-exact preview distinction,
+          and the existing export action. */}
+      <div className="nc-ce-head">
         <Btn variant="ghost" size="sm" icon="arrow-left" onClick={onBackClick}>Back</Btn>
-        <div style={{ minWidth: 0, flex: 1 }}>
+        <div className="nc-ce-title-wrap">
           <div className="eyebrow">Clip editor</div>
-          <h2 style={{ margin: 0, fontSize: 20, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={title}>
+          <h2 className="nc-ce-title" title={title}>
             {title}
           </h2>
         </div>
-        {dirty && (
-          <span style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--gold, #c90)' }}>● unsaved changes</span>
-        )}
-        <span style={{ fontSize: 12, color: 'var(--ink-dim, #666)', fontFamily: 'var(--font-mono, monospace)' }}>
+        <span className="nc-ce-badge nc-ce-badge-pending" title="Acknowledged project version">
           v{savedVersion ?? project.version}
         </span>
+        <span className={`nc-ce-badge ${saveState.cls}`} title="Project save state">
+          {saveState.label}
+        </span>
+        <span className={`nc-ce-badge ${previewBadge.cls}`} title="What the preview player is showing">
+          {previewBadge.label}
+        </span>
+        {headerExtra}
         <Btn variant="ghost" size="sm" icon="refresh-cw" onClick={onResetAi} title="Reload the AI-generated cut">
           Reset to AI cut
         </Btn>
@@ -1190,9 +1223,15 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
         </Btn>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.12fr) minmax(330px, 0.88fr)', gap: 24, alignItems: 'start' }}>
+      {/* UI-01: responsive grid (collapses to one column in a narrow
+          workspace panel); the player is labeled as the primary preview —
+          the transcript's small video is a seek aid, not a second preview. */}
+      <div className="nc-ce-grid">
         {/* left: preview + timeline */}
         <div>
+          <div className="nc-ce-preview-label">
+            <span>Primary preview</span>
+          </div>
           <div style={{ position: 'relative', width: 'min(100%, 360px)', margin: '0 auto',
             aspectRatio: '9/16', background: '#000', borderRadius: 14, overflow: 'hidden',
             boxShadow: 'var(--clay-raised-md, 0 8px 30px rgba(0,0,0,.18))' }}>
