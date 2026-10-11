@@ -133,6 +133,34 @@ export function runVerify(variant) {
     check('tabs: no tab clipped horizontally', tabsOk,
       tabs.map((t) => { const r = t.getBoundingClientRect(); return `${t.textContent.trim()}@${Math.round(r.right)}`; }).join(' '));
 
+    // Edge containment (regression): every required header control must
+    // sit fully inside the workspace panel — nothing clipped on either
+    // edge. The old scrollable action strip could be scrolled so the
+    // first buttons sat LEFT of the panel edge ("gget to edit") while
+    // the reachability checks above still passed, because they only
+    // measured the right edge / scrollability, never the left edge.
+    const panel = $('.nc-workspace-panel');
+    if (panel && strip && visible(strip)) {
+      const pr = panel.getBoundingClientRect();
+      const required = [
+        buttonByText('Back'),
+        title,
+        ...badges,
+        ...$$('button', strip),
+        ...tabs,
+      ].filter((el) => el && visible(el));
+      const minLeft = Math.min(...required.map((el) => el.getBoundingClientRect().left));
+      const maxRight = Math.max(...required.map((el) => el.getBoundingClientRect().right));
+      check('header: no required control clipped at the panel left edge',
+        minLeft >= pr.left - 1,
+        `minLeft=${Math.round(minLeft)} panelLeft=${Math.round(pr.left)}`);
+      check('header: no required control clipped at the panel right edge',
+        maxRight <= pr.right + 1,
+        `maxRight=${Math.round(maxRight)} panelRight=${Math.round(pr.right)}`);
+      check('header: action strip rests unscrolled (scrollLeft stays 0)',
+        strip.scrollLeft === 0, `scrollLeft=${strip.scrollLeft}`);
+    }
+
     // Timeline + preview.
     check('timeline scrubber reachable', reachable($('.nc-ce-grid [role="slider"]')));
     const video = $('.nc-ce-grid video');

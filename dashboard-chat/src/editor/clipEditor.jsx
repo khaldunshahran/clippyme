@@ -1284,8 +1284,8 @@ export function ClipEditorView({ jobId, clipIndex, clip, onBack, pushToast, cont
           actual pending/saved state, draft-vs-exact preview distinction,
           and the existing export action. Identity and actions are separate
           groups so narrow workspace panels can keep the identity row and
-          move the actions into a scrollable labeled tool strip (see
-          workspace.css) instead of clipping them. */}
+          wrap the actions onto their own rows (see app.css) instead
+          of clipping or scrolling them off the panel edge. */}
       <div className="nc-ce-head">
         <div className="nc-ce-identity">
           <Btn variant="ghost" size="sm" icon="arrow-left" onClick={onBackClick}>Back</Btn>

@@ -3201,9 +3201,9 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
  * "F.." and clipped the AI-cut tab). Standalone mounts (no workspace
  * container) fall back to viewport queries explicitly.
  *
- * Narrow panels keep the identity row and move the actions into a
- * horizontally scrollable labeled tool strip — compact, keyboard
- * reachable, and never a very tall one-control-per-row stack. */
+ * Narrow panels keep the identity row and wrap the actions onto
+ * their own rows inside the panel, so every control stays fully
+ * visible; a scrollable strip could hide the first controls. */
 .nc-ce-head {
   display: flex;
   align-items: center;
@@ -3262,10 +3262,7 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
     min-width: 0;
     max-width: 100%;
     box-sizing: border-box;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    padding-bottom: 4px;
-    scrollbar-width: thin;
+    flex-wrap: wrap;
   }
   .nc-ce-actions > * {
     flex-shrink: 0;
@@ -3296,10 +3293,7 @@ button.mini:focus-visible, .mini:focus-visible, .icon-btn:focus-visible {
     min-width: 0;
     max-width: 100%;
     box-sizing: border-box;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    padding-bottom: 4px;
-    scrollbar-width: thin;
+    flex-wrap: wrap;
   }
   .nc-ce-standalone .nc-ce-actions > * {
     flex-shrink: 0;
