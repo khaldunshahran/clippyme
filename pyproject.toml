@@ -35,6 +35,9 @@ host-tests = [
     "json-repair>=0.30",
     "psutil==7.0.0",
     "tqdm==4.67.3",
+    "PyJWT[crypto]==2.15.1",  # Real ES256/JWKS auth tests, including EC backend.
+    "opencv-python-headless==4.13.0.92",  # CPU decode for injected-provider route tests.
+    "scenedetect==0.6.7.1",  # main.py collection; no torch/ML wheels required.
 ]
 
 [tool.pytest.ini_options]

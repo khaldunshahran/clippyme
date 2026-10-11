@@ -232,6 +232,8 @@ pydantic-core==2.46.4
     # via pydantic
 pygments==2.20.0
     # via rich
+pyjwt==2.15.1
+    # via -r requirements.txt
 pyparsing==3.3.2
     # via matplotlib
 python-dateutil==2.9.0.post0
