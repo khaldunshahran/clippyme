@@ -124,3 +124,43 @@ export const BULK_OUTCOME_LABELS = {
 export function bulkOutcomeLabel(outcome) {
   return BULK_OUTCOME_LABELS[outcome] || outcome || '?';
 }
+
+/**
+ * Minimal prepared-operation reference, persisted per originating
+ * job+thread so a page refresh can reconnect the card to its existing
+ * ledger instead of minting a new idempotency key / operation.
+ *
+ * Only {operation_id, idempotency_key} are stored -- never project
+ * snapshots, patches or grants. localStorage access is guarded so the
+ * helpers are safe in non-browser environments (tests).
+ */
+export function bulkOpRefKey(jobId, threadId) {
+  return `nugget-bulk-op:${jobId}:${threadId}`;
+}
+export function readBulkOpRef(jobId, threadId) {
+  try {
+    if (typeof localStorage === 'undefined' || !jobId || !threadId) return null;
+    const raw = localStorage.getItem(bulkOpRefKey(jobId, threadId));
+    if (!raw) return null;
+    const ref = JSON.parse(raw);
+    if (ref && typeof ref.operation_id === 'string' && typeof ref.idempotency_key === 'string') {
+      return { operation_id: ref.operation_id, idempotency_key: ref.idempotency_key };
+    }
+  } catch { /* storage unavailable or corrupt: treat as no reference */ }
+  return null;
+}
+export function writeBulkOpRef(jobId, threadId, ref) {
+  try {
+    if (typeof localStorage === 'undefined' || !jobId || !threadId) return;
+    localStorage.setItem(
+      bulkOpRefKey(jobId, threadId),
+      JSON.stringify({ operation_id: ref.operation_id, idempotency_key: ref.idempotency_key }),
+    );
+  } catch { /* best-effort persistence only */ }
+}
+export function clearBulkOpRef(jobId, threadId) {
+  try {
+    if (typeof localStorage === 'undefined' || !jobId || !threadId) return;
+    localStorage.removeItem(bulkOpRefKey(jobId, threadId));
+  } catch { /* best-effort persistence only */ }
+}

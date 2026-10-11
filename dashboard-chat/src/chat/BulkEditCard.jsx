@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   bulkPrepare as apiBulkPrepare,
   bulkApply as apiBulkApply,
@@ -18,6 +18,9 @@ import {
   appliedItems,
   isBulkOpenState,
   bulkOutcomeLabel,
+  readBulkOpRef,
+  writeBulkOpRef,
+  clearBulkOpRef,
 } from './bulkEdit.js';
 
 // Task 19 — the bulk editing card.
@@ -144,9 +147,37 @@ export default function BulkEditCard({
     || lifetimeAlive(preparedTokRef.current);
 
   const aliveRef = useRef(true);
-  // NOTE: no useEffect here -- the test harness runs effects immediately and
-  // the component must stay usable under it; unmount safety is handled by
-  // the lifetime checks.
+  const inflightRef = useRef(false);
+  // Real lifecycle cleanup: a delayed response after unmount must not
+  // touch state. (The test harness runs effects immediately and ignores
+  // the returned cleanup, so the component stays usable under it.)
+  useEffect(() => () => { aliveRef.current = false; }, []);
+
+  // Reload: a prepared-operation reference persisted for this job+thread
+  // reconnects the card to its existing ledger instead of minting a new
+  // idempotency key and a duplicate operation. Only the operation/key
+  // reference is restored -- never project snapshots or grants.
+  const restoreRef = useRef(false);
+  useEffect(() => {
+    if (restoreRef.current) return;
+    restoreRef.current = true;
+    const ref = readBulkOpRef(jobId, threadId);
+    if (!ref) return;
+    keyRef.current = ref.idempotency_key;
+    setState('restoring');
+    (async () => {
+      try {
+        const op = await api.bulkStatus(jobId, ref.operation_id);
+        if (!aliveRef.current) return;
+        setOperation(op);
+        setInterrupted(false);
+        setState('results');
+      } catch {
+        clearBulkOpRef(jobId, threadId);
+        if (aliveRef.current) setState('idle');
+      }
+    })();
+  }, []);
 
   const setParam = (k, v) => setParams((p) => ({ ...p, [k]: v }));
 
@@ -169,6 +200,7 @@ export default function BulkEditCard({
   const startOver = () => {
     keyRef.current = api.newBulkIdempotencyKey();
     preparedTokRef.current = null;
+    clearBulkOpRef(jobId, threadId);
     setOperation(null);
     setError(null);
     setInterrupted(false);
@@ -195,15 +227,21 @@ export default function BulkEditCard({
         await controller.drain();
       }
       if (!lifetimeAlive(tok)) return;
+      // The frozen scope is the client's acknowledged enumeration -- for
+      // mode "all" that is the displayed clip list, not a bare flag the
+      // server would re-enumerate on its own. The server binds it to the
+      // current job, so no undisclosed extra clip can enter.
       const op = await api.bulkPrepare(jobId, {
-        scope: scopeMode === 'all'
-          ? { mode: 'all' }
-          : { mode: 'selected', clip_indices: frozenIndices },
+        scope: { mode: scopeMode, clip_indices: frozenIndices },
         intent,
         idempotencyKey: keyRef.current,
       });
       if (!aliveRef.current || !lifetimeAlive(tok)) return;
       setOperation(op);
+      writeBulkOpRef(jobId, threadId, {
+        operation_id: op.operation_id,
+        idempotency_key: keyRef.current,
+      });
       setState('proposal');
     } catch (e) {
       if (!aliveRef.current) return;
@@ -215,54 +253,67 @@ export default function BulkEditCard({
 
   const apply = async () => {
     if (!operation) return;
-    const tok = captureLifetime();
-    setState('applying');
-    setError(null);
-    setInterrupted(false);
+    // The proposal belongs to the generation captured at prepare start.
+    // A handler captured from an older render (stale lifetime, job
+    // switch) must refuse instead of sending a stale apply, and a
+    // delayed/double handler must not start a second apply.
+    const prepTok = preparedTokRef.current;
+    if (!prepTok || !lifetimeAlive(prepTok)) return;
+    if (inflightRef.current) return;
+    inflightRef.current = true;
     try {
-      const op = await api.bulkApply(jobId, operation.operation_id, keyRef.current);
-      if (!aliveRef.current || !lifetimeAlive(tok)) return;
-      setOperation(op);
-      setState('results');
-      await reconcileController(op);
-    } catch (e) {
-      if (!aliveRef.current) return;
-      // Lifetime ended mid-apply: leave the open state; proposalLive
-      // renders the stale view. (There is no literal 'stale' state -- it
-      // matches no render branch by design.)
-      if (!lifetimeAlive(tok)) return;
-      const answered = e && e.status >= 400 && e.status < 500;
-      if (answered) {
-        // The server answered and rejected the request: nothing landed
-        // under this call. (Per-item conflicts arrive as 200 results.)
-        setError(`Apply failed: ${e.message}. Nothing was applied by this request.`);
-        setState('error');
-        return;
+      const tok = captureLifetime();
+      setState('applying');
+      setError(null);
+      setInterrupted(false);
+      try {
+        const op = await api.bulkApply(jobId, operation.operation_id, keyRef.current);
+        if (!aliveRef.current || !lifetimeAlive(tok)) return;
+        setOperation(op);
+        setState('results');
+        await reconcileController(op, tok, controller);
+      } catch (e) {
+        if (!aliveRef.current) return;
+        // Lifetime ended mid-apply: leave the open state; proposalLive
+        // renders the stale view. (There is no literal 'stale' state -- it
+        // matches no render branch by design.)
+        if (!lifetimeAlive(tok)) return;
+        const answered = e && e.status >= 400 && e.status < 500;
+        if (answered) {
+          // The server answered and rejected the request: nothing landed
+          // under this call. (Per-item conflicts arrive as 200 results.)
+          setError(`Apply failed: ${e.message}. Nothing was applied by this request.`);
+          setState('error');
+          return;
+        }
+        // The request was issued; the response was lost. Never claim it
+        // failed -- report confirmation-unknown until reconciled.
+        setInterrupted(true);
+        setError(
+          'Confirmation unknown: the apply request was sent but its response ' +
+          'was interrupted. Nothing is claimed yet -- reconcile to see what ' +
+          'actually landed.'
+        );
+        setState('results');
       }
-      // The request was issued; the response was lost. Never claim it
-      // failed -- report confirmation-unknown until reconciled.
-      setInterrupted(true);
-      setError(
-        'Confirmation unknown: the apply request was sent but its response ' +
-        'was interrupted. Nothing is claimed yet -- reconcile to see what ' +
-        'actually landed.'
-      );
-      setState('results');
+    } finally {
+      inflightRef.current = false;
     }
   };
 
   const reconcile = async () => {
     if (!operation) return;
     const tok = captureLifetime();
+    const ctl = controller;
     setBusy(true);
     setError(null);
     try {
       const op = await api.bulkStatus(jobId, operation.operation_id);
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || !ledgerAlive() || !lifetimeAlive(tok)) return;
       setOperation(op);
       setInterrupted(false);
       setState('results');
-      await reconcileController(op);
+      await reconcileController(op, tok, ctl);
     } catch (e) {
       if (aliveRef.current) setError(`Reconcile failed: ${e?.message || 'unknown error'}`);
     } finally {
@@ -272,15 +323,17 @@ export default function BulkEditCard({
 
   const retry = async () => {
     if (!operation || !ledgerAlive()) return;
+    const tok = captureLifetime();
+    const ctl = controller;
     setBusy(true);
     setError(null);
     try {
       const op = await api.bulkRetry(jobId, operation.operation_id, keyRef.current);
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || !ledgerAlive() || !lifetimeAlive(tok)) return;
       setOperation(op);
       setInterrupted(false);
       setState('results');
-      await reconcileController(op);
+      await reconcileController(op, tok, ctl);
     } catch (e) {
       if (aliveRef.current) setError(`Retry failed: ${e?.message || 'unknown error'}`);
     } finally {
@@ -290,14 +343,16 @@ export default function BulkEditCard({
 
   const undo = async () => {
     if (!operation || !ledgerAlive()) return;
+    const tok = captureLifetime();
+    const ctl = controller;
     setBusy(true);
     setError(null);
     try {
       const op = await api.bulkUndo(jobId, operation.operation_id, keyRef.current);
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || !ledgerAlive() || !lifetimeAlive(tok)) return;
       setOperation(op);
       setState('results');
-      await reconcileController(op);
+      await reconcileController(op, tok, ctl);
     } catch (e) {
       if (aliveRef.current) setError(`Undo failed: ${e?.message || 'unknown error'}`);
     } finally {
@@ -308,20 +363,27 @@ export default function BulkEditCard({
   // After apply/retry/undo, reload the workspace controller when the active
   // clip was touched: its acknowledged version moved, and any finishing
   // preview bound to the old version is stale by construction (the
-  // Hyperframes card's version binding rejects it).
-  const reconcileController = async (op) => {
-    if (!controller || typeof controller.load !== 'function') return;
+  // Hyperframes card's version binding rejects it). The caller's generation
+  // must still be live and the controller must be the current one -- a
+  // delayed response after a job switch can never revive a disposed
+  // controller.
+  const reconcileController = async (op, tok, ctl) => {
+    const target = ctl === undefined ? controller : ctl;
+    if (!target || typeof target.load !== 'function') return;
+    if (tok && !lifetimeAlive(tok)) return;
+    if (target !== controller) return;
     const touched = bulkItemsArray(op).some(
-      (i) => i.clip_index === controller.clipIndex
+      (i) => i.clip_index === target.clipIndex
         && (i.outcome === 'applied' || (op.undo?.items?.[i.clip_index]?.outcome === 'undone'))
     );
     if (touched) {
-      try { await controller.load(); } catch { /* the controller toasts itself */ }
+      try { await target.load(); } catch { /* the controller toasts itself */ }
     }
   };
 
   const discard = () => {
     preparedTokRef.current = null;
+    clearBulkOpRef(jobId, threadId);
     setOperation(null);
     setError(null);
     setInterrupted(false);
@@ -467,9 +529,17 @@ export default function BulkEditCard({
   const items = operation ? bulkItemsArray(operation) : [];
   const canRetry = operation && retryableItems(operation).length > 0;
   const canUndo = operation && undoableItems(operation).length > 0;
-  const scopeLabel = scopeMode === 'all'
-    ? `all ${frozenIndices.length} clips in this job`
-    : `${frozenIndices.length} selected clip${frozenIndices.length === 1 ? '' : 's'} (${frozenIndices.map((i) => i + 1).join(', ')})`;
+  const scopeLabelFor = (scopeObj) => {
+    const idx = Array.isArray(scopeObj?.clip_indices) ? scopeObj.clip_indices : [];
+    return scopeObj?.mode === 'all'
+      ? `all ${idx.length} clips in this job`
+      : `${idx.length} selected clip${idx.length === 1 ? '' : 's'} (${idx.map((i) => i + 1).join(', ')})`;
+  };
+  // Idle composer: the client-side frozen scope. After prepare, the scope
+  // and count render from the server's recorded operation -- the
+  // acknowledged frozen enumeration, never the live view.
+  const composerScopeLabel = scopeLabelFor({ mode: scopeMode, clip_indices: frozenIndices });
+  const operationScopeLabel = operation ? scopeLabelFor(operation.scope) : composerScopeLabel;
 
   return (
     <div data-testid="bulk-card">
@@ -479,7 +549,7 @@ export default function BulkEditCard({
         <div style={boxStyle}>
           {text && <div style={{ marginBottom: 8, opacity: 0.85 }}>&ldquo;{text}&rdquo;</div>}
           <div style={{ marginBottom: 8 }}>
-            Scope: <strong data-testid="bulk-scope-label">{scopeLabel}</strong>
+            Scope: <strong data-testid="bulk-scope-label">{composerScopeLabel}</strong>
             <div style={{ fontSize: 12, opacity: 0.7, marginTop: 2 }}>
               The proposal freezes this exact clip list and each clip&rsquo;s acknowledged version.
             </div>
@@ -518,10 +588,14 @@ export default function BulkEditCard({
         <div style={boxStyle}>Freezing the proposal — reading each clip&rsquo;s acknowledged version…</div>
       )}
 
+      {state === 'restoring' && (
+        <div style={boxStyle}>Reconnecting to the prepared operation — reading the server&rsquo;s recorded truth…</div>
+      )}
+
       {state === 'proposal' && operation && (
         <div style={boxStyle}>
           <div style={{ marginBottom: 6 }}>
-            <strong>Proposal</strong> · {scopeLabel}
+            <strong>Proposal</strong> · {operationScopeLabel}
           </div>
           <div style={{ fontSize: 12.5, opacity: 0.8, marginBottom: 6 }} data-testid="bulk-intent-summary">
             {summarizeIntent(operation.intent)}
@@ -551,6 +625,7 @@ export default function BulkEditCard({
           <div style={{ marginBottom: 6 }}>
             <strong>Results</strong> · {operation.status}
             {' '}· {appliedItems(operation).length}/{items.length} applied
+            {' '}· {operationScopeLabel}
           </div>
           {interrupted && (
             <div style={{ color: '#fc6', marginBottom: 6 }} data-testid="bulk-interrupted">

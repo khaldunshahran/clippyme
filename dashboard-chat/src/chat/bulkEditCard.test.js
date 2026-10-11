@@ -38,7 +38,7 @@
  *  M5: interrupted apply claims failure instead of unknown -> reconcile
  *      test fails.
  */
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import React from 'react';
 vi.stubGlobal('React', React);
 
@@ -221,7 +221,7 @@ describe('prepare -> proposal', () => {
     expect(bulkApi.bulkPrepare).toHaveBeenCalledTimes(1);
     const [jobId, body] = bulkApi.bulkPrepare.mock.calls[0];
     expect(jobId).toBe('job1');
-    expect(body.scope).toEqual({ mode: 'all' });
+    expect(body.scope).toEqual({ mode: 'all', clip_indices: [0, 1, 2] });
     expect(body.intent).toEqual({
       op: 'caption_appearance',
       params: { caption_style: 'hormozi_bold' },
@@ -437,5 +437,91 @@ describe('interrupted apply', () => {
     tree = render(baseProps());
     expect(textOf(tree)).toMatch(/nothing was applied by this request/i);
     expect(findByTestId(tree, 'bulk-reconcile')).toBeNull();
+  });
+});
+
+describe('reload reconnect (review01)', () => {
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+  // Direct globalThis assignment (not vi.stubGlobal): unstubbing all vi
+  // globals would also drop the React global the harness relies on.
+  afterEach(() => { delete globalThis.localStorage; });
+
+  function stubStorage(initial = {}) {
+    const store = { ...initial };
+    globalThis.localStorage = {
+      getItem: (k) => (k in store ? store[k] : null),
+      setItem: (k, v) => { store[k] = String(v); },
+      removeItem: (k) => { delete store[k]; },
+    };
+    return store;
+  }
+
+  it('reconciles the persisted operation reference instead of minting a new key', async () => {
+    stubStorage({
+      'nugget-bulk-op:job1:t1': JSON.stringify({
+        operation_id: 'op9', idempotency_key: 'restored-key-9',
+      }),
+    });
+    const serverOp = preparedOp([
+      { ...plannedItem(0), outcome: 'applied', result_version: 3 },
+      { ...plannedItem(1), outcome: 'failed', error: 'boom' },
+    ]);
+    serverOp.operation_id = 'op9';
+    serverOp.status = 'partial';
+    bulkApi.bulkStatus.mockResolvedValue(serverOp);
+    bulkApi.bulkRetry.mockResolvedValue(serverOp);
+
+    render(baseProps());
+    await flush();
+    const tree = render(baseProps());
+    expect(bulkApi.bulkStatus).toHaveBeenCalledWith('job1', 'op9');
+    expect(bulkApi.bulkPrepare).not.toHaveBeenCalled();
+    expect(findByTestId(tree, 'bulk-result-items')).toBeTruthy();
+    expect(textOf(findByTestId(tree, 'bulk-outcome-0'))).toMatch(/applied/);
+    // Ledger actions reuse the restored key, not a fresh one.
+    await click(tree, 'bulk-retry');
+    expect(bulkApi.bulkRetry).toHaveBeenCalledWith('job1', 'op9', 'restored-key-9');
+  });
+
+  it('a dead reference clears and returns to idle without a new operation', async () => {
+    const store = stubStorage({
+      'nugget-bulk-op:job1:t1': JSON.stringify({
+        operation_id: 'op-gone', idempotency_key: 'dead-key',
+      }),
+    });
+    bulkApi.bulkStatus.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }));
+
+    render(baseProps());
+    await flush();
+    const tree = render(baseProps());
+    expect(bulkApi.bulkPrepare).not.toHaveBeenCalled();
+    expect(store['nugget-bulk-op:job1:t1']).toBeUndefined();
+    // Back at the composer: no result items, prepare still available.
+    expect(findByTestId(tree, 'bulk-result-items')).toBeNull();
+    expect(findByTestId(tree, 'bulk-prepare')).toBeTruthy();
+  });
+});
+
+describe('stale/double handlers (review01)', () => {
+  async function toProposal() {
+    bulkApi.bulkPrepare.mockResolvedValue(preparedOp([plannedItem(0)]));
+    let tree = render(baseProps());
+    pickCaptionStyle(tree);
+    tree = render(baseProps());
+    await click(tree, 'bulk-prepare');
+    return render(baseProps());
+  }
+
+  it('a delayed/double apply handler starts only one apply', async () => {
+    const tree = await toProposal();
+    let release;
+    bulkApi.bulkApply.mockImplementation(() => new Promise((r) => { release = r; }));
+    const applyHandler = findByTestId(tree, 'bulk-apply').props.onClick;
+    const p1 = applyHandler();
+    const p2 = applyHandler();
+    release(preparedOp([{ ...plannedItem(0), outcome: 'applied', result_version: 3 }]));
+    await p1;
+    await p2;
+    expect(bulkApi.bulkApply).toHaveBeenCalledTimes(1);
   });
 });

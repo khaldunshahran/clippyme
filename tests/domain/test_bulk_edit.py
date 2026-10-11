@@ -653,3 +653,206 @@ def test_undo_skips_non_applied_items(tmp_path):
     op = undo_operation(job_dir=job_dir, operation_id=op_id)
     assert op["undo"]["status"] == "nothing_to_undo"
     assert op["undo"]["items"] == {}
+
+
+# --- review01: recovery keeps undo provenance --------------------------------
+
+def test_recovered_apply_persists_base_snapshot_for_undo(tmp_path, monkeypatch):
+    """Injected lost ledger acknowledgment; retry adopts the save AND keeps
+    undo provenance (base snapshot persisted before the save)."""
+    import clippyme.domain.bulk_edit as be
+    clips = {0: _project_dict(0, version=2), 1: _project_dict(1, version=2)}
+    job_dir = _seed_job(tmp_path, clips)
+    op = create_operation(
+        job_dir=job_dir, job_id="job-1",
+        scope={"mode": "selected", "clip_indices": [0, 1]},
+        intent={"op": "caption_appearance",
+                "params": {"caption_style": "hormozi_bold"}},
+        idempotency_key="k-rec-base")
+    op_id = op["operation_id"]
+    original = be._record_item
+    failed = {"n": False}
+
+    def interrupt(jd, oi, ci, update):
+        if update.get("outcome") == "applied" and not failed["n"]:
+            failed["n"] = True
+            raise OSError("injected lost ledger acknowledgment")
+        return original(jd, oi, ci, update)
+
+    with monkeypatch.context() as m:
+        m.setattr(be, "_record_item", interrupt)
+        be.apply_operation(job_dir=job_dir, operation_id=op_id)
+    assert failed["n"]
+    op = retry_operation(job_dir=job_dir, operation_id=op_id)
+    assert op["items"]["0"]["outcome"] == OUTCOME_APPLIED
+    # Undo provenance survived the lost acknowledgment: per-clip identity
+    # and the exact pre-apply fields are recorded, not inferred.
+    for ci_str in ("0", "1"):
+        snap = op["items"][ci_str]["base_snapshot"]
+        assert isinstance(snap, dict)
+        assert snap["clip_index"] == int(ci_str)
+        assert snap["captions"]["style"] == "classic_white"
+        assert snap["source"]["file"] == f"source_{ci_str}.mp4"
+    op = undo_operation(job_dir=job_dir, operation_id=op_id)
+    assert op["undo"]["items"]["0"]["outcome"] == "undone"
+    assert op["undo"]["items"]["1"]["outcome"] == "undone"
+    with open(os.path.join(job_dir, "clip-project-0.json"),
+              encoding="utf-8") as f:
+        assert json.load(f)["captions"]["style"] == "classic_white"
+
+
+def test_undo_recovers_landed_save_and_still_protects_later_edits(
+        tmp_path, monkeypatch):
+    """A landed undo save followed by a lost ledger write is recovered as
+    this operation's own undo -- not a 'later edit' conflict. A genuine
+    later edit afterwards is still protected."""
+    import clippyme.domain.bulk_edit as be
+    job_dir = _seed_job(tmp_path, {0: _project_dict(0, version=2)})
+    op = create_operation(
+        job_dir=job_dir, job_id="job-1",
+        scope={"mode": "selected", "clip_indices": [0]},
+        intent={"op": "caption_appearance",
+                "params": {"caption_style": "hormozi_bold"}},
+        idempotency_key="k-rec-undo")
+    op_id = op["operation_id"]
+    be.apply_operation(job_dir=job_dir, operation_id=op_id)
+    assert latest_project_version(job_dir, 0) == 3
+    with monkeypatch.context() as m:
+        m.setattr(be, "_save_undo_state",
+                  lambda *a, **k: (_ for _ in ()).throw(
+                      OSError("lost undo acknowledgment")))
+        with pytest.raises(OSError):
+            be.undo_operation(job_dir=job_dir, operation_id=op_id)
+    # The undo save landed (v4); only its acknowledgment was lost.
+    assert latest_project_version(job_dir, 0) == 4
+    op = be.undo_operation(job_dir=job_dir, operation_id=op_id)
+    item = op["undo"]["items"]["0"]
+    assert item["outcome"] == "undone", op["undo"]
+    assert item["version"] == 4
+    # A genuine later edit after the recovered undo is still protected.
+    later = validate_project(_project_dict(0, version=4))
+    later.captions.style = "fire_impact"
+    save_project_version(job_dir=job_dir, clip_index=0, project=later,
+                         expected_version=4)
+    op = be.undo_operation(job_dir=job_dir, operation_id=op_id)
+    assert op["undo"]["items"]["0"]["outcome"] == "undone"  # idempotent
+    with open(os.path.join(job_dir, "clip-project-0.json"),
+              encoding="utf-8") as f:
+        assert json.load(f)["captions"]["style"] == "fire_impact"
+
+
+# --- review01: hyperframes normalization / pending retry ---------------------
+
+def test_revalidation_accepts_normalized_hyperframes_intent(tmp_path):
+    """validate -> plan -> re-validate round-trips: the canonical
+    on_override='replace' the normalizer emits is accepted on revalidation."""
+    norm = validate_bulk_intent({"op": "hyperframes_finishing",
+                                 "params": {"template": "clean-captions"}})
+    assert norm["on_override"] == "replace"
+    again = validate_bulk_intent(norm)
+    assert again == norm
+    job_dir = _seed_job(tmp_path, {0: _project_dict(0)})
+    plan = plan_bulk_operation(job_dir=job_dir, clip_indices=[0], intent=norm,
+                               worker_available={"available": True})
+    assert plan["items"][0]["patch"]["finishing"]["template"] == "clean-captions"
+
+
+def test_pending_worker_retry_rebuilds_finishing_patch(tmp_path, monkeypatch):
+    """A documented pending worker item is replanned on retry: the saved
+    project actually carries the finishing selection (decoded), not just an
+    'applied' status over an empty patch."""
+    import clippyme.domain.bulk_edit as be
+    from clippyme.domain.clip_project import project_from_json
+    job_dir = _seed_job(tmp_path, {0: _project_dict(0, version=2)})
+    monkeypatch.setattr(be, "_check_hyperframes_worker",
+                        lambda: {"available": False, "reason": "down"})
+    op = create_operation(
+        job_dir=job_dir, job_id="job-1",
+        scope={"mode": "selected", "clip_indices": [0]},
+        intent={"op": "hyperframes_finishing",
+                "params": {"template": "clean-captions"}},
+        idempotency_key="k-hf-retry")
+    op_id = op["operation_id"]
+    assert op["items"]["0"]["outcome"] == OUTCOME_PENDING
+    assert op["items"]["0"]["patch"] == {}
+    # Retry while the worker is still down: stays pending, no version minted.
+    op = retry_operation(job_dir=job_dir, operation_id=op_id)
+    assert op["items"]["0"]["outcome"] == OUTCOME_PENDING
+    assert latest_project_version(job_dir, 0) == 2
+    # Worker recovers: retry rebuilds the real finishing patch and saves it.
+    monkeypatch.setattr(be, "_check_hyperframes_worker",
+                        lambda: {"available": True})
+    op = retry_operation(job_dir=job_dir, operation_id=op_id)
+    item = op["items"]["0"]
+    assert item["outcome"] == OUTCOME_APPLIED
+    assert item["patch"].get("finishing", {}).get("template") == "clean-captions"
+    with open(os.path.join(job_dir, "clip-project-0.json"),
+              encoding="utf-8") as f:
+        project = project_from_json(f.read())
+    assert project.finishing is not None
+    assert project.finishing.renderer == "hyperframes"
+    assert project.finishing.template == "clean-captions"
+
+
+# --- review01: scope binding / strict timing / reload ------------------------
+
+def test_all_scope_explicit_enumeration_binds_to_job(tmp_path):
+    """An explicit all-scope enumeration is the acknowledged frozen list:
+    bound to the job's clips; unknown indices rejected; clips added later
+    can never sneak in."""
+    job_dir = _seed_job(tmp_path, {0: _project_dict(0), 1: _project_dict(1)})
+    op = create_operation(
+        job_dir=job_dir, job_id="job-1",
+        scope={"mode": "all", "clip_indices": [0]},
+        intent={"op": "caption_appearance",
+                "params": {"caption_style": "hormozi_bold"}},
+        idempotency_key="k-scope-bind")
+    assert op["scope"] == {"mode": "all", "clip_indices": [0], "count": 1}
+    with pytest.raises(ValueError, match="unknown clips"):
+        create_operation(
+            job_dir=job_dir, job_id="job-1",
+            scope={"mode": "all", "clip_indices": [0, 9]},
+            intent={"op": "caption_appearance",
+                    "params": {"caption_style": "hormozi_bold"}},
+            idempotency_key="k-scope-bind-2")
+
+
+def test_nonfinite_hook_timing_rejected(tmp_path):
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite"):
+            validate_bulk_intent({"op": "hook_timing",
+                                  "params": {"start": 0.0, "end": bad}})
+        with pytest.raises(ValueError, match="finite"):
+            validate_bulk_intent({"op": "hook_timing",
+                                  "params": {"start": bad, "end": 2.0}})
+
+
+def test_reload_reconciles_without_duplicate_versions(tmp_path):
+    """Simulated process restart (locks cleared): the ledger is the truth;
+    re-applying adopts recorded outcomes and mints nothing new."""
+    import clippyme.domain.bulk_edit as be
+    job_dir = _seed_job(tmp_path, {0: _project_dict(0, version=2)})
+    op = create_operation(
+        job_dir=job_dir, job_id="job-1",
+        scope={"mode": "selected", "clip_indices": [0]},
+        intent={"op": "caption_appearance",
+                "params": {"caption_style": "hormozi_bold"}},
+        idempotency_key="k-reload")
+    op_id = op["operation_id"]
+    op = apply_operation(job_dir=job_dir, operation_id=op_id)
+    v1 = op["items"]["0"]["result_version"]
+    # "Restart": drop all in-process lock state, reload from disk.
+    be._op_locks.clear()
+    be._job_locks.clear()
+    op = apply_operation(job_dir=job_dir, operation_id=op_id)
+    assert op["items"]["0"]["outcome"] == OUTCOME_APPLIED
+    assert op["items"]["0"]["result_version"] == v1
+    assert latest_project_version(job_dir, 0) == v1
+    # The same idempotency key still resolves to the one operation.
+    op2 = create_operation(
+        job_dir=job_dir, job_id="job-1",
+        scope={"mode": "selected", "clip_indices": [0]},
+        intent={"op": "caption_appearance",
+                "params": {"caption_style": "hormozi_bold"}},
+        idempotency_key="k-reload")
+    assert op2["operation_id"] == op_id

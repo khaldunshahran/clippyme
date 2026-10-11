@@ -33,11 +33,19 @@ Design rules (TASK.md scope 1-7):
 - The ledger (``bulk-operations.json`` next to ``project-versions.json``)
   records operation identity, frozen scope, typed intent identity,
   base/result versions and per-clip outcomes. It is written atomically
-  (tmp + os.replace) after every per-clip step, so a crash between a project
+  (unique tmp + os.replace, strict finite JSON) after every per-clip step.
+  Whole read/modify/write transactions are serialized per job by an
+  in-process lock (the API serves these calls from one process; no
+  cross-process guarantee is claimed), so concurrent preparations neither
+  lose records nor mint duplicate operations. A crash between a project
   save and the ledger write is recoverable: each applied clip's project
   carries a deterministic item idempotency key
   (``bulk:<operation_id>:<clip_index>``), and apply detects an already-landed
-  save by scanning the version map instead of saving again.
+  save by scanning the version map instead of saving again. The exact
+  pre-apply base snapshot is persisted BEFORE the save, so a recovered
+  apply still has undo provenance; a landed undo save is recovered by its
+  own deterministic key (``bulk:<operation_id>:undo:<clip_index>``) before
+  any later-edit conflict is reported.
 - An idempotency key binds to the exact operation payload (sha256 over the
   canonical scope+intent). Reusing a key with a different payload is
   rejected; replaying the same key+payload returns the recorded outcome and
@@ -56,6 +64,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -194,19 +203,28 @@ def validate_bulk_intent(intent: dict) -> dict:
             raise ValueError(f"unknown hook_timing params: {sorted(unknown)}")
         if "start" in params:
             s = _reject_bool(params["start"], "hook start")
-            if not isinstance(s, (int, float)) or not (s >= 0):
-                raise ValueError(f"hook start must be a number >= 0, got {s!r}")
+            if (not isinstance(s, (int, float)) or not math.isfinite(s)
+                    or not (s >= 0)):
+                raise ValueError(
+                    f"hook start must be a finite number >= 0, got {s!r}")
             norm_params["start"] = float(s)
         if "end" in params:
             e = _reject_bool(params["end"], "hook end")
-            if not isinstance(e, (int, float)) or not (e > 0):
-                raise ValueError(f"hook end must be a number > 0, got {e!r}")
+            if (not isinstance(e, (int, float)) or not math.isfinite(e)
+                    or not (e > 0)):
+                raise ValueError(
+                    f"hook end must be a finite number > 0, got {e!r}")
             norm_params["end"] = float(e)
         if ("start" in norm_params and "end" in norm_params
                 and not norm_params["end"] > norm_params["start"]):
             raise ValueError("hook end must be after hook start")
     elif op == OP_HYPERFRAMES_FINISHING:
-        if "on_override" in intent:
+        # The normalized form carries the canonical on_override="replace"
+        # (the finishing selection always replaces the finishing field).
+        # Revalidation must accept that canonical value -- plan and retry
+        # re-validate the already-normalized intent -- but nothing else.
+        if ("on_override" in intent
+                and intent["on_override"] != ON_OVERRIDE_REPLACE):
             raise ValueError(
                 "on_override does not apply to hyperframes_finishing: the "
                 "finishing selection always replaces the finishing field")
@@ -279,32 +297,47 @@ def check_hyperframes_clip_support(project) -> str | None:
 # Scope resolution
 # ---------------------------------------------------------------------------
 
+def _validate_clip_index_list(raw) -> list[int]:
+    """Ordered unique clip indices from a client-supplied list."""
+    if (not isinstance(raw, list) or not raw
+            or any(not isinstance(x, int) or isinstance(x, bool) or x < 0
+                   for x in raw)):
+        raise ValueError(
+            "scope.clip_indices must be a non-empty list of clip indices")
+    indices = sorted(set(raw))
+    if len(indices) > MAX_BULK_CLIPS:
+        raise ValueError(f"too many clips (max {MAX_BULK_CLIPS})")
+    return indices
+
+
 def resolve_scope_indices(job_dir: str, scope: dict) -> list[int]:
     """Resolve and freeze the ordered unique clip indices for a scope.
 
-    scope: {"mode": "selected"|"all", "clip_indices": [...]}. "all" enumerates
-    the current job snapshot (version map + working-copy files); clips added
-    later are never included.
+    scope: {"mode": "selected"|"all", "clip_indices": [...]}. "all" with no
+    explicit list enumerates the current job snapshot (version map +
+    working-copy files); clips added later are never included. An explicit
+    clip_indices list (either mode) is the client's acknowledged frozen
+    enumeration: every index must exist in the current job, so no
+    undisclosed extra clip can enter the operation.
     """
     if not isinstance(scope, dict):
         raise ValueError("scope must be a dict")
     mode = scope.get("mode")
     if mode == "all":
-        indices = enumerate_job_clips(job_dir)
-        if not indices:
+        current = enumerate_job_clips(job_dir)
+        if not current:
             raise ValueError("the job has no clip projects to select")
+        raw = scope.get("clip_indices")
+        if raw is None:
+            return current
+        indices = _validate_clip_index_list(raw)
+        unknown = [i for i in indices if i not in set(current)]
+        if unknown:
+            raise ValueError(
+                f"scope references unknown clips for this job: {unknown}")
         return indices
     if mode == "selected":
-        raw = scope.get("clip_indices")
-        if (not isinstance(raw, list) or not raw
-                or any(not isinstance(x, int) or isinstance(x, bool) or x < 0
-                       for x in raw)):
-            raise ValueError(
-                "scope.clip_indices must be a non-empty list of clip indices")
-        indices = sorted(set(raw))
-        if len(indices) > MAX_BULK_CLIPS:
-            raise ValueError(f"too many clips (max {MAX_BULK_CLIPS})")
-        return indices
+        return _validate_clip_index_list(scope.get("clip_indices"))
     raise ValueError(f"unknown scope mode {mode!r}; expected 'selected' or 'all'")
 
 
@@ -689,11 +722,17 @@ def load_bulk_ledger(job_dir: str) -> dict:
 
 
 def save_bulk_ledger(job_dir: str, ledger: dict) -> None:
-    """Atomic ledger write (tmp + os.replace), mirroring the version map."""
+    """Atomic ledger write (unique tmp + os.replace), mirroring the version map.
+
+    The staging name is unique per process+thread+call, so concurrent
+    operations in one job never collide on the same tmp file. Strict finite
+    JSON: a nonfinite float raises here instead of being persisted.
+    """
     path = _ledger_path(job_dir)
-    tmp = path + ".tmp"
+    tmp = (f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+           f"-{uuid.uuid4().hex}")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(ledger, f, indent=2)
+        json.dump(ledger, f, indent=2, allow_nan=False)
     os.replace(tmp, path)
 
 
@@ -764,22 +803,47 @@ def operation_lock(operation_id: str) -> threading.Lock:
         return _op_locks.setdefault(operation_id, threading.Lock())
 
 
+# One lock per job directory: the shared bulk-operations.json is read,
+# decided on and rewritten as one serialized transaction, so concurrent
+# create/apply/retry/undo calls -- including concurrent preparations with
+# different keys or the same key -- can neither lose a record nor mint
+# duplicate operations. In-process only: the API runs these through
+# asyncio.to_thread inside a single process. This lock makes NO
+# cross-process guarantee; across processes the optimistic version guards
+# and the deterministic item-key recovery remain the backstop.
+_job_locks: dict[str, threading.Lock] = {}
+_job_locks_guard = threading.Lock()
+
+
+def job_ledger_lock(job_dir: str) -> threading.Lock:
+    """The process-wide lock for one job's bulk-operations.json."""
+    key = os.path.abspath(job_dir)
+    with _job_locks_guard:
+        return _job_locks.setdefault(key, threading.Lock())
+
+
 # ---------------------------------------------------------------------------
 # Apply / retry / undo orchestration
 # ---------------------------------------------------------------------------
 
 def _record_item(job_dir: str, operation_id: str, clip_index: int,
                  update: dict) -> dict:
-    """Merge one item's outcome into the ledger (atomic) and return the op."""
-    ledger = load_bulk_ledger(job_dir)
-    op = ledger["operations"].get(operation_id)
-    if op is None:
-        raise KeyError(f"unknown bulk operation {operation_id}")
-    item = op["items"][str(clip_index)]
-    item.update(update)
-    op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    save_bulk_ledger(job_dir, ledger)
-    return op
+    """Merge one item's outcome into the ledger (atomic) and return the op.
+
+    The whole load/modify/write runs under the per-job ledger lock, so two
+    different operations in one job can never overwrite each other's item
+    updates.
+    """
+    with job_ledger_lock(job_dir):
+        ledger = load_bulk_ledger(job_dir)
+        op = ledger["operations"].get(operation_id)
+        if op is None:
+            raise KeyError(f"unknown bulk operation {operation_id}")
+        item = op["items"][str(clip_index)]
+        item.update(update)
+        op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        save_bulk_ledger(job_dir, ledger)
+        return op
 
 
 def _finalize_status(op: dict) -> str:
@@ -808,6 +872,11 @@ def create_operation(*, job_dir: str, job_id: str, scope: dict,
     operation; the same key with a different payload is rejected with
     KeyError("idempotency_key_reused"). Raises ValueError/FileNotFoundError
     for bad scope/intent.
+
+    The entire read -> idempotency decision -> plan -> write runs under the
+    per-job ledger lock, so concurrent preparations (same key or different
+    keys) serialize: the same key+payload returns one operation, different
+    keys each get their own record, and no record is lost.
     """
     norm_intent = validate_bulk_intent(intent)
     clip_indices = resolve_scope_indices(job_dir, scope)
@@ -815,58 +884,59 @@ def create_operation(*, job_dir: str, job_id: str, scope: dict,
                                 intent=norm_intent)
     sha = payload_sha(payload)
 
-    ledger = load_bulk_ledger(job_dir)
-    for op in ledger["operations"].values():
-        if op.get("idempotency_key") == idempotency_key:
-            if op.get("payload_sha") != sha:
-                raise KeyError(
-                    "idempotency_key_reused: this key is bound to a different "
-                    "operation payload")
-            return op
+    with job_ledger_lock(job_dir):
+        ledger = load_bulk_ledger(job_dir)
+        for op in ledger["operations"].values():
+            if op.get("idempotency_key") == idempotency_key:
+                if op.get("payload_sha") != sha:
+                    raise KeyError(
+                        "idempotency_key_reused: this key is bound to a different "
+                        "operation payload")
+                return op
 
-    plan = plan_bulk_operation(job_dir=job_dir, clip_indices=clip_indices,
-                               intent=norm_intent)
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
-    operation_id = uuid.uuid4().hex
-    op = {
-        "operation_id": operation_id,
-        "idempotency_key": idempotency_key,
-        "payload_sha": sha,
-        "created_at": now,
-        "updated_at": now,
-        "job_id": job_id,
-        "scope": {"mode": scope.get("mode"), "clip_indices": clip_indices,
-                  "count": len(clip_indices)},
-        "intent": norm_intent,
-        "baselines": plan["baselines"],
-        "base_versions": {str(i["clip_index"]): i["expected_version"]
-                          for i in plan["items"]},
-        "status": "proposed",
-        "items": {},
-        "undo": None,
-    }
-    if "worker" in plan:
-        op["worker"] = plan["worker"]
-    for item in plan["items"]:
-        ci = str(item["clip_index"])
-        op["items"][ci] = {
-            "clip_index": item["clip_index"],
-            "expected_version": item["expected_version"],
-            "outcome": item["outcome"],
-            "patch": item["patch"],
-            "changes": item["changes"],
-            "preserved": item["preserved"],
-            "adapted": item["adapted"],
-            "excluded": item["excluded"],
-            "summary": item["summary"],
-            "result_version": None,
-            "base_snapshot": None,
-            "error": None,
-            "recovered": False,
+        plan = plan_bulk_operation(job_dir=job_dir, clip_indices=clip_indices,
+                                   intent=norm_intent)
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        operation_id = uuid.uuid4().hex
+        op = {
+            "operation_id": operation_id,
+            "idempotency_key": idempotency_key,
+            "payload_sha": sha,
+            "created_at": now,
+            "updated_at": now,
+            "job_id": job_id,
+            "scope": {"mode": scope.get("mode"), "clip_indices": clip_indices,
+                      "count": len(clip_indices)},
+            "intent": norm_intent,
+            "baselines": plan["baselines"],
+            "base_versions": {str(i["clip_index"]): i["expected_version"]
+                              for i in plan["items"]},
+            "status": "proposed",
+            "items": {},
+            "undo": None,
         }
-    ledger["operations"][operation_id] = op
-    save_bulk_ledger(job_dir, ledger)
-    return op
+        if "worker" in plan:
+            op["worker"] = plan["worker"]
+        for item in plan["items"]:
+            ci = str(item["clip_index"])
+            op["items"][ci] = {
+                "clip_index": item["clip_index"],
+                "expected_version": item["expected_version"],
+                "outcome": item["outcome"],
+                "patch": item["patch"],
+                "changes": item["changes"],
+                "preserved": item["preserved"],
+                "adapted": item["adapted"],
+                "excluded": item["excluded"],
+                "summary": item["summary"],
+                "result_version": None,
+                "base_snapshot": None,
+                "error": None,
+                "recovered": False,
+            }
+        ledger["operations"][operation_id] = op
+        save_bulk_ledger(job_dir, ledger)
+        return op
 
 
 def apply_operation(*, job_dir: str, operation_id: str) -> dict:
@@ -932,6 +1002,14 @@ def apply_operation(*, job_dir: str, operation_id: str) -> dict:
                     })
                     continue
                 base_snapshot = project.model_dump(mode="json")
+                # Undo provenance is persisted BEFORE the save: if the
+                # applied acknowledgment below is lost (crash, injected
+                # failure), recovery adopts the landed version but the
+                # exact pre-apply baseline is already durable. It is never
+                # inferred from the already-modified project afterwards.
+                op = _record_item(job_dir, operation_id, ci, {
+                    "base_snapshot": base_snapshot,
+                })
                 patched = apply_plan_patch(project, item["patch"], intent_op)
                 patched.origin = "user"
                 patched.idempotency_key = key
@@ -943,7 +1021,6 @@ def apply_operation(*, job_dir: str, operation_id: str) -> dict:
                 op = _record_item(job_dir, operation_id, ci, {
                     "outcome": OUTCOME_APPLIED,
                     "result_version": version,
-                    "base_snapshot": base_snapshot,
                     "error": None,
                 })
             except ConflictError as exc:
@@ -988,8 +1065,13 @@ def retry_operation(*, job_dir: str, operation_id: str) -> dict:
         for ci in eligible:
             op["items"][ci]["outcome"] = OUTCOME_PLANNED
             op["items"][ci]["error"] = None
-        # A pending hyperframes item may now be supportable: re-plan just
-        # that clip's support state before applying.
+        # A pending hyperframes item carries no patch by design (the worker
+        # was down at plan time), so its stored patch is never trusted.
+        # Re-plan each eligible clip from the frozen intent under the
+        # ORIGINAL version/scope guards: only the plan fields (patch,
+        # changes, excluded, ...) are refreshed, the frozen
+        # expected_version is kept, and nothing is saved unless the
+        # rebuilt patch is non-empty and validated.
         if op["intent"]["op"] == OP_HYPERFRAMES_FINISHING:
             worker = _check_hyperframes_worker()
             op["worker"] = {"available": bool(worker.get("available")),
@@ -1001,19 +1083,14 @@ def retry_operation(*, job_dir: str, operation_id: str) -> dict:
                     item["outcome"] = OUTCOME_FAILED
                     item["error"] = "project file disappeared before retry"
                     continue
-                with open(path, "r", encoding="utf-8") as f:
-                    project = project_from_json(f.read())
-                if not worker.get("available"):
-                    item["outcome"] = OUTCOME_PENDING
-                    item["excluded"] = {
-                        "reason": ("hyperframes worker unavailable: "
-                                   f"{worker.get('reason', 'unknown')}"),
-                    }
-                    continue
-                reason = check_hyperframes_clip_support(project)
-                if reason:
-                    item["outcome"] = OUTCOME_UNSUPPORTED
-                    item["excluded"] = {"reason": reason}
+                plan = plan_bulk_operation(
+                    job_dir=job_dir, clip_indices=[int(ci)],
+                    intent=op["intent"], worker_available=worker)
+                fresh = plan["items"][0]
+                for field in ("outcome", "patch", "changes", "preserved",
+                              "adapted", "excluded", "summary"):
+                    item[field] = fresh[field]
+                item["error"] = None
         op["status"] = "applying"
         op["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         save_bulk_ledger(job_dir, ledger)
@@ -1047,7 +1124,23 @@ def undo_operation(*, job_dir: str, operation_id: str) -> dict:
             prev = undo["items"].get(ci_str)
             if prev and prev.get("outcome") == "undone":
                 continue  # idempotent: already undone, keep the record
+            undo_key = f"bulk:{operation_id}:undo:{ci}"
+            landed_undo = find_version_by_item_key(job_dir, ci, undo_key)
             latest = latest_project_version(job_dir, ci)
+            if landed_undo is not None and landed_undo == latest:
+                # This operation's own undo save already landed; only its
+                # ledger acknowledgment was lost. Recover the exact undo --
+                # this is NOT a later edit, so it must not be reported as
+                # a conflict.
+                undo["items"][ci_str] = {
+                    "clip_index": ci,
+                    "outcome": "undone",
+                    "version": landed_undo,
+                    "error": None,
+                    "recovered": True,
+                }
+                _save_undo_state(job_dir, operation_id, op)
+                continue
             if latest != item["result_version"]:
                 undo["items"][ci_str] = {
                     "clip_index": ci,
@@ -1118,9 +1211,10 @@ def undo_operation(*, job_dir: str, operation_id: str) -> dict:
 
 
 def _save_undo_state(job_dir: str, operation_id: str, op: dict) -> None:
-    ledger = load_bulk_ledger(job_dir)
-    target = ledger["operations"].get(operation_id)
-    if target is not None:
-        target["undo"] = op["undo"]
-        target["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        save_bulk_ledger(job_dir, ledger)
+    with job_ledger_lock(job_dir):
+        ledger = load_bulk_ledger(job_dir)
+        target = ledger["operations"].get(operation_id)
+        if target is not None:
+            target["undo"] = op["undo"]
+            target["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            save_bulk_ledger(job_dir, ledger)
